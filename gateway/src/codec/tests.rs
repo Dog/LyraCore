@@ -1196,6 +1196,33 @@ fn char_enum_maps_seeded_warrior() {
     assert_eq!(msg.characters[0].guid.guid(), 1);
 }
 
+/// CMaNGOS enumerates Characters by ascending guid, and the client keeps the order the list
+/// arrives in. The Store may return subscription-cache or cross-Shard probe order, which changes
+/// between logins, so the message must order the list itself.
+#[test]
+fn char_enum_orders_the_characters_by_ascending_guid() {
+    let view = |guid: u64| CharacterView {
+        guid,
+        name: format!("Tester{guid}"),
+        race: 1,
+        class: 1,
+        level: 1,
+        ..Default::default()
+    };
+    let guids = |msg: &SMSG_CHAR_ENUM| -> Vec<u64> {
+        msg.characters.iter().map(|c| c.guid.guid()).collect()
+    };
+
+    assert_eq!(
+        guids(&build_char_enum(&[view(30), view(10), view(20)]).unwrap()),
+        vec![10, 20, 30]
+    );
+    assert_eq!(
+        guids(&build_char_enum(&[view(10), view(20), view(30)]).unwrap()),
+        vec![10, 20, 30]
+    );
+}
+
 #[test]
 fn movement_relay_roundtrips_under_same_opcode() {
     use wow_world_messages::vanilla::MovementInfo_MovementFlags;

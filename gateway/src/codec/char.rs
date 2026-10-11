@@ -39,8 +39,6 @@ pub struct CharacterView {
     pub guild_id: u32,
 }
 
-/// Build the `SMSG_CHAR_ENUM` reply for the character-select screen (gateway
-/// translation §4). Each [`CharacterView`] becomes a `wow_world_messages` `Character` block;
 /// The five appearance bytes a player picks at character creation, bundled so `create_character`
 /// (dispatch → trait → coordinator) passes one value instead of five positional `u8`s that are
 /// trivial to transpose. (race/class/gender are validated separately via typed `try_from`.)
@@ -94,15 +92,20 @@ pub fn build_char_delete_response(outcome: CharDeleteOutcome) -> SMSG_CHAR_DELET
     }
 }
 
+/// Build the `SMSG_CHAR_ENUM` reply for the character-select screen (gateway
+/// translation §4). Each [`CharacterView`] becomes a `wow_world_messages` `Character` block;
 /// the count and the `first_bag_*` trailers are written by the codec, not set here.
 ///
-/// Equipment is all-zero ("naked but valid") for the slice. `race`/`class`/`gender`/`map` are
-/// load-bearing for what the client renders, so an out-of-range raw value is a hard error;
-/// `area`/`zone` is cosmetic on this screen, so an unknown zone degrades to `Area::None`
-/// rather than failing the whole enumeration.
+/// The list is ordered by ascending guid, as CMaNGOS enumerates Characters: the Store's
+/// subscription-cache and cross-Shard probe order is not stable between logins. Equipment comes
+/// from the view. `race`/`class`/`gender`/`map` are load-bearing for what the client renders, so
+/// an out-of-range raw value is a hard error; `area`/`zone` is cosmetic on this screen, so an
+/// unknown zone degrades to `Area::None` rather than failing the whole enumeration.
 pub fn build_char_enum(chars: &[CharacterView]) -> Result<SMSG_CHAR_ENUM> {
-    let mut characters = Vec::with_capacity(chars.len());
-    for c in chars {
+    let mut ordered: Vec<&CharacterView> = chars.iter().collect();
+    ordered.sort_unstable_by_key(|c| c.guid);
+    let mut characters = Vec::with_capacity(ordered.len());
+    for c in ordered {
         characters.push(Character {
             guid: Guid::new(c.guid),
             name: c.name.clone(),
