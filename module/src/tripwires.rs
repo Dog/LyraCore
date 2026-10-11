@@ -1045,6 +1045,77 @@ mod partition_discipline_tripwire {
         out
     }
 
+    fn shard_id_reads_in_file(path: &str, content: &str) -> Vec<(usize, &'static str)> {
+        if !matches!(path, "module/src/lib.rs" | "module/src/tables.rs") {
+            return shard_id_reads(content);
+        }
+        // Named table reexports declare the schema; they do not read its rows.
+        let code = super::character_owned_tripwire::production_code(content);
+        let mut masked = code.as_bytes().to_vec();
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < code.len() {
+            if depth == 0 && code[i..].starts_with("pub use ") {
+                if let Some(end) = code[i..].find(';').map(|end| i + end + 1) {
+                    let declaration = &code[i + 8..end - 1];
+                    let tokens: Vec<_> = declaration
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .filter(|token| !token.is_empty())
+                        .collect();
+                    if matches!(tokens.first(), Some(&"crate" | &"tables"))
+                        && !tokens.contains(&"as")
+                        && !declaration.contains('*')
+                    {
+                        for byte in &mut masked[i..end] {
+                            if *byte != b'\n' {
+                                *byte = b' ';
+                            }
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            match code.as_bytes()[i] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            i += code[i..].chars().next().unwrap().len_utf8();
+        }
+        shard_id_reads(std::str::from_utf8(&masked).unwrap())
+    }
+
+    #[test]
+    fn table_catalog_reexports_do_not_hide_shard_reads() {
+        let source = "pub use crate::region::{game_region_assignment, RegionAssignment};\n\
+                      fn f(row: Row) { let RegionAssignment { shard, .. } = row; row.shard; }\n";
+        for catalog in ["module/src/lib.rs", "module/src/tables.rs"] {
+            assert_eq!(
+                shard_id_reads_in_file(catalog, source),
+                vec![(2, ".shard"), (2, "RegionAssignment")]
+            );
+            for declaration in [
+                "pub use crate::region::RegionAssignment as Assignment;",
+                "fn f() { pub use crate::region::RegionAssignment; }",
+            ] {
+                assert_eq!(
+                    shard_id_reads_in_file(catalog, declaration),
+                    vec![(1, "RegionAssignment")]
+                );
+            }
+        }
+        assert_eq!(
+            shard_id_reads_in_file("module/src/quest.rs", source),
+            vec![
+                (1, "RegionAssignment"),
+                (1, "game_region_assignment"),
+                (2, ".shard"),
+                (2, "RegionAssignment"),
+            ]
+        );
+    }
+
     #[test]
     fn the_scan_finds_a_shard_field_read_but_not_prose_or_longer_names() {
         let src = "fn f(ctx: &ReducerContext, row: Row) {\n    if row.shard == DB {}\n    \
@@ -1092,7 +1163,7 @@ mod partition_discipline_tripwire {
             }
             let content =
                 std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
-            for (line, form) in shard_id_reads(&content) {
+            for (line, form) in shard_id_reads_in_file(&rel, &content) {
                 violations.push(format!("{rel}:{line} names a shard id (`{form}`)"));
             }
         }

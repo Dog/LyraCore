@@ -30,7 +30,7 @@ pub enum HappinessState {
     Happy,
 }
 
-pub fn happiness_state(value: u32) -> HappinessState {
+pub(crate) fn happiness_state(value: u32) -> HappinessState {
     if value < HAPPINESS_BAND {
         HappinessState::Unhappy
     } else if value < HAPPINESS_BAND * 2 {

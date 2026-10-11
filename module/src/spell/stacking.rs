@@ -2,7 +2,7 @@ use spacetimedb::{log, table, ReducerContext, Table};
 
 use crate::game_world_entity;
 // Aura/SpellEffect row types, the `game_aura`/`game_spell_chain` accessors, and the A_CONTROL/P_MECHANIC/
-// M_* taxonomy consts are all re-exported by `mod.rs` (`pub use tables::*` / `pub(crate) use taxonomy::*`).
+// The parent module names the shared M_* taxonomy constants.
 use super::*;
 
 // ===========================================================================================

@@ -19,7 +19,7 @@ const ASSIST_RADIUS: f32 = 10.0;
 /// True iff `(ax,ay)` and `(bx,by)` are within `ASSIST_RADIUS` of each other (squared-distance
 /// compare, `<=` so the boundary assists). The assist scan's geometry check, extracted pure so it's
 /// unit-testable without a `ReducerContext`. Pure — unit-tested.
-pub fn within_assist_radius(ax: f32, ay: f32, bx: f32, by: f32) -> bool {
+pub(crate) fn within_assist_radius(ax: f32, ay: f32, bx: f32, by: f32) -> bool {
     let (dx, dy) = (ax - bx, ay - by);
     dx * dx + dy * dy <= ASSIST_RADIUS * ASSIST_RADIUS
 }
@@ -29,13 +29,13 @@ pub fn within_assist_radius(ax: f32, ay: f32, bx: f32, by: f32) -> bool {
 /// before multiplying so custom/load-test creatures near the `u32` health ceiling remain exact.
 /// Shared by `should_flee` and the creature spell rotation's SELF_HP_BELOW_PCT condition (rank 20 —
 /// "heal when low"). Pure — unit-tested.
-pub fn hp_pct_below(health: u32, max_health: u32, pct: u32) -> bool {
+pub(crate) fn hp_pct_below(health: u32, max_health: u32, pct: u32) -> bool {
     health > 0 && (health as u64) * 100 < (max_health as u64) * (pct as u64)
 }
 
 /// Should this creature flee? True only when it's alive AND below the flee threshold. Vanilla creature
 /// AI: a mob in melee that drops to ~15% HP breaks off and runs. Pure — unit-tested.
-pub fn should_flee(health: u32, max_health: u32) -> bool {
+pub(crate) fn should_flee(health: u32, max_health: u32) -> bool {
     hp_pct_below(health, max_health, FLEE_HEALTH_PCT)
 }
 
@@ -45,7 +45,7 @@ pub fn should_flee(health: u32, max_health: u32) -> bool {
 /// dropped combat ("not all enemies should flee"). This is the minimal heuristic gate (a per-template
 /// `flags_extra` NO_FLEE flag from the DBC is the fuller fix). `creature_type` is the template column the
 /// importer loads verbatim. Pure — unit-tested. [creatures]
-pub fn flee_eligible(creature_type: u8) -> bool {
+pub(crate) fn flee_eligible(creature_type: u8) -> bool {
     creature_type == crate::spell::HUMANOID_TYPE
 }
 
@@ -56,7 +56,7 @@ pub(crate) const ROUT_DURATION_MS: u32 = 10_000;
 /// Is a rout still running, given the wall-clock ms its window closes at? `0` is the never-started
 /// sentinel, so it is never open; a close time at or before `now_ms` means the rout is over AND spent
 /// (the same field is what forbids a second rout). Pure — unit-tested.
-pub fn rout_window_open(now_ms: u32, rout_ends_ms: u32) -> bool {
+pub(crate) fn rout_window_open(now_ms: u32, rout_ends_ms: u32) -> bool {
     rout_ends_ms != 0 && now_ms < rout_ends_ms
 }
 
@@ -64,27 +64,27 @@ pub fn rout_window_open(now_ms: u32, rout_ends_ms: u32) -> bool {
 /// per-type gate) whose engagement has never stamped a window. A spent clock — open or long closed —
 /// blocks every later rout in that engagement, which is what makes the rout once-per-engagement.
 /// Pure — unit-tested.
-pub fn may_start_rout(eligible: bool, rout_ends_ms: u32) -> bool {
+pub(crate) fn may_start_rout(eligible: bool, rout_ends_ms: u32) -> bool {
     eligible && rout_ends_ms == 0
 }
 
 /// The wall-clock ms at which a rout stamped at `now_ms` closes. Never 0: that value is the
 /// never-started sentinel, so a window that wraps the u32 clock onto it would hand out a second rout.
 /// Pure — unit-tested.
-pub fn rout_close_ms(now_ms: u32) -> u32 {
+pub(crate) fn rout_close_ms(now_ms: u32) -> u32 {
     now_ms.wrapping_add(ROUT_DURATION_MS).max(1)
 }
 
 /// The wall-clock ms at which a leash refreshed at `now_ms` expires. Never 0: that is the
 /// never-refreshed sentinel, so a deadline wrapping the u32 clock onto it would re-seed the row.
 /// Pure — unit-tested.
-pub fn pursuit_deadline_ms(now_ms: u32) -> u32 {
+pub(crate) fn pursuit_deadline_ms(now_ms: u32) -> u32 {
     now_ms.wrapping_add(crate::combat::PURSUIT_WINDOW_MS).max(1)
 }
 
 /// Is the target past the ABSOLUTE distance backstop from the creature? The one raw distance that still
 /// ends a fight, so no engagement can persist across a zone. Pure — unit-tested.
-pub fn beyond_combat_backstop(dist_sq: f32) -> bool {
+pub(crate) fn beyond_combat_backstop(dist_sq: f32) -> bool {
     dist_sq > crate::combat::COMBAT_BACKSTOP_SQ
 }
 
@@ -92,7 +92,7 @@ pub fn beyond_combat_backstop(dist_sq: f32) -> bool {
 /// `combat::LEASH_RADIUS_SQ` of the position remembered at the last damage exchange — distance alone no
 /// longer ends a fight (short of [`beyond_combat_backstop`]). `0` is the never-refreshed sentinel and
 /// never evades: an armed row must survive until the leash pass stamps its clock. Pure — unit-tested.
-pub fn should_evade(now_ms: u32, pursuit_ends_ms: u32, target_dist_sq: f32) -> bool {
+pub(crate) fn should_evade(now_ms: u32, pursuit_ends_ms: u32, target_dist_sq: f32) -> bool {
     pursuit_ends_ms != 0
         && now_ms >= pursuit_ends_ms
         && target_dist_sq > crate::combat::LEASH_RADIUS_SQ
@@ -104,7 +104,7 @@ pub fn should_evade(now_ms: u32, pursuit_ends_ms: u32, target_dist_sq: f32) -> b
 /// leg by the cycle's rout phase. Without it a fleer ran at the flat 7.0 yd/s player-run constant — exact parity,
 /// so the chase gap never closed and the mob was uncatchable.
 /// Pure — unit-tested. [creatures]
-pub fn wounded_slow_factor(health: u32, max_health: u32) -> f32 {
+pub(crate) fn wounded_slow_factor(health: u32, max_health: u32) -> f32 {
     if max_health == 0 {
         return 1.0;
     }
@@ -141,7 +141,7 @@ const GREY_LEVEL_DIFF: i32 = 8;
 /// It also breaks diagnosis: infinity serialises as JSON `null`, so `spacetime sql` fails to decode
 /// ANY query over the table with "invalid type: null, expected f32" — the entity table becomes
 /// unreadable, exactly when you most need to read it. Pure — unit-tested. [pure]
-pub fn finite_point(x: f32, y: f32, z: f32) -> bool {
+pub(crate) fn finite_point(x: f32, y: f32, z: f32) -> bool {
     x.is_finite() && y.is_finite() && z.is_finite()
 }
 
@@ -158,7 +158,7 @@ pub fn finite_point(x: f32, y: f32, z: f32) -> bool {
 /// so a level-3 player draws level 1-6 fauna from 18-23 yd — vanilla-normal. Shrinking that would
 /// break ordinary aggro everywhere and would not have stopped the pile-on, because the pile-on came
 /// from accumulation over time, not from reach. Pure — unit-tested. [pure]
-pub fn is_aggro_candidate(dead: bool, godmode: bool) -> bool {
+pub(crate) fn is_aggro_candidate(dead: bool, godmode: bool) -> bool {
     !dead && !godmode
 }
 
@@ -169,7 +169,11 @@ pub fn is_aggro_candidate(dead: bool, godmode: bool) -> bool {
 /// `[MIN, MAX]`. A creature that is GREY to the player (player ≥ `GREY_LEVEL_DIFF` levels above it) does
 /// NOT initiate aggro → returns 0. The aggro pass squares this per (creature, player) pair. Pure —
 /// unit-tested. [pure]
-pub fn aggro_radius(creature_level: u32, player_level: u32, template_aggro_range: u32) -> f32 {
+pub(crate) fn aggro_radius(
+    creature_level: u32,
+    player_level: u32,
+    template_aggro_range: u32,
+) -> f32 {
     if template_aggro_range > 0 {
         return template_aggro_range as f32; // explicit hand-tuned override (e.g. seed chicken)
     }
@@ -207,7 +211,7 @@ pub fn aggro_radius(creature_level: u32, player_level: u32, template_aggro_range
 /// `const fn` so `CHASE_LEASH_SQ` can be defined from it — a hand-copied 55 would be exactly the kind of
 /// silent staleness the live template scan above exists to prevent. Spelled as a comparison rather than
 /// `f32::max` (not const-callable); the NaN branch agrees with `max`'s.
-pub const fn combat_active_radius(template_aggro_max: f32) -> f32 {
+pub(crate) const fn combat_active_radius(template_aggro_max: f32) -> f32 {
     let ceiling = if template_aggro_max > MAX_AGGRO_RADIUS {
         template_aggro_max
     } else {
@@ -252,7 +256,7 @@ const STEALTH_DETECT_MAX: f32 = 30.0;
 /// stealthed target outside the detect range stays invisible to that creature.
 /// Because the base (5) equals `MIN_AGGRO_RADIUS`, this only ever NARROWS the aggro radius for a
 /// stealthed candidate, never widens it. Pure — unit-tested. [pure]
-pub fn stealth_detect_range(creature_level: u32, target_level: u32) -> f32 {
+pub(crate) fn stealth_detect_range(creature_level: u32, target_level: u32) -> f32 {
     let advantage = (creature_level as i32 - target_level as i32).max(0) as f32;
     (STEALTH_DETECT_BASE + advantage * STEALTH_DETECT_PER_LEVEL).min(STEALTH_DETECT_MAX)
 }
@@ -262,7 +266,7 @@ pub fn stealth_detect_range(creature_level: u32, target_level: u32) -> f32 {
 /// Degenerate case (creature and target share a position, `dx==dy==0`): there's no defined "away"
 /// direction, so pick a fixed one (+x) rather than dividing by a zero length and producing NaN. Pure
 /// — unit-tested.
-pub fn flee_step(cx: f32, cy: f32, tx: f32, ty: f32, dist: f32) -> (f32, f32) {
+pub(crate) fn flee_step(cx: f32, cy: f32, tx: f32, ty: f32, dist: f32) -> (f32, f32) {
     let (dx, dy) = (cx - tx, cy - ty);
     let len = (dx * dx + dy * dy).sqrt();
     if len == 0.0 {
@@ -292,7 +296,14 @@ const FEAR_JITTER: f32 = std::f32::consts::FRAC_PI_3;
 /// linearly onto the jitter offset. Degenerate coincident case (source on top of the creature,
 /// `dx==dy==0`): there is no defined "away" bearing, so fall back to +x (0 rad) before applying jitter,
 /// so the result is always finite (never NaN) and still moves. Pure — unit-tested.
-pub fn feared_flee_step(cx: f32, cy: f32, sx: f32, sy: f32, dist: f32, rand: u32) -> (f32, f32) {
+pub(crate) fn feared_flee_step(
+    cx: f32,
+    cy: f32,
+    sx: f32,
+    sy: f32,
+    dist: f32,
+    rand: u32,
+) -> (f32, f32) {
     let (dx, dy) = (cx - sx, cy - sy);
     let base = if dx == 0.0 && dy == 0.0 {
         0.0
@@ -337,7 +348,7 @@ pub(crate) const FLEE_LEG_YD: f32 = 28.0;
 /// the leg's `start_micros` and `dur_ms`. A 0-duration leg is complete (t=1, a snap). Computed ABSOLUTELY
 /// from `now_us − start_micros` each tick — never accumulated — so any number of skipped/dormant ticks
 /// never drifts the position. The caller lerps `start + (dest − start) × t`. Pure — unit-tested.
-pub fn spline_t(now_us: u64, start_micros: u64, dur_ms: u32) -> f32 {
+pub(crate) fn spline_t(now_us: u64, start_micros: u64, dur_ms: u32) -> f32 {
     let dur_us = (dur_ms as u64) * 1000;
     if dur_us == 0 {
         return 1.0;
@@ -352,7 +363,14 @@ pub fn spline_t(now_us: u64, start_micros: u64, dur_ms: u32) -> f32 {
 /// `(cx,cy)` (no move). Degenerate coincident case (`dx==dy==0`, distance 0 ≤ any `stop_dist`) is
 /// caught by the within-`stop_dist` early return, so we never divide by a zero length. Pure —
 /// unit-tested.
-pub fn chase_step(cx: f32, cy: f32, tx: f32, ty: f32, max_step: f32, stop_dist: f32) -> (f32, f32) {
+pub(crate) fn chase_step(
+    cx: f32,
+    cy: f32,
+    tx: f32,
+    ty: f32,
+    max_step: f32,
+    stop_dist: f32,
+) -> (f32, f32) {
     let (dx, dy) = (tx - cx, ty - cy);
     let len = (dx * dx + dy * dy).sqrt();
     // Already inside the stop band (covers the coincident len==0 case) → hold position.
@@ -396,7 +414,13 @@ pub(crate) const WANDER_CHANCE_PCT: u32 = 35;
 /// through the full `u32` span keeps the math float-only (no modulo bias to reason about) and the
 /// result is provably within `radius` of home (the radius scalar is clamped to `[0, radius]`). Pure —
 /// unit-tested.
-pub fn wander_point(home_x: f32, home_y: f32, rand_a: u32, rand_b: u32, radius: f32) -> (f32, f32) {
+pub(crate) fn wander_point(
+    home_x: f32,
+    home_y: f32,
+    rand_a: u32,
+    rand_b: u32,
+    radius: f32,
+) -> (f32, f32) {
     let angle = (rand_a as f32 / u32::MAX as f32) * std::f32::consts::TAU;
     let r = (rand_b as f32 / u32::MAX as f32) * radius;
     (home_x + r * angle.cos(), home_y + r * angle.sin())
@@ -436,7 +460,7 @@ pub(crate) const SENSE_PERIOD_MICROS: i64 = MOVE_TICK_MICROS * SENSE_EVERY_N_TIC
 /// row, or garbage) is clamped to the default so the math never divides by zero. Pure fn of the
 /// scheduler timestamp in micros, so it needs no stored counter and survives across reducer
 /// invocations. Pure — unit-tested.
-pub fn is_sense_tick_for_interval(now_micros: i64, interval_micros: i64) -> bool {
+pub(crate) fn is_sense_tick_for_interval(now_micros: i64, interval_micros: i64) -> bool {
     let interval = if interval_micros > 0 {
         interval_micros
     } else {
@@ -446,7 +470,7 @@ pub fn is_sense_tick_for_interval(now_micros: i64, interval_micros: i64) -> bool
     (now_micros / interval) % every_n == 0
 }
 
-pub fn tick_secs_for_interval(interval_micros: i64) -> f32 {
+pub(crate) fn tick_secs_for_interval(interval_micros: i64) -> f32 {
     let interval = if interval_micros > 0 {
         interval_micros
     } else {
@@ -459,11 +483,11 @@ pub fn tick_secs_for_interval(interval_micros: i64) -> f32 {
 /// authored as "per 0.5s firing", so a faster row must scale it down proportionally or a feared
 /// creature would dash `FEAR_STEP` yards PER FIRING (5× terror-speed at 100ms). At the default tick
 /// this is exactly `FEAR_STEP` (ratio 1.0). Pure — unit-tested.
-pub fn fear_step_for_tick(tick_secs: f32) -> f32 {
+pub(crate) fn fear_step_for_tick(tick_secs: f32) -> f32 {
     FEAR_STEP * (tick_secs / MOVE_TICK_SECS)
 }
 
-pub fn sense_period_secs_for_interval(interval_micros: i64) -> f32 {
+pub(crate) fn sense_period_secs_for_interval(interval_micros: i64) -> f32 {
     let interval = if interval_micros > 0 {
         interval_micros
     } else {
@@ -550,7 +574,7 @@ impl TickScope {
 /// destination at leg-start, while the client animates to `leg_ends_ms`; a SEGMENT pass (patrol/wander)
 /// must not emit a new leg until the current one lands. `leg_ends_ms == 0` (fresh/respawned) is never in
 /// flight. Pure — unit-tested.
-pub fn leg_in_flight(now_ms: u32, leg_ends_ms: u32) -> bool {
+pub(crate) fn leg_in_flight(now_ms: u32, leg_ends_ms: u32) -> bool {
     now_ms < leg_ends_ms
 }
 
@@ -573,7 +597,7 @@ pub(crate) fn leg_toward(from: (f32, f32), to: (f32, f32), speed: f32) -> Option
 
 /// The index AFTER `cur_idx` in a route of `len` waypoints, wrapping at the end (ordered patrol
 /// traversal: 0→1→…→len-1→0). `len == 0` → 0 (caller guards `len >= 2`). Pure — unit-tested.
-pub fn next_waypoint_idx(cur_idx: usize, len: usize) -> usize {
+pub(crate) fn next_waypoint_idx(cur_idx: usize, len: usize) -> usize {
     if len == 0 {
         0
     } else {
@@ -583,7 +607,7 @@ pub fn next_waypoint_idx(cur_idx: usize, len: usize) -> usize {
 
 /// Index of the waypoint nearest `(cx, cy)` — the first patrol target when there's no live cursor
 /// (fresh spawn / stale `wp_target`). Squared-distance compare, no sqrt. Empty → 0. Pure — unit-tested.
-pub fn nearest_waypoint_idx(cx: f32, cy: f32, pts: &[(f32, f32)]) -> usize {
+pub(crate) fn nearest_waypoint_idx(cx: f32, cy: f32, pts: &[(f32, f32)]) -> usize {
     pts.iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {

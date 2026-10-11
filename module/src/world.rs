@@ -442,20 +442,20 @@ impl WorldEntity {
     /// Is this entity a player (vs a server-authored creature/Unit)? Tests the PLAYER bit of
     /// `OBJECT_FIELD_TYPE`. The single spelling of this check — drives damage amount, the
     /// death-vs-floor decision in the swing tick, the loot/corpse owner test, etc.
-    pub fn is_player(&self) -> bool {
+    pub(crate) fn is_player(&self) -> bool {
         self.type_mask & lyracore_shared::constants::type_mask::PLAYER_BIT != 0
     }
 
     /// The entity's RACE id — byte 0 of `unit_bytes_0` (race|class|gender|powertype). The one
     /// spelling of the unpack; the packing layout itself is pinned by lyracore-shared's
     /// `unit_bytes_0` tests.
-    pub fn race(&self) -> u8 {
+    pub(crate) fn race(&self) -> u8 {
         (self.unit_bytes_0 & 0xFF) as u8
     }
 
     /// The entity's CLASS id — byte 1 of `unit_bytes_0`. The single spelling of this shift; callers
     /// should use it rather than hand-unpacking the bitfield.
-    pub fn class(&self) -> u8 {
+    pub(crate) fn class(&self) -> u8 {
         ((self.unit_bytes_0 >> 8) & 0xFF) as u8
     }
 }
@@ -544,7 +544,7 @@ const MIN_DT_S: f32 = 0.05;
 /// `max_speed` the mover's effective allowed speed (RUN through `effective_move_speed`, so a snare lowers
 /// and Sprint raises it). Returns `(kind, magnitude)` for the worst violation, or `None` when plausible.
 /// Magnitude: teleport = the jump distance (yd); speed = the observed multiple of normal (×).
-pub fn movement_violation(dist_2d: f32, dt_s: f32, max_speed: f32) -> Option<(u8, f32)> {
+pub(crate) fn movement_violation(dist_2d: f32, dt_s: f32, max_speed: f32) -> Option<(u8, f32)> {
     // Teleport ceiling first (distance-only, applies even with an unknown dt).
     if dist_2d > TELEPORT_MAX_YD {
         return Some((MOVE_VIOLATION_TELEPORT, dist_2d));
@@ -1064,7 +1064,7 @@ pub(crate) fn apply_player_login(
     // `debug_spawn_player_entity` runs, factored into `build_player_entity`. `owner_identity` is the
     // connection's bound identity (`ctx.sender()`); `account.id` is identical to `character.account_id`
     // (gated above), so the builder reads `account_id` from the character row.
-    let mut entity = crate::build_player_entity(ctx, &character, owner);
+    let mut entity = crate::creatures::build_player_entity(ctx, &character, owner);
     // a preserved ghost rebuilds AS a ghost, `build_player_entity` always builds
     // alive (it's the shared player construction, creature-side code), so the released-ghost state
     // `persist_entity` stamped is re-applied here, the one player-owned call site. Health 1 matches

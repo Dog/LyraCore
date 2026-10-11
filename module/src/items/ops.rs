@@ -12,7 +12,7 @@ use lyracore_shared::item::ItemRefusal;
 
 use super::{next_item_guid, refuse, select_property};
 use crate::game_character; // the durable char holds `class` (the live WorldEntity does not)
-use crate::game_corpse_loot; // the loot.rs accessor trait — re-exported at crate root (`pub use loot::*`)
+use crate::game_corpse_loot;
 use crate::game_gameobject;
 use crate::game_spell_effect; // Gate A reads the on-use spell's effect kinds (by_spell) to mana-gate energize consumables
 use crate::game_start_item; // per-class starter loadout (CharStartOutfit via importer --dbc)

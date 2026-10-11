@@ -27,6 +27,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test -p lyracore-importer
 cargo test -p lyracore-module --lib --features=debug_reducers
+cargo test -p lyracore-module --test build_script
 cargo test -p lyracore-module --test package_api_lint
 cargo test -p lyracore-package-delta
 cargo test -p lyracore-gateway
@@ -40,7 +41,9 @@ the published debug reducers.
 
 CI also builds the Module with every Official Package installed, so a core change that breaks one
 fails before the Package's next publish. To run the same check, link each Package from a checkout of
-`LyraCoreProject/packages` into `packages/` and repeat the wasm check.
+`LyraCoreProject/packages` into `packages/`, run `cargo test -p lyracore-module --test package_api_lint`,
+and repeat the wasm check. The named test checks all installed Package source files; the Wasm
+compile checks their types and generated registrations.
 
 ## Durable tier
 

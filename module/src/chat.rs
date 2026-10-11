@@ -50,13 +50,13 @@ pub struct ChatEvent {
     pub target_guid: u64,
 }
 
-pub fn is_supported_chat_type(chat_type: u8) -> bool {
+pub(crate) fn is_supported_chat_type(chat_type: u8) -> bool {
     matches!(chat_type, CHAT_SAY | CHAT_YELL | CHAT_TEXT_EMOTE)
 }
 
 /// Trim + length-cap a chat line, returning `None` when nothing is left (so an empty/whitespace line
 /// is rejected rather than broadcast). Pure — unit-tested. [pure]
-pub fn normalized_message(raw: &str) -> Option<String> {
+pub(crate) fn normalized_message(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -67,7 +67,7 @@ pub fn normalized_message(raw: &str) -> Option<String> {
 /// An addon-language payload exactly as the client sent it, length-capped like any line. Addons
 /// frame their own data, so a trim would change it in transit; cmangos reads it raw and drops only
 /// an empty one (cm:ChatHandler.cpp:306-312). [pure]
-pub fn addon_payload(raw: &str) -> Option<String> {
+pub(crate) fn addon_payload(raw: &str) -> Option<String> {
     (!raw.is_empty()).then(|| raw.chars().take(MAX_CHAT_LEN).collect())
 }
 

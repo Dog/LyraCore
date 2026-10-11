@@ -4,19 +4,13 @@
 //! whom — see the banner below for the both-directions rule those two helpers encode), the engagement
 //! tables (`MeleeAttack`/`CombatEvent`/`MeleeSchedule`/`RangedImpactSchedule`), and the
 //! `start_attack`/`start_ranged_attack`/`stop_attack` reducers that arm/disarm them. The tick-driven
-//! swing resolution (`tick_melee` and everything it calls) lives in `swing.rs`. `mod.rs` re-exports
-//! this module (`pub use engage::*`) so every `crate::combat::<sym>` path resolves regardless of which
-//! submodule actually defines it.
+//! swing resolution (`tick_melee` and everything it calls) lives in `swing.rs`. `mod.rs` names the operations shared with other Module files.
 
 use spacetimedb::{table, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use crate::{game_faction_template, game_world_entity, WorldEntity};
 
-// Tables' pure formulas/consts and the sibling submodules' re-exports (`roll_swing`, `kill_creature`,
-// ...) are all pulled in from `mod.rs` (`pub use tables::*` + `pub use folds::*`/`death::*`/`swing::*`)
-// — this ALSO brings `tick_melee`/`ranged_impact` into scope for the `MeleeSchedule`/
-// `RangedImpactSchedule` tables' `scheduled(..)` macros below to resolve, since those two reducers are
-// defined in `swing.rs` (mirrors `spell::tables`'s identical cross-file `scheduled(..)` pattern).
+// Shared combat operations and formulas are named in the parent module.
 use super::*;
 use crate::actor::{ActionRefusal, ActionRefusalKind};
 use crate::creatures::tick::game_creature_spline;

@@ -97,7 +97,7 @@ pub struct Script {
 /// reaches the script as an absent `event.actor`/`event.target` rather than as a failure.
 ///
 /// A Package Event has no caller waiting on a Script Answer, so any answer is dropped.
-#[cfg_attr(not(has_packages), allow(dead_code))]
+#[allow(dead_code, reason = "retained Package API event dispatch")]
 pub(crate) fn fire(ctx: &ReducerContext, event: &str, actor_guid: u64, target_guid: u64) {
     dispatch(ctx, event, actor_guid, target_guid, ScriptPayload::default);
 }

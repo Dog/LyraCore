@@ -15,6 +15,20 @@ and is not reconstructed here.
 
 ## [Unreleased]
 
+### Changed
+
+- Package API version 3 has five roots: `actor`, `hooks`, `package`, `tables`, and
+  `script_binding`. Actor operations and observations replace direct dependencies on `chat`,
+  `combat`, `creatures`, `faction`, `gameobject`, `group`, `helpers`, `items`, `loot`, `nav`, `quest`,
+  `spell`, `stats`, `terrain`, `transfer`, `world`, and `xp`. Package setup, Config and encounters
+  move from `package_account`, `package_config`, and `encounter` to `package`. Debug fixtures and
+  unit-test helpers move to `package::fixture` and `package::test` with their existing gates.
+  Import table accessors and row types through `crate::tables`. See the
+  [Package API migration notes](docs/package-api.md#module-roots).
+- The Package API lint now runs with `cargo test -p lyracore-module --test package_api_lint`.
+  Module code generation no longer runs the lint. CI checks installed Official Packages with
+  the named test as well as compiling them.
+
 ### Added
 
 - **The Package API, version 1** — [`docs/package-api.md`](./docs/package-api.md) names what a

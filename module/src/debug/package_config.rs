@@ -10,7 +10,7 @@ use spacetimedb::{reducer, ReducerContext};
 /// Idempotent: re-running this never overwrites a value already set, whether that value came from a
 /// prior seed or from an Operator's own `set_package_config` edit.
 #[reducer]
-pub fn debug_seed_package_config(
+pub(crate) fn debug_seed_package_config(
     ctx: &ReducerContext,
     package_name: String,
     key: String,

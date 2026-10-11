@@ -32,6 +32,8 @@ pub mod go_type {
     /// a state mutation — the gateway's `CMSG_GAMEOBJ_USE` handler does that dispatch itself,
     /// module and gateway copies of this value can never drift. cmangos type 2
     /// (GAMEOBJECT_TYPE_QUESTGIVER).
+    #[cfg(any(test, feature = "debug_reducers"))]
+    #[cfg_attr(not(has_packages), allow(dead_code))]
     pub const QUESTGIVER: u8 = lyracore_shared::constants::go_type::QUESTGIVER;
     /// Loot container — `use` rolls its drop into the loot window. cmangos type 3.
     pub const CHEST: u8 = lyracore_shared::constants::go_type::CHEST;
@@ -358,14 +360,14 @@ pub const POOL_TAG: u64 = 1 << 47;
 /// 48..63, the same scheme as `debug_spawn_gameobject` and the GO seed) | [`POOL_TAG`] | point_id. The tag
 /// bit keeps the point's live row findable/deletable by the reroll while staying disjoint from standalone
 /// GO guids (see [`pool_point_id_of`] — the standalone-vs-pooled discriminator).
-pub fn pool_point_guid(point_id: u64) -> u64 {
+pub(crate) fn pool_point_guid(point_id: u64) -> u64 {
     (0xF110u64 << 48) | POOL_TAG | (point_id & 0x7FFF_FFFF_FFFF)
 }
 
 /// Recover the `point_id` from a guid IFF it is a tagged pool point (HIGHGUID_GAMEOBJECT + [`POOL_TAG`]).
 /// `None` for a standalone GO (tag bit clear) → the respawn pass never even queries the member table for it
 /// and always takes the in-place branch. A STRUCTURAL test, collision-proof — not a member-row lookup.
-pub fn pool_point_id_of(guid: u64) -> Option<u64> {
+pub(crate) fn pool_point_id_of(guid: u64) -> Option<u64> {
     if (guid >> 48) == 0xF110 && (guid & POOL_TAG) != 0 {
         Some(guid & 0x7FFF_FFFF_FFFF)
     } else {

@@ -39,7 +39,7 @@ pub(crate) fn healed_value(health: u32, max_health: u32, basis: i32) -> u32 {
 }
 
 /// New health after `basis` direct damage, FLOORED at 1 (the periodic DoT pass never kills). Negative = 0.
-pub fn damaged_value(health: u32, basis: i32) -> u32 {
+pub(crate) fn damaged_value(health: u32, basis: i32) -> u32 {
     health.saturating_sub(basis.max(0) as u32).max(1)
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn energized_value(power: u32, max_power: u32, basis: i32) -> u32 {
 /// Level is clamped into `[spell_level, max_level]` (`max_level == 0` ⇒ no cap, only the floor). A
 /// `die_sides` of 0 is deterministic (the random `roll` is ignored). Pure — the scaling/rounding is
 /// unit-tested; live casts pass `ctx.random()` for the roll.
-pub fn effect_amount(
+pub(crate) fn effect_amount(
     base_points: i32,
     die_sides: i32,
     per_level: f32,
@@ -236,7 +236,7 @@ pub(crate) fn is_behind(ax: f32, ay: f32, tx: f32, ty: f32, target_orientation: 
 /// auto-face their victim so they're exempt.
 // Deliberate simplification: front 180°, not vanilla's stricter ~120° arc — kills the
 // attack-while-fleeing exploit; tighten to 2π/3 if side-swings ever read as cheese.
-pub fn is_facing(ax: f32, ay: f32, attacker_orientation: f32, tx: f32, ty: f32) -> bool {
+pub(crate) fn is_facing(ax: f32, ay: f32, attacker_orientation: f32, tx: f32, ty: f32) -> bool {
     let (dx, dy) = (tx - ax, ty - ay);
     if dx == 0.0 && dy == 0.0 {
         return true;
@@ -246,7 +246,8 @@ pub fn is_facing(ax: f32, ay: f32, attacker_orientation: f32, tx: f32, ty: f32) 
 
 /// Absolute micros at which a `cast_time_ms` cast finishes, given `now_micros`. Pure mirror of the
 /// `checked_add(TimeDuration::from_micros(..))` deadline math used for the PendingCast schedule.
-pub fn cast_finish_micros(now_micros: i64, cast_time_ms: u32) -> i64 {
+#[cfg(test)]
+pub(crate) fn cast_finish_micros(now_micros: i64, cast_time_ms: u32) -> i64 {
     now_micros + (cast_time_ms as i64) * 1000
 }
 

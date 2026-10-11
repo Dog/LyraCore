@@ -45,7 +45,7 @@ pub enum CommandOutcome {
 }
 
 impl CommandOutcome {
-    pub fn tag(&self) -> &'static str {
+    pub(crate) fn tag(&self) -> &'static str {
         match self {
             Self::Applied => "Applied",
             Self::Unchanged => "Unchanged",

@@ -3,20 +3,17 @@
 //! gate (`swing_blocked`), and the resolvers that actually roll + fire a hit (`fire_melee_swing`,
 //! `resolve_offhand_swing`, `fire_ranged_shot`, and the scheduled `ranged_impact` reducer). Every
 //! resolver here routes through `death`'s shared `fold_incoming_damage`/`final_damage`/`apply_hit`
-//! pipeline. See `damage_pipeline_drift_tests` below, which pins that wiring. `mod.rs` re-exports
-//! this module (`pub use swing::*`) so every `crate::combat::<sym>` path resolves regardless of which submodule
-//! actually defines it.
+//! pipeline. See `damage_pipeline_drift_tests` below, which pins that wiring. `mod.rs` names the operations shared with other Module files.
 
 use spacetimedb::{reducer, ReducerContext, ScheduleAt, Table, TimeDuration};
 
+use crate::spell::SpellCastEventKind;
 use crate::{
     game_item_instance, game_item_template, game_spell, game_spell_cast_event, game_world_entity,
-    SpellCastEvent, SpellCastEventKind, WorldEntity,
+    SpellCastEvent, WorldEntity,
 };
 
-// Tables' pure formulas/consts and the sibling submodules' re-exports (`roll_swing`, `apply_hit`,
-// `enter_combat`, ...) are all pulled in from `mod.rs` (`pub use tables::*` + `pub use
-// folds::*`/`death::*`/`engage::*`) so every symbol resolves the same as before the split.
+// Shared combat operations and formulas are named in the parent module.
 use super::*;
 
 /// Swing tick (scheduled; scheduler-only). Two passes:

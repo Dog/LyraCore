@@ -210,7 +210,7 @@ pub fn debug_pet_command(
 /// The owner's pet, if any. Pet GUIDs are deterministic, so this is one primary-key read followed by
 /// an owner check. A missing row or a row that names another owner fails closed. `owner_guid == 0`
 /// returns before looking in the wild-creature namespace. [entity]
-pub fn pet_of(ctx: &ReducerContext, owner_guid: u64) -> Option<WorldEntity> {
+pub(crate) fn pet_of(ctx: &ReducerContext, owner_guid: u64) -> Option<WorldEntity> {
     if owner_guid == 0 {
         return None;
     }
@@ -238,7 +238,7 @@ fn despawn_pet_entity(ctx: &ReducerContext, pet: WorldEntity) {
 /// so the pet vanishes for every client. Called on owner logout/disconnect (`remove_from_world`), owner
 /// death (`repop`), and at the top of `summon_pet` (a re-summon replaces the old pet). Idempotent — a
 /// no-op when the owner has no pet. [entity]
-pub fn despawn_pets(ctx: &ReducerContext, owner_guid: u64) {
+pub(crate) fn despawn_pets(ctx: &ReducerContext, owner_guid: u64) {
     if let Some(pet) = pet_of(ctx, owner_guid) {
         despawn_pet_entity(ctx, pet);
     }
@@ -282,7 +282,7 @@ fn build_pet_entity(ctx: &ReducerContext, owner: &WorldEntity, entry: u32) -> Op
 /// new pet at the caster. No-op if the caster left the world or the creature template isn't loaded (logs).
 /// Generic over the kind — `entry` is the effect's `p0` (a game_creature_template entry); the engine never
 /// names Summon Imp. [entity]
-pub fn summon_pet(ctx: &ReducerContext, caster_guid: u64, entry: u32) {
+pub(crate) fn summon_pet(ctx: &ReducerContext, caster_guid: u64, entry: u32) {
     if entry == 0 {
         spacetimedb::log::info!(
             "E_SUMMON_PET with no creature entry (p0=0) for {caster_guid} — skipped"

@@ -671,7 +671,7 @@ pub struct CompanionTargetFacts {
 /// Resolve only the named hostile creature. This exact read permits a designated pull without
 /// widening the party fight scan or choosing a substitute target.
 #[cfg_attr(not(has_packages), allow(dead_code))]
-pub fn companion_target_facts(
+pub(crate) fn companion_target_facts(
     ctx: &ReducerContext,
     bot_guid: u64,
     target_guid: u64,
@@ -859,7 +859,7 @@ fn known_party_partition(
 /// and three effects on a pending spell. A missing parent Group stops with `MissingGroup`; neither
 /// failure returns facts selected from an arbitrary prefix.
 #[cfg_attr(not(has_packages), allow(dead_code))]
-pub fn party_facts(
+pub(crate) fn party_facts(
     ctx: &ReducerContext,
     character_guid: u64,
 ) -> Result<Option<PartyFacts>, PartyFactsUnavailable> {
@@ -2078,7 +2078,7 @@ pub(crate) enum Plane {
 pub fn realm_group_op(
     ctx: &ReducerContext,
     op: u8,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
     target_guid: u64,
     arg_a: u8,
     arg_b: u8,
@@ -2252,7 +2252,7 @@ pub fn sync_group_mirror(
     loot_threshold: u8,
     master_looter_guid: u64,
     members: Vec<u64>,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
     partitions: Vec<GroupMemberPartition>,
     roster_revision: u64,
     group_kind: u8,

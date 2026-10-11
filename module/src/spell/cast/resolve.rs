@@ -1,9 +1,8 @@
 //! The cast core — `resolve_cast_at` (+ its extracted `check_cast_gates` gate sweep) / `resolve_cast` /
 //! `begin_cast` / the passive-apply path (`passive_applies_effect_kind` / `apply_spell_auras`). 381
 //! split: the targeting/effect-dispatch half (`select_targets` / `aura_apply` / `apply_effect`) lives in
-//! the sibling `targeting` module; the cast-bar teardown family moved into `control.rs`. `cast::mod`
-//! glob re-exports both cast siblings, and `spell::mod` globs `cast::*` in turn, so every
-//! `crate::spell::<sym>` call site is unchanged by the split.
+//! the sibling `targeting` module; the cast-bar teardown family moved into `control.rs`. The parent modules
+//! name the operations shared with other Module files.
 
 use spacetimedb::{log, ReducerContext, ScheduleAt, Table, TimeDuration};
 

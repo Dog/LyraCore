@@ -7,7 +7,9 @@
 //! Blob layout + cell math live in `lyracore_shared::nav` (one copy, unit-tested there; the importer
 //! rasterizes through the SAME functions).
 
-use lyracore_shared::nav::{self, OBS_BYTES, OBS_DIM, WALK_BYTES, WALK_DIM};
+#[cfg(feature = "debug_reducers")]
+use lyracore_shared::nav::OBS_DIM;
+use lyracore_shared::nav::{self, OBS_BYTES, WALK_BYTES, WALK_DIM};
 use lyracore_shared::terrain::{cell_index, cell_key};
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
@@ -51,7 +53,7 @@ pub struct NavigationInputs {
 
 /// Identifies the inputs to movement on one map. It does not certify coverage at a position;
 /// the retained RouteStep carries that evidence. Dynamic obstacles still require bounded expiry.
-pub fn inputs(ctx: &ReducerContext, map_id: u32) -> NavigationInputs {
+pub(crate) fn inputs(ctx: &ReducerContext, map_id: u32) -> NavigationInputs {
     NavigationInputs {
         imported_revision: ctx
             .db
@@ -83,7 +85,7 @@ pub(crate) fn record_change(ctx: &ReducerContext) -> Result<(), String> {
 
 /// Is (x, y) standable? `None` = no nav chunk here (un-imported or fully clear) — callers keep
 /// their current behavior, exactly like `terrain::ground_z`'s off-slice contract. One PK find.
-pub fn walkable(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<bool> {
+pub(crate) fn walkable(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<bool> {
     let (cx, cy) = (cell_index(x)?, cell_index(y)?);
     let chunk = ctx
         .db
@@ -98,7 +100,8 @@ pub fn walkable(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<boo
 }
 
 /// Obstruction top-Z over (x, y), or `None` when the column (or the whole cell) is clear.
-pub fn obstruction_top(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<f32> {
+#[cfg(feature = "debug_reducers")]
+pub(crate) fn obstruction_top(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<f32> {
     let (cx, cy) = (cell_index(x)?, cell_index(y)?);
     let chunk = ctx
         .db
@@ -213,7 +216,7 @@ use crate::vmap::game_vmap_nav_coverage;
 use lyracore_shared::nav::NavCellData;
 
 /// The 243 consumption gate. Missing config row = false (fresh DB stays baseline).
-pub fn nav_enabled(ctx: &ReducerContext) -> bool {
+pub(crate) fn nav_enabled(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
         .id()
@@ -223,7 +226,7 @@ pub fn nav_enabled(ctx: &ReducerContext) -> bool {
 }
 
 /// The vmap-derived coverage gate. Missing config row = false, like `nav_enabled`.
-pub fn nav_coverage_enabled(ctx: &ReducerContext) -> bool {
+pub(crate) fn nav_coverage_enabled(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
         .id()
@@ -302,7 +305,7 @@ fn fetch_cell(
 }
 
 /// Closed doors apply even where static geometry falls back to the coarse navigation grid.
-pub fn has_los(
+pub(crate) fn has_los(
     ctx: &ReducerContext,
     map_id: u32,
     instance_id: u64,
@@ -332,6 +335,10 @@ pub enum RouteStatus {
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API route value")
+)]
 pub enum CoverageEvidence {
     Unknown,
     /// Every consulted navigation cell has a matching derived row from the active generation's
@@ -358,6 +365,10 @@ impl From<(f32, f32)> for RoutePoint {
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq)]
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API route value")
+)]
 pub struct RouteClip {
     pub attempted: RoutePoint,
     pub hit: RoutePoint,
@@ -366,6 +377,10 @@ pub struct RouteClip {
 /// `endpoint == from` means no movement. Complete means a route was planned, not arrival. Static
 /// collision and exact walk-mask validation may shorten the committed endpoint.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq)]
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API route value")
+)]
 pub struct RouteStep {
     pub from: RoutePoint,
     pub endpoint: RoutePoint,
@@ -376,13 +391,21 @@ pub struct RouteStep {
     pub coverage: CoverageEvidence,
 }
 
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API route value")
+)]
 pub struct RoutePath {
     pub step: RouteStep,
     pub points: Vec<(f32, f32, f32)>,
 }
 
 /// Retain a bounded part of one route, including its turns, after checking every segment.
-pub fn route_path(
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API operation")
+)]
+pub(crate) fn route_path(
     ctx: &ReducerContext,
     map_id: u32,
     instance_id: u64,
@@ -402,6 +425,10 @@ pub fn route_path(
 }
 
 /// Use a caller's smaller search allowance while retaining the normal movement limits.
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API operation")
+)]
 pub(crate) fn route_path_with_budget(
     ctx: &ReducerContext,
     map_id: u32,
@@ -569,6 +596,10 @@ pub(crate) fn route_path_with_budget(
     result
 }
 
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API route value")
+)]
 struct WalkingStep {
     attempted: (f32, f32, f32),
     endpoint: (f32, f32),
@@ -577,6 +608,10 @@ struct WalkingStep {
 
 /// Resample a clipped floor segment down to half a navigation cell. A clear shorter step must
 /// pass the original collision point; stopping before it would erode the wall clearance margin.
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API operation")
+)]
 fn sample_walking_step(
     from: (f32, f32),
     towards: (f32, f32),
@@ -614,6 +649,10 @@ fn sample_walking_step(
 
 /// Fit vanilla's quarter-yard points without cutting corners. A small bounded search permits
 /// neighboring points to move together; every accepted segment still passes the normal Gates.
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API operation")
+)]
 fn fit_wire_path(
     start: (f32, f32, f32),
     points: &[(f32, f32, f32)],
@@ -724,7 +763,11 @@ pub(crate) fn route_segment_clear(
 /// Plan one bot movement step. A failed search holds position; sparse missing rows retain
 /// unknown coverage. Collision can shorten complete, partial, and direct steps independently.
 #[allow(clippy::too_many_arguments)] // A movement step carries its partition, endpoints and distances.
-pub fn route_step(
+#[cfg_attr(
+    not(has_packages),
+    allow(dead_code, reason = "retained Package API operation")
+)]
+pub(crate) fn route_step(
     ctx: &ReducerContext,
     map_id: u32,
     instance_id: u64,
@@ -827,7 +870,7 @@ pub fn route_step(
 /// before flipping `vmap_enabled` on a populated map, and compare its wall time to
 /// `debug_bench_los(exact=true)`'s on that box.
 #[allow(clippy::too_many_arguments)] // A movement step carries its partition, endpoints and distances.
-pub fn nav_step(
+pub(crate) fn nav_step(
     ctx: &ReducerContext,
     map_id: u32,
     instance_id: u64,
@@ -957,7 +1000,8 @@ fn gate_step(
 /// pair readable: the same leg run with the gate off and on shows how many expansions routing
 /// around real geometry actually costs against `LEG_MAX_EXPANSIONS`, and `complete=false` means
 /// the budget ran out and the leg is best-effort.
-pub fn debug_find_leg(
+#[cfg(feature = "debug_reducers")]
+pub(crate) fn debug_find_leg(
     ctx: &ReducerContext,
     map_id: u32,
     from: (f32, f32),

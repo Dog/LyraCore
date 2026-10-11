@@ -8,15 +8,25 @@
 //! back into `pushback_cast` (the on-damage chokepoint), so co-locating it with the rest of the
 //! crowd-control model removes a cross-module callback instead of adding one.
 //!
-//! Both siblings glob-import each other's surface via `crate::spell::*` (not `super::*` — they are
-//! siblings, not parent/child, and each needs symbols the OTHER defines: `resolve` calls
-//! `targeting::{select_targets, apply_effect, aura_apply, recipe_reagents}`; `targeting`'s E_TRIGGER arm
-//! calls back into `resolve::resolve_cast_at`). This `mod.rs` glob re-exports both into
-//! `crate::spell::cast::*`, and `spell::mod` globs `cast::*` in turn — so every `crate::spell::<sym>`
-//! call site outside this module is unchanged by the split.
+//! Resolve and targeting share operations through the named exports here and in `spell::mod`.
+//! Resolve calls targeting's effect dispatch, and triggered effects call back into resolve.
 
-mod resolve;
+pub(crate) mod resolve;
 mod targeting;
 
-pub(crate) use resolve::*;
-pub(crate) use targeting::*;
+#[cfg(test)]
+pub(crate) use resolve::passive_applies_effect_kind;
+#[cfg(feature = "debug_reducers")]
+pub(crate) use resolve::resolve_cast;
+pub(crate) use resolve::{
+    apply_spell_auras, begin_cast, begin_cast_with_admission, cast_triggered,
+    check_cast_start_gates, check_pending_cast_los, clear_dead_callback_cast_admission,
+    resolve_cast_at, resolve_cast_at_typed, start_creature_spell, CreatureSpellCasterAdmission,
+    CreatureSpellStart, CreatureSpellStartMode, CreatureSpellTarget,
+};
+#[cfg(feature = "debug_reducers")]
+pub(crate) use targeting::blink_forward;
+pub(crate) use targeting::{
+    apply_direct_heal, apply_effect, aura_apply, dynamic_object_guid, faction_target_violation,
+    recipe_reagents, revive_amount, select_targets, ItemGrantOutcome,
+};

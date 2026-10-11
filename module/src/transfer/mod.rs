@@ -1,7 +1,16 @@
 //! Character Transfer. See `docs/character-transfer.md` for the contract and rationale.
 
 mod transport;
-pub(crate) use transport::*;
+#[cfg(test)]
+pub(crate) use transport::{
+    admit_command_issuer_import, decode_rows, encode_rows, export_rows_via, import_rows_via,
+    manifest, CommandIssuerImportRefusal, ManifestEntry, TransportArm, HOT_TABLES,
+    MANIFEST_EXCLUDE, NOT_TRANSPORTED, TRANSFER_TABLES_OLD_BLOBS_MAY_LACK,
+};
+pub(crate) use transport::{
+    build_export_blob, check_manifest, decode_blob, decode_character_row, export_rows, import_rows,
+    move_rows, not_transported, payload_for_this_build, Destination, ExportBlob, RowIo, TableRows,
+};
 
 #[cfg(test)]
 mod harness;
@@ -1068,7 +1077,7 @@ impl ReapSink for CtxShard<'_> {
 pub fn begin_transfer(
     ctx: &ReducerContext,
     transfer_id: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
     dest_map_id: u32,
     dest_instance_id: u64,
     dest_x: f32,
@@ -1270,7 +1279,7 @@ pub fn import_character(ctx: &ReducerContext, transfer_id: u64) -> Result<(), St
 fn require_transfer_actor(
     ctx: &ReducerContext,
     transfer_id: u64,
-    actor: crate::SessionActor,
+    actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     crate::account_ownership::require_actor(ctx, actor)?;
     let character = ctx
@@ -1310,7 +1319,7 @@ pub fn import_character_blob(
     ctx: &ReducerContext,
     transfer_id: u64,
     blob: Vec<u8>,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1331,7 +1340,7 @@ pub fn import_player_character_blob(
     source_map_id: u32,
     source_instance_id: u64,
     source_locator_revision: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1383,7 +1392,7 @@ pub fn import_bot_character_blob(
     source_map_id: u32,
     source_instance_id: u64,
     source_locator_revision: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1589,7 +1598,7 @@ pub(crate) fn apply_import_blob<S: ImportSink>(
 pub fn confirm_import(
     ctx: &ReducerContext,
     transfer_id: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1650,7 +1659,7 @@ pub(crate) fn apply_confirm<S: ShardLedger>(sink: &mut S, transfer_id: u64) -> R
 pub fn release_transfer(
     ctx: &ReducerContext,
     transfer_id: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1678,7 +1687,7 @@ pub fn release_player_transfer_arrival(
     source_map_id: u32,
     source_instance_id: u64,
     source_locator_revision: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;
@@ -1788,7 +1797,7 @@ pub(crate) fn apply_release<S: ShardLedger>(sink: &mut S, transfer_id: u64) -> R
 pub fn finish_transfer(
     ctx: &ReducerContext,
     transfer_id: u64,
-    request_actor: crate::SessionActor,
+    request_actor: crate::account_ownership::SessionActor,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     require_transfer_actor(ctx, transfer_id, request_actor)?;

@@ -41,8 +41,9 @@ facade re-export, which the scanner checks. Package paths resolve through their 
 `#![cfg(feature = "debug_reducers")]`; discovery observes that gate so an ordinary build cannot
 reference a function omitted by Rust.
 
-Package source also passes the Package API lint described in `docs/package-api.md`. A path outside
-`PACKAGE_API_ROOTS` fails with the Package, file, line, and path. An explicit
+The separate `package_api_lint` test checks Package source as described in `docs/package-api.md`.
+Code generation does not run this lint. CI runs it after installing the Official Packages. A path outside
+the five documented Package API roots fails with the Package, file, line, and path. An explicit
 `// package-api: exempt <reason>` permits an ordinary boundary exception. A gated API root still
 requires its debug or test gate, and exemptions cannot bypass that requirement. Core source does
 not pass through this lint.

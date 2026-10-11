@@ -119,8 +119,8 @@ _Avoid_: plugin, addon (when meaning the whole folder), mod, extension
 
 **Package API**:
 The part of the Module a Package may name, versioned and written down at `docs/package-api.md`. The
-build lints every Package file against it and fails on a path outside it, so a core refactor breaks a
-Package at compile time rather than on a live realm. It is a compatibility contract, never a
+named `package_api_lint` test checks every Package Rust file against it and reports paths outside
+that contract. CI runs it with the Official Packages installed. It is a compatibility contract, never a
 sandbox: compiled Package code is trusted either way.
 _Avoid_: SDK, plugin API, public API, allowlist
 

@@ -174,7 +174,7 @@ pub struct CreatureGossipMenuOverride {
 }
 
 /// Install or remove one exact creature's runtime gossip menu. Packages and relays share this owner.
-pub fn set_creature_gossip_menu(
+pub(crate) fn set_creature_gossip_menu(
     ctx: &ReducerContext,
     creature_guid: u64,
     menu_id: Option<u32>,
@@ -357,7 +357,6 @@ pub struct CreatureWaypoint {
 /// `game_creature_waypoint` patrol. Most world NPCs (quest givers, vendors, guards) are IDLE.
 pub const MOVEMENT_IDLE: u8 = 0;
 pub const MOVEMENT_RANDOM: u8 = 1;
-pub const MOVEMENT_WAYPOINT: u8 = 2;
 
 #[cfg(feature = "debug_reducers")]
 #[reducer]
@@ -542,7 +541,7 @@ pub(crate) fn current_life_seq(ctx: &spacetimedb::ReducerContext, creature_guid:
 /// Otherwise the level is uniform in `[min_level, max_level]` and the health is interpolated linearly
 /// between `min_health` and `max_health` by the level's position in the span (so a higher-level spawn
 /// is correspondingly beefier — no L3-mob-with-L1-HP inconsistency). Pure — unit-tested.
-pub fn rolled_creature_stats(
+pub(crate) fn rolled_creature_stats(
     min_level: u32,
     max_level: u32,
     min_health: u32,
@@ -572,7 +571,7 @@ pub fn rolled_creature_stats(
 /// rounding, and rank 0 (`1000`) is the identity (`hp * 1000 / 1000 == hp`), so every current rank-0
 /// spawn stays BYTE-IDENTICAL. An unknown/out-of-range rank falls back to the normal multiplier (safe
 /// default — never amplifies an unrecognized value). Pure — unit-tested.
-pub fn rank_hp_multiplier_permille(rank: u8) -> u32 {
+pub(crate) fn rank_hp_multiplier_permille(rank: u8) -> u32 {
     match rank {
         0 => 1000, // normal — identity (baseline)
         1 => 1500, // elite
@@ -586,7 +585,7 @@ pub fn rank_hp_multiplier_permille(rank: u8) -> u32 {
 /// Apply the rank HP multiplier to a base health value (integer permille math, saturating so a huge
 /// base × a high multiplier can't wrap a `u32`). Shared by `build_creature_entity` and its unit test
 /// so the live scaling and the asserted numbers never drift. Pure.
-pub fn scale_health_for_rank(base_health: u32, rank: u8) -> u32 {
+pub(crate) fn scale_health_for_rank(base_health: u32, rank: u8) -> u32 {
     let permille = rank_hp_multiplier_permille(rank);
     // Clamp the u64 product to the u32 ceiling BEFORE the cast — a bare `as u32` would silently
     // truncate (wrap) a huge base × >1000‰ product instead of saturating as documented.
@@ -596,7 +595,7 @@ pub fn scale_health_for_rank(base_health: u32, rank: u8) -> u32 {
 /// Scale a template's minimum-level damage range to a live creature level. The level-matching case
 /// is the identity, so ordinary spawns are unchanged; the swing fold uses this to give an advancing
 /// Hunter pet a monotonic, overflow-safe damage refresh.
-pub fn scale_creature_damage_for_level(
+pub(crate) fn scale_creature_damage_for_level(
     min: u32,
     max: u32,
     template_level: u32,
@@ -643,7 +642,7 @@ pub(crate) fn insert_creature_entity(ctx: &spacetimedb::ReducerContext, mut enti
     crate::hooks::fire_on_creature_spawn(ctx, &payload);
 }
 
-pub fn build_creature_entity(
+pub(crate) fn build_creature_entity(
     spawn: &CreatureSpawn,
     tmpl: &CreatureTemplate,
     rand: u32,
@@ -760,7 +759,7 @@ pub fn build_creature_entity(
 /// character's persisted `owner_identity` (a `spacetime call` runs as the CLI identity, which owns no
 /// player binding). `account_id` is taken from the character row — login gates on
 /// `character.account_id == account.id` before building, so the two are identical there.
-pub fn build_player_entity(
+pub(crate) fn build_player_entity(
     ctx: &ReducerContext,
     character: &Character,
     owner_identity: Identity,
@@ -815,7 +814,7 @@ pub fn build_player_entity(
         display_id: display,
         native_display_id: display,
         unit_flags: constants::unit_flags::PLAYER_CONTROLLED,
-        base_attack_time_ms: crate::DEFAULT_ATTACK_TIME_MS, // unarmed 2.0s
+        base_attack_time_ms: crate::combat::DEFAULT_ATTACK_TIME_MS, // unarmed 2.0s
         dynamic_flags: 0,
         dead: false,
         player_bytes: packing::player_bytes(

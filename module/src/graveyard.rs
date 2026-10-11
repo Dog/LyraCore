@@ -1,8 +1,5 @@
 //!
-//! `GraveyardLoc`/`GraveyardZone` stay `pub` tables and every accessor/type here is re-exported at
-//! the crate root via `pub use graveyard::*;` in `lib.rs` (mirroring `world.rs`'s own `pub use`) —
-//! every existing `crate::game_graveyard`/`crate::GraveyardLoc` path (seed.rs, debug.rs) is
-//! byte-identical after the move.
+//! Graveyard resolution and its imported tables. `tables.rs` exports the accessors and row types.
 
 use spacetimedb::{table, ReducerContext, Table};
 

@@ -6,8 +6,7 @@
 //! stage: rage + skill-ups, the lethal fork through the two kill chokepoints, the health write,
 //! break-on-damage, threat) are the pipeline every damage resolver in `swing.rs` and
 //! `spell::apply_target_damage` routes through. See the banner below.
-//! `mod.rs` re-exports this module (`pub use death::*`) so every `crate::combat::<sym>` path resolves
-//! regardless of which submodule actually defines it.
+//! `mod.rs` names the operations shared with other Module files.
 
 use spacetimedb::{table, ReducerContext, Table, TimeDuration};
 
@@ -499,9 +498,7 @@ pub fn debug_verify_lethal_damage_floor_fixture(
     Ok(())
 }
 
-// Tables' pure formulas/consts and the sibling submodules' re-exports (`roll_money`, `is_engaged`, ...)
-// are all pulled in from `mod.rs` (`pub use tables::*` + `pub use folds::*`/`engage::*`/`swing::*`) so
-// every symbol resolves the same as before the split.
+// Shared combat operations and formulas are named in the parent module.
 use super::*;
 
 /// Kill a CREATURE — the SHARED creature-death path. The melee kill, `debug_set_health(0)`, AND lethal

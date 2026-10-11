@@ -15,7 +15,7 @@ use crate::runtime_script::{run_event, CoreEffects, EntityView, RuntimeScript, S
 /// A guid of 0 — or one naming nothing in the world — leaves that participant absent, which is how
 /// an operator exercises the "no actor" and "no target" paths a script has to handle.
 #[reducer]
-pub fn debug_run_runtime_script(
+pub(crate) fn debug_run_runtime_script(
     ctx: &ReducerContext,
     script_name: String,
     event: String,

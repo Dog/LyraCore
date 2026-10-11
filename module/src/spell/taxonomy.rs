@@ -1,5 +1,5 @@
 //! KINDS / MECHANICS / param-tag / target / combat-field / stat / resistance taxonomy + the
-//! spell-power scaling tuning constants. `mod.rs` re-exports these (`pub(crate) use taxonomy::*`)
+//! spell-power scaling tuning constants. `mod.rs` exports the constants it shares by name
 //! so `crate::spell::<CONST>` resolves.
 
 // ===========================================================================================
@@ -488,5 +488,5 @@ const _RESERVED_NON_KIND_TAXONOMY: &[u8] = &[
 
 // (No `_MECHANICS` dead-code scaffold needed: all four mechanics are wired into real gates — M_STUN and
 // M_ROOT via their single-mechanic checkers `is_stunned`/`is_rooted`, and M_POLY/M_FEAR via the composite
-// predicates `is_incapacitated`(M_POLY) / `is_feared`(M_FEAR), which the action/movement gates
+// the stun/polymorph and fear predicates that the action/movement Gates
 // (`is_action_blocked`, `is_movement_blocked`, `is_self_movement_suppressed`) then compose.)
