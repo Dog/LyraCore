@@ -627,8 +627,7 @@ pub fn gw_accept_group_invite(
     crate::actor::accept_group_invite(ctx, actor_guid)
 }
 
-/// [`crate::world::set_target`] with the actor named by guid — `CMSG_SET_SELECTION`, second
-/// hottest call after movement.
+/// Record the Character's selection, including while a taxi flight controls movement.
 #[reducer]
 pub fn gw_set_target(
     ctx: &ReducerContext,
@@ -637,8 +636,9 @@ pub fn gw_set_target(
 ) -> Result<(), String> {
     require_operator(ctx)?;
     let actor_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
-    let player = actor(ctx, actor_guid)?;
-    crate::world::apply_set_target(ctx, player, target_guid)
+    let entity =
+        acting_entity_by_guid(ctx, actor_guid).ok_or_else(|| "mover not in world".to_string())?;
+    crate::world::apply_set_target(ctx, entity, target_guid)
 }
 
 /// [`crate::chat::apply_send_chat`] with the speaker named by guid — SAY/YELL/`/e`.

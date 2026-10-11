@@ -223,6 +223,56 @@ impl Client {
 
 #[test]
 #[ignore = "requires SpacetimeDB 2.7.1 and the Wasm toolchain"]
+fn benilla_durable_target_selection_during_taxi_keeps_the_world_session_connected() {
+    let realm = Realm::start("benilla-taxi-selection");
+    let (mut client, gateway) = realm.connect("TEST");
+    client.enter_world();
+    // Stage an active flight without a schedule so selection cannot race landing.
+    realm.standalone.assert_sql(
+        "INSERT INTO game_active_taxi_flight \
+         (character_guid,path_id,source_node_id,destination_node_id,mount_display_id,fare,\
+          current_node_index,started_micros) \
+         VALUES (1,5090102,5090100,5090101,1147,25,0,1)",
+    );
+    let flight = realm
+        .standalone
+        .query_rows("SELECT * FROM game_active_taxi_flight WHERE character_guid = 1");
+    let money = realm
+        .standalone
+        .query_rows("SELECT money FROM game_world_entity WHERE guid = 1");
+
+    for target in [2u64, 0] {
+        client.send(opcode::CMSG_SET_SELECTION, &target.to_le_bytes());
+        client.send(opcode::CMSG_PING, &messages::ping(7, 0));
+        client.until("PONG after taxi target selection", |packet| {
+            matches!(packet, ServerPacket::Pong { sequence: 7 })
+        });
+        assert_eq!(
+            realm
+                .standalone
+                .query_rows("SELECT target_guid FROM game_world_entity WHERE guid = 1")[0]
+                ["target_guid"],
+            target.to_string(),
+        );
+        assert_eq!(
+            realm
+                .standalone
+                .query_rows("SELECT * FROM game_active_taxi_flight WHERE character_guid = 1"),
+            flight,
+        );
+        assert_eq!(
+            realm
+                .standalone
+                .query_rows("SELECT money FROM game_world_entity WHERE guid = 1"),
+            money,
+        );
+    }
+    client.socket.shutdown(std::net::Shutdown::Both).unwrap();
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "requires SpacetimeDB 2.7.1 and the Wasm toolchain"]
 fn benilla_durable_created_character_appears_in_the_first_roster() {
     assert_eq!(
         crate::config::call_pipes(),
