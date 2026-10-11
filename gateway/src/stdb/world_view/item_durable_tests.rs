@@ -3,6 +3,7 @@ use crate::accept::BlockingTaskCapacity;
 use crate::config::GatewayConfig;
 use crate::durable_test_support::{poll_until, Standalone, POLL_TIMEOUT};
 use std::sync::mpsc::Receiver;
+use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::{Object, ServerMessage, UpdateMask, VisibleItemIndex};
 
 struct TopologyEnv {

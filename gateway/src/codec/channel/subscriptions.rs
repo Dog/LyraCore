@@ -51,3 +51,6 @@ crate::stdb::relays::declare_relays! {
         insert(Live) => |context, _event, row| channel_notice_appeared(&context.view, row);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;

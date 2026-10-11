@@ -107,3 +107,6 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event, _old, row| taxi_spline(&context.view, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod packet_tests;

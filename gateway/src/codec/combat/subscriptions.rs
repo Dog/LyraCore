@@ -1353,3 +1353,6 @@ pub(crate) mod tests {
         assert_eq!(*packet, codec::build_force_run_speed(7, 0.7));
     }
 }
+
+#[cfg(test)]
+mod packet_tests;

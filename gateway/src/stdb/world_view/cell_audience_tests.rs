@@ -1,10 +1,24 @@
 //! The cell-anchored relays against the whole-shard-then-gate path they replaced.
 
 use super::*;
+use crate::codec::breath::subscriptions::breath_relay_appeared;
+use crate::codec::combat::subscriptions::{
+    aura_audience, cast_audience, cast_event_appeared, combat_audience, combat_event_appeared,
+    impact_appeared, impact_audience, melee_audience, melee_disengaged, melee_engaged,
+};
+use crate::codec::corpse::subscriptions::resurrect_offered;
+use crate::codec::entity::subscriptions::entity_vanished;
+use crate::codec::gameobject::subscriptions::{gameobject_appeared, gameobject_vanished};
+use crate::codec::item::subscriptions::trade_event_appeared;
+use crate::codec::leveling::subscriptions::rest_state_appeared;
+use crate::codec::movement::subscriptions::{creature_leg, motion};
+use crate::codec::social::subscriptions::{chat_audience, emote_audience};
+use crate::codec::taxi::subscriptions::taxi_spline;
+use crate::codec::trainer::subscriptions::skill_changed;
+
 use crate::codec::combat::subscriptions::A_STEALTH;
 use crate::codec::property_tests::Rng;
-use crate::codec::social::subscriptions::chat_in_range;
-use crate::codec::social::subscriptions::chat_range_yd;
+use crate::codec::social::subscriptions::{chat_in_range, chat_range_yd};
 use crate::stdb::bindings::{
     Aura, ChatEvent, CombatEvent, EmoteEvent, MeleeAttack, SpellCastEvent, SpellImpactEvent,
 };

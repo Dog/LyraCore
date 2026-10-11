@@ -334,3 +334,6 @@ crate::stdb::relays::declare_relays! {
         delete(Snapshot) => |context, _event,  row| guild_membership_changed(&context.view, &guild_membership_read(&context.realm), row.character_guid);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;

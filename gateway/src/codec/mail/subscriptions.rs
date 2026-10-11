@@ -39,3 +39,6 @@ crate::stdb::relays::declare_relays! {
         insert(Live) => |context, _event, row| mail_arrived(&context.view, row);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;

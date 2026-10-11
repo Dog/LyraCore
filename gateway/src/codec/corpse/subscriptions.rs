@@ -166,3 +166,6 @@ crate::stdb::relays::declare_relays! {
         delete(Snapshot) => |context, _event, row| self_res_option_changed(&context.view, context.shard, row.character_guid, 0);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;
