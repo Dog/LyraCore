@@ -166,105 +166,51 @@ fn viewer_in_raid(guard: &LiveConn, viewer_guid: u64) -> bool {
         })
 }
 
-/// Does `viewer_guid` currently need quest item `item_entry`? The gateway twin
-/// of the module's `loot::killer_needs_item`/`needs_item_pure` (an ACTIVE — un-rewarded — quest with a
-/// `COLLECT_ITEM` objective naming `item_entry`, held < required), applied to the VIEWER opening the
-/// loot window rather than the credited killer, and gated by the same raid quest-credit rule
-/// (`lyracore_shared::quest::quest_progresses_for_raid`) so the loot window never promises an item
-/// a Raid member's `take_loot` would then refuse (that Gate is `loot::killer_needs_item`, gated
-/// identically). RLS-bypassed read (coordinator), same shape as
-/// `quest_objectives_complete`/`player_item_count` above.
+/// Read active collect objectives and carried quantities for the shared quest-item rule.
 fn viewer_needs_quest_item(guard: &LiveConn, viewer_guid: u64, item_entry: u32) -> bool {
-    const COLLECT_ITEM: u8 = 1; // == module objective_kind::COLLECT_ITEM
     let db = &guard.conn.db;
     let active: Vec<u32> = db
         .game_character_quest()
         .iter()
-        .filter(|q| q.character_guid == viewer_guid && !q.rewarded)
-        .map(|q| q.quest_entry)
+        .filter(|quest| quest.character_guid == viewer_guid && !quest.rewarded)
+        .map(|quest| quest.quest_entry)
         .collect();
-    if active.is_empty() {
-        return false;
-    }
-    let in_raid = viewer_in_raid(guard, viewer_guid);
-    let objectives: Vec<(u32, u32, u32)> = db
-        .game_quest_objective()
+    let objective_table = db.game_quest_objective();
+    let objectives = objective_table
         .iter()
-        .filter(|o| o.kind == COLLECT_ITEM && active.contains(&o.quest_entry))
-        .map(|o| {
-            let quest_type = db
+        .filter(|objective| active.contains(&objective.quest_entry))
+        .map(|objective| lyracore_shared::loot::QuestItemObjective {
+            quest_entry: objective.quest_entry,
+            quest_type: db
                 .game_quest_template()
                 .entry()
-                .find(&o.quest_entry)
-                .map_or(0, |t| t.quest_type);
-            (quest_type, o.target_entry, o.required_count)
-        })
-        .collect();
-    needs_quest_item_pure(
-        in_raid,
-        &objectives,
+                .find(&objective.quest_entry)
+                .map_or(0, |template| template.quest_type),
+            kind: objective.kind,
+            target_entry: objective.target_entry,
+            required_count: objective.required_count,
+        });
+    lyracore_shared::loot::needs_quest_item(
+        viewer_in_raid(guard, viewer_guid),
+        &active,
+        objectives,
         item_entry,
         player_item_count(db, viewer_guid, item_entry),
     )
 }
 
-/// Pure decision behind `viewer_needs_quest_item`: does any of `objectives` (flattened
-/// `(quest_type, target_entry, required_count)` for the viewer's active COLLECT_ITEM objectives)
-/// want `item`, given the viewer's Raid membership? Split out so the raid quest-credit rule's
-/// wiring is unit-testable without a live cache, mirroring the module's `needs_item_pure`.
-fn needs_quest_item_pure(
-    in_raid: bool,
-    objectives: &[(u32, u32, u32)],
-    item: u32,
-    held: u32,
-) -> bool {
-    objectives
-        .iter()
-        .any(|&(quest_type, target_entry, required_count)| {
-            target_entry == item
-                && held < required_count.max(1)
-                && lyracore_shared::quest::quest_progresses_for_raid(in_raid, quest_type)
-        })
-}
-
-/// The per-viewer loot-window visibility gate: is a `game_corpse_loot` row
-/// visible to `viewer_guid`? A non-quest row is always visible (FFA, unconditional). A `quest_only`
-/// row is visible when EITHER it's still the UNRESERVED shared row
-/// (`reserved_for == 0` — nobody has split it yet) and the viewer currently needs the item
-/// (`viewer_needs_item`, resolved by the caller — mirrors the module's ctx/pure split so this decision
-/// needs no live cache to unit-test), OR it's the viewer's OWN already-split reserved clone
-/// (`reserved_for == viewer_guid`) — a clone reserved for someone ELSE is invisible regardless of need.
-/// Mirrored module-side by `loot::quest_take_allowed` (same predicate shape) so a row a viewer's
-/// window shows is always a row their take can actually succeed on. Pure.
+/// Quest rows use the same reservation and need rule as the Module's take Gate.
 pub(crate) fn quest_row_visible_to_viewer(
     quest_only: bool,
     reserved_for: u64,
     viewer_guid: u64,
     viewer_needs_item: bool,
 ) -> bool {
-    if !quest_only {
-        return true;
-    }
-    if reserved_for == viewer_guid {
-        return true;
-    }
-    reserved_for == 0 && viewer_needs_item
+    !quest_only
+        || lyracore_shared::loot::quest_take_allowed(reserved_for, viewer_guid, viewer_needs_item)
 }
 
-/// The per-viewer loot-window visibility gate for a NON-quest row (the
-/// caller only calls this when `!quest_only`; `quest_row_visible_to_viewer` handles quest rows,
-/// unchanged, above). `reserved_for` is GENERALIZED here beyond the quest clone: nonzero also covers
-/// a NEED/GREED winner's inventory-full fallback row (`resolve_roll`'s module doc) — either way,
-/// nonzero means "visible ONLY to that guid", full stop. A `withheld` row (a live roll in progress)
-/// is invisible to EVERYONE (not just non-eligible viewers — matches the design's "withheld rows
-/// invisible in EVERYONE's window until resolved", proving the AutoLoot-safety trap: a grey +
-/// green drop on one corpse has the grey's row visible/FFA while the green's is withheld). A
-/// `master_only` row is never shown via the plain window (the master acts through
-/// `SMSG_LOOT_MASTER_LIST`/`CMSG_LOOT_MASTER_GIVE` instead). A `designated_looter_guid` row (round-
-/// robin/below-threshold) is visible only to its designee. The all-zero/false baseline is plain FFA
-/// (byte-identical to the original baseline). Mirrored module-side by `loot::group_loot_take_allowed`
-/// (same predicate shape) so a row a viewer's window shows is always a row their take can succeed
-/// on. Pure.
+/// Withheld rows stay hidden until their roll settles, including reserved rows.
 pub(crate) fn group_loot_row_visible_to_viewer(
     reserved_for: u64,
     withheld: bool,
@@ -272,13 +218,13 @@ pub(crate) fn group_loot_row_visible_to_viewer(
     designated_looter_guid: u64,
     viewer_guid: u64,
 ) -> bool {
-    if reserved_for != 0 {
-        return reserved_for == viewer_guid;
-    }
-    if withheld || master_only {
-        return false;
-    }
-    designated_looter_guid == 0 || designated_looter_guid == viewer_guid
+    lyracore_shared::loot::group_loot_take_allowed(
+        withheld,
+        reserved_for,
+        master_only,
+        designated_looter_guid,
+        viewer_guid,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -333,45 +279,7 @@ fn loot_request_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_loot_row_visible_to_viewer, needs_quest_item_pure, quest_row_visible_to_viewer,
-    };
-
-    // The per-viewer loot-window visibility gate. Every other read in this
-    // file goes through the coordinator's live cache (`RemoteTables`) and has no fake-cache harness to
-    // unit-test against (the module crate's "never mock the ctx, extract + test pure fns" rule applies
-    // here too). `quest_row_visible_to_viewer` and `needs_quest_item_pure` are the decisions worth
-    // pulling out pure so they're directly testable without a live SpacetimeDB connection.
-
-    /// `needs_quest_item_pure` mirrors the Module's raid quest-credit rule: a Raid member's
-    /// non-Raid quest stops needing its item, a Raid Quest's need is unaffected, and a Party
-    /// member (in_raid = false) is unaffected either way. Hand-written values, not computed by
-    /// the code under test.
-    #[test]
-    fn needs_quest_item_pure_gates_a_raid_members_non_raid_quest() {
-        let normal_quest_wants_the_item = [(0, 55, 1)]; // (quest_type, target_entry, required_count)
-        let raid_quest_wants_the_item = [(62, 55, 1)];
-        assert!(
-            needs_quest_item_pure(false, &normal_quest_wants_the_item, 55, 0),
-            "outside a Raid, a normal quest's need applies"
-        );
-        assert!(
-            !needs_quest_item_pure(true, &normal_quest_wants_the_item, 55, 0),
-            "inside a Raid, a normal quest's item need is gated off"
-        );
-        assert!(
-            needs_quest_item_pure(true, &raid_quest_wants_the_item, 55, 0),
-            "inside a Raid, a Raid Quest's need still applies"
-        );
-        assert!(
-            !needs_quest_item_pure(false, &normal_quest_wants_the_item, 55, 1),
-            "held at or above the requirement never needs it"
-        );
-        assert!(
-            !needs_quest_item_pure(true, &raid_quest_wants_the_item, 999, 0),
-            "a different item entry is never needed"
-        );
-    }
+    use super::{group_loot_row_visible_to_viewer, quest_row_visible_to_viewer};
 
     #[test]
     fn non_quest_rows_are_always_visible_regardless_of_viewer_state() {
@@ -440,10 +348,9 @@ mod tests {
     }
 
     #[test]
-    fn group_loot_reserved_winner_locked_row_wins_over_every_other_flag() {
-        // A nonzero reserved_for (the inventory-full winner fallback) is exclusive and unconditional
-        // — it overrides withheld/master_only/designated entirely (those are all stale by then).
-        assert!(group_loot_row_visible_to_viewer(7, true, true, 99, 7));
+    fn a_reserved_winner_waits_for_the_roll_to_release_its_row() {
+        assert!(!group_loot_row_visible_to_viewer(7, true, true, 99, 7));
+        assert!(group_loot_row_visible_to_viewer(7, false, true, 99, 7));
         assert!(!group_loot_row_visible_to_viewer(7, true, true, 99, 8));
     }
 

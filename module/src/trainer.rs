@@ -90,16 +90,6 @@ pub(crate) enum BuyGrant {
     Spell(u32),
 }
 
-/// Whether a profession offering at `cap` is ALREADY covered by the character's stored `max_rank` for
-/// that skill line (its rank/cap scaling) — the pure comparison the buy path's
-/// already-known gate keys on for a profession offering (a class-spell offering uses `knows_spell`
-/// instead). Extracted from `apply_trainer_buy` (pure code-motion). `None` (no `game_player_skill` row
-/// at all — never learned) is never capped. `stored_max_rank >= cap` is the boundary: exactly meeting
-/// the cap is already-known (rejected); one below it is not (the buy proceeds and lifts the ceiling).
-pub(crate) fn profession_already_capped(stored_max_rank: Option<u16>, cap: u32) -> bool {
-    stored_max_rank.is_some_and(|rank| rank as u32 >= cap)
-}
-
 /// Whether a rank purchase's `game_spell_chain` prerequisite is satisfied (reduced scope):
 /// `prev_spell == 0` — the family's first rank, or a spell with no chain concept at all — has no
 /// prerequisite, so it is ALWAYS allowed regardless of `knows_prev`. Otherwise the caster must already
@@ -119,11 +109,11 @@ pub(crate) fn trainer_buy_check(
     money: u32,
     cost: u32,
 ) -> Result<(), TrainerRefusal> {
-    if known {
-        return Err(TrainerRefusal::AlreadyKnown);
-    }
-    if level < required_level {
-        return Err(TrainerRefusal::LevelTooLow);
+    use lyracore_shared::trainer::{offering_state, OfferingState};
+    match offering_state(known, level, required_level) {
+        OfferingState::Known => return Err(TrainerRefusal::AlreadyKnown),
+        OfferingState::LevelTooLow => return Err(TrainerRefusal::LevelTooLow),
+        OfferingState::Available => {}
     }
     if money < cost {
         return Err(TrainerRefusal::NotEnoughMoney);
@@ -132,24 +122,21 @@ pub(crate) fn trainer_buy_check(
 }
 
 fn learn_target_trigger(effect: &crate::SpellEffect) -> Option<u32> {
-    (effect.trigger_spell != 0
-        && effect.kind != crate::spell::A_PERIODIC_TRIGGER
-        && effect.kind != crate::spell::A_FLAG
-        && effect.kind != crate::spell::A_PROC_TRIGGER
-        && effect.kind != crate::spell::A_PROC_DAMAGE
-        && effect.kind != crate::spell::E_TRIGGER)
-        .then_some(effect.trigger_spell)
+    lyracore_shared::trainer::learn_target_trigger(effect.kind, effect.trigger_spell)
 }
 
 fn learn_target_from_effects(spell_id: u32, effects: &[crate::SpellEffect]) -> u32 {
-    effects
-        .iter()
-        .filter_map(|effect| {
-            learn_target_trigger(effect).map(|target| (effect.effect_index, effect.id, target))
-        })
-        .min_by_key(|(effect_index, id, _)| (*effect_index, *id))
-        .map(|(_, _, target)| target)
-        .unwrap_or(spell_id)
+    lyracore_shared::trainer::resolve_learn_target(
+        spell_id,
+        effects
+            .iter()
+            .map(|effect| lyracore_shared::trainer::LearnEffect {
+                index: effect.effect_index,
+                id: effect.id,
+                kind: effect.kind,
+                trigger_spell: effect.trigger_spell,
+            }),
+    )
 }
 
 pub(crate) fn resolve_learn_target(ctx: &ReducerContext, spell_id: u32) -> u32 {
@@ -500,33 +487,10 @@ pub(crate) fn apply_trainer_buy(
             )
         })?;
 
-    // PROFESSION-LEARN BRANCH: a flagged offering teaches a SKILL, not a spell —
-    // it never resolves a wrapper/rank, never casts, never touches `game_player_spell`. `known` mirrors
-    // `learn_profession`'s presence check (a `game_player_skill` row for that line → a re-buy is the
-    // idempotent already-known no-op), and on Ok it grants the skill at 1/75. The `learn_skill_line == 0`
-    // arm below is the EXISTING spell path verbatim (byte-identical → no class-spell regression).
-    //
-    // WEAPON-MASTER FORK: the SAME `learn_skill_line` column shape also carries weapon
-    // proficiency offerings (Daggers, Polearm, …) — no new row kind. `is_combat_skill_line` tells the two
-    // apart and the cap/known computation diverges for each:
-    //   - PROFESSION cap is the offering's STATIC tier column (`learn_skill_cap`: Apprentice 75, Journeyman
-    //     150, …), author-set and independent of level; "known" is a CAP comparison (`profession_already_capped`)
-    //     so a higher-tier re-buy still lifts the ceiling.
-    //   - WEAPON cap is LEVEL-DERIVED (`skill::skill_cap_for_level(caster.level)`), exactly like every other
-    //     combat line (`raise_combat_caps`) — the offering's `learn_skill_cap` column is ignored (seeded 0/don't-
-    //     care) for a weapon row, since a static column can never track a climbing level and a stored 0 would
-    //     be the struct comment's "1/0 stuck-row hazard" (a cap that can never be climbed) if read literally.
-    //     "known" is mere ROW PRESENCE (any `game_player_skill` row for that line at all): weapon proficiency
-    //     has no tiers to re-buy, so a class-seeded line (already present via `ensure_player_skills`) is fully
-    //     known and refuses, while a lacked line proceeds — matching vanilla's "already knows Swords" refusal.
-    //
-    // RIDING FORK: the same column carries a riding offering (`learn_skill_line` = 762). It takes the cap
-    // from the offering's static tier like a profession, but grants through `learn_riding` — riding is
-    // trained WHOLE (current == max == the tier) because the mount cast gate reads the CURRENT rank.
     let profession_line = offered.learn_skill_line;
     let is_weapon_learn =
         profession_line != 0 && crate::skill::is_combat_skill_line(profession_line);
-    let (grant, known): (BuyGrant, bool) = if crate::skill::is_riding_skill_line(profession_line) {
+    let grant = if crate::skill::is_riding_skill_line(profession_line) {
         if ctx
             .db
             .game_creature_template()
@@ -539,56 +503,34 @@ pub(crate) fn apply_trainer_buy(
                 "that trainer does not teach riding",
             ));
         }
-        // "Known" is the same TIER comparison a profession uses: Apprentice-75 has not met Journeyman-150,
-        // so the second tier is buyable exactly once and a re-buy of the tier you hold is refused.
-        let stored_max_rank = ctx
-            .db
-            .game_player_skill()
-            .by_character()
-            .filter(&caster_guid)
-            .find(|s| s.skill_line == profession_line)
-            .map(|r| r.max_rank);
-        (
-            BuyGrant::Riding(offered.learn_skill_cap),
-            profession_already_capped(stored_max_rank, offered.learn_skill_cap),
-        )
+        BuyGrant::Riding(offered.learn_skill_cap)
     } else if is_weapon_learn {
-        let cap = crate::skill::skill_cap_for_level(caster.level);
-        let present = ctx
-            .db
-            .game_player_skill()
-            .by_character()
-            .filter(&caster_guid)
-            .any(|s| s.skill_line == profession_line);
-        (BuyGrant::Profession(profession_line, cap), present)
+        BuyGrant::Profession(
+            profession_line,
+            crate::skill::skill_cap_for_level(caster.level),
+        )
     } else if profession_line != 0 {
-        // Already-known keys on the CAP, not mere row presence (rank/cap scaling): "known" iff a row exists
-        // whose `max_rank` already meets-or-exceeds THIS offering's cap. So an Apprentice re-buy (cap 75 vs
-        // stored 75) is rejected for the default cap, but buying Journeyman (cap 150) while at
-        // apprentice-75 PASSES the gate and lifts the ceiling, and a 2nd Journeyman buy (150 >= 150) is
-        // then rejected.
-        let stored_max_rank = ctx
-            .db
-            .game_player_skill()
-            .by_character()
-            .filter(&caster_guid)
-            .find(|s| s.skill_line == profession_line)
-            .map(|r| r.max_rank);
-        (
-            BuyGrant::Profession(profession_line, offered.learn_skill_cap),
-            profession_already_capped(stored_max_rank, offered.learn_skill_cap),
-        )
+        BuyGrant::Profession(profession_line, offered.learn_skill_cap)
     } else {
-        // The castable RANK behind the offering — extracted to `resolve_learn_target` (see its doc) so
-        // a Package's trainer-kit pass resolves wrappers IDENTICALLY to a real buy.
-        // The already-known gate keys on the RANK so a re-buy of a known rank is rejected (not silently
-        // re-charged).
-        let to_learn = resolve_learn_target(ctx, spell_id);
-        (
-            BuyGrant::Spell(to_learn),
-            crate::spell::knows_spell(ctx, caster_guid, to_learn),
-        )
+        BuyGrant::Spell(resolve_learn_target(ctx, spell_id))
     };
+    let stored_cap = ctx
+        .db
+        .game_player_skill()
+        .by_character()
+        .filter(&caster_guid)
+        .find(|skill| skill.skill_line == profession_line)
+        .map(|skill| u32::from(skill.max_rank));
+    let knows_spell = match grant {
+        BuyGrant::Spell(to_learn) => crate::spell::knows_spell(ctx, caster_guid, to_learn),
+        _ => false,
+    };
+    let known = lyracore_shared::trainer::offering_known(
+        profession_line,
+        offered.learn_skill_cap,
+        stored_cap,
+        knows_spell,
+    );
 
     if !known {
         if let BuyGrant::Spell(to_learn) = grant {
@@ -706,23 +648,23 @@ mod tests {
     #[test]
     fn profession_already_capped_compares_stored_max_rank_against_the_offering_cap() {
         assert!(
-            !profession_already_capped(None, 75),
+            !lyracore_shared::trainer::offering_known(185, 75, None, false),
             "never learned -> not capped"
         );
         assert!(
-            profession_already_capped(Some(75), 75),
+            lyracore_shared::trainer::offering_known(185, 75, Some(75), false),
             "Apprentice re-buy at the same cap is rejected"
         );
         assert!(
-            !profession_already_capped(Some(75), 150),
+            !lyracore_shared::trainer::offering_known(185, 150, Some(75), false),
             "Apprentice-75 has NOT met the Journeyman-150 cap"
         );
         assert!(
-            profession_already_capped(Some(150), 150),
+            lyracore_shared::trainer::offering_known(185, 150, Some(150), false),
             "a 2nd Journeyman buy (150 >= 150) is rejected"
         );
         assert!(
-            !profession_already_capped(Some(74), 75),
+            !lyracore_shared::trainer::offering_known(185, 75, Some(74), false),
             "one rank below the cap is not yet capped"
         );
     }
@@ -750,19 +692,19 @@ mod tests {
     #[test]
     fn a_riding_tier_is_buyable_once_and_the_next_tier_still_sells() {
         assert!(
-            !profession_already_capped(None, 75),
+            !lyracore_shared::trainer::offering_known(762, 75, None, false),
             "an untrained rider can buy Apprentice"
         );
         assert!(
-            profession_already_capped(Some(75), 75),
+            lyracore_shared::trainer::offering_known(762, 75, Some(75), false),
             "re-buying Apprentice is refused"
         );
         assert!(
-            !profession_already_capped(Some(75), 150),
+            !lyracore_shared::trainer::offering_known(762, 150, Some(75), false),
             "Apprentice-75 has not met the Journeyman-150 tier"
         );
         assert!(
-            profession_already_capped(Some(150), 150),
+            lyracore_shared::trainer::offering_known(762, 150, Some(150), false),
             "re-buying Journeyman is refused"
         );
     }

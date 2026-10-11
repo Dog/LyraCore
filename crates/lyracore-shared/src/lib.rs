@@ -8,6 +8,7 @@
 //! lives in the module. See `docs/` for the design these constants implement.
 
 pub mod auction;
+pub mod aura;
 pub mod bank;
 pub mod calendar;
 pub mod channel;
@@ -31,6 +32,7 @@ pub mod packing;
 pub mod pet;
 pub mod quest;
 pub mod region;
+pub mod resistance;
 pub mod social;
 pub mod spatial;
 pub mod terrain;

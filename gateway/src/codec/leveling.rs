@@ -115,3 +115,5 @@ mod tests {
         assert_eq!(msg.happiness, 0);
     }
 }
+
+pub(crate) mod subscriptions;

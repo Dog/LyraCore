@@ -39,23 +39,7 @@ use crate::reputation::game_player_reputation;
 #[cfg(feature = "debug_reducers")]
 use crate::{game_creature_spawn, game_creature_template};
 
-/// Objective kinds (`QuestObjective.kind`). Only KILL ships today; the others are the documented
-/// extension points the schema already accommodates (a new kind needs only a new call site into
-/// [`credit_objective`], no migration).
-pub mod objective_kind {
-    /// Kill `required_count` of creature `target_entry`. [kill]
-    pub const KILL_CREATURE: u8 = 0;
-    /// Hold `required_count` of ITEM `target_entry` — completion is a LIVE inventory count (no kill
-    /// counter), consumed on turn-in. Covers cmangos quest ReqItemId/ReqItemCount. [collect]
-    pub const COLLECT_ITEM: u8 = 1;
-    /// Use `required_count` of GAMEOBJECT `target_entry` (a lever/totem/quest-object). Credited by
-    /// [`on_gameobject_used`] from the CMSG_GAMEOBJ_USE path, mirroring KILL_CREATURE. [use]
-    pub const USE_GAMEOBJECT: u8 = 2;
-    /// Enter AreaTrigger `target_entry` (a zone the client detects, e.g. a mine for an "explore" quest).
-    /// Credited by [`on_areatrigger_entered`] from the CMSG_AREATRIGGER path, mirroring USE_GAMEOBJECT.
-    /// `required_count` is 1 (a single explore). [explore]
-    pub const EXPLORE_AREATRIGGER: u8 = 3;
-}
+pub use lyracore_shared::quest::objective_kind;
 
 /// The raid quest-credit rule. Shared with the Gateway (`gateway/src/stdb/reads/items.rs`'s loot
 /// window must apply the identical rule, or it promises a Raid member an item their `take_loot`
@@ -294,7 +278,7 @@ pub struct QuestObjective {
 }
 
 /// A quest that needs its source event before ordinary objectives can complete it. Kept separately
-/// from [`QuestTemplate`] because this is Module-only completion metadata.
+/// from [`QuestTemplate`] so completion requirements do not change the template schema.
 #[table(
     accessor = game_quest_event_requirement,
     index(accessor = by_quest, btree(columns = [quest_entry]))
@@ -494,37 +478,10 @@ crate::character_owned!(transfer, fn sweep_transfer_game_character_quest_event_c
 /// sized to the quest's objective count (≤ this). Objectives past this are ignored at accept time.
 pub const MAX_OBJECTIVES: usize = 4;
 
-/// Is `cq` complete — has every objective of its quest reached its `required_count`? Joins the quest's
-/// [`QuestObjective`] rows and compares each against `counts[obj_index]` (a missing/short count = not
-/// met). A quest with NO objectives is trivially complete (a pure talk-to-giver quest).
-///
-/// A seam a Package reads: `apply_turn_in_quest` stays the authority that answers it for real, and a
-/// Package asks the same question before it sends a Character walking to the ender. It answers
-/// objectives ONLY — it does not read `deadline_micros`, so an expired quest reads complete here and
-/// is still refused at turn-in; a caller that cares about the deadline checks it itself.
+/// Completion requires ordinary objectives and any event requirement. Collect objectives read
+/// carried items; other objectives read their progress count. This does not check the deadline;
+/// turn-in remains the authority for expired quests.
 pub(crate) fn quest_is_complete(ctx: &ReducerContext, cq: &CharacterQuest) -> bool {
-    let has_event_credit = ctx
-        .db
-        .game_character_quest_event_credit()
-        .by_character()
-        .filter(&cq.character_guid)
-        .any(|credit| credit.quest_entry == cq.quest_entry);
-    let ordinary_objectives_complete = ctx
-        .db
-        .game_quest_objective()
-        .by_quest()
-        .filter(&cq.quest_entry)
-        .all(|obj| {
-            // KILL objectives read the per-objective kill counter; COLLECT objectives read a LIVE
-            // inventory count of the required item — no counter, completion follows the bag.
-            let have = match obj.kind {
-                objective_kind::COLLECT_ITEM => {
-                    crate::items::item_count(ctx, cq.character_guid, obj.target_entry)
-                }
-                _ => cq.counts.get(obj.obj_index as usize).copied().unwrap_or(0),
-            };
-            have >= obj.required_count
-        });
     let requires_event_credit = ctx
         .db
         .game_quest_event_requirement()
@@ -532,7 +489,28 @@ pub(crate) fn quest_is_complete(ctx: &ReducerContext, cq: &CharacterQuest) -> bo
         .filter(&cq.quest_entry)
         .next()
         .is_some();
-    ordinary_objectives_complete && (!requires_event_credit || has_event_credit)
+    let has_event_credit = ctx
+        .db
+        .game_character_quest_event_credit()
+        .by_character()
+        .filter(&cq.character_guid)
+        .any(|credit| credit.quest_entry == cq.quest_entry);
+    lyracore_shared::quest::objectives_complete(
+        ctx.db
+            .game_quest_objective()
+            .by_quest()
+            .filter(&cq.quest_entry)
+            .map(|obj| lyracore_shared::quest::Objective {
+                kind: obj.kind,
+                index: obj.obj_index,
+                target_entry: obj.target_entry,
+                required_count: obj.required_count,
+            }),
+        &cq.counts,
+        |entry| crate::items::item_count(ctx, cq.character_guid, entry),
+        requires_event_credit,
+        has_event_credit,
+    )
 }
 
 /// Does creature `creature_entry` have the `role` relation to `quest_entry` (i.e. is it a valid giver
@@ -788,49 +766,37 @@ fn giver_has_quest_role(
 /// giver to name. Bag room is not here either — the accept EFFECTS grant a `src_item` after every
 /// Gate has passed, and that Refusal is `crate::items`'.
 ///
-/// Callers: [`apply_accept_quest`] (the authority), [`evaluate_share`]'s party-share preview, and a
-/// Package choosing a quest before it walks a Character to the giver. The Gateway keeps a fourth
-/// copy in `eval_relation` (`gateway/src/stdb/reads/quest.rs`) for the `!` icon: it answers the same
-/// question over its own subscription-cache row types and cannot call Module code, so
-/// `lyracore_shared::quest`'s two mask functions are all the tiers share. A Gate changed here must
-/// visit that predicate too, or the icon offers a quest this reducer refuses.
+/// The Module and Gateway apply the shared acceptance rules to their own row facts.
 pub(crate) fn accept_gates(
     ctx: &ReducerContext,
     player: &crate::WorldEntity,
     tmpl: &QuestTemplate,
 ) -> Result<Option<CharacterQuest>, String> {
-    if player.level < tmpl.min_level {
-        return Err(format!("requires level {}", tmpl.min_level));
-    }
-    // Race/class gates (cmangos bitmasks; 0 = all). Race/class live packed in unit_bytes_0
-    // (race | class<<8 | gender<<16 | power<<24) — the same source the XP curve reads.
-    if !lyracore_shared::quest::race_allowed(tmpl.required_races, player.race()) {
-        return Err("quest not available to your race".to_string());
-    }
-    if !lyracore_shared::quest::class_allowed(tmpl.required_classes, player.class()) {
-        return Err("quest not available to your class".to_string());
-    }
-    // Prerequisite chain: the previous quest in the chain must be turned in (rewarded) first. This is
-    // what stops a fresh character from accepting a mid-chain quest (the `!`-over-everything bug).
-    if tmpl.prev_quest_id != 0 && !quest_is_rewarded(ctx, player.guid, tmpl.prev_quest_id) {
-        return Err("must complete the prerequisite quest first".to_string());
-    }
-    // A repeatable quest already turned in (rewarded=true) is RESET in place rather than rejected as a
-    // duplicate — this is the ONLY way a repeatable quest is ever re-taken. The row is UPDATED, never
-    // deleted, so a re-accept only ever flips `rewarded` back to false for the DURATION of the new attempt
-    // (exactly like any other active quest); it never erases the fact the quest was completed before, and
-    // `apply_turn_in_quest` always marks it rewarded again on the next turn-in. Any other existing row
-    // (still active, or a non-repeatable already-rewarded row) is a hard duplicate.
-    // (timed quests): an existing FAILED row (expired past its deadline) is re-acceptable
-    // exactly like a repeatable-rewarded one — reset in place, never a hard duplicate. This is
-    // independent of `repeatable`: ANY timed quest can be retried after it fails, not just repeatable
-    // ones (vanilla: a failed escort/timed quest can always be picked up again).
+    use lyracore_shared::quest::{acceptance, AcceptanceRefusal, AcceptanceRequirements, Attempt};
     let existing = character_quest_row(ctx, player.guid, tmpl.entry);
-    if let Some(ref row) = existing {
-        if !(row.failed || (tmpl.repeatable && row.rewarded)) {
-            return Err("already on or completed that quest".to_string());
-        }
-    }
+    acceptance(
+        AcceptanceRequirements {
+            min_level: tmpl.min_level,
+            required_races: tmpl.required_races,
+            required_classes: tmpl.required_classes,
+            repeatable: tmpl.repeatable,
+        },
+        player.level,
+        player.race(),
+        player.class(),
+        tmpl.prev_quest_id == 0 || quest_is_rewarded(ctx, player.guid, tmpl.prev_quest_id),
+        existing.as_ref().map(|row| Attempt {
+            rewarded: row.rewarded,
+            failed: row.failed,
+        }),
+    )
+    .map_err(|refusal| match refusal {
+        AcceptanceRefusal::Level => format!("requires level {}", tmpl.min_level),
+        AcceptanceRefusal::Race => "quest not available to your race".to_string(),
+        AcceptanceRefusal::Class => "quest not available to your class".to_string(),
+        AcceptanceRefusal::Prerequisite => "must complete the prerequisite quest first".to_string(),
+        AcceptanceRefusal::AlreadyTaken => "already on or completed that quest".to_string(),
+    })?;
     Ok(existing)
 }
 
@@ -1152,17 +1118,11 @@ pub(crate) fn request_turn_in_quest(
     player.money = player.money.saturating_add(tmpl.reward_money);
     // Quest XP is scaled by the realm xp_rate at the source (like kill XP), so a custom-rate realm
     // speeds up quest leveling too. Quest XP has no rested bonus, so this is a plain scale.
-    // Quest XP source, in priority: an explicit reward_xp override → authentic cmangos
-    // RewMoneyMaxLevel/0.6 (once a re-import populates reward_money_max_level) → the xp_reward
-    // placeholder for un-reimported rows. The gateway preview (reads.rs quest_detail_view) resolves the
-    // SAME three-way so the completion popup equals this grant.
-    let base_xp = if tmpl.reward_xp > 0 {
-        tmpl.reward_xp
-    } else if tmpl.reward_money_max_level > 0 {
-        lyracore_shared::quest::quest_xp(tmpl.reward_money_max_level)
-    } else {
-        lyracore_shared::quest::xp_reward(tmpl.quest_level)
-    };
+    let base_xp = lyracore_shared::quest::base_reward_xp(
+        tmpl.reward_xp,
+        tmpl.reward_money_max_level,
+        tmpl.quest_level,
+    );
     let xp = crate::xp::rated_xp(ctx, base_xp);
     // Level-cap payout: at the vanilla level cap, quest XP is USELESS (no next
     // level to fill) — real vanilla instead converts it to copper. Money-converted, never granted as

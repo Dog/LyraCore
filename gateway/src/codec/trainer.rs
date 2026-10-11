@@ -44,12 +44,11 @@ pub fn build_trainer_list(
     let spells = spells
         .iter()
         .map(|s| {
-            let state = if s.known {
-                TrainerSpellState::Gray
-            } else if s.player_level < s.required_level as u32 {
-                TrainerSpellState::Red
-            } else {
-                TrainerSpellState::Green
+            use lyracore_shared::trainer::{offering_state, OfferingState};
+            let state = match offering_state(s.known, s.player_level, u32::from(s.required_level)) {
+                OfferingState::Known => TrainerSpellState::Gray,
+                OfferingState::LevelTooLow => TrainerSpellState::Red,
+                OfferingState::Available => TrainerSpellState::Green,
             };
             TrainerSpell {
                 spell: s.spell_id,
@@ -213,3 +212,5 @@ mod tests {
         assert_eq!(msg.error, TrainingFailureReason::NotEnoughMoney);
     }
 }
+
+pub(crate) mod subscriptions;

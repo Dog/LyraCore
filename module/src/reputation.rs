@@ -81,16 +81,7 @@ const REP_MAX: i32 = 42000;
 /// Thresholds are the raw lower bounds mangos uses. Pure — unit-tested. `pub(crate)` so vendor pricing
 /// can read it. Neutral is the baseline (an unknown faction → 0 standing → Neutral).
 pub(crate) fn reputation_rank(standing: i32) -> u8 {
-    match standing {
-        s if s >= 42000 => 7, // Exalted
-        s if s >= 21000 => 6, // Revered
-        s if s >= 9000 => 5,  // Honored
-        s if s >= 3000 => 4,  // Friendly
-        s if s >= 0 => 3,     // Neutral
-        s if s >= -3000 => 2, // Unfriendly
-        s if s >= -6000 => 1, // Hostile
-        _ => 0,               // Hated
-    }
+    lyracore_shared::faction::reputation_rank(standing)
 }
 
 /// Vendor buy-price discount PERCENT for a raw standing. Vanilla `GetReputationPriceDiscount`:
@@ -148,26 +139,25 @@ pub(crate) fn npc_refuses_interaction(
     let Some(npc_ft) = templates.id().find(npc.faction_template) else {
         return false;
     };
-    if let Some(parent) = ctx.db.game_faction().faction_id().find(npc_ft.faction) {
-        if parent.reputation_index >= 0 {
-            let row = ctx
-                .db
+    let reputation = ctx
+        .db
+        .game_faction()
+        .faction_id()
+        .find(npc_ft.faction)
+        .filter(|parent| parent.reputation_index >= 0)
+        .and_then(|parent| {
+            ctx.db
                 .game_player_reputation()
                 .by_character()
                 .filter(&player.guid)
-                .find(|row| row.faction_id == parent.faction_id);
-            if let Some(row) = row {
-                if row.at_war {
-                    return true;
-                }
-                return reputation_rank(row.standing) <= 2;
-            }
-        }
-    }
-    templates
+                .find(|row| row.faction_id == parent.faction_id)
+        })
+        .map(|row| (row.standing, row.at_war));
+    let template_hostile = templates
         .id()
         .find(player.faction_template)
-        .is_some_and(|player_ft| crate::faction::compute_hostile(&npc_ft, &player_ft))
+        .is_some_and(|player_ft| crate::faction::compute_hostile(&npc_ft, &player_ft));
+    lyracore_shared::faction::refuses_interaction(reputation, template_hostile)
 }
 
 /// Add `amount` reputation (may be negative) for `player_guid` with `faction_id`, clamped to

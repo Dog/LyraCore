@@ -1,5 +1,10 @@
 //! `Coordinator`'s [`CastStore`] adapter.
 
+use lyracore_shared::spell::taxonomy::{
+    E_DISENCHANT, E_ENCHANT_ITEM, E_FISH, E_NEXT_SWING, E_OPEN_LOCK, E_PERSISTENT_AREA,
+    SPELL_ATTR_RANGED_AUTO_REPEAT,
+};
+
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -30,8 +35,6 @@ impl CastStore for Coordinator {
     /// casts by effect KIND, with the enchant id carried in the effect's `p_0`, instead of a hardcoded
     /// spell-id list — a new enchant spell is a data row, no gateway change.
     fn enchant_route(&self, spell_id: u32) -> Option<EnchantRoute> {
-        const E_ENCHANT_ITEM: u8 = 0x17; // taxonomy E_ENCHANT_ITEM (p_0 = enchant_id)
-        const E_DISENCHANT: u8 = 0x18; // taxonomy E_DISENCHANT
         self.0
             .coord()
             .conn
@@ -52,7 +55,6 @@ impl CastStore for Coordinator {
     /// spell's impact animation ON the paladin ("hit animation on the caster"). Kind-routed
     /// like `enchant_route` — a new ground spell is a data row.
     fn spell_is_ground_area(&self, spell_id: u32) -> bool {
-        const E_PERSISTENT_AREA: u8 = 0x1B; // lockstep with module taxonomy
         self.0
             .coord()
             .conn
@@ -65,7 +67,6 @@ impl CastStore for Coordinator {
     /// True iff `spell_id` is a FISHING cast (taxonomy `E_FISH` 0x1C — the three tier ids carry a
     /// synthesized marker effect row). Kind-routed like `enchant_route`/`spell_is_ground_area`.
     fn spell_is_fishing(&self, spell_id: u32) -> bool {
-        const E_FISH: u8 = 0x1C; // lockstep with module taxonomy
         self.0
             .coord()
             .conn
@@ -79,7 +80,6 @@ impl CastStore for Coordinator {
     /// the `pick_lock` reducer, gateway-intercepted exactly like `spell_is_fishing`/`enchant_route`. The
     /// GO guid the pick targets rides the cast's SpellCastTargets (GAMEOBJECT flag).
     fn spell_is_open_lock(&self, spell_id: u32) -> bool {
-        const E_OPEN_LOCK: u8 = 0x1D; // lockstep with module taxonomy
         self.0
             .coord()
             .conn
@@ -100,7 +100,6 @@ impl CastStore for Coordinator {
     /// 5875 client lights the button locally on the press and holds it as a pending cast until the
     /// swing-fire GO arrives. Kind value LOCKSTEP with module taxonomy.rs::E_NEXT_SWING (0x13).
     fn spell_queues_next_swing(&self, spell_id: u32) -> bool {
-        const E_NEXT_SWING: u8 = 0x13;
         let guard = self.0.coord();
         let queues = guard
             .conn
@@ -116,7 +115,6 @@ impl CastStore for Coordinator {
     /// AUTOREPEAT bit / by name). The CMSG_CAST_SPELL handler routes on this instead of a hardcoded
     /// `spell == 75 || 5019` id list, so a new ranged auto-repeat ability onboards as data.
     fn spell_is_ranged_auto_repeat(&self, spell_id: u32) -> bool {
-        const SPELL_ATTR_RANGED_AUTO_REPEAT: u32 = 0x0200; // lockstep with importer::spell.rs
         let guard = self.0.coord();
         guard
             .conn

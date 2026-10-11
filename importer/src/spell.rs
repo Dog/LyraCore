@@ -1,7 +1,7 @@
 //! Stream 1 (client DBC) — Spell.dbc → `game_spell` + `game_spell_effect` importer. Reads the
 //! operator's OWN `Spell.dbc` (+ the SpellCastTimes / SpellRange / SpellDuration / SpellRadius aux
 //! tables) IN MEMORY via the same `open_chain`/`read_table` path as `dbc.rs`, maps each spell's
-//! header + up to 3 effects onto our deduped effect/aura TAXONOMY (module/src/spell/taxonomy.rs),
+//! header + up to 3 effects onto our deduped effect/aura taxonomy in lyracore-shared,
 //! and emits derived `game_*` rows as chunked clear+reload SQL. It is the stress test of the
 //! taxonomy: every effect either maps to a REAL kind or falls back to `E_SCRIPTED` (a queryable
 //! no-op), and the run prints a COVERAGE REPORT measuring how much real vanilla spell data the
@@ -31,47 +31,28 @@ use crate::spell_snapshot::{write_snapshot, SpellEffectRow, SpellHeaderRow, Spel
 use crate::{push_insert, run_sql_statements, stamp_family, Args};
 use std::path::Path;
 
-// ===========================================================================================
-//  TAXONOMY constants — verbatim from module/src/spell/taxonomy.rs (the emit target). Duplicated
-//  here (not shared) because the wasm `module` is NEVER a dependency of this native ETL tool; these
-//  are pure numeric tags and the runtime is the source of truth — keep the two lists in lockstep.
-// ===========================================================================================
-
-// instant effects (high bit clear)
-const E_DAMAGE: u8 = 0x01;
-const E_HEAL: u8 = 0x02;
-const E_ENERGIZE: u8 = 0x03;
-const E_DISPEL: u8 = 0x04;
-const E_TRIGGER: u8 = 0x05;
-const E_TAUNT: u8 = 0x06;
-const E_CREATE_ITEM: u8 = 0x07;
-const E_CHARGE: u8 = 0x09; // rush into melee (Charge — vanilla effect 96, reclassified by name); engine teleports the caster
-const E_CONVERT_RESOURCE: u8 = 0x0A; // drain caster health -> power (Life Tap); reclassified from SCRIPT_EFFECT
-const E_JUDGEMENT: u8 = 0x0B; // unleash the active seal (Judgement); reclassified from SCRIPT_EFFECT
-const E_ADD_COMBO: u8 = 0x0C; // rogue combo GENERATOR (Sinister Strike/Gouge/Backstab); reclassified from the inert Dummy effect
-const E_FINISHER_DAMAGE: u8 = 0x0D; // rogue FINISHER damage (Eviscerate): scales with combo points; reclassified from E_DAMAGE
-const E_RESURRECT: u8 = 0x0E; // revive a dead ally (Resurrection); reclassified from SCRIPT_EFFECT
-const E_SCRIPTED: u8 = 0x0F;
-const E_PICKPOCKET: u8 = 0x10; // grant the rogue copper from a creature without engaging (Pick Pocket); reclassified from SCRIPT_EFFECT
-const E_INTERRUPT: u8 = 0x11; // cancel the target's in-progress cast (Kick); reclassified from the raw vanilla InterruptCast effect (68)
-const E_REDUCE_THREAT: u8 = 0x12; // one-time CURRENT-threat drop on the caster (Feint); reclassified from SCRIPT_EFFECT (lockstep with module taxonomy)
-const E_NEXT_SWING: u8 = 0x13; // QUEUE the strike onto the caster's next melee swing (Heroic Strike/Cleave); reclassified from E_DAMAGE by name (lockstep with module taxonomy)
-const E_SET_STANCE: u8 = 0x14; // set the caster's Warrior stance (Battle/Defensive/Berserker Stance); reclassified from the inert ModShapeshift→A_FLAG marker BY NAME, with p0 = the 0-based stance id (form id − FORM_BATTLE) (lockstep with module taxonomy)
-const E_SUMMON_PET: u8 = 0x15; // summon a persistent pet creature owned by the caster (Summon Imp); mapped from the raw vanilla Summon effect (56), with the misc_value (the summoned creature entry) routed into p0 (p0_kind = P_ENTRY) (lockstep with module taxonomy)
-const E_HEAL_MAX_HEALTH: u8 = 0x16; // heal the target to FULL max health (Lay on Hands); mapped from the raw vanilla HealMaxHealth effect (67), split out of E_HEAL because its base_points is ~0 (the magnitude is "fill to max", not a flat N) (lockstep with module taxonomy)
-const E_TAME_CREATURE: u8 = 0x20; // completed Hunter tame; raw vanilla TameCreature effect (55), lockstep with module taxonomy
-const E_FEED_PET: u8 = 0x21; // feed a Hunter pet from the explicit item target; raw effect 101
-const E_POWER_BURN: u8 = 0x19;
-const E_RECALL_HOME: u8 = 0x1F;
-const E_BLINK: u8 = 0x1A; // teleport the caster ~20yd FORWARD along its facing (Mage Blink); reclassified BY NAME from the dead SCRIPT teleport effect (lockstep with module taxonomy)
-const E_PERSISTENT_AREA: u8 = 0x1B; // ground-AoE (Consecration): spawns a fixed-position game_ground_area whose tick damages hostiles inside; reclassified BY NAME from the ground A_PERIODIC_DAMAGE effect (lockstep with module taxonomy)
-const E_OPEN_LOCK: u8 = 0x1D;
-const E_DUEL: u8 = 0x22; // Duel (raw effect 83): p0 is the duel-flag gameobject template entry
-const E_DISENCHANT: u8 = 0x18;
-const E_DISMOUNT: u8 = 0x23; // remove the target's active land mount (Dazed's mount-removal half): translated from a raw DISPEL_MECHANIC effect (108) whose misc value names the mount mechanic (21) — see `dismount_effect_kind` below. No params. Lockstep with module taxonomy.
-const E_SUMMON_HOSTILE: u8 = 0x24; // temporary ownerless summon; p0 = creature entry, p1 = required spell focus, header duration = lifetime
-const E_DISTRACT: u8 = 0x25; // turn idle enemy Creatures near the ground point toward it; raw effect 69, amount = seconds (lockstep with module taxonomy)
-const E_SELF_RESURRECT: u8 = 0x26; // raw effect 94: base_points < 0 is flat health with p0 (P_FLAT_MANA) mana, else a percent of max; die_sides ignored (lockstep with module taxonomy)
+use lyracore_shared::spell::taxonomy::{
+    A_ABSORB, A_COMBAT_HEALTH_REGEN_PCT, A_CONTROL, A_DISARM, A_FLAG, A_IMMUNITY, A_MOD_COMBAT,
+    A_MOD_DAMAGE_TAKEN, A_MOD_DETECT_RANGE, A_MOD_HEALTH_POWER, A_MOD_RESISTANCE, A_MOD_SPEED,
+    A_MOD_STAT, A_MOD_STAT_PCT, A_MOUNTED, A_PERIODIC_DAMAGE, A_PERIODIC_ENERGIZE, A_PERIODIC_HEAL,
+    A_PERIODIC_TRIGGER, A_PROC_DAMAGE, A_PROC_TRIGGER, A_RETALIATE, A_SEAL, A_SELF_RESURRECT,
+    A_SPELLMOD_FLAT, A_SPELLMOD_PCT, A_STEALTH, COMBAT_ATTACK_POWER, COMBAT_CRIT, COMBAT_DMG_DONE,
+    COMBAT_DODGE, COMBAT_HIT, COMBAT_SPELL_POWER, COMBAT_THREAT, E_ADD_COMBO, E_BLINK, E_CHARGE,
+    E_CONVERT_RESOURCE, E_CREATE_ITEM, E_DAMAGE, E_DISENCHANT, E_DISMOUNT, E_DISPEL, E_DISTRACT,
+    E_DUEL, E_ENERGIZE, E_FEED_PET, E_FINISHER_DAMAGE, E_FISH, E_HEAL, E_HEAL_MAX_HEALTH,
+    E_INTERRUPT, E_JUDGEMENT, E_NEXT_SWING, E_OPEN_LOCK, E_PERSISTENT_AREA, E_PICKPOCKET,
+    E_POWER_BURN, E_RECALL_HOME, E_REDUCE_THREAT, E_RESURRECT, E_SCRIPTED, E_SELF_RESURRECT,
+    E_SET_STANCE, E_SUMMON_HOSTILE, E_SUMMON_PET, E_TAME_CREATURE, E_TAUNT, E_TRIGGER, M_FEAR,
+    M_POLY, M_ROOT, M_STUN, P_COMBAT_FIELD, P_DISPLAY_ID, P_ENTRY, P_FLAG, P_FLAT_MANA,
+    P_GAMEOBJECT_ENTRY, P_ITEM_ENTRY, P_MECHANIC, P_NONE, P_PCT_MAX_POWER, P_POWER_TYPE, P_RAW,
+    P_SCHOOL_MASK, P_SPEED_KIND, P_SPELLMOD_OP, P_SPELL_ID, P_STAT_ID, SPEED_MOUNTED, SPEED_MOVE,
+    SPELL_ATTR_CHANNELED, SPELL_ATTR_FINISHER_DURATION, SPELL_ATTR_INCAP_OPENER,
+    SPELL_ATTR_RANGED_AUTO_REPEAT, SPELL_ATTR_REQ_BEHIND, SPELL_ATTR_REQ_DAGGER,
+    SPELL_ATTR_REQ_OVERPOWER, SPELL_ATTR_REQ_REVENGE, SPELL_ATTR_REQ_STEALTH,
+    SPELL_ATTR_STEALTH_SAFE, STANCE_BATTLE, STANCE_BEAR, STANCE_BERSERKER, STANCE_CAT,
+    STANCE_DEFENSIVE, STANCE_DIRE_BEAR, STAT_ALL, T_AREA_ALLY, T_AREA_ENEMY, T_SCRIPTED, T_SELF,
+    T_TARGET_ALLY, T_TARGET_ANY, T_TARGET_ENEMY,
+};
 
 // cmangos/classic-db cd0c426a3b2ff56dd518bf009025299468e60fdb:
 // spell_template 7728/8674 send events 1131/1134; dbscripts_on_event summons
@@ -84,110 +65,10 @@ fn binding_summon_entry(spell_id: u32, effect: i32, event: u32, focus: u32) -> O
     }
 }
 
-// aura effects (high bit set)
-const A_PERIODIC_DAMAGE: u8 = 0x90;
-const A_PERIODIC_HEAL: u8 = 0x91;
-const A_PERIODIC_ENERGIZE: u8 = 0x92;
-const A_MOD_STAT: u8 = 0xA0;
-const A_MOD_STAT_PCT: u8 = 0xAA; // PERCENT stat mod (The Human Spirit +5% Spirit) — folded as a multiplier
-const A_MOD_RESISTANCE: u8 = 0xA1;
-const A_ABSORB: u8 = 0xA2;
-const A_MOD_COMBAT: u8 = 0xA3;
-const A_MOD_SPEED: u8 = 0xA4;
-const A_MOD_HEALTH_POWER: u8 = 0xA5;
-const A_MOD_DAMAGE_TAKEN: u8 = 0xA6;
-const A_SEAL: u8 = 0xA7; // proc-on-swing holy seal (Seal of Righteousness); reclassified from A_FLAG
-const A_STEALTH: u8 = 0xA8; // stealth presence marker (Stealth); reclassified from A_FLAG
-                            // A Proc that starts a Triggered Cast of its own trigger spell (vanilla Spell.dbc aura 42,
-                            // ProcTriggerSpell). Native mapping — no name rescue (lockstep with module taxonomy, which renamed
-                            // this wire value from A_PROC_ON_HIT).
-const A_PROC_TRIGGER: u8 = 0xAB;
-const A_SPELLMOD_FLAT: u8 = 0xAC; // spell modifier FLAT (DBC aura 107 AddFlatModifier — 264): p0 = SpellModOp, p1 = affected-spell family mask
-const A_SPELLMOD_PCT: u8 = 0xAD; // spell modifier PERCENT (DBC aura 108 AddPctModifier)
-const A_DISARM: u8 = 0xAE; // Warrior Disarm (DBC AuraMod 67 ModDisarm): strips the enemy's main-hand weapon (lockstep with module taxonomy)
-const A_RETALIATE: u8 = 0xAF; // Warrior Retaliation self-buff: free counter-swing at any melee attacker; reclassified from the inert A_FLAG marker BY NAME (lockstep with module taxonomy)
-const A_CONTROL: u8 = 0xB0;
-const A_IMMUNITY: u8 = 0xB1;
-const A_MOD_DETECT_RANGE: u8 = 0xB2; // Priest Mind Soothe (DBC AuraMod 91 ModDetectRange): reduces a creature's aggro/detection radius by `amount` yards (lockstep with module taxonomy)
-const A_FLAG: u8 = 0xBE;
-const A_COMBAT_HEALTH_REGEN_PCT: u8 = 0xA9; // X% of normal health regen continues during combat (lockstep with module taxonomy)
-const A_MOUNTED: u8 = 0xB3; // land mount, the state of record (vanilla AuraMod Mounted, 78): p0 = the resolved creature DISPLAY id (p0_kind = P_DISPLAY_ID), frozen at import (lockstep with module taxonomy)
-                            // A Proc that deals its frozen amount as damage of the proc spell's own school (vanilla Spell.dbc
-                            // aura 43, ProcTriggerDamage). p0 = the header's school_mask, p0_kind = P_SCHOOL_MASK (lockstep with
-                            // module taxonomy).
-const A_PROC_DAMAGE: u8 = 0xB4;
-const A_SELF_RESURRECT: u8 = 0xB5; // Soulstone Resurrection: p0 (P_SPELL_ID) becomes the Self-Resurrection Option at death (lockstep with module taxonomy)
-
-// MECHANICS (p0 for A_CONTROL when p0_kind == P_MECHANIC)
-const M_STUN: i32 = 1;
-const M_ROOT: i32 = 2;
-const M_FEAR: i32 = 3;
-const M_POLY: i32 = 4;
 const GOUGE_RANK_IDS: [u32; 5] = [1776, 1777, 8629, 11285, 11286];
 
-// p0_kind tags
-const P_NONE: u8 = 0;
-const P_STAT_ID: u8 = 1;
-const P_SCHOOL_MASK: u8 = 2;
-const P_MECHANIC: u8 = 3;
-const P_POWER_TYPE: u8 = 4;
-const P_COMBAT_FIELD: u8 = 5;
-const P_SPEED_KIND: u8 = 6;
-const P_FLAG: u8 = 7;
-const P_ITEM_ENTRY: u8 = 8;
-const P_ENTRY: u8 = 9; // p0 is a game_creature_template entry
-const P_SPELLMOD_OP: u8 = 11; // p0 is a SpellModOp (A_SPELLMOD_*)
-const P_PCT_MAX_POWER: u8 = 12; // the effect's `amount` is a PERCENT of the caster's max power (Evocation); aura_apply converts it to an absolute per-tick (lockstep with module taxonomy)
-const P_GAMEOBJECT_ENTRY: u8 = 13; // p0 is a game_gameobject_template entry (E_DUEL)
-const P_DISPLAY_ID: u8 = 14; // p0 is a creature DISPLAY id (A_MOUNTED — the UNIT_FIELD_MOUNTDISPLAYID value)
-const P_SPELL_ID: u8 = 15; // p0 is a game_spell id (A_SELF_RESURRECT)
-const P_FLAT_MANA: u8 = 16; // p0 is a flat mana amount (E_SELF_RESURRECT)
-const P_RAW: u8 = 255;
-
-// TargetKind
-const T_SELF: u8 = 0;
-const T_TARGET_ENEMY: u8 = 1;
-const T_TARGET_ALLY: u8 = 2;
-const T_TARGET_ANY: u8 = 3;
-const T_AREA_ENEMY: u8 = 4;
-const T_AREA_ALLY: u8 = 5;
-const T_SCRIPTED: u8 = 7;
-
-// combat fields (p0 for A_MOD_COMBAT)
-const COMBAT_ATTACK_POWER: i32 = 0;
-const COMBAT_CRIT: i32 = 1;
-const COMBAT_HIT: i32 = 2;
-const COMBAT_DMG_DONE: i32 = 3;
-// (COMBAT_HASTE = 4 is intentionally absent: haste/attack-speed auras route to A_MOD_SPEED with a
-// swing/cast speed-kind, per the aura-map design — never A_MOD_COMBAT.)
-const COMBAT_SPELL_POWER: i32 = 5;
-// defender / threat fields (values lockstep with module/src/spell/taxonomy.rs 101-105)
-const COMBAT_DODGE: i32 = 7;
-const COMBAT_THREAT: i32 = 10;
-
-// stat ids
-const STAT_ALL: i32 = 0xFF;
-
-// speed kinds (p0 for A_MOD_SPEED; signed PERCENT amount) — lockstep with module/src/spell/taxonomy.rs.
-const SPEED_MOVE: i32 = 0;
-const SPEED_MOUNTED: i32 = 3; // ModIncreaseMountedSpeed family; T4 folds this speed kind at the combat seam
-
-// STANCE/FORM ids (vanilla SpellShapeshiftForm.dbc indices) — the value the ModShapeshift effect's
-// `effect_misc_value` carries (so a stance/form spell arrives as A_FLAG with p0 = the form id). Our
-// engine uses its OWN small 0-based stance id space; `form_to_stance` below is THE one form→stance
-// mapping (widened it past the Warrior trio to the Druid combat forms), consumed by BOTH
-// the E_SET_STANCE p0 remap (`stance_p0`) and the `Stances` usability-mask fold (`translate_stance_mask`)
-// so the two can never drift. The Spell.dbc `Stances` usability mask is a form-BIT mask
-// (`1 << (formId-1)`: bit0=Cat/bit4=Bear/bit7=DireBear/bit16=Battle/bit17=Defensive/bit18=Berserker);
-// each mapped form bit folds onto our stance bit (`1 << stance`) for the header `stances` column.
-// The full convention (LOCKSTEP with module/src/spell/taxonomy.rs STANCE_* — that comment block is the
-// definition site):
-//   form 17 Battle    → stance 0        form  5 Bear      → stance 3
-//   form 18 Defensive → stance 1        form  1 Cat       → stance 4
-//   form 19 Berserker → stance 2        form  8 Dire Bear → stance 5
-// Unmapped forms (Aquatic 4 / Travel 3 / Tree 2 / Ghoul 7 / Moonkin 31 / …) stay out of scope: their
-// mask bits are DROPPED (a spell usable ONLY in an unmapped form imports with the mapped-form bits it
-// has, or 0 = "any stance").
+// Vanilla form IDs differ from durable stance IDs. Both effect parameters and
+// usability masks use this mapping; unsupported forms contribute no stance bit.
 const FORM_CAT: i32 = 1;
 const FORM_BEAR: i32 = 5;
 const FORM_DIRE_BEAR: i32 = 8;
@@ -195,45 +76,23 @@ const FORM_BATTLE: i32 = 17;
 const FORM_DEFENSIVE: i32 = 18;
 const FORM_BERSERKER: i32 = 19;
 
-/// THE one vanilla ShapeshiftForm id → our 0-based stance id mapping (see the FORM_* block above; the
-/// module's `taxonomy.rs` STANCE_* consts are the lockstep definition site). `None` = an out-of-scope
-/// form (Aquatic/Travel/Tree/…) — dropped from usability masks, never produced by the E_SET_STANCE
-/// name rescue. Pure. [import]
 fn form_to_stance(form_id: i32) -> Option<i32> {
     match form_id {
-        FORM_BATTLE => Some(0),
-        FORM_DEFENSIVE => Some(1),
-        FORM_BERSERKER => Some(2),
-        FORM_BEAR => Some(3),
-        FORM_CAT => Some(4),
-        FORM_DIRE_BEAR => Some(5),
+        FORM_BATTLE => Some(i32::from(STANCE_BATTLE)),
+        FORM_DEFENSIVE => Some(i32::from(STANCE_DEFENSIVE)),
+        FORM_BERSERKER => Some(i32::from(STANCE_BERSERKER)),
+        FORM_BEAR => Some(i32::from(STANCE_BEAR)),
+        FORM_CAT => Some(i32::from(STANCE_CAT)),
+        FORM_DIRE_BEAR => Some(i32::from(STANCE_DIRE_BEAR)),
         _ => None,
     }
 }
-
-// Rogue cast-gate flags — OUR OWN bits in the DEDICATED game_spell.cast_flags column, set BY NAME below
-// (lockstep with module/src/spell/taxonomy.rs SPELL_ATTR_*). A separate column from the raw vanilla
-// `attributes` (whose bits are densely used and would collide). The engine gates on these in
-// resolve_cast_at.
-const SPELL_ATTR_REQ_BEHIND: u32 = 0x0001; // must be cast from behind the target (Backstab)
-const SPELL_ATTR_REQ_STEALTH: u32 = 0x0002; // must be cast while stealthed (Sap)
-const SPELL_ATTR_STEALTH_SAFE: u32 = 0x0004; // casting it does NOT break stealth (Sap, Pick Pocket, Distract)
-const SPELL_ATTR_FINISHER_DURATION: u32 = 0x0008; // combo-finisher whose aura DURATION scales with combo points (Slice and Dice)
-const SPELL_ATTR_INCAP_OPENER: u32 = 0x0010; // Sap-shaped incapacitate opener: additionally require the target OUT of combat + HUMANOID (Sap). Split OUT of REQ_STEALTH so Garrote (a stealth opener on ANY type, usable in combat) carries REQ_STEALTH without these constraints
-const SPELL_ATTR_REQ_OVERPOWER: u32 = 0x0020; // Overpower: castable only in the ~5s window after the caster's swing was DODGED (Tier 2b react window)
-const SPELL_ATTR_REQ_REVENGE: u32 = 0x0040; // Revenge: castable only in the ~5s window after the caster DODGED/PARRIED/BLOCKED an incoming swing (Tier 2b react window)
-const SPELL_ATTR_CHANNELED: u32 = 0x0080; // CHANNELED (Arcane Missiles): the cast ticks a per-tick effect over duration_ms and breaks on action — set from the DBC AttributesEx1 CHANNELED bit (0x44), by-NAME fallback. Drives the A_PERIODIC_TRIGGER reclassify below
-const SPELL_ATTR_REQ_DAGGER: u32 = 0x0100; // Backstab: castable only with a DAGGER equipped in the main hand (lockstep with module/src/spell/taxonomy.rs)
-const SPELL_ATTR_RANGED_AUTO_REPEAT: u32 = 0x0200;
 
 // vanilla `AttributesEx1` CHANNELED bits — IS_CHANNELLED (0x04) | CHANNELED_2 (0x40). cmangos: channeled = AttributesEx1 & 0x44.
 const ATTR_EX1_CHANNELED_MASK: u32 = 0x0000_0044;
 const ATTR_EX1_EXCLUDE_CASTER: u32 = 0x0008_0000;
 // vanilla `AttributesEx2` SPELL_ATTR_EX2_AUTOREPEAT_FLAG (0x20) — marks auto-repeat ranged attacks (Auto Shot, wand Shoot).
 const ATTR_EX2_AUTOREPEAT: u32 = 0x0000_0020;
-
-// the A_PERIODIC_TRIGGER aura kind (lockstep with module/src/spell/taxonomy.rs) — a CHANNEL's per-tick trigger.
-const A_PERIODIC_TRIGGER: u8 = 0x93;
 
 // vanilla SpellEffect numeric IDs that PLACE an aura → branch to the AuraMod map.
 const EFFECT_APPLY_AURA: i32 = 6;
@@ -800,7 +659,7 @@ fn resolve_aura_params(kind: u8, aura: AuraMod, misc: u32) -> (i32, u8) {
         // Flat and percentage modifiers both select the stat from misc. u32::MAX selects all.
         A_MOD_STAT | A_MOD_STAT_PCT => {
             let p0 = if misc == u32::MAX {
-                STAT_ALL
+                i32::from(STAT_ALL)
             } else {
                 (misc & 0xFF) as i32
             };
@@ -819,20 +678,20 @@ fn resolve_aura_params(kind: u8, aura: AuraMod, misc: u32) -> (i32, u8) {
                 ModDamageDone
                 | ModDamagePercentDone
                 | ModDamageDoneCreature
-                | ModDamageDoneVersus => COMBAT_DMG_DONE,
+                | ModDamageDoneVersus => i32::from(COMBAT_DMG_DONE),
                 ModCritPercent
                 | ModSpellCritChance
                 | ModSpellCritChanceSchool
-                | ModCritPercentVersus => COMBAT_CRIT,
-                ModHitChance | ModSpellHitChance => COMBAT_HIT,
-                ModHealing | ModHealingDone => COMBAT_SPELL_POWER,
-                ModDodgePercent => COMBAT_DODGE, // Evasion — defender +dodge (scaled to bp below)
+                | ModCritPercentVersus => i32::from(COMBAT_CRIT),
+                ModHitChance | ModSpellHitChance => i32::from(COMBAT_HIT),
+                ModHealing | ModHealingDone => i32::from(COMBAT_SPELL_POWER),
+                ModDodgePercent => i32::from(COMBAT_DODGE), // Evasion — defender +dodge (scaled to bp below)
                 // Fade (ModTotalThreat, signed % on ALL threat) + Righteous Fury (ModThreat, +60% →
                 // 1.6× threat, the paladin tank aura) both fold onto the COMBAT_THREAT field the
                 // threat::add_threat multiplier already reads — zero engine code.
-                ModTotalThreat | ModThreat => COMBAT_THREAT,
+                ModTotalThreat | ModThreat => i32::from(COMBAT_THREAT),
                 // remaining A_MOD_COMBAT auras are the attack-power family
-                _ => COMBAT_ATTACK_POWER,
+                _ => i32::from(COMBAT_ATTACK_POWER),
             };
             (field, P_COMBAT_FIELD)
         }
@@ -847,9 +706,9 @@ fn resolve_aura_params(kind: u8, aura: AuraMod, misc: u32) -> (i32, u8) {
                 ModCastingSpeedNotStack => 2,
                 ModIncreaseSwimSpeed => 2,
                 ModIncreaseMountedSpeed | ModMountedSpeedAlways | ModMountedSpeedNotStack => {
-                    SPEED_MOUNTED
+                    i32::from(SPEED_MOUNTED)
                 }
-                _ => SPEED_MOVE,
+                _ => i32::from(SPEED_MOVE),
             };
             (kind_v, P_SPEED_KIND)
         }
@@ -1649,7 +1508,7 @@ fn resolve_effect_kind(
                                                                 // Avoidance-chance combat fields are basis-points in our engine but PERCENT in the DBC, so
                                                                 // scale ×100 (Evasion's +50% dodge → +5000 bp). COMBAT_THREAT is a signed percent in both
                                                                 // (the threat fold divides by 100), so it is NOT scaled.
-    let base_points = if kind == A_MOD_COMBAT && p0 == COMBAT_DODGE {
+    let base_points = if kind == A_MOD_COMBAT && p0 == i32::from(COMBAT_DODGE) {
         base_points * 100
     } else {
         base_points
@@ -1822,7 +1681,6 @@ fn trainer_offering_rows(
 /// (not client data, firewall-clean), written by key AFTER the bulk insert so they replace whatever
 /// the DBC mapped at the same effect slot.
 fn fishing_marker_rows() -> Vec<SpellEffectRow> {
-    const E_FISH: u8 = 0x1C; // lockstep with module taxonomy
     [7620u32, 7731, 7732]
         .into_iter()
         .map(|spell_id| SpellEffectRow {
@@ -2906,11 +2764,11 @@ mod tests {
         assert_eq!(aura_mod_to_kind(ModTotalThreat), A_MOD_COMBAT);
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModDodgePercent, 0).0,
-            COMBAT_DODGE
+            i32::from(COMBAT_DODGE)
         );
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModTotalThreat, 0).0,
-            COMBAT_THREAT
+            i32::from(COMBAT_THREAT)
         );
     }
 
@@ -3620,23 +3478,23 @@ mod tests {
         use AuraMod::*;
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModAttackPower, 99),
-            (COMBAT_ATTACK_POWER, P_COMBAT_FIELD)
+            (i32::from(COMBAT_ATTACK_POWER), P_COMBAT_FIELD)
         );
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModCritPercent, 0),
-            (COMBAT_CRIT, P_COMBAT_FIELD)
+            (i32::from(COMBAT_CRIT), P_COMBAT_FIELD)
         );
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModHitChance, 0),
-            (COMBAT_HIT, P_COMBAT_FIELD)
+            (i32::from(COMBAT_HIT), P_COMBAT_FIELD)
         );
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModDamageDone, 0),
-            (COMBAT_DMG_DONE, P_COMBAT_FIELD)
+            (i32::from(COMBAT_DMG_DONE), P_COMBAT_FIELD)
         );
         assert_eq!(
             resolve_aura_params(A_MOD_COMBAT, ModHealing, 0),
-            (COMBAT_SPELL_POWER, P_COMBAT_FIELD)
+            (i32::from(COMBAT_SPELL_POWER), P_COMBAT_FIELD)
         );
     }
 
@@ -3722,7 +3580,7 @@ mod tests {
         // misc -1 (u32::MAX) on a ModStat ⇒ all-stats sentinel 0xFF.
         assert_eq!(
             resolve_aura_params(A_MOD_STAT, ModStat, u32::MAX),
-            (STAT_ALL, P_STAT_ID)
+            (i32::from(STAT_ALL), P_STAT_ID)
         );
         assert_eq!(resolve_aura_params(A_MOD_STAT, ModStat, 3), (3, P_STAT_ID)); // INT
                                                                                  // ModStat is FLAT; ModTotalStatPercentage / ModPercentStat are PERCENT (distinct kind). BOTH resolve
@@ -3735,7 +3593,7 @@ mod tests {
         ); // Spirit
         assert_eq!(
             resolve_aura_params(A_MOD_STAT_PCT, ModTotalStatPercentage, u32::MAX),
-            (STAT_ALL, P_STAT_ID)
+            (i32::from(STAT_ALL), P_STAT_ID)
         );
         // resistance keeps the 7-bit school mask.
         assert_eq!(
@@ -3943,7 +3801,7 @@ mod tests {
         ] {
             assert_eq!(
                 resolve_aura_params(A_MOD_SPEED, mounted, 0),
-                (SPEED_MOUNTED, P_SPEED_KIND)
+                (i32::from(SPEED_MOUNTED), P_SPEED_KIND)
             );
         }
         // Vanilla stores the flat amount MINUS one; 59/99 normalize to the nominal 60%/100%.

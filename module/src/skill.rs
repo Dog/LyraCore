@@ -512,22 +512,7 @@ pub(crate) fn gain_defense_skill(ctx: &ReducerContext, target: &WorldEntity) {
 /// forks its profession-learn branch on this same taxonomy — a weapon-master offering (`learn_skill_line` set
 /// to a weapon line) needs a LEVEL-derived cap, not the offering's static tier column.
 pub(crate) fn is_combat_skill_line(line: u32) -> bool {
-    use skill_line::*;
-    matches!(
-        line,
-        AXE_1H
-            | AXE_2H
-            | MACE_1H
-            | MACE_2H
-            | POLEARM
-            | SWORD_1H
-            | SWORD_2H
-            | STAFF
-            | FIST
-            | DAGGER
-            | UNARMED
-            | DEFENSE
-    )
+    lyracore_shared::trainer::is_combat_skill_line(line)
 }
 
 /// Is `line` the Riding line? Its own third taxonomy alongside `is_combat_skill_line` and

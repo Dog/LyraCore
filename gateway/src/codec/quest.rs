@@ -871,3 +871,5 @@ mod tests {
         assert_eq!(comp.item_rewards.len(), 1);
     }
 }
+
+pub(crate) mod subscriptions;

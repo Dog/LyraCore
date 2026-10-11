@@ -321,3 +321,243 @@ mod tests {
         );
     }
 }
+
+/// Durable objective-kind bytes.
+pub mod objective_kind {
+    pub const KILL_CREATURE: u8 = 0;
+    pub const COLLECT_ITEM: u8 = 1;
+    pub const USE_GAMEOBJECT: u8 = 2;
+    pub const EXPLORE_AREATRIGGER: u8 = 3;
+}
+
+/// Facts for one objective. Inventory quantities are supplied by the owning tier.
+#[derive(Clone, Copy)]
+pub struct Objective {
+    pub kind: u8,
+    pub index: u8,
+    pub target_entry: u32,
+    pub required_count: u32,
+}
+
+/// All objectives and any event requirement must be met. This does not check quest state.
+pub fn objectives_complete(
+    objectives: impl IntoIterator<Item = Objective>,
+    counts: &[u32],
+    mut carried_item_count: impl FnMut(u32) -> u32,
+    requires_event_credit: bool,
+    has_event_credit: bool,
+) -> bool {
+    objectives.into_iter().all(|objective| {
+        let have = if objective.kind == objective_kind::COLLECT_ITEM {
+            carried_item_count(objective.target_entry)
+        } else {
+            counts.get(objective.index as usize).copied().unwrap_or(0)
+        };
+        have >= objective.required_count
+    }) && (!requires_event_credit || has_event_credit)
+}
+
+#[derive(Clone, Copy)]
+pub struct AcceptanceRequirements {
+    pub min_level: u32,
+    pub required_races: u32,
+    pub required_classes: u32,
+    pub repeatable: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct Attempt {
+    pub rewarded: bool,
+    pub failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptanceRefusal {
+    Level,
+    Race,
+    Class,
+    Prerequisite,
+    AlreadyTaken,
+}
+
+/// Apply acceptance Gates in the Module's order. A failed attempt may always be retried.
+pub fn acceptance(
+    requirements: AcceptanceRequirements,
+    level: u32,
+    race: u8,
+    class: u8,
+    prerequisite_rewarded: bool,
+    existing: Option<Attempt>,
+) -> Result<(), AcceptanceRefusal> {
+    if level < requirements.min_level {
+        return Err(AcceptanceRefusal::Level);
+    }
+    if !race_allowed(requirements.required_races, race) {
+        return Err(AcceptanceRefusal::Race);
+    }
+    if !class_allowed(requirements.required_classes, class) {
+        return Err(AcceptanceRefusal::Class);
+    }
+    if !prerequisite_rewarded {
+        return Err(AcceptanceRefusal::Prerequisite);
+    }
+    if existing
+        .is_some_and(|attempt| !(attempt.failed || (requirements.repeatable && attempt.rewarded)))
+    {
+        return Err(AcceptanceRefusal::AlreadyTaken);
+    }
+    Ok(())
+}
+
+/// Resolve the unscaled reward. The Module applies the realm XP rate after this selection.
+pub fn base_reward_xp(explicit_xp: u32, reward_money_max_level: u32, quest_level: u32) -> u32 {
+    if explicit_xp > 0 {
+        explicit_xp
+    } else if reward_money_max_level > 0 {
+        quest_xp(reward_money_max_level)
+    } else {
+        xp_reward(quest_level)
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn completion_reads_each_objective_kind_from_its_authority() {
+        let objectives = [
+            Objective {
+                kind: 0,
+                index: 0,
+                target_entry: 80,
+                required_count: 3,
+            },
+            Objective {
+                kind: 1,
+                index: 1,
+                target_entry: 90,
+                required_count: 2,
+            },
+            Objective {
+                kind: 3,
+                index: 2,
+                target_entry: 100,
+                required_count: 1,
+            },
+        ];
+        assert!(objectives_complete(
+            objectives,
+            &[3, 0, 1],
+            |_| 2,
+            false,
+            false
+        ));
+        assert!(!objectives_complete(
+            objectives,
+            &[3, 99, 1],
+            |_| 1,
+            false,
+            false
+        ));
+        assert!(!objectives_complete(
+            objectives,
+            &[3, 99],
+            |_| 2,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn event_credit_is_required_even_when_no_ordinary_objectives_exist() {
+        assert!(!objectives_complete([], &[], |_| 0, true, false));
+        assert!(objectives_complete([], &[], |_| 0, true, true));
+        assert!(objectives_complete([], &[], |_| 0, false, false));
+        let kill = Objective {
+            kind: 0,
+            index: 0,
+            target_entry: 80,
+            required_count: 3,
+        };
+        assert!(!objectives_complete([kill], &[2], |_| 0, true, true));
+    }
+
+    fn requirements(repeatable: bool) -> AcceptanceRequirements {
+        AcceptanceRequirements {
+            min_level: 10,
+            required_races: 1,
+            required_classes: 2,
+            repeatable,
+        }
+    }
+
+    #[test]
+    fn failed_attempts_can_be_retried_without_making_completed_quests_repeatable() {
+        let failed = Some(Attempt {
+            failed: true,
+            rewarded: false,
+        });
+        let rewarded = Some(Attempt {
+            failed: false,
+            rewarded: true,
+        });
+        assert_eq!(
+            acceptance(requirements(false), 10, 1, 2, true, failed),
+            Ok(())
+        );
+        assert_eq!(
+            acceptance(requirements(false), 10, 1, 2, true, rewarded),
+            Err(AcceptanceRefusal::AlreadyTaken)
+        );
+        assert_eq!(
+            acceptance(requirements(true), 10, 1, 2, true, rewarded),
+            Ok(())
+        );
+        assert_eq!(
+            acceptance(
+                requirements(true),
+                10,
+                1,
+                2,
+                true,
+                Some(Attempt {
+                    failed: false,
+                    rewarded: false
+                })
+            ),
+            Err(AcceptanceRefusal::AlreadyTaken)
+        );
+    }
+
+    #[test]
+    fn retry_still_applies_level_race_class_and_prerequisite_gates_in_order() {
+        let failed = Some(Attempt {
+            failed: true,
+            rewarded: false,
+        });
+        assert_eq!(
+            acceptance(requirements(false), 9, 2, 1, false, failed),
+            Err(AcceptanceRefusal::Level)
+        );
+        assert_eq!(
+            acceptance(requirements(false), 10, 2, 1, false, failed),
+            Err(AcceptanceRefusal::Race)
+        );
+        assert_eq!(
+            acceptance(requirements(false), 10, 1, 1, false, failed),
+            Err(AcceptanceRefusal::Class)
+        );
+        assert_eq!(
+            acceptance(requirements(false), 10, 1, 2, false, failed),
+            Err(AcceptanceRefusal::Prerequisite)
+        );
+    }
+
+    #[test]
+    fn reward_priority_is_explicit_then_imported_then_placeholder() {
+        assert_eq!(base_reward_xp(123, 270, 10), 123);
+        assert_eq!(base_reward_xp(0, 270, 10), 450);
+        assert_eq!(base_reward_xp(0, 0, 10), 490);
+    }
+}

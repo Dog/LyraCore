@@ -1,5 +1,7 @@
 //! `Coordinator`'s [`CharacterStore`] adapter.
 
+use lyracore_shared::spell::taxonomy::{A_SPELLMOD_FLAT, A_SPELLMOD_PCT};
+
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -207,8 +209,6 @@ impl CharacterStore for Coordinator {
     /// rows — the client-mirror source for SMSG_SET_FLAT/PCT_SPELL_MODIFIER (aggregation by
     /// (op, mask-bit) happens in the codec helper; mangos sends the TOTAL per bit).
     fn spell_modifiers(&self, character_guid: u64) -> Vec<(u32, u8, i32, bool)> {
-        const A_SPELLMOD_FLAT: u8 = 0xAC; // lockstep with module taxonomy
-        const A_SPELLMOD_PCT: u8 = 0xAD;
         self.0
             .coord()
             .conn

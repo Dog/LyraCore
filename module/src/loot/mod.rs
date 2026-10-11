@@ -20,7 +20,6 @@ use crate::actor::{ActionRefusal, ActionRefusalKind};
 use crate::character::game_character;
 use crate::game_group_member; // clone_quest_loot_for_group's GameObject roster read
 use crate::game_world_entity;
-use crate::quest::objective_kind;
 use crate::{game_character_quest, game_quest_objective}; // killer_needs_item (fishing's zone resolve now lives in terrain::zone_id_at)
 use lyracore_shared::loot::LootRefusal;
 use lyracore_shared::loot_roll::event_kind as roll_event_kind; // apply_loot_money's MONEY_SHARE push
@@ -243,22 +242,13 @@ pub(crate) fn roll_loot_rows(
         .collect()
 }
 
-/// Pure gate: may `taker_guid` claim a `quest_only` row whose current
-/// reservation is `reserved_for`, given `taker_needs_item` (already resolved by the caller — mirrors
-/// `needs_item_pure`'s ctx/pure split)? An UNRESERVED row (`reserved_for == 0` — the shared row nobody
-/// has split yet) is claimable by anyone who currently needs it; a RESERVED row is claimable by its
-/// reserved owner UNCONDITIONALLY — the reservation itself is the grant (need was checked when the
-/// clone was minted). Re-checking need here would contradict the gateway's display filter
-/// (`quest_row_visible_to_viewer`, `gateway/src/stdb/reads.rs`), which always shows a reservee their
-/// row: a member whose need lapsed between clone and take (capped the count off another corpse, say)
-/// would face a visible-but-untakeable row stuck until corpse decay. Same predicate shape on both
-/// sides, so a row a viewer's window shows is always a row their take can actually succeed on. Pure.
+/// A quest reservation grants its owner the item even when current need has ended.
 pub(crate) fn quest_take_allowed(
     reserved_for: u64,
     taker_guid: u64,
     taker_needs_item: bool,
 ) -> bool {
-    reserved_for == taker_guid || (reserved_for == 0 && taker_needs_item)
+    lyracore_shared::loot::quest_take_allowed(reserved_for, taker_guid, taker_needs_item)
 }
 
 pub(crate) fn group_loot_take_allowed(
@@ -268,16 +258,13 @@ pub(crate) fn group_loot_take_allowed(
     designated_looter_guid: u64,
     taker_guid: u64,
 ) -> bool {
-    if withheld {
-        return false; // a live roll owns this row — nobody autostores it; the winner gets reserved_for
-    }
-    if reserved_for != 0 {
-        return reserved_for == taker_guid;
-    }
-    if master_only {
-        return false; // master-loot rows are taken ONLY via `loot_master_give`, never autostore
-    }
-    designated_looter_guid == 0 || designated_looter_guid == taker_guid
+    lyracore_shared::loot::group_loot_take_allowed(
+        withheld,
+        reserved_for,
+        master_only,
+        designated_looter_guid,
+        taker_guid,
+    )
 }
 
 /// Pure: given `(character_guid, currently_needs_item)` pairs for every OTHER
@@ -313,68 +300,41 @@ pub(crate) fn next_free_slots(used_slots: &[u8], count: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Pure decision behind `killer_needs_item`: does ANY of `objectives` (flattened `(quest_entry, kind,
-/// target_entry)` triples for the killer's ACTIVE — unrewarded — quests) want `item` as a
-/// `COLLECT_ITEM` target on a quest actually in `active_quests`? Split out so the decision is
-/// unit-testable without a live `ReducerContext` (mirrors `can_skin`/`can_gather`'s pure-gate split).
-pub(crate) fn needs_item_pure(
-    active_quests: &[u32],
-    objectives: &[(u32, u8, u32, u32)], // (quest, kind, target, required_count)
-    item: u32,
-    held: u32,
-) -> bool {
-    objectives
-        .iter()
-        .any(|&(quest_entry, kind, target_entry, required_count)| {
-            kind == objective_kind::COLLECT_ITEM
-                && target_entry == item
-                && active_quests.contains(&quest_entry)
-                && held < required_count.max(1)
-        })
-}
-
-/// Does `killer` currently need `item` for an ACTIVE (unrewarded) quest's `COLLECT_ITEM` objective?
-/// `killer = None` (a debug/environmental kill with no credited player) never needs anything — a
-/// quest-only row is simply invisible there, matching vanilla (no quest, no drop). Fetches the killer's
-/// live quest log + objectives, drops a Raid member's non-Raid quests first
-/// ([`lyracore_shared::quest::quest_progresses_for_raid`], cm:Player.cpp:13796-13799: a normal
-/// quest item does not drop for a Raid member), then defers the actual decision to the pure
-/// `needs_item_pure`.
+/// Read quest and inventory facts for the shared quest-item need rule.
 pub(crate) fn killer_needs_item(ctx: &ReducerContext, killer: Option<u64>, item: u32) -> bool {
     let Some(killer_guid) = killer else {
         return false;
     };
-    // `in_raid` is an indexed lookup on `killer_guid` alone: computed once, not once per quest.
     let in_raid = crate::group::in_raid(ctx, killer_guid);
     let active: Vec<u32> = ctx
         .db
         .game_character_quest()
         .by_character()
         .filter(&killer_guid)
-        .filter(|cq| !cq.rewarded)
-        .map(|cq| cq.quest_entry)
-        .filter(|&quest_entry| {
-            lyracore_shared::quest::quest_progresses_for_raid(
-                in_raid,
-                crate::quest::quest_type_of(ctx, quest_entry),
-            )
-        })
+        .filter(|quest| !quest.rewarded)
+        .map(|quest| quest.quest_entry)
         .collect();
-    if active.is_empty() {
-        return false;
-    }
-    let objs: Vec<(u32, u8, u32, u32)> = active
-        .iter()
-        .flat_map(|q| {
-            ctx.db
-                .game_quest_objective()
-                .by_quest()
-                .filter(q)
-                .map(|o| (o.quest_entry, o.kind, o.target_entry, o.required_count))
-        })
-        .collect();
-    let held = crate::items::item_count(ctx, killer_guid, item);
-    needs_item_pure(&active, &objs, item, held)
+    let objectives = active.iter().flat_map(|quest_entry| {
+        let quest_type = crate::quest::quest_type_of(ctx, *quest_entry);
+        ctx.db
+            .game_quest_objective()
+            .by_quest()
+            .filter(quest_entry)
+            .map(move |objective| lyracore_shared::loot::QuestItemObjective {
+                quest_entry: objective.quest_entry,
+                quest_type,
+                kind: objective.kind,
+                target_entry: objective.target_entry,
+                required_count: objective.required_count,
+            })
+    });
+    lyracore_shared::loot::needs_quest_item(
+        in_raid,
+        &active,
+        objectives,
+        item,
+        crate::items::item_count(ctx, killer_guid, item),
+    )
 }
 
 /// Purge every `game_corpse_loot` / `game_corpse_loot_eligible` row still parked on `guid`, BEFORE a
@@ -1106,40 +1066,6 @@ mod tests {
     }
 
     // ---- LOOT-FAMILY COMPLETENESS ----
-
-    /// `needs_item_pure` — the pure decision behind `killer_needs_item`: a COLLECT_ITEM objective on an
-    /// ACTIVE quest matching `item` says yes; a KILL_CREATURE objective (wrong kind), a different item
-    /// (wrong target), or an objective whose quest ISN'T in `active_quests` (a stale/rewarded quest's
-    /// leftover objective row) all say no.
-    #[test]
-    fn needs_item_pure_matches_only_an_active_quests_collect_item_objective() {
-        let active = [100u32, 200];
-        let objectives = [
-            (100u32, objective_kind::COLLECT_ITEM, 55u32, 10u32), // matches — quest 100 is active, needs 10
-            (100, objective_kind::KILL_CREATURE, 999, 5),         // wrong kind (same quest)
-            (300, objective_kind::COLLECT_ITEM, 55, 10), // right item, but quest 300 is NOT active
-        ];
-        assert!(needs_item_pure(&active, &objectives, 55, 0));
-        assert!(
-            !needs_item_pure(&active, &objectives, 999, 0),
-            "a KILL_CREATURE objective never satisfies an item need"
-        );
-        assert!(
-            !needs_item_pure(&active, &objectives, 12345, 0),
-            "no objective names this item at all"
-        );
-        assert!(
-            !needs_item_pure(&[], &objectives, 55, 0),
-            "no active quests at all → nothing is ever needed"
-        );
-        // The count cap: holding 9/10 still needs it; 10/10 (or more) stops the drop.
-        assert!(needs_item_pure(&active, &objectives, 55, 9));
-        assert!(
-            !needs_item_pure(&active, &objectives, 55, 10),
-            "requirement met → the quest drop stops"
-        );
-        assert!(!needs_item_pure(&active, &objectives, 55, 11));
-    }
 
     #[test]
     fn quest_take_allowed_admits_the_reservee_unconditionally_and_needing_takers_on_shared_rows() {

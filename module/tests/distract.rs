@@ -5,6 +5,10 @@
 
 mod support;
 
+use lyracore_shared::spell::taxonomy::{
+    A_STEALTH, E_DISTRACT, SPELL_ATTR_STEALTH_SAFE, T_AREA_ENEMY, T_SELF,
+};
+
 use std::collections::BTreeMap;
 use std::f32::consts::{FRAC_PI_4, TAU};
 use std::time::Duration;
@@ -19,11 +23,6 @@ const TEST_WOLF_ENTRY: u32 = 51000;
 const DISTRACT: u32 = 1725;
 const FIXTURE_STEALTH: u32 = 509_0700;
 
-const E_DISTRACT: u32 = 0x25;
-const A_STEALTH: u32 = 0xA8;
-const T_SELF: u32 = 0;
-const T_AREA_ENEMY: u32 = 4;
-const SPELL_ATTR_STEALTH_SAFE: u32 = 0x0004;
 const POWER_ENERGY: u32 = 3;
 const MOVEMENT_RANDOM: u32 = 1;
 
@@ -85,7 +84,15 @@ fn shard(name: &str) -> (Standalone, Line) {
         0,
         SPELL_ATTR_STEALTH_SAFE,
     );
-    insert_effect(&shard, DISTRACT, E_DISTRACT, 10, 1, T_AREA_ENEMY, 10.0);
+    insert_effect(
+        &shard,
+        DISTRACT,
+        u32::from(E_DISTRACT),
+        10,
+        1,
+        u32::from(T_AREA_ENEMY),
+        10.0,
+    );
     seed_hostile_factions(&shard);
     let player = entity(&shard, PLAYER);
     let line = Line {
@@ -294,7 +301,15 @@ fn distract_turns_only_the_idle_creatures_near_the_point_and_keeps_the_rogue_hid
         600_000,
         0,
     );
-    insert_effect(&shard, FIXTURE_STEALTH, A_STEALTH, 0, 0, T_SELF, 0.0);
+    insert_effect(
+        &shard,
+        FIXTURE_STEALTH,
+        u32::from(A_STEALTH),
+        0,
+        0,
+        u32::from(T_SELF),
+        0.0,
+    );
     shard.assert_call(
         "debug_force_cast_at",
         &[

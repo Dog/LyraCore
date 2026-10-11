@@ -300,21 +300,6 @@ pub(crate) enum EquipStat {
     Block,
 }
 
-impl EquipStat {
-    pub(crate) fn resistance_for_school(school_mask: u8) -> Option<Self> {
-        match school_mask.trailing_zeros() {
-            0 if school_mask != 0 => Some(Self::Armor),
-            1 => Some(Self::HolyResistance),
-            2 => Some(Self::FireResistance),
-            3 => Some(Self::NatureResistance),
-            4 => Some(Self::FrostResistance),
-            5 => Some(Self::ShadowResistance),
-            6 => Some(Self::ArcaneResistance),
-            _ => None,
-        }
-    }
-}
-
 /// This item template's contribution to one `EquipStat` — the single typed column the variant names.
 /// Pure (no ctx): the per-template projection `equipped_stat_bonus` sums across a unit's worn pieces, so
 /// the stat-sum arithmetic is unit-testable on a plain `ItemTemplate` without a live module. A column the
@@ -708,20 +693,6 @@ pub(crate) mod tests {
         // An untouched column is 0 — the starter/loadout templates carry no stats, so they contribute 0.
         assert_eq!(template_stat(&t, EquipStat::Stamina), 0);
         assert_eq!(template_stat(&blank_template(25), EquipStat::Strength), 0);
-    }
-
-    #[test]
-    fn resistance_kind_uses_the_lowest_school_bit() {
-        assert_eq!(
-            EquipStat::resistance_for_school(1 << 2),
-            Some(EquipStat::FireResistance)
-        );
-        assert_eq!(
-            EquipStat::resistance_for_school((1 << 4) | (1 << 6)),
-            Some(EquipStat::FrostResistance)
-        );
-        assert_eq!(EquipStat::resistance_for_school(0), None);
-        assert_eq!(EquipStat::resistance_for_school(1 << 7), None);
     }
 
     #[test]

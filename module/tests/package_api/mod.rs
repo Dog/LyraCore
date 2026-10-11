@@ -1,5 +1,5 @@
 //! The Package API lint: every crate-root path an installed Package names is on Package API
-//! version 3, as `docs/package-api.md` documents it.
+//! version 4, as `docs/package-api.md` documents it.
 
 mod contract;
 mod paths;
@@ -56,7 +56,7 @@ impl fmt::Display for Diagnostic {
             Finding::Outside { path, replacement } => {
                 write!(
                     f,
-                    "Package `{package}` names `{path}` at {at}, outside Package API version 3 \
+                    "Package `{package}` names `{path}` at {at}, outside Package API version 4 \
                      (docs/package-api.md). "
                 )?;
                 match replacement {

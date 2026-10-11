@@ -158,7 +158,7 @@ fn build(players: usize, rng: &mut Rng, workload: Workload) -> SyntheticRealm {
                 creatures[pick - players].0
             };
             let kind = if i % 20 == 0 {
-                super::super::subscriptions::A_STEALTH
+                crate::codec::combat::subscriptions::A_STEALTH
             } else {
                 0xA0
             };
@@ -335,7 +335,7 @@ fn aura_burst(realm: &SyntheticRealm, rng: &mut Rng) -> (Duration, usize, Durati
                 continue;
             }
             let started = Instant::now();
-            let _ = super::super::subscriptions::aura_sync(
+            let _ = crate::codec::combat::subscriptions::aura_sync(
                 realm.view.auras.on_target(0, row.target_guid).into_iter(),
                 row.target_guid,
             );

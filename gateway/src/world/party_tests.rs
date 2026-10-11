@@ -3184,7 +3184,8 @@ fn the_realm_core_list_relay_renders_a_member_on_another_shard_online() {
         recipient_guid: GINGER,
     };
 
-    let packets = crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
+    let packets =
+        crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
 
     let mut packets = packets.into_iter();
     let (Some(packet), None) = (packets.next(), packets.next()) else {
@@ -3576,7 +3577,7 @@ fn relayed_leader_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
 ) -> Option<String> {
-    let packets = crate::stdb::subscriptions::group_event_outbound(realm, GINGER, row);
+    let packets = crate::codec::social::subscriptions::group_event_outbound(realm, GINGER, row);
     match &packets[..] {
         [] => None,
         [Outbound::One(ServerOpcodeMessage::SMSG_GROUP_SET_LEADER(announced))] => {
@@ -3624,7 +3625,7 @@ fn relayed_invite_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
 ) -> Option<String> {
-    let packets = crate::stdb::subscriptions::group_event_outbound(realm, GINGER, row);
+    let packets = crate::codec::social::subscriptions::group_event_outbound(realm, GINGER, row);
     match &packets[..] {
         [] => None,
         [Outbound::One(ServerOpcodeMessage::SMSG_GROUP_INVITE(invite))] => {
@@ -3679,7 +3680,7 @@ fn relayed_decline_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
 ) -> Option<String> {
-    let packets = crate::stdb::subscriptions::group_event_outbound(realm, GINGER, row);
+    let packets = crate::codec::social::subscriptions::group_event_outbound(realm, GINGER, row);
     match &packets[..] {
         [] => None,
         [Outbound::One(ServerOpcodeMessage::SMSG_GROUP_DECLINE(decline))] => {
@@ -4803,7 +4804,7 @@ fn the_relay_renders_each_group_broadcast_kind() {
         let row = group_event(kind, VIM, payload);
 
         let packets =
-            crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
+            crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
 
         let sent: Vec<_> = packets.iter().map(wire).collect();
         assert_eq!(sent, [expected], "kind {kind} payload {payload:?}");
@@ -4837,7 +4838,7 @@ fn the_relay_renders_each_meeting_stone_kind() {
         let row = group_event(kind, other_guid, payload);
 
         let packets =
-            crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
+            crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
 
         let sent: Vec<_> = packets.iter().map(wire).collect();
         assert_eq!(sent, [expected], "kind {kind} payload {payload:?}");
@@ -4852,7 +4853,7 @@ fn the_relay_drops_a_meeting_stone_queue_it_cannot_encode() {
     for payload in ["1581", "1581,6", "x,1", "4294967295,1"] {
         let row = group_event(event_kind::QUEUE, 0, payload);
         assert!(
-            crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row)
+            crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row)
                 .is_empty(),
             "payload {payload:?}"
         );
@@ -5002,7 +5003,7 @@ fn the_relay_drops_a_group_broadcast_it_cannot_decode() {
     ] {
         let row = group_event(kind, VIM, payload);
         assert!(
-            crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row)
+            crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row)
                 .is_empty(),
             "kind {kind} payload {payload:?}"
         );
@@ -5025,7 +5026,8 @@ fn a_party_list_with_target_icons_sends_the_list_then_the_icons() {
     }];
     let row = group_event(event_kind::LIST, 0, &roster.encode());
 
-    let packets = crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
+    let packets =
+        crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
 
     let mut packets = packets.into_iter();
     let (Some(list), Some(icons), None) = (packets.next(), packets.next(), packets.next()) else {
@@ -5043,7 +5045,8 @@ fn a_party_list_with_target_icons_sends_the_list_then_the_icons() {
     roster.target_icons.clear();
     let row = group_event(event_kind::LIST, 0, &roster.encode());
     assert_eq!(
-        crate::stdb::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row).len(),
+        crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row)
+            .len(),
         1
     );
 }

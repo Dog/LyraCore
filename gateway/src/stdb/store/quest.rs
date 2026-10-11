@@ -240,16 +240,11 @@ pub(crate) fn quest_detail_view(
 ) -> Option<crate::codec::QuestDetailView> {
     use crate::codec::QuestDetailView;
     let tmpl = db.game_quest_template().entry().find(&quest_id)?;
-    // MUST mirror module/src/quest.rs's award resolution exactly (explicit override → authentic
-    // RewMoneyMaxLevel/0.6 → xp_reward placeholder) so the completion popup equals the grant. No
-    // over-level penalty on either side yet (deferred — add to both together with the player's level).
-    let reward_xp = if tmpl.reward_xp > 0 {
-        tmpl.reward_xp
-    } else if tmpl.reward_money_max_level > 0 {
-        lyracore_shared::quest::quest_xp(tmpl.reward_money_max_level)
-    } else {
-        lyracore_shared::quest::xp_reward(tmpl.quest_level)
-    };
+    let reward_xp = lyracore_shared::quest::base_reward_xp(
+        tmpl.reward_xp,
+        tmpl.reward_money_max_level,
+        tmpl.quest_level,
+    );
     // Body text from the side table (cmangos Details/Objectives/OfferReward/RequestItems).
     let text = db.game_quest_text().quest_entry().find(&quest_id);
     let details = text.as_ref().map(|t| t.details.clone()).unwrap_or_default();
@@ -333,24 +328,29 @@ fn eval_relation(
     use crate::codec::{GiverQuestEval, ROLE_START};
     let tmpl = db.game_quest_template().entry().find(&quest_entry)?;
     let logrow = log.iter().find(|q| q.quest_entry == quest_entry);
-    let active = logrow.map(|q| !q.rewarded).unwrap_or(false);
-    // Complete = active AND every objective met — INVENTORY-AWARE for COLLECT_ITEM (see the helper).
+    let active = logrow.is_some_and(|q| !q.rewarded && !q.failed);
     let complete = active && quest_objectives_complete(db, quest_entry, logrow, player_guid);
-    // A repeatable quest already rewarded keeps its CharacterQuest row (module/src/quest.rs no longer
-    // deletes it — deleting would erase the only record it was ever completed, breaking any OTHER quest's
-    // `prev_quest_id` check below), so "no row" is not the right re-offer test for it: a rewarded row on a
-    // repeatable quest is startable again, mirroring apply_accept_quest's duplicate-guard exception.
-    let no_active_or_done =
-        logrow.is_none() || (tmpl.repeatable && logrow.is_some_and(|q| q.rewarded));
     let startable = role == ROLE_START
-        && no_active_or_done
-        && player_level >= tmpl.min_level
-        && lyracore_shared::quest::race_allowed(tmpl.required_races, race)
-        && lyracore_shared::quest::class_allowed(tmpl.required_classes, class)
-        && (tmpl.prev_quest_id == 0
-            || log
-                .iter()
-                .any(|q| q.quest_entry == tmpl.prev_quest_id && q.rewarded));
+        && lyracore_shared::quest::acceptance(
+            lyracore_shared::quest::AcceptanceRequirements {
+                min_level: tmpl.min_level,
+                required_races: tmpl.required_races,
+                required_classes: tmpl.required_classes,
+                repeatable: tmpl.repeatable,
+            },
+            player_level,
+            race,
+            class,
+            tmpl.prev_quest_id == 0
+                || log
+                    .iter()
+                    .any(|q| q.quest_entry == tmpl.prev_quest_id && q.rewarded),
+            logrow.map(|q| lyracore_shared::quest::Attempt {
+                rewarded: q.rewarded,
+                failed: q.failed,
+            }),
+        )
+        .is_ok();
     Some(GiverQuestEval {
         quest_id: tmpl.entry,
         title: tmpl.title.clone(),

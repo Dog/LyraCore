@@ -105,3 +105,5 @@ pub fn build_resurrect_request(caster_guid: u64, caster_name: String) -> SMSG_RE
         player: true,
     }
 }
+
+pub(crate) mod subscriptions;

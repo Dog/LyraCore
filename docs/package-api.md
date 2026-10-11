@@ -1,4 +1,4 @@
-# Package API, version 3
+# Package API, version 4
 
 The Package API is the part of the Module a Package may name. A Package compiles into the Module
 wasm and can reach any `crate::` path the compiler resolves; this document says which of those paths
@@ -25,6 +25,13 @@ own. The order core operations run in, beyond the ordering stated below. Anythin
 The Package API is a compatibility contract, not a sandbox. Compiled Package code runs inside the
 Module with full access to every table, exactly as `lyracore packages add`'s Trust Review states. The
 lint tells a Package author when core moved under them; it stops nothing at run time.
+
+## Spell effect kinds
+
+`crate::actor::EffectKind` defines the known effect codes shared by the Module, Gateway and
+Importer. Convert a row's `kind` byte with `EffectKind::try_from`; handle unknown authored codes
+explicitly. Existing Actor byte constants keep their values. Version 4 retains the five roots
+and Actor operations from version 3.
 
 ## The surface
 

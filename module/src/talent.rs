@@ -135,15 +135,10 @@ crate::character_owned!(restamp, fn sweep_restamp_game_character_talent(ctx, cha
 //  Pure rules (unit-tested) [server]
 // ===========================================================================================
 
-/// The character level at which the FIRST talent point is granted (vanilla: level 10).
-pub const TALENT_START_LEVEL: u32 = 10;
-
 /// Talent points AVAILABLE to spend: `(level - 9)` earned (1/level from L10, 51 at L60) minus the points
 /// already `spent`, saturating at 0. Pure — unit-tested.
 pub(crate) fn talent_points_available(level: u32, spent: u32) -> u32 {
-    level
-        .saturating_sub(TALENT_START_LEVEL - 1)
-        .saturating_sub(spent)
+    lyracore_shared::talent::points_available(level, spent)
 }
 
 /// Validate a learn of a talent: returns the NEXT rank on success, else a distinguished error. Gates, in
@@ -527,19 +522,7 @@ pub(crate) fn talent_rank_spell(t: &Talent, rank: u8) -> u32 {
 /// the imported per-rank spells. A 0 higher-rank field (demo tree, or a single-rank imported talent) falls
 /// back to `r1`. Rank 0 → 0 (unlearned).
 fn pick_rank_spell(rank: u8, r1: u32, r2: u32, r3: u32, r4: u32, r5: u32) -> u32 {
-    let s = match rank {
-        0 => return 0,
-        1 => r1,
-        2 => r2,
-        3 => r3,
-        4 => r4,
-        _ => r5,
-    };
-    if s != 0 {
-        s
-    } else {
-        r1
-    }
+    lyracore_shared::talent::rank_spell(rank, [r1, r2, r3, r4, r5])
 }
 
 /// Teach `talent`'s `rank`-spell into `guid`'s spellbook AND apply its effects — the shared body of

@@ -698,3 +698,5 @@ mod tests {
         assert_eq!(buy.name, "Night Watch");
     }
 }
+
+pub(crate) mod subscriptions;

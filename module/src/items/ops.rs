@@ -23,8 +23,7 @@ use super::rules::{
     binds_on_grant, equip_slot, meets_required_level, resolve_equip_slot, template_stat, EquipStat,
 };
 use super::tables::{
-    game_item_instance, game_item_template, item_in_slot, item_is_broken, ItemInstance,
-    ItemTemplate,
+    game_item_instance, game_item_template, item_in_slot, ItemInstance, ItemTemplate,
 };
 
 /// Grant the starter loadout to a character the first time it logs in, idempotently. Called from
@@ -427,17 +426,16 @@ pub(crate) fn grant_letter_item(
     Ok(())
 }
 
-/// Total quantity of `item_entry` the player owns across ALL stacks (bag + equipped) — drives
-/// collect-quest completion (parity). Sums `stack_count` over the owner's matching item rows. [entity]
+/// Carried quantity of `item_entry` for collect-quest completion and turn-in.
 pub(crate) fn item_count(ctx: &ReducerContext, owner_guid: u64, item_entry: u32) -> u32 {
-    ctx.db
-        .game_item_instance()
-        .by_owner_guid()
-        .filter(&owner_guid)
-        // Banked copies don't count toward a collect quest.
-        .filter(|i| is_carried_slot(i.slot) && i.entry == item_entry)
-        .map(|i| i.stack_count)
-        .sum()
+    lyracore_shared::item::carried_quantity(
+        item_entry,
+        ctx.db
+            .game_item_instance()
+            .by_owner_guid()
+            .filter(&owner_guid)
+            .map(|item| (item.slot, item.entry, item.stack_count)),
+    )
 }
 
 /// Remove exactly `count` carried units, lowest slot first. Missing quantity leaves every item
@@ -686,6 +684,48 @@ pub(crate) fn apply_item_use(
     .map_err(|detail| refuse(ItemRefusal::NotRightNow, detail))
 }
 
+/// Project owned item rows for the shared resistance fold.
+pub(crate) fn resistance_items(
+    ctx: &ReducerContext,
+    owner_guid: u64,
+) -> impl Iterator<Item = lyracore_shared::resistance::ResistanceItem> + '_ {
+    use crate::game_item_random_property;
+    use lyracore_shared::resistance::ResistanceItem;
+    ctx.db
+        .game_item_instance()
+        .by_owner_guid()
+        .filter(owner_guid)
+        .filter_map(|item| {
+            let tmpl = ctx.db.game_item_template().entry().find(item.entry)?;
+            let property = (item.random_property_id != 0)
+                .then(|| {
+                    ctx.db
+                        .game_item_random_property()
+                        .property_id()
+                        .find(item.random_property_id)
+                })
+                .flatten();
+            Some(ResistanceItem {
+                slot: item.slot,
+                max_durability: tmpl.max_durability,
+                durability: item.durability,
+                template: [
+                    EquipStat::Armor,
+                    EquipStat::HolyResistance,
+                    EquipStat::FireResistance,
+                    EquipStat::NatureResistance,
+                    EquipStat::FrostResistance,
+                    EquipStat::ShadowResistance,
+                    EquipStat::ArcaneResistance,
+                ]
+                .map(|which| template_stat(&tmpl, which)),
+                enchant_id: item.enchant_id,
+                property_enchants: property
+                    .map_or([0; 3], |p| [p.enchant_id_1, p.enchant_id_2, p.enchant_id_3]),
+            })
+        })
+}
+
 /// One item's template, applied enchantment, and Random Property contribution to a Stat Kind.
 fn item_stat_bonus_for_school(
     ctx: &ReducerContext,
@@ -710,9 +750,7 @@ fn item_stat_bonus_for_school(
             ),
         )
     };
-    template_stat(tmpl, which)
-        .saturating_add(enchant)
-        .saturating_add(property)
+    lyracore_shared::item_property::item_stat(template_stat(tmpl, which), enchant, property)
 }
 
 pub(crate) fn item_stat_bonus(
@@ -731,29 +769,28 @@ fn equipped_stat_bonus_for_school(
     school_mask: u32,
 ) -> i32 {
     let templates = ctx.db.game_item_template();
-    ctx.db
-        .game_item_instance()
-        .by_owner_guid()
-        .filter(&owner_guid)
-        .filter(|i| i.slot <= equip_slot::END) // equipment region only (0..=18); bags/backpack don't count
-        .filter_map(|i| {
-            let tmpl = templates.entry().find(i.entry)?;
-            if item_is_broken(&tmpl, &i) {
-                return None; // a broken item grants no stats until repaired
-            }
-            // The template stat PLUS this instance's per-instance ENCHANT overlay (ENCHANTING, completing
-            // the 13). `enchant_stat` is 0 for an unenchanted item (enchant_id 0) → byte-identical readout
-            // for every existing/unenchanted piece (baseline-safe). A broken item already returned above, so
-            // a broken-but-enchanted piece grants neither — the enchant rides the item's working state.
-            Some(item_stat_bonus_for_school(
-                ctx,
-                &i,
-                &tmpl,
-                which,
-                school_mask,
-            ))
-        })
-        .fold(0i32, i32::saturating_add)
+    lyracore_shared::item_property::equipped_stat(
+        ctx.db
+            .game_item_instance()
+            .by_owner_guid()
+            .filter(&owner_guid)
+            .filter_map(|item| {
+                let tmpl = templates.entry().find(item.entry)?;
+                if !lyracore_shared::item::grants_equipped_stats(
+                    item.slot,
+                    tmpl.max_durability,
+                    item.durability,
+                ) {
+                    return None;
+                }
+                Some((
+                    item.slot,
+                    tmpl.max_durability,
+                    item.durability,
+                    item_stat_bonus_for_school(ctx, &item, &tmpl, which, school_mask),
+                ))
+            }),
+    )
 }
 
 /// Sum one Stat Kind across working items in the equipment region.

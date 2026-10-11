@@ -16,7 +16,7 @@
 //!   - `reducers`: reducer calls no Store trait owns (relays, logon, provisioning, heartbeat).
 //!   - `realm_db`: `RealmDb` for `Coordinator`, the Realm-core routing seam.
 //!   - `store`: one Store family adapter per file.
-//!   - `subscriptions`: `PlayerSubscriptions`, viewer setup, and shared packet builders.
+//!   - `subscriptions`: `PlayerSubscriptions`, viewer setup, and durable background work.
 //!   - `views`: row→view converters + the thin `RealmRow`/`AccountRow` mirrors.
 
 // The SpacetimeDB codegen writes one function per table subscription; several run past any
@@ -26,17 +26,17 @@ pub mod bindings;
 
 mod account_sessions;
 pub(crate) mod aoi; // `world/mod.rs`'s 10s task reads `aoi::AOI_RECENTERS` for the AOISTAT line
-mod armor; // the gateway-side EFFECTIVE-armor fold for the character sheet (Approach B)
+pub(crate) mod armor; // Character sheet projection from Coordinator rows
 mod auction_holds;
 mod connection;
 mod member_stats_relay; // Member Stats for group mates outside the viewer's AOI
-mod movement_batch;
-mod reads;
+pub(crate) mod movement_batch;
+pub(crate) mod reads;
 mod realm_db; // impl RealmDb for Coordinator
 mod reducers;
 mod store; // one Store family adapter per file
 pub(crate) mod subscriptions;
-mod views;
+pub(crate) mod views;
 pub(crate) mod world_index;
 pub(crate) mod world_view; // shared per-shard spatial, broadcast, private, and owner dispatch
 
@@ -49,3 +49,5 @@ pub use subscriptions::PlayerSubscriptions;
 // crate the re-export has no external consumer to mark it used, yet the path must stay resolvable.
 #[allow(unused_imports)]
 pub use views::{AccountRow, RealmRow};
+
+pub(crate) mod relays;

@@ -21,30 +21,30 @@ pub mod social;
 pub mod update_mask;
 
 // Packet-family submodules.
-mod auction;
-mod breath;
+pub(crate) mod auction;
+pub(crate) mod breath;
 mod char;
-mod combat;
-mod corpse;
-mod duel;
-mod entity;
-mod gameobject;
-mod guild;
-mod item;
-mod leveling;
+pub(crate) mod combat;
+pub(crate) mod corpse;
+pub(crate) mod duel;
+pub(crate) mod entity;
+pub(crate) mod gameobject;
+pub(crate) mod guild;
+pub(crate) mod item;
+pub(crate) mod leveling;
 mod loot;
-mod mail;
+pub(crate) mod mail;
 mod meeting_stone;
 mod member_stats;
-mod movement;
+pub(crate) mod movement;
 mod movement_info;
 mod npc;
-mod pet;
-mod quest;
-mod taxi;
-mod trainer;
+pub(crate) mod pet;
+pub(crate) mod quest;
+pub(crate) mod taxi;
+pub(crate) mod trainer;
 mod values;
-mod weather;
+pub(crate) mod weather;
 
 pub use social::{
     build_chat_message_to, build_emote_anim, build_friend_list_response, build_friend_status_raw,

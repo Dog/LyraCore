@@ -1035,227 +1035,59 @@ fn call_pipe_needs_repair(is_healthy: bool, already_reconnecting: bool) -> bool 
 /// any of them on a single-database gateway anyway — `settle_home_shard` short-circuits on
 /// `is_sharded()` before it looks at the index.
 fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
-    let mut queries = vec![
+    let mut queries = crate::stdb::relays::queries();
+    queries.extend([
         "SELECT * FROM game_realm",
         "SELECT * FROM game_account",
         "SELECT * FROM game_session",
-        "SELECT * FROM game_account_claim",
         "SELECT * FROM game_account_fence",
         "SELECT * FROM game_account_character_owner",
-        "SELECT * FROM game_character",
-        "SELECT * FROM game_world_entity",
-        // Loot Tag rendering is viewer-relative. These rows let the Gateway project the stored
-        // dynamic flags on its shared CREATE and VALUES paths. `game_group_member` stays here as
-        // well: a captured party member who leaves loses the viewer-relative tap bit immediately.
         "SELECT * FROM game_creature_quest_tap",
         "SELECT * FROM game_creature_quest_tap_member",
         "SELECT * FROM game_creature_loot_tag_group",
         "SELECT * FROM game_corpse_loot_eligible",
-        "SELECT * FROM game_group_member",
         "SELECT * FROM game_auction",
         "SELECT * FROM game_auction_bid_decision",
         "SELECT * FROM game_auction_bid_hold",
         "SELECT * FROM game_auction_hold",
         "SELECT * FROM game_auction_house",
-        "SELECT * FROM game_auction_notice",
         "SELECT * FROM game_auction_operation_receipt",
-        // Guilds. Realm-core holds every row; World Shards hold none. The Gateway reads membership
-        // for the Guild Projection and renders Guild Events from this cache.
         "SELECT * FROM game_guild",
         "SELECT * FROM game_guild_rank",
-        "SELECT * FROM game_guild_member",
-        "SELECT * FROM game_guild_event",
-        // A Fee Hold lives on the payer's Home Shard, the fee decision on Realm-core.
         "SELECT * FROM game_guild_fee_hold",
         "SELECT * FROM game_guild_fee_decision",
-        // `game_guild_invite` is NOT subscribed here: every invite Gate and read runs inside
-        // `realm_guild_op`, so no Gateway code ever reads the row back from a cache.
-        // Petitions and their Signatures live on Realm-core. The Gateway renders the signature
-        // window, the petition query and the Guild Charter's Petition id from them.
-        "SELECT * FROM game_guild_petition",
         "SELECT * FROM game_guild_petition_signature",
-        // The four box-scoped tables now ride THIS one global subscription per shard instead
-        // of ~600 per-player 5×5-box subscriptions, and the gateway's own cell index
-        // (`stdb::world_index`) decides who sees each row. `game_world_entity` and
-        // `game_gameobject` were already here (the coordinator has always read them RLS-bypassed);
-        // these two are the whole server-side delta the change needed.
-        //
-        // The point is NOT that these queries are cheaper to evaluate — a `SELECT *` is the
-        // cheapest possible query, but that was never the cost. The cost was that ~600 DISTINCT
-        // query strings can neither be shared nor pruned, so every committed transaction woke ~600
-        // SDK pumps to re-evaluate them: load average 11–14 on 8 cores at 34% CPU with 7 runnable
-        // threads (clockworklabs/SpacetimeDB). One subscription wakes one pump.
-        //
-        // ⚠ These are the two HIGHEST-RATE tables in the module (one upsert per mover per movement
-        // heartbeat, one per creature leg). They are handled by `world_view`'s dispatch, which does
-        // index bookkeeping and an enqueue per recipient and NOTHING else on the pump — no
-        // encoding, no per-session locks held. Adding work to that path is adding it to a thread
-        // every session on the shard depends on.
-        "SELECT * FROM game_entity_motion",
-        "SELECT * FROM game_creature_spline",
-        "SELECT * FROM game_taxi_passenger_spline",
-        // The SOURCE-side escrow. The ONE module→gateway data flow the cross-database
-        // transfer adds: the export blob is written here by `begin_transfer` and the gateway
-        // carries it to the other database's `import_character_blob`. Private table, read
-        // through the owner token like game_account/game_session. Also the whole of transfer
-        // RECOVERY: a restarted gateway re-derives an in-flight transfer's id, destination and
-        // payload from this row alone.
-        //
-        // Escrows, arrival fences and source instance leases are base subscriptions on every
-        // topology. Private Transfer state is read with the Owner Token.
         "SELECT * FROM game_transfer_out",
         "SELECT * FROM game_transfer_in",
         "SELECT * FROM game_instance",
-        // Stable Coordinator relays keep addressed events available across player subscription
-        // changes. Callbacks route them through the World View's owner and identity indexes.
-        "SELECT * FROM game_teleport_event",
-        "SELECT * FROM game_xp_event",
-        "SELECT * FROM game_levelup_event",
-        // Session-less Group Intents run on every topology, including a single database.
         "SELECT * FROM game_bot_invite_intent",
         "SELECT * FROM game_party_command_intent WHERE pending = true",
         "SELECT * FROM game_party_command_dispatch_lane",
         "SELECT * FROM game_party_command_receipt",
-        // Bot-initiated Shard crossings, here for every reason the invite intent above is: a bot has
-        // no session, so no other connection could see the row, and it rides the BASE list because a
-        // single-database realm writes the same rows (the relay finds nothing to cross there and
-        // says so). Its durable dispatcher drives the SAME Escrow sequence a player's
-        // `MSG_MOVE_WORLDPORT_ACK` does.
         "SELECT * FROM game_bot_transfer_intent",
-        // Addon-bridge messages: the server→client UI stream — coordinator-ridden
-        // from day one (the coordinator-relay rule). Any addon UI that streams live state rides
-        // this, and a dropped frame is a stuck widget on the client.
-        "SELECT * FROM game_addon_message",
-        // Explored areas (a live find, same rule): the fog-word relay's coordinator leg — a fresh
-        // login's first-movement discovery lands exactly in the per-player AOI-churn window.
-        "SELECT * FROM game_character_explored",
-        // Rest-state flips: same shape — `world_view::
-        // rest_state_appeared` relays each row to its owner's session only. TTL-reaped.
-        "SELECT * FROM game_rest_state_event",
-        // The live sky, one row per zone that has weather. Read at world entry and at a zone
-        // crossing, and relayed by `world_view::weather_changed` to exactly the viewers whose
-        // stored zone matches the row's. Durable state and relay source in the same row, so a
-        // reconnect replays what everyone else already has. Tiny (one row per zone) and slow (one
-        // roll per zone every ten minutes).
-        "SELECT * FROM game_zone_weather",
-        // Breath timer edges and server-resolved drowning hits: self-only relay, with the same
-        // owner-session audience as rest state. The bar counts down client-side between edges.
-        "SELECT * FROM game_breath_relay_event",
-        // Instance Removal countdowns: `world_view` relays each row to its owner, and the world
-        // entry sweep replays a running one with the time left. The row is durable Module state,
-        // so a Gateway restart loses no countdown.
-        "SELECT * FROM game_instance_removal",
-        // Ground-area spell visuals: `world_view::dynobj_appeared`
-        // relays instance-gated CREATE/DESTROY. Short-lived rows (the area's duration).
-        "SELECT * FROM game_dynamic_object",
-        // Swing log + combat stance: `world_view::
-        // combat_event_appeared` / `melee_engaged` / `melee_disengaged` run the shared
-        // per-viewer bodies. Both TTL-reaped/ephemeral combat tables.
-        "SELECT * FROM game_combat_event",
-        "SELECT * FROM game_melee_attack",
-        // The social tier: emote broadcast and range-gated say/yell
-        // (`world_view::emote_appeared`/`chat_appeared`).
-        "SELECT * FROM game_chat_event",
-        "SELECT * FROM game_emote_event",
-        // Creature virtual-item display projection. Durable rows are replayed after peer CREATE;
-        // insert/update/delete also relay the three sparse UNIT fields live.
-        "SELECT * FROM game_encounter_equip",
-        // Cast visuals + projectile impact: `world_view::
-        // cast_event_appeared` runs the full cast-lock contract per viewer; `impact_appeared`
-        // the deferred damage number. Both TTL-reaped event tables.
-        "SELECT * FROM game_spell_cast_event",
-        "SELECT * FROM game_spell_impact_event",
-        // Pet bar spells: tiny static table `offer_peer_create_for` joins for the
-        // viewer's own pet CREATE (SMSG_PET_SPELLS slots 3–6) — read HERE since the first
-        // shared-dispatch move, but for a while not subscribed here at all: the only subscription
-        // left was the per-player copy nothing read any more, and the pet bar came up empty.
         "SELECT * FROM game_creature_cast",
-        // Bounded Hunter-pet protocol projection. The durable care row stays module-private; this
-        // carries only fields required to render the owner's live pet and answer its name query.
-        "SELECT * FROM game_hunter_pet_protocol",
-        // The PRIVATE tier: recipient-addressed rows the shared
-        // dispatch delivers through the owner-session lookup + private_recipient_audience. The
-        // owner token bypasses each row's per-recipient RLS — the gateway predicate IS the
-        // privacy guarantee on this path. In the BASE list (not the sharded block) so a
-        // single-database gateway's shared path works too; on realm-core the same subscription
-        // additionally feeds the per-session cross-shard twins, unchanged.
-        "SELECT * FROM game_resurrect_request",
-        "SELECT * FROM game_self_resurrect_option",
-        "SELECT * FROM game_system_message_event",
-        "SELECT * FROM game_mail_arrival",
-        "SELECT * FROM game_group_event",
-        "SELECT * FROM game_trade_event",
-        "SELECT * FROM game_duel_event",
-        // Realm Chat Lines carry their whole audience. Only Realm-core writes them; every
-        // database subscribes so an unsharded Realm hears them on its one connection.
-        "SELECT * FROM game_realm_chat_event",
-        // Auto-Replies, beside the live entity on each Home Shard. A whisper reads the target's
-        // one row by primary key (`world::presence::auto_reply`).
         "SELECT * FROM game_character_away",
-        // Chat Channels and their Channel Notices. Only Realm-core writes them. The channel and
-        // member tables answer `/chatlist` and the owner query through `ChannelIndex`; the
-        // notices carry their whole audience like Realm Chat Lines.
         "SELECT * FROM game_chat_channel",
         "SELECT * FROM game_chat_channel_member",
         "SELECT * FROM game_chat_channel_ban",
-        "SELECT * FROM game_chat_channel_notice_event",
-        // The Meeting Stone Queue. Stones are static and read on the Home Shard to name a stone's
-        // dungeon area; Seekers are written on Realm-core and answer `CMSG_MEETINGSTONE_INFO`.
-        // Both are small, and an unsharded Realm reads both on its one connection.
         "SELECT * FROM game_meeting_stone",
         "SELECT * FROM game_meeting_stone_seeker",
-        // Server-wide tunables. The gateway reads ONE column: `hosts_instances`, at
-        // startup, to answer "when this realm creates a dungeon instance, will anything actually
-        // spawn its population" (`ShardMap::check_instance_hosting`). Before this subscription the
-        // gateway could only GUESS — the old `instance_hosting_reminder` warned on every sharded
-        // startup regardless of the flag's value, and the far more damaging inverse (flag false with
-        // no routing ⇒ every dungeon created with 0 entities) was undetectable in either process.
-        //
-        // BASE list, not `sharded_tables`, and that is load-bearing: that empty-dungeon failure
-        // happens with NO shard map at all, so a single-database gateway is exactly the one that
-        // must read the flag. `game_config` is public and predates all of the sharding work, so
-        // subscribing it cannot brick the restart of a gateway whose module predates
-        // multi-database routing (the hazard `coordinator_queries`' doc comment describes). Its
-        // BINDING must stay in sync, though — `hosts_instances` was END-appended after the
-        // generated `server_config_type.rs` was last regenerated, which
-        // `gateway/tests/schema_parity.rs` now pins.
         "SELECT * FROM game_config",
         "SELECT * FROM game_creature_template",
-        // AreaTable catalogue: zone names for `/who`'s search-string match. Static and small
-        // enough for one coordinator cache, like every other imported catalogue on this list.
         "SELECT * FROM game_area",
-        // Taxi catalogue. Static and small enough for one coordinator cache; later discovery and
-        // activation slices resolve nodes, directed routes, and ordered path points from here.
         "SELECT * FROM game_taxi_node",
         "SELECT * FROM game_taxi_path",
         "SELECT * FROM game_taxi_path_node",
-        // Private, transient, request-id-keyed mailbox written by the module's cohesive status/open
-        // operations. The owner-token coordinator may subscribe it; discovery stays module-private
-        // policy and is deliberately not subscribed.
         "SELECT * FROM game_taxi_service_reply",
         "SELECT * FROM game_start_position",
-        "SELECT * FROM game_corpse",
-        // Items: the static item definitions (for CMSG_ITEM_QUERY_SINGLE) + every
-        // owned-item instance. The coordinator authenticates as the module owner, which bypasses
-        // RLS, so it reads all players' item rows (like game_character) to drive each login spawn.
         "SELECT * FROM game_item_template",
         "SELECT * FROM game_item_random_property",
         "SELECT * FROM game_item_enchantment",
-        // Static spell headers — spell_cast_time() reads cast_time_ms via coord() so the
-        // CMSG_CAST_SPELL handler can clear INSTANT casts synchronously.
         "SELECT * FROM game_spell",
-        // Spell effects — the gateway reads these to route ITEM-target enchant/disenchant casts by
-        // effect KIND (E_ENCHANT_ITEM/E_DISENCHANT) instead of a hardcoded spell-id list.
         "SELECT * FROM game_spell_effect",
-        "SELECT * FROM game_item_instance",
-        // Buyback ring: read by the coordinator to rebuild a player's buyback-tab view
-        // after sell/buyback and at login (private table — the owner-token coordinator sees it).
         "SELECT * FROM game_character_buyback",
-        // Items: a creature corpse's item loot, read for the loot window.
         "SELECT * FROM game_corpse_loot",
-        // Vendors (Tier 2): a creature's vendor stock, read for SMSG_LIST_INVENTORY.
         "SELECT * FROM game_npc_vendor",
-        // Gossip menus, runtime per-creature selections, NPC text, and clickable options.
         "SELECT * FROM game_gossip_menu",
         "SELECT * FROM game_gossip_option",
         "SELECT * FROM game_gossip_menu_profile",
@@ -1263,111 +1095,38 @@ fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
         "SELECT * FROM game_creature_gossip_menu_override",
         "SELECT * FROM game_npc_text",
         "SELECT * FROM game_npc_text_slot",
-        // Quests (gateway slice): the static quest tables + every player's quest log. The
-        // coordinator bypasses RLS, so game_character_quest is read for any player to compute the
-        // overhead `!`/`?` status + the completion gate.
         "SELECT * FROM game_quest_template",
         "SELECT * FROM game_quest_text",
         "SELECT * FROM game_quest_objective",
         "SELECT * FROM game_quest_reward_item",
         "SELECT * FROM game_quest_reward_choice",
         "SELECT * FROM game_creature_quest",
-        // The GAMEOBJECT twin of `game_creature_quest` — GO 68 "Wanted Poster"
-        // starts q176 with no creature giver at all, and the GO 55/56 "Lost Guards" corpses drive
-        // the q37/q45/q71 END chain. Without this subscription the coordinator's `RemoteTables`
-        // cache of `game_gameobject_quest` stays empty forever (the binding/decode plumbing landed
-        // earlier, but nothing ever asked the node to send rows) and `quest_giver_evals`'s GO
-        // fallback would silently evaluate against zero relations no matter what the module holds.
         "SELECT * FROM game_gameobject_quest",
-        "SELECT * FROM game_character_quest",
-        // The player's learned spells, chained into the login spellbook (e.g. Auto Shot).
         "SELECT * FROM game_player_spell",
-        // Imported action-bar rows (hand-written binding — see
-        // `stdb/bindings/player_action_type.rs`'s header note). Empty until a dump import runs;
-        // the coordinator's own read cache needs this subscription the same way game_player_spell
-        // does above (RLS-bypassed, so player_actions() can read ANY player's rows for login).
         "SELECT * FROM game_player_action",
-        // Trainers: the static teach-list (SMSG_TRAINER_LIST) + every player's trained skills. The
-        // coordinator bypasses RLS, so game_player_skill is read for any player to compute each
-        // profession offering's "known" (gray-out a tier already trained past) in trainer_list.
         "SELECT * FROM game_trainer_spell",
         "SELECT * FROM game_spell_chain",
-        "SELECT * FROM game_player_skill",
-        // Gameobjects: spawned props + templates, relayed to clients as GameObject CREATE_OBJECT,
-        // joined for the query reply + the chest-loot use.
-        "SELECT * FROM game_gameobject",
         "SELECT * FROM game_gameobject_template",
-        // Talents: static talent metadata for the gateway to look up grant_spell_id on CMSG_LEARN_TALENT,
-        // plus every character's spent ranks (RLS-bypassed like game_player_skill) so the live pick
-        // relays the rank-spell (SMSG_LEARNED_SPELL/SUPERCEDED) and the decremented
-        // PLAYER_CHARACTER_POINTS1 — without these the 5875 talent pane freezes until relog.
         "SELECT * FROM game_talent",
         "SELECT * FROM game_character_talent",
-        // Spell-modifier mirror: the coordinator reads every player's A_SPELLMOD auras to
-        // build the SMSG_SET_FLAT/PCT_SPELL_MODIFIER packets at login + on a talent pick.
-        "SELECT * FROM game_aura",
-        // The player's persisted reputation standings, chained into the
-        // login SMSG_INITIALIZE_FACTIONS. Without this subscription the coordinator's local cache of
-        // game_player_reputation is empty and player_reputations() always returns nothing.
-        "SELECT * FROM game_player_reputation",
-        // Mail. Subscribed on EVERY connection in the set, because the mailbox has two planes:
-        // realm-core is authoritative on a sharded realm, and a single-database gateway reads its
-        // own copy. The gateway answers `CMSG_GET_MAIL_LIST` from this cache. The list itself is a
-        // poll; only the Mail Arrival above is relayed.
         "SELECT * FROM game_mail",
-        // The mail ESCROW ledger, and the `game_transfer_out` precedent verbatim: the gateway is
-        // the only component that can see both databases, so a fence its predecessor abandoned is
-        // re-derived from this row and driven forward. Private, read through the owner token. Every
-        // connection in the set, because a letter fences on the sender's shard and a take fences on
-        // realm-core. A single-database gateway holds only Reward Letters here, which the turn-in
-        // files on its one database.
         "SELECT * FROM game_mail_escrow",
-        // Letter Copy's readable item text (`CMSG_MAIL_CREATE_TEXT_ITEM`). Same two-plane shape as
-        // game_mail: a copied letter's text lives wherever the mail plane does, and it outlives the
-        // mail row that created it, so `CMSG_ITEM_TEXT_QUERY` must find it there even after the
-        // mail is gone. Private, read through the owner token.
         "SELECT * FROM game_item_text",
-        // Friends/ignore: every character's contact rows, so the coordinator can
-        // build any player's SMSG_FRIEND_LIST/SMSG_IGNORE_LIST (RLS-bypassed, like game_character).
-        "SELECT * FROM game_character_contact",
-        // Reaction gating: standing-derived reaction for interaction windows —
-        // the NPC's template resolves to its parent faction (rep bar or mask fallback). Both
-        // static/small (314 + ~470 rows).
         "SELECT * FROM game_faction",
         "SELECT * FROM game_faction_template",
-        // Guid ranges. Two one-row tables, subscribed on EVERY deployment because a database
-        // that holds no range refuses to create characters at all: `ensure_guid_ranges` reads the
-        // allocator's high-water to decide which range the database is already minting from, and
-        // reads back the range it ends up holding to log it.
         "SELECT * FROM game_guid_allocator",
         "SELECT * FROM game_guid_range",
-    ];
+    ]);
     if sharded_tables {
-        // Character→shard index. On realm-core this is the realm-wide directory the login
-        // path consults; on a world shard it is the receipt `finish_transfer` writes in the escrow's
-        // own transaction. Private, like game_account/game_session — the owner token reads it, no
-        // client ever sees it. Multi-database deployments only (see this function's doc comment).
-        queries.push("SELECT * FROM game_character_shard");
-        // Realm-core owns party membership; each World Shard retains its mirror. World reads need
-        // the roster and member revisions when Transfer replaces local rows. Events and members
-        // already live in the base subscription.
-        queries.push("SELECT * FROM game_group");
-        queries.push("SELECT * FROM game_group_roster_revision");
-        queries.push("SELECT * FROM game_group_member_partition");
-        // Loot rolls — a DIFFERENT reason than every table above: nothing here is a CLIENT
-        // relay (`game_group_event` still carries every wire-visible roll transition, unchanged). The
-        // gateway's own loot-roll relay (`world::loot::relay_tick`) needs these two PRIVATE tables to
-        // do its job: on a WORLD SHARD, `pending_local_rolls` reads a freshly kill-time-created
-        // staging roll to promote onto realm-core; on REALM-CORE, the promoted/voted rows are what
-        // `remove_member`'s disband branch resolves directly. Subscribed on every connection in the
-        // set for the same reason party state is: each handle reads its own database's copy, and the
-        // relay decides which copy needs which action.
-        queries.push("SELECT * FROM game_loot_roll");
-        queries.push("SELECT * FROM game_loot_roll_vote");
-        // The guid-range REGISTRY — realm-core's answer to which shard mints from where.
-        // Only meaningful in a multi-database deployment: with one database there is one minter and
-        // nothing to arbitrate.
-        queries.push("SELECT * FROM game_guid_range_registry");
+        queries.extend([
+            "SELECT * FROM game_character_shard",
+            "SELECT * FROM game_group",
+            "SELECT * FROM game_group_roster_revision",
+            "SELECT * FROM game_group_member_partition",
+            "SELECT * FROM game_loot_roll",
+            "SELECT * FROM game_loot_roll_vote",
+            "SELECT * FROM game_guid_range_registry",
+        ]);
     }
     queries
 }

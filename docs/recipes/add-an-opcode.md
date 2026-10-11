@@ -53,9 +53,11 @@ Required for every new table and every new reducer.
 - Run the `spacetime generate` command in [`danger-zones.md`](../danger-zones.md) section 1.2 and
   restore the hand-patched names and the comment it lists.
 - Run `scripts/check-gateway-bindings.py`. It must report no difference.
-- For each table the Gateway subscribes to, add its `SELECT * FROM <table>` to
-  `coordinator_queries` in `gateway/src/stdb/connection.rs`, then add a `parity_test!` and the table
-  name to `MANIFEST_TABLES` in `gateway/tests/schema_parity.rs`.
+- For a Relay table, add its declaration beside its codec as described in step 11. The declaration
+  generates the subscription query. For a table used only by Durable Reads, add its query to
+  `coordinator_queries` in `gateway/src/stdb/connection.rs`.
+- Add a `parity_test!` and the table name to `MANIFEST_TABLES` in
+  `gateway/tests/schema_parity.rs`. Its inventory checks both query sources.
 
 ## 5. Call the reducer from the Store trait method
 
@@ -135,15 +137,22 @@ byte, opcode and size header included.
 
 ## 11. Relay the row
 
-File: `gateway/src/stdb/world_view.rs`.
+File: `gateway/src/codec/<family>/subscriptions.rs`, declared by its codec module.
 
-- Register the callbacks with `wire_insert` and `wire_delete` in `register_shard_callbacks` for a
-  World Shard table, or in `arm_realm_private` for a Realm-core one.
-- In the callback, find the recipient's viewer by key, for example
-  `view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid))`, and queue the packet with
-  `enqueue(viewer, move |viewer| vec![...])`. The job runs on that session's writer, in order.
-- If a client that enters the world must see a running state, send it from the world entry sweep as
-  well. The Instance Removal countdown does this.
+- Add a `declare_relays!` entry with the generated table accessor, its Realm-core choice, and each
+  insert, update or delete callback. It generates the query and per-Shard registration together.
+  Set the Realm-core choice to `true` only for a table that also needs the private Realm-core Relay.
+- Choose `insert(Live)` to suppress initial subscription rows or `insert(Snapshot)` to replay them.
+  Updates and deletes always carry live deltas. Follow the table's behavior; event names do not
+  determine its replay policy.
+- Keep the row callback and outbound builder in this file. Find the recipient with a WorldView
+  routing method, clone rows before queuing, then call the builder inside
+  `enqueue(viewer, move |viewer| vec![...])`. The World Session writer runs that job in order.
+- A new Protocol Family joins `protocol_relays!` in `gateway/src/stdb/relays.rs`. It then contributes
+  both its queries and its callbacks. WorldView keeps the shared AOI and viewer lifetime, and
+  registers callbacks before seeding the cache on reconnect.
+- If world entry must show resident state, add it to the world entry sweep too. The Instance Removal
+  countdown does this.
 
 ## 12. Test each seam
 
@@ -151,7 +160,7 @@ File: `gateway/src/stdb/world_view.rs`.
   `ReducerCallError::refused` and the client gets the Refusal answer. One answers
   `ReducerCallError::transport_lost` and the dispatcher returns `Err`.
 - The packet bytes, in the codec file.
-- The Relay's recipient choice and packet, in the `world_view.rs` test modules.
+- The Relay builder in its codec file, and shared audience and queue behavior in `world_view.rs`.
 - The Module rule, in a durable test `module/tests/<family>.rs`. CI picks up a new target with no
   workflow edit.
 - A cross-Shard Gateway behaviour, in an ignored test under `gateway/src/stdb/`. CI runs those one by

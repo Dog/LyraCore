@@ -123,7 +123,7 @@ pub(crate) fn apply_racial_passives(ctx: &ReducerContext, guid: u64, race: u8, l
         let Some(hdr) = ctx.db.game_spell().spell_id().find(spell_id) else {
             continue;
         };
-        if hdr.attributes & crate::spell::taxonomy::SPELL_ATTR_PASSIVE != 0 {
+        if hdr.attributes & lyracore_shared::spell::taxonomy::SPELL_ATTR_PASSIVE != 0 {
             crate::spell::apply_spell_auras(ctx, spell_id, guid, level, 1);
         }
     }

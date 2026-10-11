@@ -325,9 +325,8 @@ pub(crate) fn swing_time_with_haste(base_ms: u32, haste_pct: i32) -> u32 {
 /// faster; negative = slower (a snare like Hamstring). Floored at 10% of base so a heavy snare slows but
 /// never freezes a unit dead (a zero-length step breaks the movement passes' no-op-leg skip and would
 /// look frozen). Pure — unit-tested. `pct == 0` → exactly `base` (baseline-safe). [pure]
-pub(crate) fn move_speed_with_pct(base: f32, pct: i32) -> f32 {
-    base * (100 + pct).max(10) as f32 / 100.0
-}
+#[cfg(test)]
+use lyracore_shared::aura::move_speed_with_pct;
 
 /// Per-1000 melee-damage multiplier for a creature's classification `rank` (the swing twin of
 /// `creatures::rank_hp_multiplier_permille`). cmangos `creature_template.rank`: `0`=normal, `1`=elite,

@@ -319,3 +319,5 @@ mod tests {
         assert_eq!(body.len(), 19 + text.len());
     }
 }
+
+pub(crate) mod subscriptions;
