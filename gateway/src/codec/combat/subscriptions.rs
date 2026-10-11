@@ -1218,8 +1218,7 @@ pub(crate) mod tests {
             Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(m))) => m,
             _ => panic!("expected Some(Outbound::One(SMSG_FORCE_RUN_SPEED_CHANGE))"),
         };
-        let expected_speed = 7.0f32 * (1.0 + 30_f32 / 100.0); // BASE_RUN_SPEED * (1 + summed pct)
-        assert_eq!(*m, codec::build_force_run_speed(self_guid, expected_speed));
+        assert_eq!(*m, codec::build_force_run_speed(self_guid, 9.1));
         // A non-move-speed change on self spams nothing (ordinary buffs/debuffs don't trigger this).
         let unrelated = aura(self_guid, 0xA1, 1, 10, 0, i64::MAX);
         assert!(run_speed_packet(current.clone().into_iter(), &unrelated, self_guid).is_none());
