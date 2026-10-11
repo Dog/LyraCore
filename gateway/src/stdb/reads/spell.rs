@@ -1,6 +1,8 @@
 //! Spell/spellbook cache-accessor methods — pure code-motion split of the former
 //! `reads.rs`.
 
+use lyracore_shared::spell::taxonomy::SPELL_ATTR_PASSIVE;
+
 use super::super::bindings::*;
 
 // --- quest read helpers (free fns over the cache, shared by the methods above) ---------------------
@@ -14,7 +16,6 @@ use super::super::bindings::*;
 /// non-mana-cost spells (rage/energy/health) SUPERSEDE their old rank. Unknown spell → stack
 /// (never hide a rank on missing data). LOCKSTEP: SPELL_ATTR_PASSIVE = 0x40 (module taxonomy).
 pub(in crate::stdb) fn spell_ranks_stack_in_book(db: &RemoteTables, spell_id: u32) -> bool {
-    const SPELL_ATTR_PASSIVE: u32 = 0x40;
     const POWER_MANA: u8 = 0;
     match db.game_spell().spell_id().find(&spell_id) {
         Some(h) => h.attributes & SPELL_ATTR_PASSIVE == 0 && h.power_type == POWER_MANA,

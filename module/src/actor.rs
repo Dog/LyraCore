@@ -336,3 +336,5 @@ pub(crate) fn stop_movement(ctx: &ReducerContext, actor_guid: u64) {
         ctx.db.game_creature_spline().guid().delete(actor_guid);
     }
 }
+
+package_only! { pub(crate) use lyracore_shared::spell::taxonomy::EffectKind as EffectKind; }

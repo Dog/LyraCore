@@ -1,62 +1,27 @@
 //! Character-sheet resistances from the coordinator's entity, aura, item and catalogue caches.
-//! The fold mirrors Module combat resistance, including applied enchantments and Random Properties.
+//! The shared combat fold includes applied enchantments and Random Properties.
 //! Other character-sheet values come directly from the Module's derived entity fields.
 
 use super::bindings::*;
 use spacetimedb_sdk::Table;
 use std::collections::HashMap;
 
-/// Aura kind `A_MOD_RESISTANCE` — a direct resistance/armor bonus (e.g. Demon Skin). Mirrors
-/// `module::spell::taxonomy::A_MOD_RESISTANCE = 0xA1`.
-const A_MOD_RESISTANCE: u8 = 0xA1;
-const RESISTANCE_BITS: [u32; 7] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
-const RESISTANCE_KINDS: [u8; 7] = [
-    lyracore_shared::item_property::ARMOR,
-    lyracore_shared::item_property::HOLY_RESISTANCE,
-    lyracore_shared::item_property::FIRE_RESISTANCE,
-    lyracore_shared::item_property::NATURE_RESISTANCE,
-    lyracore_shared::item_property::FROST_RESISTANCE,
-    lyracore_shared::item_property::SHADOW_RESISTANCE,
-    lyracore_shared::item_property::ARCANE_RESISTANCE,
-];
-/// Inclusive upper bound of the equipment region (`equip_slot::END == TABARD == 18`). Only worn pieces in
-/// slots 0..=18 carry armor; bags/backpack/bank don't count. Mirrors `items::equipped_stat_bonus`.
-const EQUIP_REGION_END: u8 = 18;
+use lyracore_shared::{
+    aura::AuraAmount,
+    resistance::{self, ResistanceItem},
+};
 
-/// One aura row's armor contribution: `amount × max(stacks, 1)` IF it is an `A_MOD_RESISTANCE` aura whose
-/// frozen `eff_p0` school mask overlaps `RESIST_ARMOR` (bit 0); else 0. Mirrors the module's
-/// `resistance_bonus` predicate + `stacked_amount`: `stacks` is floored at 1 so a legacy 0-stack row still
-/// counts ONCE, and a negative `amount × stacks` (Sunder Armor) subtracts. Pure → unit-tested.
-fn aura_resistance_contribution(
-    eff_kind: u8,
-    eff_p0: i32,
-    amount: i32,
-    stacks: u8,
-    school_bit: u32,
-) -> i32 {
-    if eff_kind == A_MOD_RESISTANCE && (eff_p0 as u32 & school_bit) != 0 {
-        amount.saturating_mul(i32::from(stacks.max(1)))
-    } else {
-        0
-    }
-}
-
-fn aura_armor_contribution(eff_kind: u8, eff_p0: i32, amount: i32, stacks: u8) -> i32 {
-    aura_resistance_contribution(eff_kind, eff_p0, amount, stacks, RESISTANCE_BITS[0])
-}
-
-/// One equipped item's armor contribution: its template `stat_armor`, or 0 if the item is outside the
-/// equipment region (`slot > 18`) or BROKEN (`max_durability > 0 && durability == 0`). Mirrors the
-/// module's `equipped_stat_bonus(Armor)` (slot gate + `item_is_broken`). A no-durability item
-/// (`max_durability == 0`, e.g. a cloak) is never broken. Pure → unit-tested.
-fn gear_armor_contribution(slot: u8, stat_armor: i32, max_durability: u32, durability: u32) -> i32 {
-    if slot > EQUIP_REGION_END {
-        return 0;
-    }
-    if max_durability > 0 && durability == 0 {
-        return 0; // broken → grants no armor until repaired
-    }
-    stat_armor
+fn aura_values(db: &RemoteTables, guid: u64) -> Vec<AuraAmount> {
+    db.game_aura()
+        .iter()
+        .filter(move |a| a.target_guid == guid)
+        .map(|a| AuraAmount {
+            kind: a.eff_kind,
+            parameter: a.eff_p0,
+            amount: a.amount,
+            stacks: a.stacks,
+        })
+        .collect()
 }
 
 /// Everything the paperdoll shows that GEAR/AURAS move on the STR/AGI/STA/INT/SPI/AP/damage-range/crit
@@ -103,12 +68,7 @@ pub(crate) fn sheet_stats(db: &RemoteTables, guid: u64) -> Option<crate::codec::
 }
 
 pub(crate) fn aura_armor_positive(db: &RemoteTables, guid: u64) -> u32 {
-    db.game_aura()
-        .iter()
-        .filter(|a| a.target_guid == guid)
-        .map(|a| aura_armor_contribution(a.eff_kind, a.eff_p0, a.amount, a.stacks))
-        .filter(|&c| c > 0)
-        .fold(0u32, |total, amount| total.saturating_add(amount as u32))
+    resistance::positive_armor(aura_values(db, guid))
 }
 
 /// Effective armor followed by Holy, Fire, Nature, Frost, Shadow and Arcane resistance.
@@ -118,84 +78,63 @@ pub(crate) fn effective_resistances(db: &RemoteTables, guid: u64) -> [u32; 7] {
         .game_world_entity()
         .guid()
         .find(&guid)
-        .map(|e| e.armor as i64)
-        .unwrap_or(0);
-    let mut aura = [0i64; 7];
-    for row in db.game_aura().iter().filter(|a| a.target_guid == guid) {
-        for (index, school_bit) in RESISTANCE_BITS.into_iter().enumerate() {
-            aura[index] += i64::from(aura_resistance_contribution(
-                row.eff_kind,
-                row.eff_p0,
-                row.amount,
-                row.stacks,
-                school_bit,
-            ));
-        }
-    }
-    // The SDK exposes no non-unique enchantment index. Read the catalogue once per projection.
-    let mut enchantments = HashMap::<(u32, u8), i32>::new();
-    for effect in db
-        .game_item_enchantment()
-        .iter()
-        .filter(|effect| effect.enchant_id != 0 && RESISTANCE_KINDS.contains(&effect.kind))
-    {
-        let total = enchantments
-            .entry((effect.enchant_id, effect.kind))
-            .or_default();
-        *total = total.saturating_add(effect.amount);
-    }
-    let enchant_stat = |id, kind| enchantments.get(&(id, kind)).copied().unwrap_or(0);
-    let templates = db.game_item_template();
-    let mut gear = [0i32; 7];
-    for item in db
+        .map_or(0, |e| e.armor);
+    let auras = aura_values(db, guid);
+    let items: Vec<_> = db
         .game_item_instance()
         .iter()
-        .filter(|i| i.owner_guid == guid && i.slot <= EQUIP_REGION_END)
-    {
-        let Some(tmpl) = templates.entry().find(&item.entry) else {
-            continue;
-        };
-        if tmpl.max_durability > 0 && item.durability == 0 {
-            continue;
-        }
-        let template = [
-            tmpl.stat_armor,
-            tmpl.holy_res,
-            tmpl.fire_res,
-            tmpl.nature_res,
-            tmpl.frost_res,
-            tmpl.shadow_res,
-            tmpl.arcane_res,
-        ];
-        let property = db
-            .game_item_random_property()
-            .property_id()
-            .find(&item.random_property_id);
-        for index in 0..RESISTANCE_KINDS.len() {
-            let kind = RESISTANCE_KINDS[index];
-            let mut amount = template[index].saturating_add(enchant_stat(item.enchant_id, kind));
-            if let Some(property) = &property {
-                let property_amount = [
-                    property.enchant_id_1,
-                    property.enchant_id_2,
-                    property.enchant_id_3,
-                ]
-                .into_iter()
-                .map(|id| enchant_stat(id, kind))
-                .fold(0i32, i32::saturating_add);
-                amount = amount.saturating_add(property_amount);
-            }
-            let amount = if index == 0 {
-                gear_armor_contribution(item.slot, amount, tmpl.max_durability, item.durability)
-            } else {
-                amount
-            };
-            gear[index] = gear[index].saturating_add(amount);
-        }
+        .filter(|i| i.owner_guid == guid)
+        .filter_map(|item| {
+            let tmpl = db.game_item_template().entry().find(&item.entry)?;
+            let property = (item.random_property_id != 0)
+                .then(|| {
+                    db.game_item_random_property()
+                        .property_id()
+                        .find(&item.random_property_id)
+                })
+                .flatten();
+            Some(ResistanceItem {
+                slot: item.slot,
+                max_durability: tmpl.max_durability,
+                durability: item.durability,
+                template: [
+                    tmpl.stat_armor,
+                    tmpl.holy_res,
+                    tmpl.fire_res,
+                    tmpl.nature_res,
+                    tmpl.frost_res,
+                    tmpl.shadow_res,
+                    tmpl.arcane_res,
+                ],
+                enchant_id: item.enchant_id,
+                property_enchants: property
+                    .map_or([0; 3], |p| [p.enchant_id_1, p.enchant_id_2, p.enchant_id_3]),
+            })
+        })
+        .collect();
+    // The SDK exposes no non-unique enchantment index. Read its catalogue once per projection.
+    let mut enchantments = HashMap::<u32, Vec<(u8, i32, u32)>>::new();
+    for effect in db.game_item_enchantment().iter() {
+        enchantments.entry(effect.enchant_id).or_default().push((
+            effect.kind,
+            effect.amount,
+            effect.school_mask,
+        ));
     }
     std::array::from_fn(|index| {
-        let base = if index == 0 { base_armor } else { 0 };
-        (base + aura[index] + i64::from(gear[index])).clamp(0, i64::from(u32::MAX)) as u32
+        let bonus = resistance::resistance_bonus(
+            resistance::SCHOOL_BITS[index],
+            auras.iter().copied(),
+            items.iter().copied(),
+            |id, kind| {
+                lyracore_shared::item_property::enchant_stat(
+                    kind,
+                    u32::MAX,
+                    enchantments.get(&id).into_iter().flatten().copied(),
+                )
+            },
+        );
+        resistance::effective_resistance(if index == 0 { base_armor } else { 0 }, bonus)
     })
 }
 
@@ -261,69 +200,10 @@ mod tests {
             coordinator.effective_magic_resistances(1) == [0; 6]
         }));
         shard.assert_call("debug_fill_aura_slots", &["1", "1", "false", "3"]);
-        shard.assert_sql("UPDATE game_aura SET eff_kind = 161, eff_p0 = 1, amount = 2147483647, stacks = 255 WHERE target_guid = 1");
+        shard.assert_sql("UPDATE game_aura SET eff_kind = 161, eff_p0 = 1, amount = 100, stacks = 3 WHERE target_guid = 1");
         assert!(poll_until(POLL_TIMEOUT, || {
             let guard = coordinator.0.coord();
-            aura_armor_positive(&guard.conn.db, 1) == u32::MAX
+            aura_armor_positive(&guard.conn.db, 1) == 900
         }));
-    }
-
-    #[test]
-    fn armor_aura_contribution_matches_module_predicate() {
-        // A_MOD_RESISTANCE(0xA1) whose eff_p0 mask includes RESIST_ARMOR(0x01) → amount × max(stacks,1).
-        assert_eq!(aura_armor_contribution(0xA1, 0x01, 160, 1), 160); // Demon Skin-style flat +160
-                                                                      // stacks floored at 1: a legacy 0-stack row still counts ONCE (not zero).
-        assert_eq!(aura_armor_contribution(0xA1, 0x01, 160, 0), 160);
-        // Stacking, negative (Sunder Armor-style): amount × stacks subtracts.
-        assert_eq!(aura_armor_contribution(0xA1, 0x01, -90, 5), -450);
-        assert_eq!(
-            aura_armor_contribution(0xA1, 0x01, i32::MAX, u8::MAX),
-            i32::MAX
-        );
-        assert_eq!(
-            aura_armor_contribution(0xA1, 0x01, i32::MIN, u8::MAX),
-            i32::MIN
-        );
-        // A school MASK that merely INCLUDES the armor bit still counts (mask test, not ==).
-        assert_eq!(aura_armor_contribution(0xA1, 0x03, 50, 1), 50);
-        // A non-armor school (eff_p0 == 0x02, e.g. holy) does NOT touch armor.
-        assert_eq!(aura_armor_contribution(0xA1, 0x02, 160, 1), 0);
-        // A different aura kind (not A_MOD_RESISTANCE) is ignored.
-        assert_eq!(aura_armor_contribution(0x1D, 0x01, 160, 1), 0);
-    }
-
-    #[test]
-    fn gear_armor_contribution_gates_region_and_broken() {
-        // A worn chest (slot 4) with 120 armor contributes it.
-        assert_eq!(gear_armor_contribution(4, 120, 100, 100), 120);
-        // BROKEN (max_durability > 0, durability == 0) → grants nothing until repaired.
-        assert_eq!(gear_armor_contribution(4, 120, 100, 0), 0);
-        // A no-durability item (max_durability == 0, e.g. a cloak) is NEVER broken → contributes.
-        assert_eq!(gear_armor_contribution(14, 30, 0, 0), 30);
-        // Outside the equipment region (a backpack slot 23) contributes nothing.
-        assert_eq!(gear_armor_contribution(23, 120, 100, 100), 0);
-        // The region boundary (TABARD == 18) is INCLUSIVE.
-        assert_eq!(gear_armor_contribution(18, 5, 0, 0), 5);
-    }
-
-    // The former `melee_attack_power_for`/`swing_range_ap` gateway-side mirrors (and the parity tests
-    // that pinned them against `lyracore_module`) are GONE: `sheet_stats` above is now a plain
-    // read of `module::spell::recompute_sheet`'s output, so there is no gateway-side formula left to
-    // drift from the module — the module row IS the source of truth.
-
-    #[test]
-    fn aura_and_gear_terms_compose_additively_before_the_caller_clamps() {
-        // `effective_armor` itself needs a live `RemoteTables` subscription cache and is NOT
-        // unit-tested here (no ReducerContext mocking) — this only pins that its two REAL pure
-        // terms (`aura_armor_contribution`, `gear_armor_contribution`) compose by simple addition
-        // with a base, and that the max(0, ..) clamp `effective_armor` applies to that same sum
-        // never underflows on a debuff exceeding base + gear.
-        let base = 40i64; // agility 20 * 2
-        let aura = aura_armor_contribution(0xA1, 0x01, 160, 1) as i64; // Demon Skin
-        let gear = gear_armor_contribution(4, 120, 100, 100) as i64; // a chest
-        assert_eq!(base + aura + gear, 320);
-        // A debuff exceeding base + gear clamps at 0 (never underflows the u32).
-        let big_debuff = aura_armor_contribution(0xA1, 0x01, -1000, 1) as i64;
-        assert_eq!((base + big_debuff + gear).max(0) as u32, 0);
     }
 }

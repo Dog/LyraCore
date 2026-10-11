@@ -1353,3 +1353,5 @@ mod party_tests {
         assert_eq!(result.result, PartyResult::AlreadyInGroup);
     }
 }
+
+pub(crate) mod subscriptions;

@@ -153,8 +153,16 @@ fn forced_elwynn_rain_reaches_only_the_client_standing_in_elwynn() {
         world_session_in_world(session_store(westfall_entity), 2);
 
     // Elwynn is forced to heavy rain; Westfall drifts into light snow of its own.
-    crate::stdb::world_view::relay_zone_weather(&view, 0, &zone_weather_row(ELWYNN, 1, 0.75));
-    crate::stdb::world_view::relay_zone_weather(&view, 0, &zone_weather_row(WESTFALL, 2, 0.30));
+    crate::codec::weather::subscriptions::relay_zone_weather(
+        &view,
+        0,
+        &zone_weather_row(ELWYNN, 1, 0.75),
+    );
+    crate::codec::weather::subscriptions::relay_zone_weather(
+        &view,
+        0,
+        &zone_weather_row(WESTFALL, 2, 0.30),
+    );
 
     match ServerOpcodeMessage::read_encrypted(&mut elwynn_client, &mut elwynn_dec).unwrap() {
         ServerOpcodeMessage::SMSG_WEATHER(m) => {

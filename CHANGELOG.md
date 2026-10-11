@@ -17,6 +17,11 @@ and is not reconstructed here.
 
 ### Changed
 
+- Package API version 4 adds `actor::EffectKind`, the shared spell effect taxonomy. Existing
+  Actor byte constants keep their values. Package authors can use `EffectKind::try_from`
+  when reading effect rows; unknown bytes remain possible in authored content. The five API
+  roots from version 3 stay the same.
+
 - Package API version 3 has five roots: `actor`, `hooks`, `package`, `tables`, and
   `script_binding`. Actor operations and observations replace direct dependencies on `chat`,
   `combat`, `creatures`, `faction`, `gameobject`, `group`, `helpers`, `items`, `loot`, `nav`, `quest`,

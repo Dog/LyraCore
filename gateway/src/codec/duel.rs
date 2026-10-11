@@ -65,3 +65,5 @@ mod tests {
             .all(|(index, _)| *index != update_mask::idx::OBJECT_TYPE));
     }
 }
+
+pub(crate) mod subscriptions;

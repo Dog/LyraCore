@@ -686,3 +686,5 @@ mod spellmod_tests {
         }
     }
 }
+
+pub(crate) mod subscriptions;

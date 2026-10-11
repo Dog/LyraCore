@@ -610,9 +610,15 @@ pub(crate) fn stance_threat_pct(stance: u8) -> i32 {
 /// `effective_swing_time` folds `SPEED_SWING` (Thunder Clap's slow, the migrated Quickening haste) and
 /// `effective_move_speed` folds `SPEED_MOVE` (Hamstring's snare). 0 for an un-affected unit. [entity]
 pub(crate) fn speed_bonus(ctx: &ReducerContext, unit_guid: u64, speed_kind: u8) -> i32 {
-    sum_active_auras(ctx, unit_guid, |a| {
-        a.eff_kind == A_MOD_SPEED && a.eff_p0 == speed_kind as i32
-    })
+    lyracore_shared::aura::speed_bonus(
+        auras_on(ctx, unit_guid).map(|a| lyracore_shared::aura::AuraAmount {
+            kind: a.eff_kind,
+            parameter: a.eff_p0,
+            amount: a.amount,
+            stacks: a.stacks,
+        }),
+        speed_kind,
+    )
 }
 
 /// The owner's active auras as an iterator — the READ twin of `sum_active_auras`, scanning the IDENTICAL
@@ -629,7 +635,7 @@ pub(crate) fn auras_on(ctx: &ReducerContext, unit_guid: u64) -> impl Iterator<It
 /// Sunder Armor frozen at `amount == -90`, `stacks == 5` → `-450` armor. A non-stacking aura is always
 /// `stacks == 1`, so this is exactly `amount` for every existing aura. Pure → unit-tested. [pure]
 fn stacked_amount(a: &Aura) -> i32 {
-    a.amount * (a.stacks.max(1) as i32)
+    lyracore_shared::aura::stacked_amount(a.amount, a.stacks)
 }
 
 /// Sum `amount × stacks` over every active aura on `unit_guid` matching `pred` — the shared pipeline behind
@@ -725,13 +731,18 @@ pub(crate) fn stat_pct_bonus(ctx: &ReducerContext, unit_guid: u64, stat: u8) -> 
 /// effective resistance before computing damage mitigation. The matching equipped resistance Stat Kind
 /// is added once; a multi-school spell uses its lowest school bit, matching the mitigation caller. [entity]
 pub(crate) fn resistance_bonus(ctx: &ReducerContext, unit_guid: u64, school_mask: u8) -> i32 {
-    let aura = sum_active_auras(ctx, unit_guid, |a| {
-        a.eff_kind == A_MOD_RESISTANCE && (a.eff_p0 as u32 & school_mask as u32) != 0
-    });
-    let gear = crate::items::EquipStat::resistance_for_school(school_mask)
-        .map(|which| crate::items::equipped_stat_bonus(ctx, unit_guid, which))
-        .unwrap_or(0);
-    aura.saturating_add(gear)
+    use lyracore_shared::aura::AuraAmount;
+    lyracore_shared::resistance::resistance_bonus(
+        school_mask,
+        auras_on(ctx, unit_guid).map(|a| AuraAmount {
+            kind: a.eff_kind,
+            parameter: a.eff_p0,
+            amount: a.amount,
+            stacks: a.stacks,
+        }),
+        crate::items::resistance_items(ctx, unit_guid),
+        |id, kind| crate::items::enchant_stat(ctx, id, kind),
+    )
 }
 
 // ===========================================================================================
@@ -782,16 +793,7 @@ pub(crate) fn aura_moves_vitals(kind: u8, p0: i32) -> bool {
 /// the two stats that move a pool) — a +STR/+AGI/+SPI buff, an AP buff, or a crit-rating buff moves the
 /// sheet even though none of them move a pool. Pure → unit-tested (mirrors `aura_moves_vitals`'s test
 /// shape).
-pub(crate) fn aura_moves_sheet(kind: u8, p0: i32) -> bool {
-    (kind == A_MOD_STAT
-        && (p0 == STAT_STR as i32
-            || p0 == STAT_AGI as i32
-            || p0 == STAT_STA as i32
-            || p0 == STAT_INT as i32
-            || p0 == STAT_SPI as i32
-            || p0 == STAT_ALL as i32))
-        || (kind == A_MOD_COMBAT && (p0 == COMBAT_ATTACK_POWER as i32 || p0 == COMBAT_CRIT as i32))
-}
+pub(crate) use lyracore_shared::aura::moves_sheet as aura_moves_sheet;
 
 /// One shield's draw against `incoming` damage from a pool of `remaining`: returns
 /// `(absorbed, pool_left, leftover)`. The shield soaks up to its pool — `absorbed = min(remaining,

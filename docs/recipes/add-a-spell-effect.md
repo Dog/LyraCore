@@ -7,8 +7,7 @@ touched 24 files, three of them generated bindings. Read that diff next to this 
 git diff e3858119^1 e3858119 --stat
 ```
 
-The steps run in this order because each one depends on the one before it. The spell effect
-taxonomy has three hand-kept copies today, so step 2 and step 3 must agree exactly.
+The shared taxonomy supplies the codes used by the Module, Gateway and Importer.
 
 ## 1. State the 1.12.1 behaviour
 
@@ -17,24 +16,21 @@ cooldown and header attributes from the client's `Spell.dbc`, and what vmangos o
 the effect. This is the **Expected (1.12.1)** part of the issue, and the tests in later steps assert
 these values.
 
-## 2. Add the kind to the Module taxonomy
+## 2. Add the kind to the shared taxonomy
 
-File: `module/src/spell/taxonomy.rs`.
+File: `crates/lyracore-shared/src/spell/taxonomy.rs`.
 
-- Add `pub(crate) const E_<NAME>: u8` at the next free value, with a doc comment that names the raw
-  effect and what its amount means. An instant kind sits below `0x80`. An aura kind sets
-  `KIND_AURA_BIT`.
-- The value is append-only. Stored `game_spell_effect` rows carry it, so never renumber a kind.
-- Add the kind to `ALL_INSTANT_KINDS` or `ALL_AURA_KINDS`.
-
-File: `module/src/spell/tests.rs`. Raise the count in `instant_kind_wire_values_exhaustive` (or its
-aura twin) by one and pin the new value, for example `assert_eq!(E_DISTRACT, 0x25)`.
+- Add the byte name, enum variant and code to `effect_kinds!`. An instant kind sits below `0x80`;
+  an aura kind sets `KIND_AURA_BIT`.
+- Codes are append-only. Stored `game_spell_effect` rows retain their byte encoding.
+- Add a literal encoding assertion for the new code. The macro supplies conversion and iteration;
+  no separate kind list or count needs an edit.
 
 ## 3. Map the raw effect in the importer
 
 File: `importer/src/spell.rs`.
 
-- Add the same `E_<NAME>` constant with the same value.
+- Import the new byte name from `lyracore_shared::spell::taxonomy`.
 - Map the raw effect id in `instant_effect_to_kind` (or the aura mapping) and name the kind in
   `kind_name`.
 - If the effect needs parameters, set them in `resolve_instant_params`. If it needs a header
@@ -56,7 +52,8 @@ Files: `module/src/spell/cast/resolve.rs`, `module/src/spell/outcome.rs`.
 
 ## 5. Apply the effect
 
-File: `module/src/spell/cast/targeting.rs`. Add one arm to `apply_effect` that calls the owning
+File: `module/src/spell/cast/targeting.rs`. The exhaustive `EffectKind` match in `apply_effect`
+requires an arm for the new variant. Call the owning
 family. The behaviour lives in that family's module, not in the arm. Distract calls
 `crate::creatures::distraction::distract`, a new module declared in `module/src/creatures/mod.rs`.
 
@@ -85,9 +82,11 @@ the binding check compares the complete generated tree.
 - Run `scripts/check-gateway-bindings.py`. It must report no difference.
 - Review the diff under `gateway/src/stdb/bindings/`. Distract added
   `creature_distraction_type.rs`, `game_creature_distraction_table.rs` and lines in `mod.rs`.
-- If the Gateway subscribes to the table, add its query to `coordinator_queries` in
-  `gateway/src/stdb/connection.rs`, and add a `parity_test!` and the table name to
-  `MANIFEST_TABLES` in `gateway/tests/schema_parity.rs`.
+- If the table drives a Relay, declare it in `gateway/src/codec/<family>/subscriptions.rs`. The
+  declaration generates its query and row callbacks. A table used only by Durable Reads goes in
+  `coordinator_queries` in `gateway/src/stdb/connection.rs`.
+- Add a `parity_test!` and the subscribed table name to `MANIFEST_TABLES` in
+  `gateway/tests/schema_parity.rs`. The inventory covers both query sources.
 
 ## 8. Change the packets, if the client needs it
 

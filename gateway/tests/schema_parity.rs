@@ -1103,7 +1103,7 @@ parity_test!(parity_game_emote_event, "game_emote_event", lyracore_module::Emote
 });
 
 /// Every table name that has a `parity_test!` line above. The completeness guard cross-checks
-/// this against `stdb/connection.rs`'s real subscription list.
+/// this against the Coordinator reads and registered Protocol Family Relay declarations.
 const MANIFEST_TABLES: &[&str] = &[
     "game_realm",
     // Shared-connection model: moved from the per-player AOI box onto the coordinator's global
@@ -1202,6 +1202,8 @@ const MANIFEST_TABLES: &[&str] = &[
     "game_creature_quest",
     "game_gameobject_quest",
     "game_character_quest",
+    "game_quest_event_requirement",
+    "game_character_quest_event_credit",
     "game_player_spell",
     "game_player_action",
     "game_trainer_spell",
@@ -1252,70 +1254,142 @@ const MANIFEST_TABLES: &[&str] = &[
 // ---------------------------------------------------------------------------------------------
 
 const CONNECTION_RS: &str = include_str!("../src/stdb/connection.rs");
+const RELAYS_RS: &str = include_str!("../src/stdb/relays.rs");
 
-/// Scan `source` for every `"SELECT * FROM game_<x>"` subscription-string literal and return the
-/// `game_<x>` table names, in the order they appear. A plain substring scan rather than a
-/// `regex` dependency — the subscription strings are a fixed, simple literal shape.
+/// Only executable string literals in the Coordinator query function count. Comments and tests
+/// cannot make an unsubscribed table appear covered.
 fn extract_select_star_tables(source: &str) -> Vec<String> {
-    let needle = "SELECT * FROM ";
-    let mut out = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find(needle) {
-        let after = &rest[pos + needle.len()..];
-        let end = after
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(after.len());
-        out.push(after[..end].to_string());
-        rest = &after[end..];
+    use syn::visit::Visit;
+    struct Queries(Vec<String>);
+    impl<'ast> Visit<'ast> for Queries {
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            if let Some(query) = literal.value().strip_prefix("SELECT * FROM ") {
+                self.0
+                    .push(query.split_whitespace().next().unwrap().to_owned());
+            }
+        }
     }
-    out
+    let file = syn::parse_file(source).expect("valid query source");
+    let mut queries = Queries(Vec::new());
+    for item in file.items {
+        if let syn::Item::Fn(function) = item {
+            if function.sig.ident == "coordinator_queries" {
+                queries.visit_block(&function.block);
+            }
+        }
+    }
+    queries.0
 }
 
-#[test]
-fn completeness_guard_extraction_flags_a_missing_manifest_entry() {
-    // Synthetic input (NOT the real connection.rs) proving the extraction+diff logic itself
-    // works, independent of today's real subscription list.
-    let fake = r#"
-        .subscribe(vec![
-            "SELECT * FROM game_real_one",
-            "SELECT * FROM game_totally_fake_table",
-        ]);
-    "#;
-    let subscribed = extract_select_star_tables(fake);
-    let manifest = ["game_real_one"];
-    let missing: Vec<&String> = subscribed
-        .iter()
-        .filter(|t| !manifest.contains(&t.as_str()))
-        .collect();
+fn macro_tokens(source: &str, name: &str) -> Vec<String> {
+    syn::parse_file(source)
+        .expect("valid Relay source")
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn::Item::Macro(item) if item.mac.path.segments.last()?.ident == name => {
+                Some(item.mac.tokens)
+            }
+            _ => None,
+        })
+        .flat_map(|tokens| tokens.into_iter().map(|token| token.to_string()))
+        .collect()
+}
+
+fn relay_tables(source: &str) -> Vec<String> {
+    let tokens = macro_tokens(source, "declare_relays");
     assert_eq!(
-        missing,
-        vec!["game_totally_fake_table"],
-        "the completeness-guard extraction/diff should flag exactly the one subscribed table \
-         missing from the manifest"
+        tokens.len() % 3,
+        0,
+        "each Relay declares a table, Realm-core choice and callbacks"
+    );
+    tokens
+        .chunks_exact(3)
+        .map(|entry| {
+            assert!(entry[0].starts_with("game_"));
+            assert!(entry[1].starts_with('['));
+            assert!(entry[2].starts_with('{'));
+            entry[0].clone()
+        })
+        .collect()
+}
+
+fn missing_manifest_tables(tables: &[String], manifest: &[&str]) -> Vec<String> {
+    tables
+        .iter()
+        .filter(|table| !manifest.contains(&table.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn completeness_inventory_detects_an_unmanifested_relay() {
+    let source = r#"
+        // game_comment_only [false] { insert(Snapshot) => ignored; }
+        declare_relays! {
+            game_real_one [false] { insert(Snapshot) => real_callback; }
+            game_missing_relay [true] { insert(Live) => missing_callback; }
+        }
+        #[cfg(test)]
+        mod tests { declare_relays! { game_test_only [false] {} } }
+    "#;
+    assert_eq!(
+        missing_manifest_tables(&relay_tables(source), &["game_real_one"]),
+        ["game_missing_relay"],
     );
 }
 
 #[test]
-fn every_subscribed_table_in_connection_rs_has_a_parity_manifest_entry() {
-    let subscribed = extract_select_star_tables(CONNECTION_RS);
-    assert!(
-        subscribed.len() >= 30,
-        "sanity check: found only {} `SELECT * FROM game_...` subscriptions in connection.rs — \
-         did the subscription-string format change? (the extraction scan needs updating)",
-        subscribed.len()
+fn completeness_inventory_detects_an_unmanifested_read() {
+    let source = r#"
+        // SELECT * FROM game_comment_only
+        fn coordinator_queries() {
+            ["SELECT * FROM game_real_one", "SELECT * FROM game_missing_read WHERE pending = true"];
+        }
+        #[cfg(test)]
+        fn unrelated_test() { "SELECT * FROM game_test_only"; }
+    "#;
+    assert_eq!(
+        missing_manifest_tables(&extract_select_star_tables(source), &["game_real_one"]),
+        ["game_missing_read"],
     );
-    let missing: Vec<&String> = subscribed
-        .iter()
-        .filter(|t| !MANIFEST_TABLES.contains(&t.as_str()))
-        .collect();
+}
+
+#[test]
+fn every_coordinator_subscription_has_a_parity_manifest_entry() {
+    let mut subscribed = extract_select_star_tables(CONNECTION_RS);
+    let codec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codec");
+    let protocol_families = macro_tokens(RELAYS_RS, "protocol_relays");
+    assert!(
+        !protocol_families.is_empty(),
+        "the runtime Relay registration list must be scanned"
+    );
+    for family in protocol_families.into_iter().filter(|token| token != ",") {
+        let source = std::fs::read_to_string(codec.join(family).join("subscriptions.rs")).unwrap();
+        let tables = relay_tables(&source);
+        assert!(
+            !tables.is_empty(),
+            "registered Protocol Family has no Relay declarations"
+        );
+        subscribed.extend(tables);
+    }
+    assert!(
+        subscribed.len() >= 132,
+        "Coordinator query inventory lost sources"
+    );
+    let missing = missing_manifest_tables(&subscribed, MANIFEST_TABLES);
     assert!(
         missing.is_empty(),
-        "connection.rs subscribes {missing:?} but gateway/tests/schema_parity.rs has no \
-         `parity_test!` line for it — add one (copy the pattern from any existing entry above) \
-         AND add the table name to MANIFEST_TABLES, or a gateway binding drift on this table will \
-         break live BSATN decode silently."
+        "Coordinator subscribes to {missing:?}; add parity_test! entries and MANIFEST_TABLES names"
     );
 }
+
+parity_test!(parity_game_quest_event_requirement, "game_quest_event_requirement", lyracore_module::QuestEventRequirement, bindings::quest_event_requirement_type::QuestEventRequirement, {
+    id, quest_entry,
+});
+parity_test!(parity_game_character_quest_event_credit, "game_character_quest_event_credit", lyracore_module::CharacterQuestEventCredit, bindings::character_quest_event_credit_type::CharacterQuestEventCredit, {
+    id, character_guid, quest_entry,
+});
 
 parity_test!(parity_game_item_random_property, "game_item_random_property", lyracore_module::ItemRandomProperty, bindings::item_random_property_type::ItemRandomProperty, {
     property_id, enchant_id_1, enchant_id_2, enchant_id_3, suffix,

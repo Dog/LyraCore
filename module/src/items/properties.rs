@@ -115,16 +115,15 @@ pub(crate) fn enchant_stat_for_school(
     if enchant_id == 0 {
         return 0;
     }
-    ctx.db
-        .game_item_enchantment()
-        .by_enchant()
-        .filter(enchant_id)
-        .filter(|row| {
-            row.kind != kind::UNKNOWN
-                && row.kind == stat_kind
-                && (row.school_mask == 0 || row.school_mask & school_mask != 0)
-        })
-        .fold(0i32, |sum, row| sum.saturating_add(row.amount))
+    kind::enchant_stat(
+        stat_kind,
+        school_mask,
+        ctx.db
+            .game_item_enchantment()
+            .by_enchant()
+            .filter(enchant_id)
+            .map(|row| (row.kind, row.amount, row.school_mask)),
+    )
 }
 
 pub(crate) fn property_stat(ctx: &ReducerContext, property_id: u32, stat_kind: u8) -> i32 {
@@ -148,14 +147,14 @@ pub(crate) fn property_stat_for_school(
     else {
         return 0;
     };
-    [
-        property.enchant_id_1,
-        property.enchant_id_2,
-        property.enchant_id_3,
-    ]
-    .into_iter()
-    .map(|id| enchant_stat_for_school(ctx, id, stat_kind, school_mask))
-    .fold(0i32, i32::saturating_add)
+    kind::property_stat(
+        [
+            property.enchant_id_1,
+            property.enchant_id_2,
+            property.enchant_id_3,
+        ],
+        |id| enchant_stat_for_school(ctx, id, stat_kind, school_mask),
+    )
 }
 
 pub(crate) fn is_known_enchant(ctx: &ReducerContext, enchant_id: u32) -> bool {

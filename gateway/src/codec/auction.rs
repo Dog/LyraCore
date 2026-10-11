@@ -319,3 +319,5 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 }
+
+pub(crate) mod subscriptions;

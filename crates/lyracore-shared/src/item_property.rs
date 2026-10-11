@@ -27,6 +27,41 @@ pub const DODGE: u8 = 23;
 pub const PARRY: u8 = 24;
 pub const BLOCK: u8 = 25;
 
+pub fn enchant_stat(
+    kind: u8,
+    school_mask: u32,
+    effects: impl IntoIterator<Item = (u8, i32, u32)>,
+) -> i32 {
+    effects
+        .into_iter()
+        .filter(|&(effect_kind, _, mask)| {
+            effect_kind != UNKNOWN && effect_kind == kind && (mask == 0 || mask & school_mask != 0)
+        })
+        .fold(0i32, |sum, (_, amount, _)| sum.saturating_add(amount))
+}
+
+pub fn property_stat(enchantments: [u32; 3], mut enchant_stat: impl FnMut(u32) -> i32) -> i32 {
+    enchantments
+        .into_iter()
+        .map(&mut enchant_stat)
+        .fold(0i32, i32::saturating_add)
+}
+
+pub fn item_stat(template: i32, enchantment: i32, property: i32) -> i32 {
+    template
+        .saturating_add(enchantment)
+        .saturating_add(property)
+}
+
+pub fn equipped_stat(items: impl IntoIterator<Item = (u8, u32, u32, i32)>) -> i32 {
+    items
+        .into_iter()
+        .filter(|&(slot, max_durability, durability, _)| {
+            crate::item::grants_equipped_stats(slot, max_durability, durability)
+        })
+        .fold(0i32, |sum, (_, _, _, amount)| sum.saturating_add(amount))
+}
+
 /// Authored compatibility entries as `(stored, client, kind, amount)`. Stored items and synthetic
 /// enchanting spells use the stored ID, which the build 5875 client catalogue lacks. The Gateway
 /// sends the client ID instead: the Enchanting result with the same Stat Kind and amount. Random
@@ -46,6 +81,47 @@ pub fn client_enchantment_id(stored: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enchantment_effects_require_the_stat_kind_and_school() {
+        let effects = [
+            (SPELL_POWER, 7, 0),
+            (SPELL_POWER, 11, 4),
+            (SPELL_POWER, 13, 16),
+            (ARMOR, 100, 0),
+            (UNKNOWN, 100, 0),
+        ];
+        assert_eq!(enchant_stat(SPELL_POWER, 4, effects), 18);
+        assert_eq!(enchant_stat(UNKNOWN, u32::MAX, effects), 0);
+    }
+
+    #[test]
+    fn contributions_saturate_in_template_enchantment_property_order() {
+        let enchant = enchant_stat(
+            ARMOR,
+            u32::MAX,
+            [(ARMOR, i32::MAX, 0), (ARMOR, 10, 0), (ARMOR, -5, 0)],
+        );
+        assert_eq!(enchant, i32::MAX - 5);
+        let property = property_stat([1, 2, 3], |id| match id {
+            1 => i32::MAX,
+            2 => 10,
+            3 => -30,
+            _ => 0,
+        });
+        assert_eq!(property, i32::MAX - 30);
+        assert_eq!(item_stat(i32::MAX, 10, -50), i32::MAX - 50);
+        assert_eq!(
+            equipped_stat([
+                (4, 100, 1, i32::MAX),
+                (5, 100, 0, -100),
+                (23, 0, 0, -100),
+                (18, 0, 0, 10),
+                (14, 0, 0, -5)
+            ]),
+            i32::MAX - 5
+        );
+    }
 
     #[test]
     fn compatibility_entries_map_to_client_enchantments_with_the_same_text() {

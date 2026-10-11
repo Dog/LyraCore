@@ -218,3 +218,5 @@ mod tests {
         assert_eq!(&wire[4..], expected.as_slice());
     }
 }
+
+pub(crate) mod subscriptions;

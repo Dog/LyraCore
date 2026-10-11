@@ -15,7 +15,7 @@ A World of Warcraft 1.12.1 server. Game state lives in SpacetimeDB; the gateway 
 
 **D** [Datascript](#packages) · [Delivery Delay](#mail) · [Dismount](#mounts) · [Distraction](#creature-ai) · [Dormant Character](#accounts-characters-and-sessions) · [Durable Read](#gateway-and-module) · [Durable Request](#gateway-and-module)
 
-**E** [Encounter Binding](#realm-topology) · [Encounter Signal](#realm-topology) · [Engagement](#creature-ai) · [Entity Handle](#runtime-scripts) · [Escrow](#sharding-and-transfer) · [Event Binding](#packages) · [EventAI Source Profile](#realm-topology)
+**E** [Effect Kind](#gateway-and-module) · [Encounter Binding](#realm-topology) · [Encounter Signal](#realm-topology) · [Engagement](#creature-ai) · [Entity Handle](#runtime-scripts) · [Escrow](#sharding-and-transfer) · [Event Binding](#packages) · [EventAI Source Profile](#realm-topology)
 
 **F** [Fake](#working-method) · [Fee Hold](#guilds) · [Fixed Rout](#creature-ai) · [Fixture-Reserved Identifier](#packages) · [Flat Cast](#creature-ai) · [Forced Death](#creature-ai) · [Foreground Action](#sharding-and-transfer) · [Fuel Budget](#runtime-scripts)
 
@@ -161,6 +161,11 @@ The Gateway's subscribed connection per shard, authenticated with the Owner Toke
 
 **Owner Token**:
 The credential that bypasses row-level security.
+
+**Effect Kind**:
+A known durable spell effect code. The shared `EffectKind` enum defines its byte value and whether
+it applies an aura. Imported and authored table rows keep their byte encoding; unknown codes
+remain possible and consumers handle them explicitly.
 
 **Relay**:
 Gateway code that turns a table change into a client message.

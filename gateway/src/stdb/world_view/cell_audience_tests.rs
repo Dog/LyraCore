@@ -1,11 +1,13 @@
 //! The cell-anchored relays against the whole-shard-then-gate path they replaced.
 
 use super::*;
+use crate::codec::combat::subscriptions::A_STEALTH;
 use crate::codec::property_tests::Rng;
+use crate::codec::social::subscriptions::chat_in_range;
+use crate::codec::social::subscriptions::chat_range_yd;
 use crate::stdb::bindings::{
     Aura, ChatEvent, CombatEvent, EmoteEvent, MeleeAttack, SpellCastEvent, SpellImpactEvent,
 };
-use crate::stdb::subscriptions::{chat_in_range, chat_range_yd, A_STEALTH};
 use crate::world::{Outbound, SessionTx};
 use std::sync::mpsc::Receiver;
 
@@ -937,7 +939,7 @@ fn jobs_selected_before_worldport_cannot_reach_the_replacement_world_session() {
     );
     let delayed_row = row.clone();
     enqueue(selected, move |viewer| {
-        super::super::subscriptions::melee_engage_outbound(&viewer.created, &delayed_row)
+        crate::codec::combat::subscriptions::melee_engage_outbound(&viewer.created, &delayed_row)
     });
     melee_engaged(&view, 0, &row);
 

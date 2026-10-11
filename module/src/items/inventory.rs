@@ -538,10 +538,7 @@ pub(crate) fn is_bank_slot(slot: u8) -> bool {
 /// owned. Bank slots are owned but not carried: they don't count for collect quests, aren't consumed
 /// on turn-in, aren't fired as ammo, and never receive auto-stored loot. Stated as the carried ranges
 /// rather than "not the bank", so the bank-bag region stays uncarried when it opens.
-pub(crate) fn is_carried_slot(slot: u8) -> bool {
-    slot < BACKPACK_SLOT_END // 0..=38 (equip + bag-equip + backpack)
-        || (BAG_CONTENT_OFFSET..BAG_CONTENT_END).contains(&slot) // 120..=191
-}
+pub(crate) use lyracore_shared::item::is_carried_slot;
 
 /// Splits target storage slots only. Equipment requires the move path's Gates.
 pub(crate) fn valid_split_dest_slot(to_slot: u8) -> bool {

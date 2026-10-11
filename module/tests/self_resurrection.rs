@@ -3,6 +3,10 @@
 
 mod support;
 
+use lyracore_shared::spell::taxonomy::{
+    A_SELF_RESURRECT, E_SELF_RESURRECT, P_FLAT_MANA, P_SPELL_ID, T_SELF, T_TARGET_ALLY,
+};
+
 use std::collections::BTreeMap;
 
 use lyracore_shared::constants::{player_flags, unit_flags, unit_vis_flags};
@@ -18,13 +22,6 @@ const SOULSTONE_SELF_RES: u32 = 3026;
 const SOULSTONE_HEALTH: u32 = 400;
 const SOULSTONE_MANA: u32 = 700;
 const RESURRECTION_SICKNESS: u32 = 15007;
-
-const E_SELF_RESURRECT: u32 = 0x26;
-const A_SELF_RESURRECT: u32 = 0xB5;
-const P_SPELL_ID: u32 = 15;
-const P_FLAT_MANA: u32 = 16;
-const T_SELF: u32 = 0;
-const T_TARGET_ALLY: u32 = 2;
 
 const WARRIOR: u32 = 1;
 const ROGUE: u32 = 4;
@@ -178,21 +175,21 @@ fn start(name: &str) -> Standalone {
     insert_effect(
         &standalone,
         SOULSTONE_AURA,
-        A_SELF_RESURRECT,
+        u32::from(A_SELF_RESURRECT),
         0,
-        T_TARGET_ALLY,
+        u32::from(T_TARGET_ALLY),
         SOULSTONE_SELF_RES as i32,
-        P_SPELL_ID,
+        u32::from(P_SPELL_ID),
     );
     insert_spell(&standalone, SOULSTONE_SELF_RES, "Use Soulstone", 0);
     insert_effect(
         &standalone,
         SOULSTONE_SELF_RES,
-        E_SELF_RESURRECT,
+        u32::from(E_SELF_RESURRECT),
         -(SOULSTONE_HEALTH as i32),
-        T_SELF,
+        u32::from(T_SELF),
         SOULSTONE_MANA as i32,
-        P_FLAT_MANA,
+        u32::from(P_FLAT_MANA),
     );
     standalone
 }

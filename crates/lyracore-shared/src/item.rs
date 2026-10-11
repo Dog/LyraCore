@@ -1,5 +1,36 @@
 //! Item rules shared by the module and gateway.
 
+pub const fn is_carried_slot(slot: u8) -> bool {
+    slot <= 38 || (slot >= 120 && slot <= 191)
+}
+
+pub fn carried_quantity(entry: u32, items: impl IntoIterator<Item = (u8, u32, u32)>) -> u32 {
+    items
+        .into_iter()
+        .filter(|&(slot, item_entry, _)| is_carried_slot(slot) && item_entry == entry)
+        .map(|(_, _, count)| count)
+        .sum()
+}
+
+/// Any projectile class is suitable; launcher subclass pairing is not enforced by the Module.
+pub fn loaded_ammo<T>(
+    items: impl IntoIterator<Item = T>,
+    fields: impl Fn(&T) -> (u8, u32, Option<u8>),
+) -> Option<T> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let (slot, count, class) = fields(&item);
+            (is_carried_slot(slot) && count > 0 && class == Some(6)).then_some((slot, item))
+        })
+        .min_by_key(|(slot, _)| *slot)
+        .map(|(_, item)| item)
+}
+
+pub const fn grants_equipped_stats(slot: u8, max_durability: u32, durability: u32) -> bool {
+    slot <= 18 && !(max_durability > 0 && durability == 0)
+}
+
 /// Why the Module refused an item Durable Request. The tag is the whole reducer error text, so
 /// neither tier matches on human prose; the detail stays in the Module log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +278,39 @@ mod tests {
     use super::*;
 
     use armor_subclass::*;
+
+    #[test]
+    fn carried_quantity_excludes_bank_and_unknown_slots() {
+        assert_eq!(
+            carried_quantity(
+                7,
+                [
+                    (0, 7, 1),
+                    (38, 7, 2),
+                    (39, 7, 40),
+                    (119, 7, 40),
+                    (120, 7, 3),
+                    (191, 7, 4),
+                    (192, 7, 40),
+                    (23, 8, 50)
+                ]
+            ),
+            10
+        );
+    }
+
+    #[test]
+    fn loaded_ammo_uses_the_lowest_carried_nonempty_projectile() {
+        let items = [
+            (39, 20, Some(6)),
+            (120, 5, Some(6)),
+            (191, 7, Some(6)),
+            (23, 0, Some(6)),
+            (24, 8, Some(2)),
+            (25, 1, None),
+        ];
+        assert_eq!(loaded_ammo(items, |item| *item), Some((120, 5, Some(6))));
+    }
 
     /// The nine playable classes (6 and 10 are unused in 1.12).
     const PLAYABLE: [u8; 9] = [1, 2, 3, 4, 5, 7, 8, 9, 11];

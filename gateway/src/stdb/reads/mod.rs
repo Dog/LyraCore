@@ -41,9 +41,11 @@ pub(in crate::stdb) use spell::spell_ranks_stack_in_book;
 /// `items::item_count`. Shared by `quest::quest_objectives_complete` and
 /// `items::viewer_needs_quest_item`.
 pub(in crate::stdb) fn player_item_count(db: &RemoteTables, owner_guid: u64, entry: u32) -> u32 {
-    db.game_item_instance()
-        .iter()
-        .filter(|i| i.owner_guid == owner_guid && i.entry == entry)
-        .map(|i| i.stack_count)
-        .sum()
+    lyracore_shared::item::carried_quantity(
+        entry,
+        db.game_item_instance()
+            .iter()
+            .filter(|item| item.owner_guid == owner_guid)
+            .map(|item| (item.slot, item.entry, item.stack_count)),
+    )
 }

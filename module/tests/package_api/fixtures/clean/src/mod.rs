@@ -1,4 +1,4 @@
-//! A Package that names only Package API version 3. `crate::spell::pending_cast` here is inert.
+//! A Package that names only Package API version 4. `crate::spell::pending_cast` here is inert.
 
 mod fixture;
 mod runner;

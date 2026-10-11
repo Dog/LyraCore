@@ -1,5 +1,5 @@
 //! The Package API lint, an Architecture Test: every installed Package names only Package API
-//! version 3. Core CI runs it with no Package installed; the official Packages job runs it with
+//! version 4. Core CI runs it with no Package installed; the official Packages job runs it with
 //! the collection installed.
 
 mod package_api;
@@ -20,7 +20,7 @@ fn contract() -> Contract {
 fn the_documented_version_and_roots_match_the_lint() {
     let document = std::fs::read_to_string(manifest_dir().join("../docs/package-api.md"))
         .expect("read the Package API contract");
-    assert_eq!(document.lines().next(), Some("# Package API, version 3"));
+    assert_eq!(document.lines().next(), Some("# Package API, version 4"));
     let roots = document
         .split_once("### Module roots")
         .expect("the contract documents Module roots")
@@ -199,7 +199,7 @@ fn the_fixture_inventory_reports_each_finding_with_its_location() {
     let fixtures = manifest_dir().join("tests/package_api/fixtures");
     let diagnostics = check_inventory(&contract(), &fixtures).expect_err("denied has findings");
     let lines: Vec<String> = diagnostics.iter().map(Diagnostic::to_string).collect();
-    let outside = "outside Package API version 3 (docs/package-api.md).";
+    let outside = "outside Package API version 4 (docs/package-api.md).";
     let any_root = "Name a path under `crate::actor`, `crate::hooks`, `crate::package`, \
                     `crate::tables`, `crate::script_binding`, or write `// package-api: exempt \
                     <reason>` on that line and raise the gap with the maintainers.";

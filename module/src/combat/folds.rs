@@ -232,13 +232,10 @@ pub(crate) fn effective_agility(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
 /// incoming hits. Clamped ≥0; no aura and no armor gear → the base value (mitigation byte-identical to
 /// before — baseline-safe). [entity]
 pub(crate) fn effective_armor(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
-    (i64::from(e.armor)
-        + i64::from(crate::spell::resistance_bonus(
-            ctx,
-            e.guid,
-            crate::spell::RESIST_ARMOR,
-        )))
-    .clamp(0, i64::from(u32::MAX)) as u32
+    lyracore_shared::resistance::effective_resistance(
+        e.armor,
+        crate::spell::resistance_bonus(ctx, e.guid, crate::spell::RESIST_ARMOR),
+    )
 }
 
 /// A unit's EFFECTIVE shield BLOCK VALUE — the flat physical damage a blocked swing absorbs: the
@@ -327,19 +324,19 @@ pub(crate) fn effective_swing_time(ctx: &ReducerContext, attacker: &WorldEntity)
 /// movement and the anti-cheat max-speed check (`world::score_and_log_movement`), so a mounted player's
 /// higher speed is never flagged as a speedhack. No move/mount aura → exactly `base` (baseline-safe). [entity]
 pub(crate) fn effective_move_speed(ctx: &ReducerContext, guid: u64, base: f32) -> f32 {
-    let move_pct = crate::spell::speed_bonus(ctx, guid, crate::spell::SPEED_MOVE);
-    let mounted_pct = crate::spell::speed_bonus(ctx, guid, crate::spell::SPEED_MOUNTED);
-    let mounted = crate::mount::active_mount_spell(ctx, guid).is_some();
-    move_speed_with_pct(base, mounted_move_pct(move_pct, mounted_pct, mounted))
+    lyracore_shared::aura::run_speed(
+        base,
+        crate::spell::auras_on(ctx, guid).map(|aura| lyracore_shared::aura::AuraAmount {
+            kind: aura.eff_kind,
+            parameter: aura.eff_p0,
+            amount: aura.amount,
+            stacks: aura.stacks,
+        }),
+    )
 }
 
-/// The mounted-speed fold's PURE core: `SPEED_MOVE` always contributes; `SPEED_MOUNTED` only while
-/// `mounted` — so dismounting drops the mount's bonus but an ordinary buff/snare stays folded in, and a
-/// leftover `SPEED_MOUNTED` reading (e.g. stale test data) never registers while `A_MOUNTED` is absent.
-/// Pure — unit-tested without a `ReducerContext`. [pure]
-fn mounted_move_pct(move_pct: i32, mounted_pct: i32, mounted: bool) -> i32 {
-    move_pct + if mounted { mounted_pct } else { 0 }
-}
+#[cfg(test)]
+use lyracore_shared::aura::mounted_move_pct;
 
 /// The player's equipped WEAPON profile in inventory `slot`: `(damage_min, damage_max, delay_ms,
 /// subclass)`, or `None` when the slot is EMPTY, its instance has no template, it holds a NON-weapon
@@ -419,20 +416,19 @@ pub(crate) fn equipped_ranged_weapon(
 /// fires (we don't enforce the bow→arrow / gun→bullet subclass pairing); any ammo is fine for v1.
 pub(crate) fn find_ammo(ctx: &ReducerContext, player_guid: u64) -> Option<ItemInstance> {
     let templates = ctx.db.game_item_template();
-    ctx.db
-        .game_item_instance()
-        .by_owner_guid()
-        .filter(&player_guid)
-        .filter(|i| {
-            // Banked ammo is not loaded — only carried stacks fire.
-            crate::items::is_carried_slot(i.slot)
-                && i.stack_count > 0
-                && templates
-                    .entry()
-                    .find(i.entry)
-                    .is_some_and(|t| t.class == 6)
-        })
-        .min_by_key(|i| i.slot)
+    lyracore_shared::item::loaded_ammo(
+        ctx.db
+            .game_item_instance()
+            .by_owner_guid()
+            .filter(&player_guid),
+        |item| {
+            (
+                item.slot,
+                item.stack_count,
+                templates.entry().find(item.entry).map(|tmpl| tmpl.class),
+            )
+        },
+    )
 }
 
 /// Per-swing percent chance the main-hand weapon loses 1 durability. Vanilla wears weapons SLOWLY (the

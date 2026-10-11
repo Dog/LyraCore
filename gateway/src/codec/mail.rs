@@ -648,3 +648,5 @@ mod tests {
         assert_eq!(body, [0, 0, 0, 0], "cmangos Player.cpp:3074-3075");
     }
 }
+
+pub(crate) mod subscriptions;

@@ -124,25 +124,29 @@ impl TrainerStore for Coordinator {
             .iter()
             .filter(|t| t.trainer_entry == trainer_entry)
             .collect();
-        rows.sort_by_key(|t| t.spell_id); // stable order (SQL has no ORDER BY in 2.5)
-                                          // A class-spell offering id is a LearnSpell WRAPPER (1873 teaches 639); game_player_spell holds
-                                          // the RESOLVED rank, so `known` must compare the resolved id or every known spell reads Green.
-                                          // Same first-qualifying-trigger rule as resolve_learn_target (can't call it: coord() re-lock);
-                                          // one pass over the effect table for the whole list instead of a scan per row.
-        const EXCLUDED: [u8; 4] = [0x93, 0xBE, 0xAB, 0x05];
-        let wrapper_ids: std::collections::HashSet<u32> = rows
+        rows.sort_by_key(|t| t.spell_id);
+        let wrapper_ids: std::collections::HashSet<_> = rows
             .iter()
-            .filter(|t| t.learn_skill_line == 0)
-            .map(|t| t.spell_id)
+            .filter(|offering| offering.learn_skill_line == 0)
+            .map(|offering| offering.spell_id)
             .collect();
-        let mut resolved: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        for e in db.game_spell_effect().iter() {
-            if wrapper_ids.contains(&e.spell_id)
-                && e.trigger_spell != 0
-                && !EXCLUDED.contains(&e.kind)
-            {
-                resolved.entry(e.spell_id).or_insert(e.trigger_spell);
-            }
+        let mut effects: std::collections::HashMap<
+            u32,
+            Vec<lyracore_shared::trainer::LearnEffect>,
+        > = std::collections::HashMap::new();
+        for effect in db
+            .game_spell_effect()
+            .iter()
+            .filter(|effect| wrapper_ids.contains(&effect.spell_id))
+        {
+            effects.entry(effect.spell_id).or_default().push(
+                lyracore_shared::trainer::LearnEffect {
+                    index: effect.effect_index,
+                    id: effect.id,
+                    kind: effect.kind,
+                    trigger_spell: effect.trigger_spell,
+                },
+            );
         }
         Ok(rows
             .into_iter()
@@ -151,17 +155,15 @@ impl TrainerStore for Coordinator {
                 cost: t.cost,
                 required_level: t.required_level,
                 player_level: player.level,
-                // PROFESSION row: "known" iff the player's skill cap for this line already meets the
-                // offering's cap (mirrors module trainer_buy_check's gate → the client grays the tiers
-                // already trained past). CLASS-SPELL row (line 0): known iff a game_player_spell row
-                // for the RESOLVED rank behind the wrapper (mirrors the module buy gate's knows_spell).
-                known: if t.learn_skill_line != 0 {
-                    skill_caps
-                        .get(&t.learn_skill_line)
-                        .is_some_and(|&c| c >= t.learn_skill_cap)
-                } else {
-                    learned.contains(resolved.get(&t.spell_id).unwrap_or(&t.spell_id))
-                },
+                known: lyracore_shared::trainer::offering_known(
+                    t.learn_skill_line,
+                    t.learn_skill_cap,
+                    skill_caps.get(&t.learn_skill_line).copied(),
+                    learned.contains(&lyracore_shared::trainer::resolve_learn_target(
+                        t.spell_id,
+                        effects.get(&t.spell_id).into_iter().flatten().copied(),
+                    )),
+                ),
                 learn_skill_line: t.learn_skill_line,
             })
             .collect())
@@ -197,18 +199,22 @@ impl TrainerStore for Coordinator {
     }
 
     fn resolve_learn_target(&self, spell_id: u32) -> u32 {
-        const EXCLUDED: [u8; 4] = [0x93, 0xBE, 0xAB, 0x05];
         let guard = self.0.coord();
-        let resolved = guard
-            .conn
-            .db
-            .game_spell_effect()
-            .iter()
-            .filter(|e| e.spell_id == spell_id)
-            .find_map(|e| {
-                (e.trigger_spell != 0 && !EXCLUDED.contains(&e.kind)).then_some(e.trigger_spell)
-            });
-        resolved.unwrap_or(spell_id)
+        lyracore_shared::trainer::resolve_learn_target(
+            spell_id,
+            guard
+                .conn
+                .db
+                .game_spell_effect()
+                .iter()
+                .filter(|effect| effect.spell_id == spell_id)
+                .map(|effect| lyracore_shared::trainer::LearnEffect {
+                    index: effect.effect_index,
+                    id: effect.id,
+                    kind: effect.kind,
+                    trigger_spell: effect.trigger_spell,
+                }),
+        )
     }
 
     /// The `grant_spell_id` for `talent_id` from the coordinator's `game_talent` cache (0 = passive,
@@ -244,8 +250,8 @@ impl TrainerStore for Coordinator {
     /// returns with the cache already consistent): `(teach_spell, superseded_prev, points_remaining)`.
     /// `teach_spell` = the rank-spell the module just put in the spellbook — the 1.12 TalentFrame
     /// derives a talent's shown rank from which rank-spell is KNOWN, so this must relay live as
-    /// SMSG_LEARNED_SPELL or the pane freezes until relog; 0 when the module taught nothing (mirror
-    /// of `talent::apply_talent_rank`'s game_spell-existence gate). `superseded_prev` = the previous
+    /// SMSG_LEARNED_SPELL or the pane freezes until relog; 0 when the Module spellbook has no row
+    /// for that rank. `superseded_prev` = the previous
     /// rank's now-replaced spell (drives SMSG_SUPERCEDED_SPELL; 0 for rank 1 / same-spell demo
     /// trees). `points_remaining` = earned (level−9, floor 0) minus spent — the live
     /// `PLAYER_CHARACTER_POINTS1` value. Callers may pass `talent_id = 0` to get just the points.
@@ -264,8 +270,7 @@ impl TrainerStore for Coordinator {
             .filter(|t| t.character_guid == character_guid)
             .map(|t| t.rank as u32)
             .sum();
-        let remaining = (level as i32 - 9).max(0) as u32;
-        let remaining = remaining.saturating_sub(spent);
+        let remaining = lyracore_shared::talent::points_available(level, spent);
         let Some(t) = db.game_talent().iter().find(|t| t.talent_id == talent_id) else {
             return (0, 0, remaining);
         };
@@ -281,10 +286,13 @@ impl TrainerStore for Coordinator {
         } else {
             0
         };
-        // Mirror the module's teach gate: apply_talent_rank only puts the rank-spell in the book
-        // when it exists in game_spell (an unimported rank-spell is skipped there — sending
-        // LEARNED for it would desync the client book from the server).
-        let teach = if new_spell != 0 && db.game_spell().spell_id().find(&new_spell).is_some() {
+        // The Module's resulting spellbook row is the authority for what was taught.
+        let teach = if new_spell != 0
+            && db
+                .game_player_spell()
+                .iter()
+                .any(|spell| spell.character_guid == character_guid && spell.spell_id == new_spell)
+        {
             new_spell
         } else {
             0
@@ -402,22 +410,17 @@ impl TrainerStore for Coordinator {
     }
 }
 
-/// Mirror of the module's `talent::pick_rank_spell`: rank N's spell from the per-rank columns
-/// (`rank_spell_2..5`), a 0 column falling back to `spell_id` (the demo tree scales ONE spell by
-/// rank; the imported tree has a distinct spell per rank).
 fn pick_rank_spell(rank: u8, t: &Talent) -> u32 {
-    let s = match rank {
-        2 => t.rank_spell_2,
-        3 => t.rank_spell_3,
-        4 => t.rank_spell_4,
-        5 => t.rank_spell_5,
-        _ => t.spell_id,
-    };
-    if s != 0 {
-        s
-    } else {
-        t.spell_id
-    }
+    lyracore_shared::talent::rank_spell(
+        rank,
+        [
+            t.spell_id,
+            t.rank_spell_2,
+            t.rank_spell_3,
+            t.rank_spell_4,
+            t.rank_spell_5,
+        ],
+    )
 }
 
 /// The Module's typed trainer Refusal. Only a reducer the Module rejected carries a tag; a timeout,

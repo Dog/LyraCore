@@ -83,15 +83,13 @@ fn relation_holds(
     mask: u32,
     other: &FactionTemplate,
 ) -> bool {
-    if other.faction != 0 {
-        if asserting.contains(&other.faction) {
-            return true;
-        }
-        if vetoing.contains(&other.faction) {
-            return false;
-        }
-    }
-    (mask & other.faction_group) != 0
+    lyracore_shared::faction::relation_holds(
+        asserting,
+        vetoing,
+        mask,
+        other.faction,
+        other.faction_group,
+    )
 }
 
 /// Is `a` hostile to `b`? The enemy direction of the relationship rule: an explicit enemy entry

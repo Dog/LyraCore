@@ -1,4 +1,4 @@
-//! Package API version 3: the crate-root paths a Package may name.
+//! Package API version 4: the crate-root paths a Package may name.
 
 use std::collections::BTreeSet;
 use std::fs;

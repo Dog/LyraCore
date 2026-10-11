@@ -40,3 +40,5 @@ pub fn build_drowning_damage_log(character_guid: u64, damage: u32) -> ServerOpco
         resist: 0,
     }))
 }
+
+pub(crate) mod subscriptions;

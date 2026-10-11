@@ -7,6 +7,8 @@
 
 mod support;
 
+use lyracore_shared::spell::taxonomy::{E_ENERGIZE, E_SCRIPTED, T_SELF, T_TARGET_ANY};
+
 use std::collections::BTreeMap;
 
 use lyracore_shared::constants::unit_flags;
@@ -25,11 +27,6 @@ const E_PARTIAL_FAILURE_SPELL: u32 = 50_903;
 const HEAL_SCRIPT: u32 = 100_900;
 const GATE_SCRIPT: u32 = 100_902;
 const FAILING_SCRIPT: u32 = 100_903;
-
-const E_SCRIPTED: u32 = 0x0F;
-const E_ENERGIZE: u32 = 0x03;
-const T_SELF: u32 = 0;
-const T_TARGET_ANY: u32 = 3;
 
 const HEAL_SCRIPT_COST: u32 = 30;
 const GATE_SPELL_COST: u32 = 40;
@@ -54,9 +51,9 @@ fn an_enabled_scripted_effect_heals_the_resolved_target_and_credits_xp_to_the_ca
         &standalone,
         E_HEAL_SCRIPT_SPELL,
         0,
-        E_SCRIPTED,
+        u32::from(E_SCRIPTED),
         0,
-        T_TARGET_ANY,
+        u32::from(T_TARGET_ANY),
         HEAL_SCRIPT,
     );
     insert_script(
@@ -119,9 +116,9 @@ fn a_scripted_effect_with_script_id_zero_stays_the_vanilla_no_op() {
         &standalone,
         E_NOOP_SCRIPT_ID_ZERO_SPELL,
         0,
-        E_SCRIPTED,
+        u32::from(E_SCRIPTED),
         0,
-        T_TARGET_ANY,
+        u32::from(T_TARGET_ANY),
         0,
     );
 
@@ -171,9 +168,9 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
         &standalone,
         E_GATE_SPELL,
         0,
-        E_SCRIPTED,
+        u32::from(E_SCRIPTED),
         0,
-        T_TARGET_ANY,
+        u32::from(T_TARGET_ANY),
         GATE_SCRIPT,
     );
     let wolf = spawn_wolf(&standalone);
@@ -261,9 +258,9 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
         &standalone,
         E_PARTIAL_FAILURE_SPELL,
         0,
-        E_ENERGIZE,
+        u32::from(E_ENERGIZE),
         50,
-        T_SELF,
+        u32::from(T_SELF),
         0,
     );
     // Effect 1: a script that stages a heal and then fails — the staged heal must never commit.
@@ -271,9 +268,9 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
         &standalone,
         E_PARTIAL_FAILURE_SPELL,
         1,
-        E_SCRIPTED,
+        u32::from(E_SCRIPTED),
         0,
-        T_TARGET_ANY,
+        u32::from(T_TARGET_ANY),
         FAILING_SCRIPT,
     );
     insert_script(

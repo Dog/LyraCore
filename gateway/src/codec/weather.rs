@@ -178,3 +178,5 @@ mod tests {
         assert_eq!(msg.sound_id, 0);
     }
 }
+
+pub(crate) mod subscriptions;

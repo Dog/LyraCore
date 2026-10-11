@@ -749,78 +749,55 @@ pub(crate) fn apply_effect(
     // never start a proc.
     triggered: bool,
 ) -> EffectHit {
-    if e.kind & KIND_AURA_BIT != 0 {
-        // CC IMMUNITY: an `A_CONTROL` crowd-control effect (a stun/root/…) is REFUSED if the target is
-        // immune to that mechanic (an active `A_IMMUNITY(mechanic)` aura). The effect simply doesn't land
-        // — no aura is placed — so the unit is never stunned/rooted while the immunity holds. Gated per
-        // EFFECT (not per cast), so a multi-effect spell still applies its non-CC effects. Baseline-safe:
-        // `is_immune_to_mechanic` is `false` for any unit without an `A_IMMUNITY` aura → unchanged.
-        if e.kind == A_CONTROL
-            && e.p0_kind == P_MECHANIC
-            && is_immune_to_mechanic(ctx, target_guid, e.p0)
-        {
-            log::info!(
-                "spell {} A_CONTROL(mechanic {}) refused — target {target_guid} is immune",
-                e.spell_id,
-                e.p0
+    use lyracore_shared::spell::taxonomy::EffectKind;
+
+    let kind = match EffectKind::try_from(e.kind) {
+        Ok(kind) => kind,
+        // Authored high-bit codes have always produced inert auras when no reader handles them.
+        Err(raw) if raw & KIND_AURA_BIT != 0 => {
+            return apply_aura_effect(
+                ctx,
+                e,
+                hdr,
+                caster_guid,
+                target_guid,
+                cast_target_guid,
+                level,
+                points,
             );
-            return EffectHit::none(); // a refused CC aura deals no damage
         }
-        // All aura kinds are PLACED identically (the difference is how tick_auras / combat READ the
-        // frozen row). A_PERIODIC_DAMAGE/HEAL (ticked), A_MOD_COMBAT (combat-read), A_FLAG (passive
-        // marker) are wired; an aura kind with no tick/read handler is simply an inert marker for now.
-        aura_apply(
-            ctx,
-            e,
-            hdr,
-            caster_guid,
-            target_guid,
-            cast_target_guid,
-            level,
-            points,
-        );
-        // Linked-debuff APPLY (Weakened Soul): the twin of the refusal gate in `resolve_cast_at` — a
-        // nonzero `e.p1` names a SEPARATE spell to also apply on `target_guid` right after this aura lands
-        // (PW:Shield's absorb effect names Weakened Soul). Generic over the kind/spell id: any aura effect
-        // can opt in via its `p1`, the engine never names one. No-op if the linked spell/effect isn't loaded
-        // (data-missing → graceful skip, never panics) or `p1 == 0` (every existing aura effect).
-        if e.p1 != 0 {
-            apply_linked_debuff(ctx, e.p1 as u32, caster_guid, target_guid, level);
+        Err(raw) => {
+            log::info!(
+                "spell {} effect kind 0x{raw:02x} not implemented (graceful no-op)",
+                e.spell_id
+            );
+            return EffectHit::none();
         }
-        // CC interrupt: an action-blocking control (stun/poly/fear — NOT root, which still allows
-        // casting) landing on a unit that is MID-CAST cancels its in-progress cast AND any channel it is
-        // running (Arcane Missiles stops if you're stunned/feared). Checked AFTER the aura lands so
-        // `is_action_blocked` sees it. Routes through `break_channel` (which both interrupts the timed cast
-        // and deletes the channel aura) so CC tears down a channel for free — without it the deferred cast
-        // would still fire if the CC expired before the cast finished, and a channel would keep ticking
-        // (the tick arm's own action-blocked check would END it next tick, but breaking it now is prompt).
-        // No-op when the new aura isn't action-blocking, or the target has no cast/channel. [entity]
-        if e.kind == A_CONTROL && is_action_blocked(ctx, target_guid) {
-            break_channel(ctx, target_guid);
-        }
-        return EffectHit::none(); // an aura effect deals no direct cast damage
-    }
-    match e.kind {
-        E_SUMMON_HOSTILE => {
+    };
+    match kind {
+        EffectKind::SummonHostile => {
             if let Err(error) = crate::creatures::summon_hostile(ctx, caster_guid, hdr, e) {
                 spacetimedb::log::warn!("hostile summon refused: {error}");
             }
             EffectHit::none()
         }
-        E_DISTRACT => {
+        EffectKind::Distract => {
             // The ground destination Gate refuses a Distract without a point before it gets here.
             if let Some(point) = dest {
                 crate::creatures::distraction::distract(ctx, target_guid, point, points);
             }
             EffectHit::none()
         }
-        E_DUEL => {
+        EffectKind::Duel => {
             if e.p0_kind == P_GAMEOBJECT_ENTRY {
                 crate::duel::request_duel(ctx, caster_guid, target_guid, e.p0.max(0) as u32);
             }
             EffectHit::none()
         }
-        E_DAMAGE | E_WEAPON_STRIKE | E_JUDGEMENT | E_FINISHER_DAMAGE => apply_damage_effect(
+        EffectKind::Damage
+        | EffectKind::WeaponStrike
+        | EffectKind::Judgement
+        | EffectKind::FinisherDamage => apply_damage_effect(
             ctx,
             e,
             hdr,
@@ -830,24 +807,38 @@ pub(crate) fn apply_effect(
             points,
             triggered,
         ),
-        E_HEAL | E_HEAL_MAX_HEALTH | E_ENERGIZE | E_CONVERT_RESOURCE | E_POWER_BURN
-        | E_ADD_COMBO => {
+        EffectKind::Heal
+        | EffectKind::HealMaxHealth
+        | EffectKind::Energize
+        | EffectKind::ConvertResource
+        | EffectKind::PowerBurn
+        | EffectKind::AddCombo => {
             apply_restore_effect(ctx, e, hdr, caster_guid, target_guid, points, triggered)
         }
-        E_TAUNT | E_INTERRUPT | E_REDUCE_THREAT | E_NEXT_SWING => {
+        EffectKind::Taunt
+        | EffectKind::Interrupt
+        | EffectKind::ReduceThreat
+        | EffectKind::NextSwing => {
             apply_threat_effect(ctx, e, hdr, caster_guid, target_guid, points)
         }
-        E_CHARGE | E_BLINK | E_RECALL_HOME | E_DISMOUNT | E_PERSISTENT_AREA => {
+        EffectKind::Charge
+        | EffectKind::Blink
+        | EffectKind::RecallHome
+        | EffectKind::Dismount
+        | EffectKind::PersistentArea => {
             apply_reposition_effect(ctx, e, hdr, caster_guid, target_guid, points, dest)
         }
-        E_CREATE_ITEM | E_PICKPOCKET => {
+        EffectKind::CreateItem | EffectKind::Pickpocket => {
             apply_inventory_effect(ctx, e, caster_guid, target_guid, points)
         }
-        E_RESURRECT | E_SUMMON_PET | E_TAME_CREATURE | E_SET_STANCE => {
-            apply_character_effect(ctx, e, caster_guid, target_guid, points)
+        EffectKind::Resurrect
+        | EffectKind::SummonPet
+        | EffectKind::TameCreature
+        | EffectKind::SetStance => apply_character_effect(ctx, e, caster_guid, target_guid, points),
+        EffectKind::Trigger | EffectKind::Scripted => {
+            apply_delegating_effect(ctx, e, caster_guid, target_guid, level)
         }
-        E_TRIGGER | E_SCRIPTED => apply_delegating_effect(ctx, e, caster_guid, target_guid, level),
-        E_SELF_RESURRECT => {
+        EffectKind::SelfResurrect => {
             // Only `do_self_resurrect` reads this effect; the cast pipeline refuses dead casters.
             log::info!(
                 "spell {} self-resurrect effect has no cast path (no-op)",
@@ -855,7 +846,7 @@ pub(crate) fn apply_effect(
             );
             EffectHit::none()
         }
-        E_DISPEL => {
+        EffectKind::Dispel => {
             // The dispelled CATEGORY: the effect's `p0` (the authored override) if set, else the
             // dispelling spell's header `dispel_type`. 0 = strip every foreign aura (the baseline —
             // Dispel Magic 527 has p0=0 + dispel_type=0, so it strips everything).
@@ -868,19 +859,117 @@ pub(crate) fn apply_effect(
             log::info!("dispel (cat {category}) on {target_guid} removed {removed} debuff(s)");
             EffectHit::none()
         }
-        other => {
-            // Unmapped residue: a graceful no-op + log (the import safety net — casts and does
-            // nothing, vs doing the wrong thing). Spells that LOOK scripted in the raw DBC but are
-            // really a known effect (Holy Light → a heal, Life Tap → a resource convert, Charge → a rush)
-            // are reclassified to a generic kind at IMPORT time (the importer's curated correction), so
-            // they arrive here as E_HEAL / E_CONVERT_RESOURCE / E_CHARGE and never reach this arm.
+        EffectKind::EnchantItem
+        | EffectKind::Disenchant
+        | EffectKind::Fish
+        | EffectKind::OpenLock
+        | EffectKind::FeedPet => {
             log::info!(
-                "spell {} effect kind 0x{other:02x} not implemented (graceful no-op)",
-                e.spell_id
+                "spell {} effect kind 0x{:02x} has no cast path (no-op)",
+                e.spell_id,
+                e.kind
             );
             EffectHit::none()
         }
+        EffectKind::AuraPeriodicDamage
+        | EffectKind::AuraPeriodicHeal
+        | EffectKind::AuraPeriodicEnergize
+        | EffectKind::AuraPeriodicTrigger
+        | EffectKind::AuraModStat
+        | EffectKind::AuraModResistance
+        | EffectKind::AuraAbsorb
+        | EffectKind::AuraModCombat
+        | EffectKind::AuraModSpeed
+        | EffectKind::AuraModHealthPower
+        | EffectKind::AuraModDamageTaken
+        | EffectKind::AuraSeal
+        | EffectKind::AuraStealth
+        | EffectKind::AuraCombatHealthRegenPct
+        | EffectKind::AuraModStatPct
+        | EffectKind::AuraProcTrigger
+        | EffectKind::AuraSpellmodFlat
+        | EffectKind::AuraSpellmodPct
+        | EffectKind::AuraDisarm
+        | EffectKind::AuraRetaliate
+        | EffectKind::AuraControl
+        | EffectKind::AuraImmunity
+        | EffectKind::AuraModDetectRange
+        | EffectKind::AuraMounted
+        | EffectKind::AuraProcDamage
+        | EffectKind::AuraSelfResurrect
+        | EffectKind::AuraFlag => apply_aura_effect(
+            ctx,
+            e,
+            hdr,
+            caster_guid,
+            target_guid,
+            cast_target_guid,
+            level,
+            points,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_aura_effect(
+    ctx: &ReducerContext,
+    e: &SpellEffect,
+    hdr: &Spell,
+    caster_guid: u64,
+    target_guid: u64,
+    cast_target_guid: u64,
+    level: u8,
+    points: i32,
+) -> EffectHit {
+    // CC IMMUNITY: an `A_CONTROL` crowd-control effect (a stun/root/…) is REFUSED if the target is
+    // immune to that mechanic (an active `A_IMMUNITY(mechanic)` aura). The effect simply doesn't land
+    // — no aura is placed — so the unit is never stunned/rooted while the immunity holds. Gated per
+    // EFFECT (not per cast), so a multi-effect spell still applies its non-CC effects. Baseline-safe:
+    // `is_immune_to_mechanic` is `false` for any unit without an `A_IMMUNITY` aura → unchanged.
+    if e.kind == A_CONTROL
+        && e.p0_kind == P_MECHANIC
+        && is_immune_to_mechanic(ctx, target_guid, e.p0)
+    {
+        log::info!(
+            "spell {} A_CONTROL(mechanic {}) refused — target {target_guid} is immune",
+            e.spell_id,
+            e.p0
+        );
+        return EffectHit::none(); // a refused CC aura deals no damage
+    }
+    // All aura kinds are PLACED identically (the difference is how tick_auras / combat READ the
+    // frozen row). A_PERIODIC_DAMAGE/HEAL (ticked), A_MOD_COMBAT (combat-read), A_FLAG (passive
+    // marker) are wired; an aura kind with no tick/read handler is simply an inert marker for now.
+    aura_apply(
+        ctx,
+        e,
+        hdr,
+        caster_guid,
+        target_guid,
+        cast_target_guid,
+        level,
+        points,
+    );
+    // Linked-debuff APPLY (Weakened Soul): the twin of the refusal gate in `resolve_cast_at` — a
+    // nonzero `e.p1` names a SEPARATE spell to also apply on `target_guid` right after this aura lands
+    // (PW:Shield's absorb effect names Weakened Soul). Generic over the kind/spell id: any aura effect
+    // can opt in via its `p1`, the engine never names one. No-op if the linked spell/effect isn't loaded
+    // (data-missing → graceful skip, never panics) or `p1 == 0` (every existing aura effect).
+    if e.p1 != 0 {
+        apply_linked_debuff(ctx, e.p1 as u32, caster_guid, target_guid, level);
+    }
+    // CC interrupt: an action-blocking control (stun/poly/fear — NOT root, which still allows
+    // casting) landing on a unit that is MID-CAST cancels its in-progress cast AND any channel it is
+    // running (Arcane Missiles stops if you're stunned/feared). Checked AFTER the aura lands so
+    // `is_action_blocked` sees it. Routes through `break_channel` (which both interrupts the timed cast
+    // and deletes the channel aura) so CC tears down a channel for free — without it the deferred cast
+    // would still fire if the CC expired before the cast finished, and a channel would keep ticking
+    // (the tick arm's own action-blocked check would END it next tick, but breaking it now is prompt).
+    // No-op when the new aura isn't action-blocking, or the target has no cast/channel. [entity]
+    if e.kind == A_CONTROL && is_action_blocked(ctx, target_guid) {
+        break_channel(ctx, target_guid);
+    }
+    EffectHit::none()
 }
 
 /// The hit a damage arm hands to the shared pipeline: this spell, and the proc event its source

@@ -144,22 +144,19 @@ fn ammo_display<St: CastStore + ?Sized>(store: &St, self_guid: u64) -> Option<(u
     if launcher.class != 2 || !matches!(launcher.subclass, 2 | 3 | 18) {
         return None;
     }
-    // Lowest slot among live stacks mirrors the module's per-shot `find_ammo` pick, so the
-    // projectile nocked on the START is the one each shot consumes. The client's item cache is
-    // unsorted, and a spent stack must never be nocked.
-    items
-        .iter()
-        .filter(|i| i.stack_count > 0)
-        .filter(|i| {
+    lyracore_shared::item::loaded_ammo(items.iter(), |item| {
+        (
+            item.slot,
+            item.stack_count,
             store
-                .item_template(i.entry)
+                .item_template(item.entry)
                 .ok()
                 .flatten()
-                .is_some_and(|t| t.class == 6)
-        })
-        .min_by_key(|i| i.slot)
-        .and_then(|i| store.item_template(i.entry).ok().flatten())
-        .map(|t| (t.display_id, 24))
+                .map(|tmpl| tmpl.class),
+        )
+    })
+    .and_then(|item| store.item_template(item.entry).ok().flatten())
+    .map(|tmpl| (tmpl.display_id, 24))
 }
 
 #[cfg(test)]
@@ -472,5 +469,12 @@ mod tests {
             Some((2010, 24)),
             "slot 2 is spent, so slot 4 is the deterministic pick"
         );
+    }
+    #[test]
+    fn banked_projectiles_never_supply_the_activation() {
+        let store = armed_with(launcher(100, 2), vec![(39, 200, 40), (120, 300, 20)]);
+        assert_eq!(activate_ammo(&store), Some((3000, 24)));
+        let bank_only = armed_with(launcher(100, 2), vec![(39, 200, 40)]);
+        assert_eq!(activate_ammo(&bank_only), None);
     }
 }

@@ -349,13 +349,15 @@ pub fn build_create_object(
             .set_player_next_level_xp(entity.next_level_xp as i32)
             .set_player_field_coinage(entity.money as i32) // purse in copper
             // Free talent points (PLAYER_CHARACTER_POINTS1) so the talent pane shows a non-zero count
-            // Mirrors the module's `talent::talent_points_available`: 1/level from level 10
+            // Shared talent calculation: one point per level from level 10
             // (= level - 9), clamped at 0 below 10. NOTE: this does NOT yet subtract points already spent
             // (the gateway doesn't read game_character_talent here) — it's a display of points EARNED, exact
             // for a fresh character and approximate after spending. Learning is reducer-gated server-side;
             // the in-client *clickable* pane additionally needs talent data aligned to the client's
             // Talent.dbc (real ids + rank-spells) — a separate follow-up, not wired here.
-            .set_player_character_points1((entity.level as i32 - 9).max(0))
+            .set_player_character_points1(
+                lyracore_shared::talent::points_available(entity.level, 0) as i32,
+            )
             // The five base attributes (UNIT_FIELD_STAT0..4) so the character sheet shows real
             // numbers (set at login from the cmangos curve; 0 until that data is loaded). Part of the
             // full CREATE mask — not a partial VALUES update — so no dirty_reset concern.
@@ -923,3 +925,5 @@ pub fn build_set_faction_standing_raw(
     body.extend_from_slice(&(standing as u32).to_le_bytes()); // signed standing, bit-cast (client reads it i32)
     Some((SMSG_SET_FACTION_STANDING_OPCODE, body))
 }
+
+pub(crate) mod subscriptions;

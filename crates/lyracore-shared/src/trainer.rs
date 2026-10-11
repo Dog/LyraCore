@@ -178,3 +178,168 @@ mod tests {
         assert_eq!(trainer_type::PETS, 3);
     }
 }
+
+#[derive(Clone, Copy)]
+pub struct LearnEffect {
+    pub index: u8,
+    pub id: u64,
+    pub kind: u8,
+    pub trigger_spell: u32,
+}
+
+pub fn learn_target_trigger(kind: u8, trigger_spell: u32) -> Option<u32> {
+    use crate::spell::taxonomy::{
+        A_FLAG, A_PERIODIC_TRIGGER, A_PROC_DAMAGE, A_PROC_TRIGGER, E_TRIGGER,
+    };
+    (trigger_spell != 0
+        && ![
+            A_PERIODIC_TRIGGER,
+            A_FLAG,
+            A_PROC_TRIGGER,
+            A_PROC_DAMAGE,
+            E_TRIGGER,
+        ]
+        .contains(&kind))
+    .then_some(trigger_spell)
+}
+
+/// Resolve a wrapper independently of table iteration order.
+pub fn resolve_learn_target(spell_id: u32, effects: impl IntoIterator<Item = LearnEffect>) -> u32 {
+    effects
+        .into_iter()
+        .filter_map(|effect| {
+            learn_target_trigger(effect.kind, effect.trigger_spell)
+                .map(|target| (effect.index, effect.id, target))
+        })
+        .min_by_key(|&(index, id, _)| (index, id))
+        .map_or(spell_id, |(_, _, target)| target)
+}
+
+pub fn is_combat_skill_line(line: u32) -> bool {
+    matches!(
+        line,
+        44 | 172 | 54 | 160 | 229 | 43 | 55 | 136 | 473 | 173 | 162 | 95
+    )
+}
+
+/// Combat skills are known by row presence; profession and riding tiers compare caps.
+pub fn offering_known(
+    skill_line: u32,
+    offered_cap: u32,
+    stored_cap: Option<u32>,
+    knows_spell: bool,
+) -> bool {
+    if skill_line == 0 {
+        knows_spell
+    } else if is_combat_skill_line(skill_line) {
+        stored_cap.is_some()
+    } else {
+        stored_cap.is_some_and(|cap| cap >= offered_cap)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferingState {
+    Known,
+    LevelTooLow,
+    Available,
+}
+
+pub fn offering_state(known: bool, level: u32, required_level: u32) -> OfferingState {
+    if known {
+        OfferingState::Known
+    } else if level < required_level {
+        OfferingState::LevelTooLow
+    } else {
+        OfferingState::Available
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_resolution_orders_eligible_effects_by_index_then_id() {
+        let effects = [
+            LearnEffect {
+                index: 2,
+                id: 1,
+                kind: 0,
+                trigger_spell: 100,
+            },
+            LearnEffect {
+                index: 1,
+                id: 8,
+                kind: 0,
+                trigger_spell: 200,
+            },
+            LearnEffect {
+                index: 1,
+                id: 7,
+                kind: 0,
+                trigger_spell: 300,
+            },
+        ];
+        assert_eq!(resolve_learn_target(1873, effects), 300);
+        assert_eq!(resolve_learn_target(1873, effects.into_iter().rev()), 300);
+    }
+
+    #[test]
+    fn wrapper_resolution_ignores_all_trigger_and_proc_kinds() {
+        let excluded = [0x93, 0xBE, 0xAB, 0xB4, 0x05];
+        for kind in excluded {
+            let effect = LearnEffect {
+                index: 0,
+                id: 1,
+                kind,
+                trigger_spell: 639,
+            };
+            assert_eq!(resolve_learn_target(1873, [effect]), 1873, "kind {kind:#x}");
+        }
+        assert_eq!(
+            resolve_learn_target(
+                1873,
+                [LearnEffect {
+                    index: 0,
+                    id: 1,
+                    kind: 0,
+                    trigger_spell: 0
+                }]
+            ),
+            1873
+        );
+        assert_eq!(
+            resolve_learn_target(
+                1873,
+                [LearnEffect {
+                    index: 0,
+                    id: 1,
+                    kind: 0,
+                    trigger_spell: 639
+                }]
+            ),
+            639
+        );
+    }
+
+    #[test]
+    fn weapon_proficiency_uses_row_presence_while_riding_and_professions_use_tiers() {
+        assert!(offering_known(173, 300, Some(1), false));
+        assert!(!offering_known(173, 0, None, true));
+        for line in [185, 762] {
+            assert!(offering_known(line, 75, Some(75), false));
+            assert!(!offering_known(line, 150, Some(75), false));
+            assert!(!offering_known(line, 75, None, true));
+        }
+        assert!(offering_known(0, 0, None, true));
+        assert!(!offering_known(0, 0, Some(300), false));
+    }
+
+    #[test]
+    fn known_offerings_stay_gray_even_below_the_required_level() {
+        assert_eq!(offering_state(true, 1, 10), OfferingState::Known);
+        assert_eq!(offering_state(false, 9, 10), OfferingState::LevelTooLow);
+        assert_eq!(offering_state(false, 10, 10), OfferingState::Available);
+    }
+}

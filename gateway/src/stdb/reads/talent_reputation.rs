@@ -31,86 +31,54 @@ impl Coordinator {
         let Some(npc_ft) = templates.id().find(&npc.faction_template) else {
             return Ok(false);
         };
-        if let Some(parent) = db.game_faction().faction_id().find(&npc_ft.faction) {
-            if parent.reputation_index >= 0 {
-                let row = db
-                    .game_player_reputation()
-                    .iter()
-                    .find(|r| r.character_guid == player_guid && r.faction_id == parent.faction_id);
-                if let Some(row) = row {
-                    // The At-War checkbox forces hostile regardless of standing (vanilla).
-                    if row.at_war {
-                        return Ok(true);
-                    }
-                    return Ok(reputation_rank(row.standing) <= RANK_UNFRIENDLY);
-                }
-            }
-        }
-        let Some(player_ft) = templates.id().find(&player.faction_template) else {
-            return Ok(false);
-        };
-        Ok(faction_template_hostile(&npc_ft, &player_ft))
+        let reputation = db
+            .game_faction()
+            .faction_id()
+            .find(&npc_ft.faction)
+            .filter(|parent| parent.reputation_index >= 0)
+            .and_then(|parent| {
+                db.game_player_reputation().iter().find(|row| {
+                    row.character_guid == player_guid && row.faction_id == parent.faction_id
+                })
+            })
+            .map(|row| (row.standing, row.at_war));
+        let template_hostile = templates
+            .id()
+            .find(&player.faction_template)
+            .is_some_and(|player_ft| faction_template_hostile(&npc_ft, &player_ft));
+        Ok(lyracore_shared::faction::refuses_interaction(
+            reputation,
+            template_hostile,
+        ))
     }
 }
 
-/// Reputation RANK for a raw standing (0=Hated .. 7=Exalted, Neutral=3). KEEP IN LOCKSTEP with
-/// `module/src/reputation.rs::reputation_rank` — same mangos thresholds, duplicated because the
-/// module fn is table-crate-private (promote both into lyracore_shared if a third consumer appears).
-fn reputation_rank(standing: i32) -> u8 {
-    match standing {
-        s if s >= 42000 => 7,
-        s if s >= 21000 => 6,
-        s if s >= 9000 => 5,
-        s if s >= 3000 => 4,
-        s if s >= 0 => 3,
-        s if s >= -3000 => 2,
-        s if s >= -6000 => 1,
-        _ => 0,
-    }
-}
-/// Refuse-interaction threshold: Unfriendly (2) and below refuse; Neutral (3)+ interacts.
-const RANK_UNFRIENDLY: u8 = 2;
-
-/// Is template `a` HOSTILE to template `b`? KEEP IN LOCKSTEP with
-/// `module/src/faction.rs::compute_hostile` (the vanilla `FactionTemplate.dbc` relationship rule) — the
-/// explicit enemy list wins, then the explicit friend list, else the group masks decide. Duplicated
-/// over the gateway BINDING type for the interaction-window mask fallback.
 fn faction_template_hostile(
     a: &super::super::bindings::FactionTemplate,
     b: &super::super::bindings::FactionTemplate,
 ) -> bool {
-    if b.faction != 0 {
-        if [a.enemy_0, a.enemy_1, a.enemy_2, a.enemy_3].contains(&b.faction) {
-            return true;
-        }
-        if [a.friend_0, a.friend_1, a.friend_2, a.friend_3].contains(&b.faction) {
-            return false;
-        }
-    }
-    (a.enemy_group & b.faction_group) != 0
+    lyracore_shared::faction::relation_holds(
+        &[a.enemy_0, a.enemy_1, a.enemy_2, a.enemy_3],
+        &[a.friend_0, a.friend_1, a.friend_2, a.friend_3],
+        a.enemy_group,
+        b.faction,
+        b.faction_group,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    // The two pure reaction helpers, vectors mirrored from module/src/reputation.rs +
-    // module/src/faction.rs tests (the lockstep contract).
     #[test]
     fn reputation_rank_thresholds_match_mangos() {
-        use super::reputation_rank;
+        use lyracore_shared::faction::reputation_rank;
         assert_eq!(reputation_rank(42000), 7); // Exalted
         assert_eq!(reputation_rank(9000), 5); // Honored
         assert_eq!(reputation_rank(0), 3); // Neutral
         assert_eq!(reputation_rank(-1), 2); // Unfriendly
         assert_eq!(reputation_rank(-3001), 1); // Hostile
         assert_eq!(reputation_rank(-42000), 0); // Hated
-        assert!(
-            reputation_rank(-1) <= super::RANK_UNFRIENDLY,
-            "Unfriendly refuses"
-        );
-        assert!(
-            reputation_rank(0) > super::RANK_UNFRIENDLY,
-            "Neutral interacts"
-        );
+        assert!(reputation_rank(-1) <= 2, "Unfriendly refuses");
+        assert!(reputation_rank(0) > 2, "Neutral interacts");
     }
 
     #[test]

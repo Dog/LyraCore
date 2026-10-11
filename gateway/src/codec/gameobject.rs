@@ -392,3 +392,5 @@ mod tests {
         assert_eq!(found.raw_data, [15, 20, 1581, 0, 0, 0]);
     }
 }
+
+pub(crate) mod subscriptions;

@@ -5,6 +5,8 @@
 
 mod support;
 
+use lyracore_shared::spell::taxonomy::{E_NEXT_SWING, T_TARGET_ENEMY};
+
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -160,8 +162,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
 /// `E_NEXT_SWING` effect on the target, which is the shape the importer gives Heroic Strike and
 /// Cleave. No global cooldown, so the staging casts below never wait on one.
 fn stage_on_next_swing_spell(standalone: &Standalone, spell_id: u32, name: &str, cost: u32) {
-    const E_NEXT_SWING: u32 = 0x13;
-    const T_TARGET_ENEMY: u32 = 1;
     const RAGE: u32 = 1;
     standalone.assert_sql(&format!(
         "INSERT INTO game_spell (spell_id, name, power_type, cost, cast_time_ms, gcd_ms, \
