@@ -75,12 +75,10 @@ Only when the effect outlives the cast. Add the table in the owning family's mod
 ## 7. Regenerate the Gateway bindings
 
 Required for every new table or reducer, including a private table the Gateway never reads, because
-the binding check compares the complete generated tree.
+preparation covers the complete private schema.
 
-- Run the `spacetime generate` command in [`danger-zones.md`](../danger-zones.md) section 1.2, then
-  restore the hand-patched names and the comment it lists.
-- Run `scripts/check-gateway-bindings.py`. It must report no difference.
-- Review the diff under `gateway/src/stdb/bindings/`. Distract added
+- Run `./lyracore bindings`, then `cargo test -p lyracore-gateway`.
+- Inspect the generated files under `.lyracore/generated/gateway/`. Distract added
   `creature_distraction_type.rs`, `game_creature_distraction_table.rs` and lines in `mod.rs`.
 - If the table drives a Relay, declare it in `gateway/src/codec/<family>/subscriptions.rs`. The
   declaration generates its query and row callbacks. A table used only by Durable Reads goes in

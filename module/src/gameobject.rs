@@ -205,9 +205,8 @@ pub struct GameObject {
     /// imported/seeded/pool/debug row stays 0; only the per-instance COPIES `instance::create_instance`
     /// makes of a dungeon's DOOR/BUTTON/CHEST/GOOBER rows carry a live instance id (GO_COPY_BAND
     /// guids), and the instance reap deletes them. END-appended + `#[default(0u64)]` (danger-zones §2
-    /// additive migration). GATEWAY-SUBSCRIBED table → the binding
-    /// (`gateway/src/stdb/bindings/game_object_type.rs`) and the `schema_parity.rs` manifest are
-    /// hand-synced in the SAME change (playbook failure-mode).
+    /// additive migration). After changing this subscribed row, run `./lyracore bindings`
+    /// and update the `schema_parity.rs` field manifest.
     #[default(0u64)]
     pub instance_id: u64,
     /// AOI grid cell: stamped from (x, y) at insert — GOs are static, no re-stamp. The

@@ -50,9 +50,7 @@ instead of a scan.
 
 Required for every new table and every new reducer.
 
-- Run the `spacetime generate` command in [`danger-zones.md`](../danger-zones.md) section 1.2 and
-  restore the hand-patched names and the comment it lists.
-- Run `scripts/check-gateway-bindings.py`. It must report no difference.
+- Run `./lyracore bindings`, then `cargo test -p lyracore-gateway`.
 - For a Relay table, add its declaration beside its codec as described in step 11. The declaration
   generates the subscription query. For a table used only by Durable Reads, add its query to
   `coordinator_queries` in `gateway/src/stdb/connection.rs`.

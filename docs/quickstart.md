@@ -202,7 +202,7 @@ What that actually did:
 
 1. Started SpacetimeDB on `127.0.0.1:3000` — **or reused one already listening there.** A node this
    CLI did not start is never recorded and never stopped by `dev down`.
-2. Built the gateway (`cargo build -p lyracore-gateway`).
+2. Prepared the Gateway bindings, then built the Gateway with `cargo build -p lyracore-gateway`.
 3. Published the **four fixture databases** — `lyracore`, `lyracore-kalimdor`,
    `lyracore-instances` and `lyracore-realm` — always through `./lyracore publish`. Nothing in this path runs a bare
    `spacetime publish`, and the command **refuses** to forward the destructive `-c` clear-publish.

@@ -17,7 +17,7 @@ fn aura_values(db: &RemoteTables, guid: u64) -> Vec<AuraAmount> {
         .filter(move |a| a.target_guid == guid)
         .map(|a| AuraAmount {
             kind: a.eff_kind,
-            parameter: a.eff_p0,
+            parameter: a.eff_p_0,
             amount: a.amount,
             stacks: a.stacks,
         })

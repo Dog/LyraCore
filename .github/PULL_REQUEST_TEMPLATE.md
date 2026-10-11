@@ -33,7 +33,7 @@ The commands CI runs, in `.github/workflows/rust.yml`:
 In `.github/workflows/module-durable.yml`, when the change reaches the Module or the schema:
 
 - [ ] `cargo test -p lyracore-module --test <target> -- --ignored` for each durable target the change touches (CI runs them all)
-- [ ] `scripts/check-gateway-bindings.py`
+- [ ] `./lyracore bindings --check`
 
 In `.github/workflows/runtime-scripts.yml`, when the change reaches `datascripts/`:
 

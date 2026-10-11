@@ -1,7 +1,7 @@
 /target
 **/*.rs.bk
 
-# Local lifecycle state, logs, process ownership locks, and the pinned-tool caches: the `lyracore`
+# Local lifecycle state, logs, generated Gateway bindings, process ownership locks, and tool caches: the `lyracore`
 # CLI (.lyracore/cli/<rev>/) and the wire harness (.lyracore/wire-harness/<sha>/, #246 — a checkout
 # of LyraCoreProject/wire-harness plus its own target/, which is why this must stay ignored).
 /.lyracore/

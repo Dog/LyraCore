@@ -221,8 +221,8 @@ impl CharacterStore for Coordinator {
             })
             .map(|a| {
                 (
-                    a.eff_p1 as u32,
-                    a.eff_p0 as u8,
+                    a.eff_p_1 as u32,
+                    a.eff_p_0 as u8,
                     a.amount,
                     a.eff_kind == A_SPELLMOD_PCT,
                 )

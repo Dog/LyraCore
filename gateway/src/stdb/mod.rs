@@ -19,10 +19,7 @@
 //!   - `subscriptions`: `PlayerSubscriptions`, viewer setup, and durable background work.
 //!   - `views`: row→view converters + the thin `RealmRow`/`AccountRow` mirrors.
 
-// The SpacetimeDB codegen writes one function per table subscription; several run past any
-// reasonable length ceiling and no edit here survives a regeneration.
-#[allow(clippy::too_many_lines)]
-pub mod bindings;
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 mod account_sessions;
 pub(crate) mod aoi; // `world/mod.rs`'s 10s task reads `aoi::AOI_RECENTERS` for the AOISTAT line

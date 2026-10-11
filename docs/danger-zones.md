@@ -20,38 +20,19 @@ any line in §1 needs a human review before it ships, whoever or whatever wrote 
      else = publish aborts.
    - New reducer ARG → change the module reducer **and** the gateway `call_reducer!` **in the same
      commit** (code lockstep, NOT a database migration).
-   - New TABLE → **regenerate the gateway bindings**. Regeneration is the supported path here:
-     `spacetime generate --lang rust --out-dir gateway/src/stdb/bindings --module-path module \
-     --include-private --build-options='--features=debug_reducers' -y`. **`--include-private` is REQUIRED**
-     (without it `game_account`/`game_session`/the schedule tables/`pkg_*` silently vanish and the
-     gateway will not compile), and the generator snake-cases digit suffixes (`eff_p0`→`eff_p_0`,
-     `cond_value1`→`cond_value_1`), so a regen breaks exactly those columns whose GATEWAY CODE uses
-     the non-underscore name. Post-regen hand-patch (verified 2026-07-18 on the exploration-fog
-     regen, re-confirmed 2026-08-30 on the bot-transfer-intent regen): put `gossip_option_type.rs`
-     and `gossip_menu_profile_option_type.rs` `cond_value1`/`2`, and `aura_type.rs`/`mod.rs`
-     `eff_p0`/`1`(`_kind`), back to the no-underscore spelling. BUT LEAVE `spell_effect_type.rs`
-     `p_0`/`p_1` and `game_object_template_type.rs`/`debug_spawn_gameobject_reducer.rs`
-     `data_0`/`data_1` AS GENERATED (with the underscore) — their gateway code uses the underscore
-     names. The rule: match the COMMITTED (working) binding's field name, which is what the gateway
-     code accesses; `cargo build` E0609 "no field X" tells you which way each one goes.
-     Regeneration also removes the explanatory `facing` / `facing_angle` comment from
-     `creature_spline_type.rs`; restore it from the committed binding after every regeneration.
-     `scripts/check-gateway-bindings.py` runs the same private generation offline with SpacetimeDB
-     2.7.1, applies only these spelling and comment exceptions in its temporary output, formats it
-     with the pinned Rust toolchain, and compares every generated file with the committed tree.
-     Regeneration needs a machine that can run `spacetimedb-standalone` — schema extraction shells
-     out to it, so a sandbox without it cannot regenerate. Diff-review the regenerated tree before
-     committing (it rewrites every file; drift deletions are expected and correct), then run the
-     gateway tests. Do NOT hand-splice new tables into `bindings/mod.rs` — that hand-maintenance tax
-     is what regeneration replaces.
-     `gateway/tests/schema_parity.rs` structurally checks every subscribed table's binding against
-     the module schema — run `cargo test -p lyracore-gateway` after ANY hand edit to a
-     `<table>_type.rs` file to catch a missed, misordered, or mistyped column before it ships.
-     `game_transfer_out`, its transfer/instance reducers, `record_shard_load`, and
-     `record_region_load` began as narrow hand-splices when a full regeneration was unavailable or
-     carried too much unrelated churn. The full generated baseline now contains equivalent output
-     for them, and the complete-tree check covers their table and reducer definitions. The Gateway
-     still only needs to use a table binding when it subscribes to or reads that table.
+   - After a Module schema change, run `./lyracore bindings`. The CLI generates the Gateway's
+     private Rust bindings from the local Module with `debug_reducers`, using the pinned
+     SpacetimeDB and Rust versions. It needs `spacetimedb-standalone` for offline schema extraction,
+     but does not contact a Realm or publish anything.
+   - Bindings live under `.lyracore/generated/gateway/` and are never committed or hand-edited.
+     Use the generator's Rust field names, including digit separators such as `eff_p_0` and
+     `cond_value_1`. These Rust names do not rename the Module's SQL columns.
+   - Run `cargo test -p lyracore-gateway` after preparation. `gateway/tests/schema_parity.rs`
+     compares every Coordinator subscription with the Module schema. Update its field manifest
+     when a subscribed table changes, including explicit mappings for generated Rust names.
+   - Direct Gateway Cargo builds check the prepared output through the installed, pinned CLI.
+     Missing output, changed inputs, or edited generated files stop the build with preparation
+     instructions. `./lyracore bindings --check` performs the same read-only check.
 
    **A defaulted column's default can be a VALID VALUE, not a sentinel — plan the backfill (#456).**
    `cell` was END-appended to the four AOI-scoped tables as `#[default(0i64)]`, and 0 is the legitimate
@@ -441,6 +422,7 @@ cargo build
 # SINGLE-DATABASE gateway — no Kalimdor, no instances, no realm-core — and every one of
 # those degrades SILENTLY rather than refusing to start. Anything that omits a variable below is the
 # single-database dev config, which is not what a sharded realm runs.
+./lyracore bindings
 cargo build -p lyracore-gateway
 TOKEN=$(grep -oP 'spacetimedb_token = "\K[^"]+' ~/.config/spacetime/cli.toml)
 # ⚠ `lyracore-gatewa` is NOT a typo — see the trap note under this block.

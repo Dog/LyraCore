@@ -109,8 +109,8 @@ impl NpcStore for Coordinator {
                         action: option.action,
                         action_menu_id: option.action_menu_id,
                         cond_type: option.cond_type,
-                        cond_value1: option.cond_value1,
-                        cond_value2: option.cond_value2,
+                        cond_value1: option.cond_value_1,
+                        cond_value2: option.cond_value_2,
                     })
                     .collect());
             }
@@ -130,8 +130,8 @@ impl NpcStore for Coordinator {
                 action: option.action,
                 action_menu_id: option.action_menu_id,
                 cond_type: option.cond_type,
-                cond_value1: option.cond_value1,
-                cond_value2: option.cond_value2,
+                cond_value1: option.cond_value_1,
+                cond_value2: option.cond_value_2,
             })
             .collect())
     }

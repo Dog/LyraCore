@@ -86,14 +86,32 @@ cargo test -p lyracore-gateway --bin lyracore-gateway stdb::subscriptions::party
 
 ## Gateway bindings
 
-Also in `module-durable.yml`. The check regenerates the full private schema into a temporary
-directory and compares it with `gateway/src/stdb/bindings`. It needs the SpacetimeDB 2.7.1 CLI and
-publishes nothing.
+Before Gateway tests, checks, or Clippy on a fresh checkout, prepare its bindings:
 
 ```bash
-python3 -m unittest discover -s scripts/tests
-scripts/check-gateway-bindings.py
+./lyracore bindings
+cargo test -p lyracore-gateway
 ```
+
+Preparation needs the pinned SpacetimeDB CLI and standalone, builds the local Module with
+`debug_reducers`, and includes private tables. It does not contact a Realm. The Rust and durable
+CI workflows prepare bindings before compiling the Gateway. Schema generation and CLI publishing
+use Rust flags from the checkout's Cargo configuration and ignore ambient Rust-flag overrides.
+
+Generated files stay in `.lyracore/generated/gateway/`. The CLI reuses complete output while its
+inputs and generated files match their recorded hashes. Module sources, installed Package sources,
+workspace crates, Cargo manifests and lockfile, Cargo configuration, the Runtime Script event
+catalogue, and toolchain pins are inputs. Source edits, Package additions and removals, and edits
+through Package symlinks require preparation again.
+
+`./lyracore bindings --check` checks freshness without running Cargo or SpacetimeDB. It prints JSON
+with the generated directory and watched paths for the Gateway build script. Direct Cargo builds
+use the installed CLI binary for this check, so they never install tools or start a nested build.
+Prepare bindings before opening the Gateway in an editor on a fresh checkout.
+
+A failed generation preserves the previous complete directory, but stale output cannot pass a
+build. Old directories remain available to compilers already reading them. Delete
+`.lyracore/generated/gateway/` to clear this cache, then prepare again.
 
 ## Runtime Scripts
 

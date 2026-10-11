@@ -357,7 +357,7 @@ pub(crate) fn armor_packet(
     const RESISTANCE_MASK: u32 = 0x7f;
     if changed.target_guid != self_guid
         || changed.eff_kind != A_MOD_RESISTANCE
-        || (changed.eff_p0 as u32 & RESISTANCE_MASK) == 0
+        || (changed.eff_p_0 as u32 & RESISTANCE_MASK) == 0
     {
         return None;
     }
@@ -382,7 +382,7 @@ pub(crate) fn sheet_packet(
     changed: &Aura,
     self_guid: u64,
 ) -> Option<Outbound> {
-    let moves_sheet = lyracore_shared::aura::moves_sheet(changed.eff_kind, changed.eff_p0);
+    let moves_sheet = lyracore_shared::aura::moves_sheet(changed.eff_kind, changed.eff_p_0);
     if changed.target_guid != self_guid || !moves_sheet {
         return None;
     }
@@ -820,7 +820,7 @@ pub(crate) fn run_speed_packet(
 ) -> Option<Outbound> {
     const BASE_RUN_SPEED: f32 = 7.0; // vanilla base run yd/s
     if changed.target_guid != self_guid
-        || !lyracore_shared::aura::moves_run_speed(changed.eff_kind, changed.eff_p0)
+        || !lyracore_shared::aura::moves_run_speed(changed.eff_kind, changed.eff_p_0)
     {
         return None;
     }
@@ -830,7 +830,7 @@ pub(crate) fn run_speed_packet(
             .filter(|aura| aura.target_guid == self_guid)
             .map(|aura| lyracore_shared::aura::AuraAmount {
                 kind: aura.eff_kind,
-                parameter: aura.eff_p0,
+                parameter: aura.eff_p_0,
                 amount: aura.amount,
                 stacks: aura.stacks,
             }),
@@ -850,7 +850,7 @@ pub(crate) fn swim_speed_packet(
 ) -> Option<Outbound> {
     if changed.target_guid != self_guid
         || changed.eff_kind != A_MOD_SPEED
-        || changed.eff_p0 != i32::from(SPEED_SWIM)
+        || changed.eff_p_0 != i32::from(SPEED_SWIM)
     {
         return None;
     }
@@ -860,7 +860,7 @@ pub(crate) fn swim_speed_packet(
             .filter(|aura| aura.target_guid == self_guid)
             .map(|aura| lyracore_shared::aura::AuraAmount {
                 kind: aura.eff_kind,
-                parameter: aura.eff_p0,
+                parameter: aura.eff_p_0,
                 amount: aura.amount,
                 stacks: aura.stacks,
             }),
@@ -1183,13 +1183,13 @@ impl SpellCastEventKind {
 pub(crate) mod tests {
     use super::*;
     use lyracore_shared::spell::taxonomy::SPEED_MOVE;
-    /// A minimal `Aura` row for the packet-builder tests: `target_guid`/`eff_kind`/`eff_p0`/`amount`
+    /// A minimal `Aura` row for the packet-builder tests: `target_guid`/`eff_kind`/`eff_p_0`/`amount`
     /// are the fields those builders branch on; `applied_at`/`expires_at` (raw micros) drive the
     /// duration math. Everything else is a fixed, inert value.
     pub(crate) fn aura(
         target_guid: u64,
         eff_kind: u8,
-        eff_p0: i32,
+        eff_p_0: i32,
         amount: i32,
         applied_at_micros: i64,
         expires_at_micros: i64,
@@ -1207,9 +1207,9 @@ pub(crate) mod tests {
             effect_id: 1,
             eff_kind,
             amount,
-            eff_p0,
-            eff_p0_kind: 0,
-            eff_p1: 0,
+            eff_p_0,
+            eff_p_0_kind: 0,
+            eff_p_1: 0,
             period_ms: 0,
             amount_remaining: 0,
             stacks: 1,
