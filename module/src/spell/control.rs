@@ -364,9 +364,7 @@ pub(crate) fn break_auras_on_damage(
             crate::spell::stacking::dr_window_on_removal(ctx, a.target_guid, category, now_micros);
         }
     }
-    for a in to_break {
-        auras.id().delete(a.id);
-    }
+    shed_auras(ctx, target_guid, to_break);
     // Stealth breaks on ANY real damage to the stealthed unit (melee/direct-spell/DoT, since this
     // chokepoint is called from all three) — vanilla's "getting hit reveals you" rule, independent of
     // the BREAK_ON_DAMAGE header bit above (A_STEALTH is never flagged with it). The attacker-side
@@ -666,12 +664,9 @@ pub(crate) fn interrupt_cast_and_lock(
 /// including Ghost, Resurrection Sickness and the Warrior stances). Nothing else is spared: a mount, a
 /// buff, a DoT and a crowd-control aura all come off.
 ///
-/// This module keeps the PASSIVE half and sheds everything else. `game_spell.attributes` carries the raw
-/// `Spell.dbc` Attributes column, so the passive bit is real imported data; `AttributesEx3` is not
-/// imported, so the death-persistent half has no data to read. Of that vanilla exempt list only
-/// Resurrection Sickness exists here as an aura at all — the Warrior stances are a `WorldEntity` field
-/// and Ghost is a player flag, both of which survive death by construction — so the gap is one debuff a
-/// second death clears early. Carrying `AttributesEx3` into `game_spell` is what closes it.
+/// Only the passive bit is imported. Resurrection Sickness still needs the missing
+/// death-persistent attribute; Warrior stances live on the entity, and Ghost is applied
+/// after death when the Character releases spirit.
 ///
 /// Pure over the attribute mask, so the policy is one testable decision rather than a filter buried in a
 /// scan. A spell with no header at all reads as not-passive at the call site and is shed: unauthored
@@ -719,6 +714,7 @@ pub(crate) fn shed_auras(ctx: &ReducerContext, unit_guid: u64, shed: Vec<Aura>) 
     let mut revitalize = false;
     let mut resheet = false;
     let mut remount = false;
+    let redisplay = shed.iter().any(|a| a.eff_kind == A_TRANSFORM);
     for a in &shed {
         revitalize |= aura_moves_vitals(a.eff_kind, a.eff_p0);
         resheet |= crate::spell::aura_moves_sheet(a.eff_kind, a.eff_p0);
@@ -736,6 +732,9 @@ pub(crate) fn shed_auras(ctx: &ReducerContext, unit_guid: u64, shed: Vec<Aura>) 
     }
     if remount {
         crate::mount::recompute_mount(ctx, unit_guid);
+    }
+    if redisplay {
+        recompute_display(ctx, unit_guid);
     }
 }
 

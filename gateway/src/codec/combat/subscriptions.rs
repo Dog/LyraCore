@@ -1,5 +1,5 @@
 //! Table Relays for this Protocol Family.
-use lyracore_shared::spell::taxonomy::{A_MOD_RESISTANCE, A_MOD_SPEED, SPEED_MOVE};
+use lyracore_shared::spell::taxonomy::{A_MOD_RESISTANCE, A_MOD_SPEED, SPEED_SWIM};
 
 use crate::codec::entity::subscriptions::build_peer_create;
 use crate::codec::{self};
@@ -549,6 +549,9 @@ pub(crate) fn aura_insert_outbound(
         out.push(o);
     }
     if let Some(current) = current {
+        if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
+            out.push(o);
+        }
         if let Some(o) = run_speed_packet(current.into_iter(), row, self_guid) {
             out.push(o);
         }
@@ -597,6 +600,9 @@ pub(crate) fn aura_update_outbound(
         }
     }
     if let Some(current) = current {
+        if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
+            out.push(o);
+        }
         if let Some(o) = run_speed_packet(current.into_iter(), row, self_guid) {
             out.push(o);
         }
@@ -630,6 +636,9 @@ pub(crate) fn aura_delete_outbound(
     if visible {
         let current = view.auras.on_target(shard, row.target_guid);
         out.push(aura_sync(current.iter().cloned(), row.target_guid));
+        if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
+            out.push(o);
+        }
         if let Some(o) = run_speed_packet(current.into_iter(), row, self_guid) {
             out.push(o);
         }
@@ -708,6 +717,12 @@ pub(crate) fn aura_snapshot_outbound(
             .iter()
             .chain(previous)
             .find_map(|row| run_speed_packet(current.iter().cloned(), row, viewer.self_guid)),
+    );
+    out.extend(
+        current
+            .iter()
+            .chain(previous)
+            .find_map(|row| swim_speed_packet(current.iter().cloned(), row, viewer.self_guid)),
     );
     out.extend(
         current
@@ -805,8 +820,7 @@ pub(crate) fn run_speed_packet(
 ) -> Option<Outbound> {
     const BASE_RUN_SPEED: f32 = 7.0; // vanilla base run yd/s
     if changed.target_guid != self_guid
-        || changed.eff_kind != A_MOD_SPEED
-        || changed.eff_p0 != i32::from(SPEED_MOVE)
+        || !lyracore_shared::aura::moves_run_speed(changed.eff_kind, changed.eff_p0)
     {
         return None;
     }
@@ -823,6 +837,36 @@ pub(crate) fn run_speed_packet(
     );
     Some(Outbound::One(
         ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(Box::new(codec::build_force_run_speed(
+            self_guid, speed,
+        ))),
+    ))
+}
+
+/// A swimming aura change refreshes the owner from the remaining aura set.
+pub(crate) fn swim_speed_packet(
+    auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
+    changed: &Aura,
+    self_guid: u64,
+) -> Option<Outbound> {
+    if changed.target_guid != self_guid
+        || changed.eff_kind != A_MOD_SPEED
+        || changed.eff_p0 != i32::from(SPEED_SWIM)
+    {
+        return None;
+    }
+    let speed = lyracore_shared::aura::swim_speed(
+        lyracore_shared::constants::speeds::SWIM,
+        auras
+            .filter(|aura| aura.target_guid == self_guid)
+            .map(|aura| lyracore_shared::aura::AuraAmount {
+                kind: aura.eff_kind,
+                parameter: aura.eff_p0,
+                amount: aura.amount,
+                stacks: aura.stacks,
+            }),
+    );
+    Some(Outbound::One(
+        ServerOpcodeMessage::SMSG_FORCE_SWIM_SPEED_CHANGE(Box::new(codec::build_force_swim_speed(
             self_guid, speed,
         ))),
     ))
@@ -1138,6 +1182,7 @@ impl SpellCastEventKind {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use lyracore_shared::spell::taxonomy::SPEED_MOVE;
     /// A minimal `Aura` row for the packet-builder tests: `target_guid`/`eff_kind`/`eff_p0`/`amount`
     /// are the fields those builders branch on; `applied_at`/`expires_at` (raw micros) drive the
     /// duration math. Everything else is a fixed, inert value.
@@ -1207,24 +1252,66 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_speed_packet_sums_move_speed_auras_on_self_only() {
+    fn run_speed_packet_uses_the_strongest_move_bonus_on_self_only() {
         let self_guid = 1u64;
-        // Two move-speed auras on self (e.g. Sprint 25% + a totem 5%) sum into ONE force-speed packet.
+        // Ghost and Wisp Spirit coexist, but only the stronger run bonus applies.
         let a1 = aura(self_guid, 0xA4, 0, 25, 0, i64::MAX);
-        let a2 = aura(self_guid, 0xA4, 0, 5, 0, i64::MAX);
+        let a2 = aura(self_guid, 0xA4, 0, 50, 0, i64::MAX);
         let current = vec![a1.clone(), a2.clone()];
         let out = run_speed_packet(current.clone().into_iter(), &a1, self_guid);
         let m = match out {
             Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(m))) => m,
             _ => panic!("expected Some(Outbound::One(SMSG_FORCE_RUN_SPEED_CHANGE))"),
         };
-        assert_eq!(*m, codec::build_force_run_speed(self_guid, 9.1));
+        assert_eq!(*m, codec::build_force_run_speed(self_guid, 10.5));
         // A non-move-speed change on self spams nothing (ordinary buffs/debuffs don't trigger this).
         let unrelated = aura(self_guid, 0xA1, 1, 10, 0, i64::MAX);
         assert!(run_speed_packet(current.clone().into_iter(), &unrelated, self_guid).is_none());
         // A move-speed change on a DIFFERENT guid (a peer) never triggers self's packet.
         let peer_changed = aura(self_guid + 1, 0xA4, 0, 25, 0, i64::MAX);
         assert!(run_speed_packet(current.into_iter(), &peer_changed, self_guid).is_none());
+    }
+
+    #[test]
+    fn run_speed_packet_refreshes_always_and_not_stack_bonuses_after_removal() {
+        use lyracore_shared::spell::taxonomy::{SPEED_MOVE_ALWAYS, SPEED_MOVE_NOT_STACK};
+        let guid = 7;
+        for speed_kind in [SPEED_MOVE_ALWAYS, SPEED_MOVE_NOT_STACK] {
+            let changed = aura(guid, A_MOD_SPEED, i32::from(speed_kind), 50, 0, i64::MAX);
+            for (current, expected) in [(vec![changed.clone()], 10.5), (vec![], 7.0)] {
+                let Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(packet))) =
+                    run_speed_packet(current.into_iter(), &changed, guid)
+                else {
+                    panic!("run speed packet");
+                };
+                assert_eq!(*packet, codec::build_force_run_speed(guid, expected));
+            }
+        }
+    }
+
+    #[test]
+    fn swim_speed_packet_updates_and_restores_the_owner_speed() {
+        let guid = 7;
+        let ghost = aura(guid, A_MOD_SPEED, i32::from(SPEED_SWIM), 25, 0, i64::MAX);
+        let wisp = aura(guid, A_MOD_SPEED, i32::from(SPEED_SWIM), 50, 0, i64::MAX);
+        let base = lyracore_shared::constants::speeds::SWIM;
+        for (current, expected) in [
+            (vec![ghost.clone(), wisp.clone()], base * 1.5),
+            (vec![ghost.clone()], base * 1.25),
+            (vec![], base),
+        ] {
+            let Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_SWIM_SPEED_CHANGE(packet))) =
+                swim_speed_packet(current.into_iter(), &wisp, guid)
+            else {
+                panic!("swim speed packet");
+            };
+            assert_eq!(packet.guid.guid(), guid);
+            assert_eq!(packet.move_event, 0);
+            assert!((packet.speed - expected).abs() < 0.000001);
+        }
+        assert!(swim_speed_packet([ghost.clone()].into_iter(), &ghost, guid + 1).is_none());
+        let cast = aura(guid, A_MOD_SPEED, 2, 50, 0, i64::MAX);
+        assert!(swim_speed_packet([cast.clone()].into_iter(), &cast, guid).is_none());
     }
     #[test]
     fn mounted_snare_apply_and_remove_preserve_the_mount_bonus() {
