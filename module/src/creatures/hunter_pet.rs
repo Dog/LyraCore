@@ -10,11 +10,9 @@ use crate::{
 
 const CLASS_HUNTER: u8 = 3;
 const INITIAL_HAPPINESS: u32 = 166_500;
-pub const PET_KIND_SUMMONED: u8 = 0;
-pub const PET_KIND_HUNTER: u8 = 1;
 
 /// The one durable Hunter-pet identity currently owned by a character. The table is module-private;
-/// callers use the narrow owner/id lookups below.
+/// callers read a pet through its owner lookup below.
 #[derive(Clone)]
 #[table(
     accessor = game_hunter_pet,
@@ -104,7 +102,7 @@ fn classify_pet_kind(hunter_pet_id: Option<u64>) -> PetKind {
     }
 }
 
-pub fn hunter_pet_for_owner(ctx: &ReducerContext, owner_guid: u64) -> Option<HunterPet> {
+pub(crate) fn hunter_pet_for_owner(ctx: &ReducerContext, owner_guid: u64) -> Option<HunterPet> {
     ctx.db
         .game_hunter_pet()
         .by_owner()
@@ -112,13 +110,13 @@ pub fn hunter_pet_for_owner(ctx: &ReducerContext, owner_guid: u64) -> Option<Hun
         .next()
 }
 
-pub fn hunter_pet_by_id(ctx: &ReducerContext, pet_id: u64) -> Option<HunterPet> {
-    ctx.db.game_hunter_pet().pet_id().find(pet_id)
-}
-
 /// Publish the bounded protocol projection after a durable identity write. Care/progression modules
 /// call this at their identity-update seam so the gateway sees one owner-addressed delta.
-pub fn publish_hunter_pet_protocol(ctx: &ReducerContext, pet: &HunterPet, live_pet_guid: u64) {
+pub(crate) fn publish_hunter_pet_protocol(
+    ctx: &ReducerContext,
+    pet: &HunterPet,
+    live_pet_guid: u64,
+) {
     let row = HunterPetProtocol {
         pet_id: pet.pet_id,
         owner_guid: pet.owner_guid,
@@ -141,7 +139,7 @@ pub fn publish_hunter_pet_protocol(ctx: &ReducerContext, pet: &HunterPet, live_p
     }
 }
 
-pub fn live_pet_kind(ctx: &ReducerContext, pet_guid: u64) -> PetKind {
+pub(crate) fn live_pet_kind(ctx: &ReducerContext, pet_guid: u64) -> PetKind {
     classify_pet_kind(
         ctx.db
             .game_live_pet_kind()

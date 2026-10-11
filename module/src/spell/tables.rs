@@ -1,7 +1,6 @@
 //! Spell/aura/cooldown table structs (the [static] definition tables + the [event]/[entity]/[server]
 //! runtime tables). The `#[table]` macro generates the per-table accessor traits here; `mod.rs`
-//! re-exports them (`pub use tables::*`) so every `crate::spell::<Table>` / `ctx.db.game_<table>()`
-//! path resolves.
+//! exports each accessor and row type by name.
 
 use spacetimedb::{table, Identity, ReducerContext, ScheduleAt, Table, Timestamp};
 

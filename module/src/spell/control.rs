@@ -30,7 +30,7 @@ fn has_control_mechanic(ctx: &ReducerContext, unit_guid: u64, mechanic: i32) -> 
 /// gate "cast this debuff only if the target lacks it" (TARGET_MISSING_AURA) and "buff self only if
 /// missing" (SELF_MISSING_AURA), so a creature doesn't waste casts re-applying a live aura. A unit with
 /// no aura from that spell → `false`. [entity]
-pub fn has_aura(ctx: &ReducerContext, unit_guid: u64, spell_id: u32) -> bool {
+pub(crate) fn has_aura(ctx: &ReducerContext, unit_guid: u64, spell_id: u32) -> bool {
     auras_on(ctx, unit_guid).any(|a| a.spell_id == spell_id)
 }
 
@@ -63,7 +63,7 @@ pub enum ControlReadError {
 /// Read all control auras for one unit within a declared limit. Oversized state is unavailable, so
 /// an arbitrary prefix cannot decide whether the party may damage the unit.
 #[cfg_attr(not(has_packages), allow(dead_code))]
-pub fn control_status(
+pub(crate) fn control_status(
     ctx: &ReducerContext,
     unit_guid: u64,
     limit: usize,
@@ -92,7 +92,7 @@ pub fn control_status(
 
 /// Classify a spell from its complete effect set. A spell has at most three effects.
 #[cfg_attr(not(has_packages), allow(dead_code))]
-pub fn spell_control(
+pub(crate) fn spell_control(
     ctx: &ReducerContext,
     spell_id: u32,
 ) -> Result<Option<UnitControl>, ControlReadError> {
@@ -125,7 +125,7 @@ pub fn spell_control(
 /// Whether a target needs the requested buff. Oversized or ambiguous catalogue data is unavailable,
 /// so callers hold instead of choosing from an arbitrary prefix.
 #[cfg_attr(not(has_packages), allow(dead_code))]
-pub fn buff_status(
+pub(crate) fn buff_status(
     ctx: &ReducerContext,
     target_guid: u64,
     spell_id: u32,
@@ -181,7 +181,7 @@ pub(crate) fn is_non_melee_spell_casting(ctx: &ReducerContext, unit_guid: u64) -
 /// (no melee swing, no creature aggro/cast) NOR MOVE — the combat melee tick and EVERY creature pass
 /// gate on this. Pure read over `game_aura` (no entity write); `false` for any unit without an
 /// A_CONTROL(M_STUN) aura, so an un-stunned unit's combat/AI is unaffected. [entity]
-pub fn is_stunned(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_stunned(ctx: &ReducerContext, unit_guid: u64) -> bool {
     has_control_mechanic(ctx, unit_guid, M_STUN)
 }
 
@@ -191,7 +191,7 @@ pub fn is_stunned(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// of `is_stunned` (presence over the same `by_target` scan, FIRST match short-circuits) — A_DISARM is NOT an
 /// A_CONTROL mechanic, so it scans the kind directly. `false` for any unit without an A_DISARM aura, so an
 /// un-disarmed unit's swing is byte-identical (baseline-safe). [entity]
-pub fn is_disarmed(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_disarmed(ctx: &ReducerContext, unit_guid: u64) -> bool {
     auras_on(ctx, unit_guid).any(|a| a.eff_kind == A_DISARM)
 }
 
@@ -200,7 +200,7 @@ pub fn is_disarmed(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// unlike `is_stunned` — root does NOT gate the swing or the action passes. A STUN also implies no
 /// movement, so the movement gates check `is_stunned(..) || is_rooted(..)`. Pure read; `false` without
 /// an A_CONTROL(M_ROOT) aura, so an un-rooted unit's movement is unaffected. [entity]
-pub fn is_rooted(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_rooted(ctx: &ReducerContext, unit_guid: u64) -> bool {
     has_control_mechanic(ctx, unit_guid, M_ROOT)
 }
 
@@ -210,7 +210,7 @@ pub fn is_rooted(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// the one mechanic that MOVES the unit: stun/poly freeze (no act, no move), root pins (act, no move),
 /// fear routs (no act, forced flee). Pure read over `game_aura` (no entity write); `false` for any unit
 /// without an A_CONTROL(M_FEAR) aura, so an un-feared unit is unaffected. [entity]
-pub fn is_feared(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_feared(ctx: &ReducerContext, unit_guid: u64) -> bool {
     has_control_mechanic(ctx, unit_guid, M_FEAR)
 }
 
@@ -219,27 +219,16 @@ pub fn is_feared(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// AWAY from this source, so it both DETECTS fear (`Some`) and supplies the bearing. Reuses the same
 /// `by_target` aura scan as `is_feared` (which is `fear_source(..).is_some()` in spirit) but returns the
 /// caster instead of a bool. [entity]
-pub fn fear_source(ctx: &ReducerContext, unit_guid: u64) -> Option<u64> {
+pub(crate) fn fear_source(ctx: &ReducerContext, unit_guid: u64) -> Option<u64> {
     auras_on(ctx, unit_guid)
         .find(|a| a.eff_kind == A_CONTROL && a.eff_p0 == M_FEAR)
         .map(|a| a.caster_guid)
 }
 
-/// Is `unit_guid` INCAPACITATED — FROZEN and unable to ACT? True under STUN *or* POLYMORPH (M_POLY): both
-/// fully neutralize the unit (no act AND no move), vs root which only pins it (a rooted unit still acts)
-/// and fear which routs it (no act but force-moved). It is the "no act AND no move" core: the MOVEMENT
-/// gate (`is_movement_blocked`) folds it in, and the ACTION gate (`is_action_blocked`) folds it in too.
-/// Baseline-safe: with no poly aura `is_incapacitated == is_stunned` (a unit without a control aura is
-/// `false`). [entity]
-pub fn is_incapacitated(ctx: &ReducerContext, unit_guid: u64) -> bool {
-    is_stunned(ctx, unit_guid) || has_control_mechanic(ctx, unit_guid, M_POLY)
-}
-
 /// Pure CC-axis lattice: given the four independent control booleans (already resolved off a live
 /// `A_CONTROL` scan), derive the three composite gates the action/movement pipeline reads — lifted
 /// verbatim from `is_action_blocked`/`is_movement_blocked`/`is_self_movement_suppressed`'s own boolean
-/// expressions (which each build on the same `incapacitated = stunned || poly` core `is_incapacitated`
-/// computes) so the fear/root/poly axis composition is unit-tested without a live ctx. Returns
+/// expressions, which share `incapacitated = stunned || poly` so the fear/root/poly axis composition is unit-tested without a live ctx. Returns
 /// `(action_blocked, movement_blocked, self_movement_suppressed)`.
 pub(crate) fn cc_blocks(
     stunned: bool,
@@ -247,7 +236,7 @@ pub(crate) fn cc_blocks(
     feared: bool,
     poly: bool,
 ) -> (bool, bool, bool) {
-    let incapacitated = stunned || poly; // is_incapacitated
+    let incapacitated = stunned || poly;
     let action_blocked = incapacitated || feared; // is_action_blocked
     let movement_blocked = incapacitated || rooted; // is_movement_blocked
     let self_movement_suppressed = movement_blocked || feared; // is_self_movement_suppressed
@@ -258,9 +247,9 @@ pub(crate) fn cc_blocks(
 /// under INCAPACITATE (stun/poly) *or* FEAR: a feared unit loses control of its actions exactly like an
 /// incapacitated one — the only difference is movement (incapacitate freezes it in place, fear force-flees
 /// it). The ACTION gates — the melee swing, the creature aggro/assist/cast passes, and the cast chokepoint
-/// — gate on THIS (not on `is_incapacitated`), so fear silences as well as routs. Baseline-safe: with no
+/// Fear silences as well as routs. Baseline-safe: with no
 /// poly/fear aura `is_action_blocked == is_stunned`. [entity]
-pub fn is_action_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_action_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
     cc_blocks(
         is_stunned(ctx, unit_guid),
         is_rooted(ctx, unit_guid),
@@ -275,7 +264,7 @@ pub fn is_action_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// frozen, it is force-fled — see `is_self_movement_suppressed`.) The fear-flee pass uses this to know a
 /// stun/root/poly OUTRANKS fear and keeps the unit put. `false` for any un-CC'd unit (the common path), so
 /// movement is unaffected. [entity]
-pub fn is_movement_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_movement_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
     cc_blocks(
         is_stunned(ctx, unit_guid),
         is_rooted(ctx, unit_guid),
@@ -292,7 +281,7 @@ pub fn is_movement_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// !is_movement_blocked`, so a feared-but-not-frozen creature is moved by EXACTLY one pass (fear-flee), a
 /// frozen one by none, and the two never both fire. `false` for any un-CC'd creature (the common path).
 /// [entity]
-pub fn is_self_movement_suppressed(ctx: &ReducerContext, unit_guid: u64) -> bool {
+pub(crate) fn is_self_movement_suppressed(ctx: &ReducerContext, unit_guid: u64) -> bool {
     cc_blocks(
         is_stunned(ctx, unit_guid),
         is_rooted(ctx, unit_guid),

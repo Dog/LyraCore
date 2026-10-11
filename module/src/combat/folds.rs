@@ -5,8 +5,7 @@
 //! (Heroic Strike/Cleave) on-next-swing folds, the react-window (Overpower/Revenge) arm/check, the
 //! equipped-weapon/ammo lookups, and `roll_swing`/`roll_ranged_swing` — the attack-table rolls that
 //! `death`'s pipeline and `swing`'s resolvers consume. No lethal/death handling and no reducers live
-//! here; `mod.rs` re-exports this module (`pub use folds::*`) so every `crate::combat::<sym>` path
-//! resolves regardless of which submodule actually defines it.
+//! here. `mod.rs` names the operations shared with other Module files.
 
 use spacetimedb::ReducerContext;
 
@@ -15,9 +14,7 @@ use crate::{
     game_world_entity, ItemInstance, WorldEntity,
 };
 
-// Tables' pure formulas/consts (`dodge_chance_bp`, `armor_mitigation_pct`, `CRIT_MULT`, ...) and the
-// sibling submodules' re-exports are all pulled in from `mod.rs` (`pub use tables::*` + `pub use
-// folds::*`/`death::*`/`engage::*`/`swing::*`) so every symbol resolves the same as before the split.
+// Shared combat operations and formulas are named in the parent module.
 use super::*;
 
 /// Fold aura and equipped-item rating onto one attack-table band.
@@ -37,7 +34,7 @@ fn fold_band(
 /// `target`'s EFFECTIVE dodge chance (bp) vs a swing with skill difference `sd`: the agility-derived
 /// `dodge_chance_bp` PLUS any `A_MOD_COMBAT(COMBAT_DODGE)` aura. `roll_swing` builds the dodge band from
 /// this and `debug_compute_swing` reads it back. No dodge aura → exactly the agility band (baseline-safe).
-pub fn effective_dodge_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -> u32 {
+pub(crate) fn effective_dodge_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -> u32 {
     fold_band(
         ctx,
         target.guid,
@@ -50,7 +47,7 @@ pub fn effective_dodge_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -
 /// `target`'s EFFECTIVE parry chance (bp) vs a swing with skill difference `sd`: `parry_chance_bp(sd)` PLUS
 /// any `A_MOD_COMBAT(COMBAT_PARRY)` aura (e.g. the Deflection talent). No parry aura → the flat band
 /// (baseline-safe). The parry twin of `effective_crit_bp`/`effective_dodge_bp`. [entity]
-pub fn effective_parry_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -> u32 {
+pub(crate) fn effective_parry_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -> u32 {
     fold_band(
         ctx,
         target.guid,
@@ -65,7 +62,7 @@ pub fn effective_parry_bp(ctx: &ReducerContext, target: &WorldEntity, sd: u32) -
 /// the defender has a shield (`block_value > 0`, passed in by the caller so the gate uses the SAME value
 /// the HIT_BLOCK damage subtraction does — no recompute, no split-gate divergence). An unshielded unit
 /// blocks at 0 regardless of any block aura (you can't block without a shield) — baseline-safe. [entity]
-pub fn effective_block_bp(
+pub(crate) fn effective_block_bp(
     ctx: &ReducerContext,
     target: &WorldEntity,
     sd: u32,
@@ -234,7 +231,7 @@ pub(crate) fn effective_agility(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
 /// armor drives physical-damage mitigation, so an armor buff OR an armored piece actually softens
 /// incoming hits. Clamped ≥0; no aura and no armor gear → the base value (mitigation byte-identical to
 /// before — baseline-safe). [entity]
-pub fn effective_armor(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
+pub(crate) fn effective_armor(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
     (i64::from(e.armor)
         + i64::from(crate::spell::resistance_bonus(
             ctx,
@@ -250,7 +247,7 @@ pub fn effective_armor(ctx: &ReducerContext, e: &WorldEntity) -> u32 {
 /// block-band gate (`effective_block_bp`) and the flat subtraction on a `HIT_BLOCK` swing. Creatures carry
 /// no equipment so this is always 0 for them; an unshielded player is likewise 0 — so the block band is
 /// 0 and combat is byte-identical until a real shield is equipped (baseline-safe). [entity]
-pub fn effective_block_value(ctx: &ReducerContext, defender: &WorldEntity) -> u32 {
+pub(crate) fn effective_block_value(ctx: &ReducerContext, defender: &WorldEntity) -> u32 {
     let Some(inst) =
         crate::items::item_in_slot(ctx, defender.guid, crate::items::equip_slot::OFFHAND)
     else {
@@ -276,7 +273,7 @@ pub fn effective_block_value(ctx: &ReducerContext, defender: &WorldEntity) -> u3
 /// `[0, 10000]`. `bonus == 0` → exactly `CRIT_BP` (the no-aura crit band is byte-identical to before).
 /// The ctx-aware twin of how `effective_strength` folds a stat buff into the swing — `roll_swing` builds
 /// the table's crit band from this and `debug_compute_swing` reads it back. [entity]
-pub fn effective_crit_bp(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
+pub(crate) fn effective_crit_bp(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
     // Aura crit rating (A_MOD_COMBAT(CRIT)) PLUS the crit rating summed across equipped gear — both fold
     // into the same flat `CRIT_BP` base via the pure core. No aura and no +crit gear → bonus 0 → exactly
     // `CRIT_BP` (the no-gear/no-aura crit band is byte-identical to before — baseline-safe).
@@ -294,7 +291,11 @@ pub fn effective_crit_bp(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
 /// floored at 0. `bonus == 0` → exactly `miss_chance_bp(skill_diff)` (the no-aura miss band is
 /// byte-identical to before). The hit-rating twin of `effective_crit_bp` — `roll_swing` builds the
 /// table's miss band from this and `debug_compute_swing` reads it back. [entity]
-pub fn effective_miss_bp(ctx: &ReducerContext, attacker: &WorldEntity, skill_diff: u32) -> u32 {
+pub(crate) fn effective_miss_bp(
+    ctx: &ReducerContext,
+    attacker: &WorldEntity,
+    skill_diff: u32,
+) -> u32 {
     // Aura hit rating (A_MOD_COMBAT(HIT)) PLUS the hit rating summed across equipped gear — both REDUCE
     // the miss band (the pure core subtracts the bonus, floored at 0). No aura and no +hit gear → bonus 0
     // → exactly `miss_chance_bp(skill_diff)` (the no-gear/no-aura miss band is byte-identical — baseline-safe).
@@ -308,7 +309,7 @@ pub fn effective_miss_bp(ctx: &ReducerContext, attacker: &WorldEntity, skill_dif
 /// so a haste buff (e.g. Quickening) makes the unit attack faster and an attack-speed SLOW (e.g. Thunder
 /// Clap, a negative %) makes it slower — the swing-timer twin of the crit/hit folds. No speed aura → the
 /// base time (the un-buffed swing cadence is byte-identical — baseline-safe). [entity]
-pub fn effective_swing_time(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
+pub(crate) fn effective_swing_time(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
     let speed = crate::spell::speed_bonus(ctx, attacker.guid, crate::spell::SPEED_SWING);
     swing_time_with_haste(attacker.base_attack_time_ms, speed)
 }
@@ -325,7 +326,7 @@ pub fn effective_swing_time(ctx: &ReducerContext, attacker: &WorldEntity) -> u32
 /// value (base 1.0) into `run_speed_mult_bp` for the player wire relay; this copy governs SERVER-driven
 /// movement and the anti-cheat max-speed check (`world::score_and_log_movement`), so a mounted player's
 /// higher speed is never flagged as a speedhack. No move/mount aura → exactly `base` (baseline-safe). [entity]
-pub fn effective_move_speed(ctx: &ReducerContext, guid: u64, base: f32) -> f32 {
+pub(crate) fn effective_move_speed(ctx: &ReducerContext, guid: u64, base: f32) -> f32 {
     let move_pct = crate::spell::speed_bonus(ctx, guid, crate::spell::SPEED_MOVE);
     let mounted_pct = crate::spell::speed_bonus(ctx, guid, crate::spell::SPEED_MOUNTED);
     let mounted = crate::mount::active_mount_spell(ctx, guid).is_some();
@@ -467,7 +468,7 @@ pub(crate) fn wear_weapon(ctx: &ReducerContext, player_guid: u64) {
 /// (and now creature rank) actually drives live damage. The pure AP cores (`player_swing_range_ap` /
 /// `weapon_swing_range_ap`) carry the unarmed/weapon math (and its unit tests); this layers the ctx
 /// reads — effective Strength, aura AP, the equipped weapon, and the creature rank — on top.
-pub fn swing_range_ctx(ctx: &ReducerContext, attacker: &WorldEntity) -> (u32, u32) {
+pub(crate) fn swing_range_ctx(ctx: &ReducerContext, attacker: &WorldEntity) -> (u32, u32) {
     // Warrior Disarm (A_DISARM): a disarmed attacker's main-hand weapon is stripped. Read ONCE — the
     // creature and player branches handle it differently (a creature has no weapon/unarmed split). `false`
     // for any un-disarmed unit, so the whole function stays byte-identical without an A_DISARM aura.
@@ -542,7 +543,7 @@ pub fn swing_range_ctx(ctx: &ReducerContext, attacker: &WorldEntity) -> (u32, u3
 /// scales off the weapon like a real strike, not a flat number. (Slice scope: specials always land — no
 /// miss/dodge/parry roll yet; the attack table for yellow hits is a follow-up.) Uses the module RNG
 /// (`ctx.random`, deterministic per reducer transaction). [entity]
-pub fn weapon_strike_damage(
+pub(crate) fn weapon_strike_damage(
     ctx: &ReducerContext,
     caster: &WorldEntity,
     target: &WorldEntity,

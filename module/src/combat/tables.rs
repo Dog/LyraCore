@@ -3,8 +3,7 @@
 //! unit-testable in isolation (the tests live at the bottom of this file). The ctx/db layer that wires
 //! these into live combat — `roll_swing`, `swing_range_ctx`, the `effective_*` aura family,
 //! `kill_creature`, the reducers — lives in the parent `mod.rs` and re-exports this module
-//! (`pub use tables::*`), so every `crate::combat::<sym>` path resolves regardless of which submodule
-//! actually defines the symbol.
+//! by name for its callers.
 
 use crate::WorldEntity;
 
@@ -152,7 +151,7 @@ pub(crate) const HIT_BLOCK: u8 = 7; // a LANDED hit a shield reduced by a flat b
 /// Miss chance in basis points (vanilla hit table): 5% at `skill_diff` 0, rising with the skill
 /// difference — `+0.1%`/point up to +10, then `+0.4%`/point beyond (the classic 5%→7%→9% curve vs
 /// +1/+2/+3 skill tiers). Pure — unit-tested.
-pub fn miss_chance_bp(skill_diff: u32) -> u32 {
+pub(crate) fn miss_chance_bp(skill_diff: u32) -> u32 {
     let raw = if skill_diff > 10 {
         700 + (skill_diff - 10) * 40
     } else {
@@ -164,7 +163,7 @@ pub fn miss_chance_bp(skill_diff: u32) -> u32 {
 /// Defender dodge chance in basis points: a `BASE_DODGE_BP` floor, plus an agility term, plus the
 /// skill-difference term (a higher-defense target dodges more), capped at `MAX_DODGE_BP`. Pure. A
 /// same-skill creature (agility 0) dodges at the floor.
-pub fn dodge_chance_bp(agility: u32, skill_diff: u32) -> u32 {
+pub(crate) fn dodge_chance_bp(agility: u32, skill_diff: u32) -> u32 {
     (BASE_DODGE_BP + agility * DODGE_BP_PER_AGILITY + skill_diff * 10).min(MAX_DODGE_BP)
 }
 
@@ -172,7 +171,7 @@ pub fn dodge_chance_bp(agility: u32, skill_diff: u32) -> u32 {
 /// higher-defense defender parries more — capped at `MAX_PARRY_BP`. Unlike dodge, parry does NOT scale
 /// with agility; it tracks defense-vs-weapon-skill only (vanilla). Pure — unit-tested. `skill_diff` 0 →
 /// the flat 5% floor (baseline-safe).
-pub fn parry_chance_bp(skill_diff: u32) -> u32 {
+pub(crate) fn parry_chance_bp(skill_diff: u32) -> u32 {
     (PARRY_BP + skill_diff * PARRY_BP_PER_SKILL).min(MAX_PARRY_BP)
 }
 
@@ -181,14 +180,14 @@ pub fn parry_chance_bp(skill_diff: u32) -> u32 {
 /// OUTCOME — it lands a hit whose damage a flat shield `block_value` was subtracted from, not the
 /// zero-damage avoidance of dodge/parry. Pure — unit-tested. The CALLER (`roll_swing`) gates this to a
 /// defender that actually has a shield equipped; an unshielded unit's band is 0 (baseline-safe).
-pub fn block_chance_bp(skill_diff: u32) -> u32 {
+pub(crate) fn block_chance_bp(skill_diff: u32) -> u32 {
     (BLOCK_BP + skill_diff * BLOCK_BP_PER_SKILL).min(MAX_BLOCK_BP)
 }
 
 /// Glancing chance in basis points: 0 against an equal/lower-level target, else `+10%` per level the
 /// target is above the attacker, capped at `MAX_GLANCING_BP`. Glancing blows can't crit and land
 /// reduced damage — the leveling-combat "tougher mob shrugs part of it off". Pure — unit-tested.
-pub fn glancing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
+pub(crate) fn glancing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
     (target_level.saturating_sub(attacker_level) * GLANCING_BP_PER_LEVEL).min(MAX_GLANCING_BP)
 }
 
@@ -197,7 +196,7 @@ pub fn glancing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
 /// creature-side mirror of glancing (which keys on the target being above the attacker) — a deep
 /// level gap lets a mob shrug the player around for amplified hits. Pure — unit-tested. The CALLER gates
 /// this to NPC→player swings (players never crush); an equal/lower-level attacker gets 0 here regardless.
-pub fn crushing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
+pub(crate) fn crushing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
     let diff = attacker_level.saturating_sub(target_level);
     if diff < CRUSH_MIN_LEVEL_DIFF {
         return 0;
@@ -207,7 +206,7 @@ pub fn crushing_chance_bp(attacker_level: u32, target_level: u32) -> u32 {
 
 /// Melee attack power from the Strength-based-class formula: `level*3 + Str*2 - 20`, clamped at 0
 /// (a tiny-stat unit has no negative AP). Exact for Warrior/Paladin; the general str-class curve.
-pub fn melee_attack_power(strength: u32, level: u32) -> u32 {
+pub(crate) fn melee_attack_power(strength: u32, level: u32) -> u32 {
     (level * 3 + strength * 2).saturating_sub(20)
 }
 
@@ -215,7 +214,7 @@ pub fn melee_attack_power(strength: u32, level: u32) -> u32 {
 const CLASS_HUNTER: u8 = 3;
 const CLASS_ROGUE: u8 = 4;
 
-pub fn melee_attack_power_for(class: u8, strength: u32, agility: u32, level: u32) -> u32 {
+pub(crate) fn melee_attack_power_for(class: u8, strength: u32, agility: u32, level: u32) -> u32 {
     match class {
         CLASS_ROGUE | CLASS_HUNTER => (level * 2 + strength + agility).saturating_sub(20),
         _ => melee_attack_power(strength, level),
@@ -226,13 +225,13 @@ pub fn melee_attack_power_for(class: u8, strength: u32, agility: u32, level: u32
 /// An approximation of the vanilla ranged-AP formula — close enough at low level; the only consumer is
 /// Auto Shot (spell 75, bows/guns). Wands (Shoot, 5019) use NO ranged AP (flat weapon damage). Folded into
 /// the ranged weapon's `[min,max]` by `weapon_swing_range_ap` so it scales with the weapon's speed. Pure.
-pub fn ranged_attack_power(agility: u32, level: u32) -> u32 {
+pub(crate) fn ranged_attack_power(agility: u32, level: u32) -> u32 {
     (level * 2 + agility).saturating_sub(10)
 }
 
 /// Ranged paperdoll values from the same weapon facts and pure calculations used by a ranged shot.
 /// Launchers scale with ranged attack power. Wands and other ranged weapons keep flat damage.
-pub fn ranged_sheet_values(
+pub(crate) fn ranged_sheet_values(
     agility: u32,
     level: u32,
     weapon: Option<(u32, u32, u32, u8)>,
@@ -255,7 +254,7 @@ pub fn ranged_sheet_values(
 /// `AP / 14`-per-second bonus (`ap * attack_time_ms / 14000`). The AP-explicit core so a caller can
 /// fold in extra AP (e.g. a Battle Shout aura) BEFORE the bonus is derived — the multiply is on the
 /// summed AP, the vanilla way (the buff scales with weapon speed too). Pure — unit-tested.
-pub fn player_swing_range_ap(ap: u32, attack_time_ms: u32) -> (u32, u32) {
+pub(crate) fn player_swing_range_ap(ap: u32, attack_time_ms: u32) -> (u32, u32) {
     let bonus = ap * attack_time_ms / (AP_PER_DPS * 1000);
     (UNARMED_BASE_MIN + bonus, UNARMED_BASE_MAX + bonus)
 }
@@ -264,12 +263,17 @@ pub fn player_swing_range_ap(ap: u32, attack_time_ms: u32) -> (u32, u32) {
 /// damage plus the `AP * delay_ms / 14000` bonus. The AP-explicit weapon core (mirrors
 /// `player_swing_range_ap`) so an aura's extra AP folds into the summed AP before the per-swing
 /// bonus is scaled by the weapon's speed. Pure — unit-tested.
-pub fn weapon_swing_range_ap(ap: u32, dmg_min: u32, dmg_max: u32, delay_ms: u32) -> (u32, u32) {
+pub(crate) fn weapon_swing_range_ap(
+    ap: u32,
+    dmg_min: u32,
+    dmg_max: u32,
+    delay_ms: u32,
+) -> (u32, u32) {
     let bonus = ap * delay_ms / (AP_PER_DPS * 1000);
     (dmg_min + bonus, dmg_max + bonus)
 }
 
-pub fn apply_offhand_penalty(min: u32, max: u32) -> (u32, u32) {
+pub(crate) fn apply_offhand_penalty(min: u32, max: u32) -> (u32, u32) {
     ((min / 2).max(1), (max / 2).max(1))
 }
 
@@ -286,7 +290,7 @@ pub(crate) fn effective_stat(base: i32, aura: i32, gear: i32) -> u32 {
 /// so the attack table's crit band never goes negative or overflows the 0..10000 line. The AP-explicit
 /// twin (mirrors `player_swing_range_ap`): the pure core so `effective_crit_bp` folds in the aura sum
 /// and the unit tests cover the math without a context. `bonus == 0` → exactly `CRIT_BP`. Pure. [entity]
-pub fn crit_bp_with_bonus(bonus: i32) -> u32 {
+pub(crate) fn crit_bp_with_bonus(bonus: i32) -> u32 {
     (CRIT_BP as i32 + bonus).clamp(0, 10_000) as u32
 }
 
@@ -296,7 +300,7 @@ pub fn crit_bp_with_bonus(bonus: i32) -> u32 {
 /// band ALONGSIDE the flat `CRIT_BP` base + the aura/gear bonus (so this is an ADD, not a replace — a
 /// zero-Agility unit, e.g. every creature, contributes 0 here and keeps the flat base, baseline-safe).
 /// Low-level approximation, NOT a byte-exact vanilla curve — `100`/`+4` are tuning knobs. Pure.
-pub fn agility_crit_bp(agility: u32, level: u32) -> u32 {
+pub(crate) fn agility_crit_bp(agility: u32, level: u32) -> u32 {
     agility * 100 / (level + 4)
 }
 
@@ -304,7 +308,7 @@ pub fn agility_crit_bp(agility: u32, level: u32) -> u32 {
 /// REDUCES the chance to miss, floored at 0 rather than underflowing). The pure core so
 /// `effective_miss_bp` folds in the aura sum and the unit tests cover the math without a context.
 /// `bonus == 0` → exactly `miss`. Pure. [entity]
-pub fn miss_bp_with_bonus(miss: u32, bonus: i32) -> u32 {
+pub(crate) fn miss_bp_with_bonus(miss: u32, bonus: i32) -> u32 {
     (miss as i32 - bonus).max(0) as u32
 }
 
@@ -312,7 +316,7 @@ pub fn miss_bp_with_bonus(miss: u32, bonus: i32) -> u32 {
 /// faster (shorter interval, a haste); negative = slower (longer, an attack-speed slow like Thunder Clap).
 /// The denominator is floored at 1 so a ≥100% slow can't divide-by-zero — it just becomes a very slow
 /// swing. Pure — unit-tested. `pct == 0` → exactly `base_ms` (baseline-safe).
-pub fn swing_time_with_haste(base_ms: u32, haste_pct: i32) -> u32 {
+pub(crate) fn swing_time_with_haste(base_ms: u32, haste_pct: i32) -> u32 {
     let denom = (100 + haste_pct).max(1) as u32;
     base_ms.saturating_mul(100) / denom
 }
@@ -321,7 +325,7 @@ pub fn swing_time_with_haste(base_ms: u32, haste_pct: i32) -> u32 {
 /// faster; negative = slower (a snare like Hamstring). Floored at 10% of base so a heavy snare slows but
 /// never freezes a unit dead (a zero-length step breaks the movement passes' no-op-leg skip and would
 /// look frozen). Pure — unit-tested. `pct == 0` → exactly `base` (baseline-safe). [pure]
-pub fn move_speed_with_pct(base: f32, pct: i32) -> f32 {
+pub(crate) fn move_speed_with_pct(base: f32, pct: i32) -> f32 {
     base * (100 + pct).max(10) as f32 / 100.0
 }
 
@@ -332,7 +336,7 @@ pub fn move_speed_with_pct(base: f32, pct: i32) -> f32 {
 /// normal 1.0×, elite 1.4×, rare-elite 1.8×, boss 2.5×, rare 1.5×. PERMILLE (×1000) keeps the scaling
 /// exact integer math (`dmg * permille / 1000`); rank 0 (`1000`) is the identity so every current
 /// rank-0 creature swing stays BYTE-IDENTICAL. Unknown rank → normal (never amplify). Pure — unit-tested.
-pub fn rank_damage_multiplier_permille(rank: u8) -> u32 {
+pub(crate) fn rank_damage_multiplier_permille(rank: u8) -> u32 {
     match rank {
         0 => 1000, // normal — identity (baseline)
         1 => 1400, // elite
@@ -346,7 +350,7 @@ pub fn rank_damage_multiplier_permille(rank: u8) -> u32 {
 /// Scale a creature swing `[min, max]` range by its `rank` (integer permille math, saturating). Shared
 /// by `swing_range_ctx` and its unit test so the live scaling and the asserted numbers never drift.
 /// Rank 0 → unchanged (`(CREATURE_MELEE_MIN, CREATURE_MELEE_MAX)` verbatim). Pure.
-pub fn scale_swing_for_rank(min: u32, max: u32, rank: u8) -> (u32, u32) {
+pub(crate) fn scale_swing_for_rank(min: u32, max: u32, rank: u8) -> (u32, u32) {
     let permille = rank_damage_multiplier_permille(rank);
     let scale = |d: u32| ((d as u64 * permille as u64) / 1000) as u32;
     (scale(min), scale(max))
@@ -357,7 +361,7 @@ pub fn scale_swing_for_rank(min: u32, max: u32, rank: u8) -> (u32, u32) {
 /// (every creature today) takes full damage; a player's agility-derived armor shaves a few percent
 /// off incoming creature swings. The single mitigation source shared by `roll_swing` (applies it to
 /// the rolled hit) and `swing_profile`/`debug_compute_swing` (surfaces it) — so they never drift.
-pub fn armor_mitigation_pct(armor: u32, attacker_level: u32) -> u32 {
+pub(crate) fn armor_mitigation_pct(armor: u32, attacker_level: u32) -> u32 {
     if armor == 0 {
         return 0;
     }
@@ -370,7 +374,7 @@ pub fn armor_mitigation_pct(armor: u32, attacker_level: u32) -> u32 {
 /// 1.12 community approximation (the real engine rolls partial-resist bands whose *average* this models)
 /// and is empirically live-verified here (a +6 fire ward vs an L2 caster mitigates Fireball 20→11 = 45%).
 /// It is NOT cross-checked byte-for-byte against retail; a band-rolled refinement is a later option.
-pub fn resist_mitigation_pct(resistance: u32, caster_level: u32) -> u32 {
+pub(crate) fn resist_mitigation_pct(resistance: u32, caster_level: u32) -> u32 {
     if resistance == 0 || caster_level == 0 {
         return 0;
     }
@@ -384,6 +388,7 @@ pub fn resist_mitigation_pct(resistance: u32, caster_level: u32) -> u32 {
 /// Pure. `roll_swing` rolls within the base range then applies the SAME `armor_mitigation_pct`, so a
 /// `debug_compute_swing` readout reflects exactly what live combat does (no drift). A landed hit is
 /// floored at 1 damage.
+#[cfg(any(test, feature = "debug_reducers"))]
 pub struct SwingProfile {
     pub base_min: u32,
     pub base_max: u32,
@@ -392,7 +397,8 @@ pub struct SwingProfile {
     pub final_max: u32,
 }
 
-pub fn swing_profile(
+#[cfg(any(test, feature = "debug_reducers"))]
+pub(crate) fn swing_profile(
     base_min: u32,
     base_max: u32,
     target_armor: u32,
@@ -519,7 +525,8 @@ fn health_regen_per_tick(spirit: u32, level: u32) -> u32 {
 ///
 /// BASELINE-SAFETY: with `spirit == 0` a mana unit still regens `level/2 + 1` per tick when not
 /// paused; energy is unchanged by spirit; rage decays at the vanilla-approximate rate.
-pub fn regen_power(
+#[cfg(test)]
+pub(crate) fn regen_power(
     power_type: u8,
     current: u32,
     max: u32,
@@ -588,7 +595,8 @@ fn regen_power_with_flat(
 /// max HP that is NOT engaged. Pure — unit-tested. Never exceeds `max` (the `.min(max)` cap);
 /// `max == 0` yields no change. A spirit-0 unit (every creature today) still heals `level + 1` per
 /// tick — a small, sane amount that keeps the prior "recovers a bit out of combat" behavior.
-pub fn regen_health(current: u32, max: u32, spirit: u32, level: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn regen_health(current: u32, max: u32, spirit: u32, level: u32) -> u32 {
     regen_health_with_flat(current, max, spirit, level, 0)
 }
 
@@ -688,7 +696,8 @@ pub(crate) fn regen_entity_health(
 /// multiple auras can stack to 100). Never exceeds `max`; `max == 0` yields no change. Pure —
 /// unit-tested. `spirit == 0` (every creature today) still heals `(level+1) * pct / 100` which
 /// for a L5 troll is (6) * 10 / 100 = 0 (floored) — tiny but not 0 once `level` is meaningful.
-pub fn regen_health_in_combat(
+#[cfg(any(test, feature = "debug_reducers"))]
+pub(crate) fn regen_health_in_combat(
     current: u32,
     max: u32,
     spirit: u32,

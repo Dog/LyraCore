@@ -43,7 +43,7 @@ pub(crate) fn meets_required_reputation(
 /// whole stack at once). Pure — unit-tested. Saturating so a pathological count never wraps the copper
 /// total (the credit itself is also saturating on the player's money). A 0 `sell_price` is the
 /// "no vendor value" sentinel handled by the caller, not here.
-pub fn sell_value(unit_price: u32, count: u32) -> u32 {
+pub(crate) fn sell_value(unit_price: u32, count: u32) -> u32 {
     unit_price.saturating_mul(count)
 }
 
@@ -51,14 +51,14 @@ pub fn sell_value(unit_price: u32, count: u32) -> u32 {
 /// `buy_price * count`). Pure — unit-tested. Saturating so a pathological count never wraps the copper
 /// total; the affordability check then compares against the player's money. A 0 `buy_price` is the
 /// "no vendor value" sentinel rejected by the caller (an item the vendor never sells), not here.
-pub fn buy_cost(unit_price: u32, count: u32) -> u32 {
+pub(crate) fn buy_cost(unit_price: u32, count: u32) -> u32 {
     unit_price.saturating_mul(count)
 }
 
 /// Copper to repair ONE item from `durability` back to `max_durability`: 1 copper per restored point.
 /// Pure — unit-tested. A simple, correct proxy for vanilla's DBC DurabilityCost table (which we don't
 /// import): monotonic in damage, zero when undamaged, saturating. `repair_all` sums this over the body.
-pub fn repair_cost(max_durability: u32, durability: u32) -> u32 {
+pub(crate) fn repair_cost(max_durability: u32, durability: u32) -> u32 {
     max_durability.saturating_sub(durability)
 }
 
@@ -66,7 +66,7 @@ pub fn repair_cost(max_durability: u32, durability: u32) -> u32 {
 /// source has, but never more than the destination's remaining headroom (`max_stack - dst`). Pure —
 /// unit-tested. `saturating_sub` keeps an already-full (or over-full) destination at 0 headroom rather
 /// than wrapping. The merge caller uses this for the move-onto-same-stackable case (FEATURE B). [entity]
-pub fn merge_amount(src: u32, dst: u32, max_stack: u32) -> u32 {
+pub(crate) fn merge_amount(src: u32, dst: u32, max_stack: u32) -> u32 {
     src.min(max_stack.saturating_sub(dst))
 }
 
@@ -76,7 +76,7 @@ pub fn merge_amount(src: u32, dst: u32, max_stack: u32) -> u32 {
 /// Anything else (food, armor, an off-hand-only weapon type) is rejected, so you can't equip e.g.
 /// Tough Jerky in the weapon slot. The other 18 equipment slots are validated by `can_equip_into` /
 /// `inventory_type_to_slot`, which this function backs for main-hand specifically. [reference]
-pub fn can_equip_mainhand(class: u8, inventory_type: u8) -> bool {
+pub(crate) fn can_equip_mainhand(class: u8, inventory_type: u8) -> bool {
     class == 2 && matches!(inventory_type, 13 | 17 | 21)
 }
 
@@ -87,8 +87,11 @@ pub mod bonding {
     pub const NONE: u8 = 0;
     pub const BIND_ON_PICKUP: u8 = 1; // BoP — binds the instant it's granted (quest reward, loot, starter kit, vendor buy)
     pub const BIND_ON_EQUIP: u8 = 2; // BoE — binds the first time it's equipped
+    #[cfg(test)]
     pub const BIND_ON_USE: u8 = 3;
+    #[cfg(test)]
     pub const QUEST_ITEM: u8 = 4;
+    #[cfg(test)]
     pub const QUEST_ITEM2: u8 = 5;
 }
 
@@ -96,11 +99,11 @@ pub mod bonding {
 /// `grant_starter_item` insert — quest reward, loot, starter kit, vendor buy, buyback)? Pure —
 /// unit-tested. Only BIND_ON_PICKUP (BoP) does; everything else (unbound, BoE, BoU, quest items)
 /// does not bind at grant time. [reference]
-pub fn binds_on_grant(item_bonding: u8) -> bool {
+pub(crate) fn binds_on_grant(item_bonding: u8) -> bool {
     item_bonding == bonding::BIND_ON_PICKUP
 }
 
-pub fn binds_on_equip(item_bonding: u8) -> bool {
+pub(crate) fn binds_on_equip(item_bonding: u8) -> bool {
     item_bonding == bonding::BIND_ON_EQUIP
 }
 
@@ -133,6 +136,7 @@ pub mod equip_slot {
 }
 
 pub mod invtype {
+    #[cfg(test)]
     pub const NON_EQUIP: u8 = 0;
     pub const HEAD: u8 = 1;
     pub const NECK: u8 = 2;
@@ -171,7 +175,7 @@ pub mod invtype {
 /// FREE slot of the pair. 2H + main-hand-only weapons and a plain one-hand all map to MAINHAND (15);
 /// off-hand weapon / shield / holdable map to OFFHAND (16); bow/gun/thrown/wand map to RANGED (17).
 /// The vanilla first-free-slot rule, as a pure type→slot lookup of our own. [reference]
-pub fn inventory_type_to_slot(inventory_type: u8) -> Option<u8> {
+pub(crate) fn inventory_type_to_slot(inventory_type: u8) -> Option<u8> {
     use equip_slot as e;
     use invtype as t;
     Some(match inventory_type {
@@ -225,7 +229,12 @@ pub(crate) fn paired_equip_slot(slot: u8) -> Option<u8> {
 /// acceptance below. When `false`, a one-hander is only accepted at MAINHAND (matching
 /// `inventory_type_to_slot`'s WEAPON→MAINHAND mapping) — baseline-safe for every caller that hasn't
 /// threaded Dual Wield knowledge. [reference]
-pub fn can_equip_into(class: u8, inventory_type: u8, dest_slot: u8, can_dual_wield: bool) -> bool {
+pub(crate) fn can_equip_into(
+    class: u8,
+    inventory_type: u8,
+    dest_slot: u8,
+    can_dual_wield: bool,
+) -> bool {
     use equip_slot as e;
     // Main-hand defers to the stricter `can_equip_mainhand` gate (weapon class + specific invtypes).
     if dest_slot == e::MAINHAND {
@@ -248,13 +257,15 @@ pub fn can_equip_into(class: u8, inventory_type: u8, dest_slot: u8, can_dual_wie
     resolved == canonical
 }
 
-pub use lyracore_shared::item::{armor_subclass, weapon_subclass, Proficiency};
+#[cfg(test)]
+pub use lyracore_shared::item::armor_subclass;
+pub use lyracore_shared::item::{weapon_subclass, Proficiency};
 
 /// Whether a character of `player_level` meets an item's `required_level` to EQUIP or USE it. Pure —
 /// unit-tested. A required_level of 1 (every seeded item today) is met by every character, so this gate
 /// is a no-op for the existing loadout; only items SQL-raised above the character level are rejected.
 /// Vanilla "requires level N" — you can carry a too-high item in the bag, you just can't equip/use it.
-pub fn meets_required_level(player_level: u32, required_level: u8) -> bool {
+pub(crate) fn meets_required_level(player_level: u32, required_level: u8) -> bool {
     player_level >= required_level as u32
 }
 

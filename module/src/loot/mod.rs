@@ -26,9 +26,25 @@ use lyracore_shared::loot::LootRefusal;
 use lyracore_shared::loot_roll::event_kind as roll_event_kind; // apply_loot_money's MONEY_SHARE push
 
 mod rolls;
-pub use rolls::*;
+pub use rolls::{
+    game_corpse_loot_eligible, game_loot_roll, game_loot_roll_promotion_receipt,
+    game_loot_roll_vote, CorpseLootEligible, LootRoll, LootRollPromotionReceipt, LootRollVote,
+};
+
+pub(crate) use rolls::{
+    apply_group_loot_rules, apply_master_give, cast_vote_on, force_resolve_rolls_for_disband,
+    sweep_loot_rolls,
+};
+
 pub(crate) mod tag;
-pub use tag::*;
+pub(crate) use tag::{
+    corpse_access, corpse_access_gate, corpse_eligible_for_access, corpse_eligible_recipients,
+    death_entitlement,
+};
+pub use tag::{
+    game_creature_loot_tag_group, game_creature_quest_tap, game_creature_quest_tap_member,
+    CreatureLootTagGroup, CreatureQuestTap, CreatureQuestTapMember,
+};
 
 // The profession reducers (skinning/fishing/enchanting) live in the sibling top-level
 // `crate::professions` module — re-exported here so every existing
@@ -125,7 +141,7 @@ pub struct CreatureLoot {
 
 /// Independent drop test (`group_id == 0`): does an item with `chance_bp` (0..=10000) drop on a
 /// `roll` in 0..10000? Half-open (`roll < chance`) so 10000 always drops and 0 never does. Pure/testable.
-pub fn loot_drops(chance_bp: u32, roll_0_9999: u32) -> bool {
+pub(crate) fn loot_drops(chance_bp: u32, roll_0_9999: u32) -> bool {
     roll_0_9999 < chance_bp
 }
 
@@ -133,7 +149,7 @@ pub fn loot_drops(chance_bp: u32, roll_0_9999: u32) -> bool {
 /// of the member that drops, or `None` if the roll lands past the members' cumulative weight (the
 /// group's "nothing" band — only reachable when the weights sum below 10000). This is the vanilla
 /// group-loot semantics: at most one item from a shared pool, weighted by chance. Pure/testable.
-pub fn group_pick(member_bp: &[u32], roll_0_9999: u32) -> Option<usize> {
+pub(crate) fn group_pick(member_bp: &[u32], roll_0_9999: u32) -> Option<usize> {
     let mut cum = 0u32;
     for (i, &bp) in member_bp.iter().enumerate() {
         cum = cum.saturating_add(bp);
@@ -150,7 +166,7 @@ pub fn group_pick(member_bp: &[u32], roll_0_9999: u32) -> Option<usize> {
 /// boss 3.0×, rare 2.0×. PERMILLE (×1000) for exact integer math; rank 0 (`1000`) is the identity so a
 /// normal kill's purse is BYTE-IDENTICAL to before. Unknown rank → normal (never amplify). Pure —
 /// unit-tested. (HP/damage rank scaling live in `creatures/`/`combat/`; this is the loot twin.)
-pub fn rank_money_multiplier_permille(rank: u8) -> u32 {
+pub(crate) fn rank_money_multiplier_permille(rank: u8) -> u32 {
     match rank {
         0 => 1000, // normal — identity (baseline)
         1 => 1500, // elite
@@ -165,7 +181,7 @@ pub fn rank_money_multiplier_permille(rank: u8) -> u32 {
 /// large roll × a high multiplier can't wrap a `u32`). Shared by the killing-blow money roll
 /// (combat/) and the unit test so the live scaling and the asserted numbers never drift. Rank 0 →
 /// the amount unchanged. Pure.
-pub fn scale_money_for_rank(money: u32, rank: u8) -> u32 {
+pub(crate) fn scale_money_for_rank(money: u32, rank: u8) -> u32 {
     let permille = rank_money_multiplier_permille(rank);
     ((money as u64 * permille as u64) / 1000) as u32
 }

@@ -1,8 +1,8 @@
-# Package API, version 2
+# Package API, version 3
 
 The Package API is the part of the Module a Package may name. A Package compiles into the Module
 wasm and can reach any `crate::` path the compiler resolves; this document says which of those paths
-core will keep working, and `module/build.rs` fails the build on the rest.
+core will keep working, and `cargo test -p lyracore-module --test package_api_lint` reports paths outside that contract.
 
 This is a contract, not a tutorial. Read `packages/README.md` for how a Package is installed and
 [the Reference Packages](https://github.com/LyraCoreProject/packages#packages) for working examples.
@@ -88,7 +88,7 @@ ordering does not promise an atomic operation across Shards.
 
 ### Package-owned Accounts
 
-`package_account::create_package_character(ctx, package_name, name, race, class) -> Result<u64, String>`
+`package::create_character(ctx, package_name, name, race, class) -> Result<u64, String>`
 creates a Character with no Session and returns its guid. It applies the Refusals a client-created
 Character meets: `NAME_IN_USE` for a taken name, `INVALID_RACE_CLASS` for a pair the imported
 CharBaseInfo does not list, and the guid range Refusal. These Refusals write nothing.
@@ -131,7 +131,7 @@ Characters stay Dormant.
 
 ### Encounter kernel
 
-`crate::encounter` holds the encounter state machine and the choreography verbs a Package drives it
+`crate::package::encounter` holds the encounter state machine and the choreography verbs a Package drives it
 with: `get_encounter_state`, `set_encounter_state`, `get_encounter_data`, `set_encounter_data`,
 `watch_hp_threshold`, `reset_hp_fired`, `open_door`, `spawn_wave`, `equip_swap`, `move_to_point`,
 `encounter_reset`, `encounter_reset_full`, and the four `ENCOUNTER_*` state constants. Core ships no
@@ -173,7 +173,7 @@ selected profile is the source of the entitlement.
 complete old curated header shapes. Imported or Operator-tuned rows remain authoritative.
 
 `actor::request_cast(ctx, actor_guid, spell_id, target_guid)` returns
-`Result<spell::CastStart, spell::CastRefusal>`. `Started` carries a Cast Handle. `Waiting` carries
+`Result<actor::CastStart, actor::CastRefusal>`. `Started` carries a Cast Handle. `Waiting` carries
 an existing cast's original identity, spell, target, and current due time, even when the new request
 names a different spell or target. It never restarts that cast. `Resolved` means effects dispatched
 synchronously, which does not imply a projectile hit. Channeled spells return `UnsupportedChannel`
@@ -183,24 +183,25 @@ requests require the spell in `game_player_spell`. Creature and triggered spell-
 their existing spellbook exemption.
 
 A scheduled cast ends through `on_cast_finished`. Its payload carries the caster, target, scheduled
-identity, and `spell::CastFinish`. Packages must match the scheduled identity before updating retained
+identity, and `actor::CastFinish`. Packages must match the scheduled identity before updating retained
 work. The hook runs after the pending row is removed. An instant cast returns its result directly and
 does not fire this hook. `on_cast_resolved` keeps its existing effect-dispatch contract.
 
-`spell::pending_cast` reads the current Cast Handle by caster. Refusal kinds are supplied by the
+`actor::pending_cast` reads the current Cast Handle by caster. Refusal kinds are supplied by the
 owning Gate. `Other` preserves a Gate's message when no current caller needs a separate policy.
 `UnlearnedSpell` and `NoLineOfSight` identify the spellbook and targeted visibility Gates.
 
-`spell::cancel_cast_attempt(ctx, caster_guid, scheduled_id)` cancels only that scheduled cast.
-`spell::expire_cast_attempt(ctx, caster_guid, scheduled_id, deadline_micros)` also requires the
+`actor::cancel_cast_attempt(ctx, caster_guid, scheduled_id)` cancels only that scheduled cast.
+`actor::expire_cast_attempt(ctx, caster_guid, scheduled_id, deadline_micros)` also requires the
 caller's action deadline to have passed. They return whether they removed the cast and report
 `Cancelled` or `Expired` through `on_cast_finished`. A stale identity cannot cancel a replacement.
 
-`crate::helpers` holds the reads a Package needs before it acts: `live_entity`, `require_character`,
-`character_by_guid`, `character_by_name`, `entity_by_owner`, `acting_entity_by_guid`, `entities_near`,
-`nearest_entity`, `in_same_partition`, `require_operator`.
+`crate::actor` also exposes Character and live-entity reads, nearby entities, partition checks,
+quest eligibility, loot entitlement, spell readiness and cast observations. The named re-exports
+in `module/src/actor.rs` are the supported operations. Package authorization, Character setup and
+encounter operations are named in `module/src/package.rs`.
 
-`group::party_facts(ctx, character_guid)` reads the Character's local durable party mirror. It names
+`actor::party_facts(ctx, character_guid)` reads the Character's local durable party mirror. It names
 the leader and every member, with nullable live position, health, and death facts. An absent local
 Unit may instead carry a Realm-core-certified map, instance, and locator revision. Pending Transfer,
 unknown location, and departed-member fences expose no partition. Enemy facts cover hostile
@@ -221,7 +222,7 @@ acting from an arbitrary prefix.
 ### Package Config
 
 An Operator-tunable value, seeded by the Package and edited without a republish.
-`crate::package_config::ensure_package_config_default(ctx, package, key, default)` inserts only when
+`crate::package::ensure_config_default(ctx, package, key, default)` inserts only when
 the row is absent, so a Package calls it from its own ensure path on every run. The Operator edits
 with the `set_package_config` reducer.
 
@@ -236,7 +237,7 @@ Events.
 
 ### Package fixtures (debug only)
 
-`crate::package_fixture` exists only in a Module built with `debug_reducers`. It holds the setup and
+`crate::package::fixture` exists only in a Module built with `debug_reducers`. It holds the setup and
 observation steps a Package's own debug fixtures need. A release build has no such root.
 
 | operation | does |
@@ -250,7 +251,7 @@ observation steps a Package's own debug fixtures need. A release build has no su
 | `record_completed_transfer(ctx, character_guid, map_id, instance_id)` | records a finished Transfer in Realm-core's character-to-shard index |
 | `declare_next_movement_tick(ctx, delay)` | makes the next creature movement tick fire once, `delay` from now; refuses unless the catch-all tick is the only movement schedule |
 
-A fixture reads the navigation revision through `nav::inputs(ctx, map_id).imported_revision`.
+A fixture reads the navigation revision through `actor::movement::inputs(ctx, map_id).imported_revision`.
 
 Name this root only from a Package file whose first non-blank line is
 `#![cfg(feature = "debug_reducers")]`. The lint refuses it anywhere else, and no exemption clears
@@ -258,7 +259,7 @@ it, because a release build would compile that file without the root.
 
 ### Package tests (test only)
 
-`crate::package_test` exists only in a Module test build. It holds what a Package's own unit tests
+`crate::package::test` exists only in a Module test build. It holds what a Package's own unit tests
 need.
 
 | operation | does |
@@ -284,42 +285,46 @@ rule `docs/schema.md` states. The Package name in the accessor is what keeps two
 colliding. The accessor is also the table name Package Teardown empties, so the build refuses a
 Package table that sets its own `name`.
 
-Core table accessors are named `game_*` and are reached at the crate root:
-`use crate::{game_world_entity, game_character};`. Row types are re-exported at the crate root under
-their type names: `crate::WorldEntity`, `crate::CharacterQuest`. Both forms are on the surface.
-`crate::CHARACTER_OWNED_TABLES` is the generated manifest of character-keyed tables.
+Core table accessors and row types are named under `crate::tables`, for example
+`use crate::tables::{game_world_entity, WorldEntity};`. The catalog in
+`module/src/tables.rs` lists them explicitly. Crate-root row aliases remain for Core and schema
+checks; a Package uses the catalog path. `crate::CHARACTER_OWNED_TABLES` is the generated manifest
+of character-keyed tables.
 
 ### Module roots
 
-The `crate::` roots a Package may name. Everything under a listed root is on the surface at this
-version; root granularity is deliberate, so a core refactor inside a root does not churn the
-contract.
+A Package may name these five roots. Each operation and type is a named declaration or re-export.
 
 ```
-actor      chat     combat    creatures  encounter  faction   gameobject
-group      helpers  hooks     items      loot       nav       package_account
-package_config      quest     script_binding        spell     stats
-terrain    transfer world     xp
+actor hooks package tables script_binding
 ```
 
-Debug only: `package_fixture`, in a file gated on `debug_reducers` (see Package fixtures above).
-Test only: `package_test`, in a file gated on `#![cfg(test)]` (see Package tests above).
+`actor` holds Actor operations and observations. `actor::movement` holds navigation and movement
+operations. `hooks` holds event payloads. `package` holds Package-owned Character setup, Package
+Config, authorization and encounter operations. `tables` holds table accessors and row types.
+`script_binding` holds Runtime Script dispatch.
 
-Plus, at the crate root: any `game_*` name (a table accessor or registration marker), any
-`pkg_*` name (a Package's own generated root module), any type name in UpperCamelCase (a row or
-payload type), `character_owned!`, `encounter_package!`, and `CHARACTER_OWNED_TABLES`.
+`package::fixture` requires a file gated on `debug_reducers`. `package::test` requires a file gated
+on `#![cfg(test)]`. These child paths retain the gates described above.
 
-A root that is absent is core's own business. `auth`, `debug`, `runtime_script`, `test_scan`,
-`realm_core`, `gw` and the rest are not promised, and naming one fails the build.
+The marker macros listed above, `CHARACTER_OWNED_TABLES`, and generated `pkg_*` modules also remain
+available at the crate root. Arbitrary `game_*` or UpperCamelCase names do not qualify.
+
+The former roots `chat`, `combat`, `creatures`, `encounter`, `faction`, `gameobject`, `group`,
+`helpers`, `items`, `loot`, `nav`, `package_account`, `package_config`, `quest`, `spell`, `stats`,
+`terrain`, `transfer`, `world`, and `xp` are internal. Migrate calls to the named Actor or Package
+operation and table imports to `crate::tables`. There are no compatibility aliases for those
+roots in the Package contract.
 
 ## The lint
 
-`module/build.rs` reads every file under `packages/*/src/` and fails the build on the first path that
+`cargo test -p lyracore-module --test package_api_lint` reads every Rust file under
+`packages/*/src/` and fails when a path
 reaches a crate root outside the list above. The failure names the Package, file, line and path. Core
 `src/` is never linted because the Package API is a promise core makes to Packages, not to itself.
 
 The scanner recognizes `crate::`, `$crate::`, and a `super::` chain that leaves the Package module.
-Raw identifiers have their ordinary meaning, so `crate::r#helpers` names the documented `helpers`
+Raw identifiers have their ordinary meaning, so `crate::r#actor` names the documented `actor`
 root.
 
 The scanner uses the file path and inline modules to distinguish a crate-root escape from a
@@ -335,7 +340,7 @@ that supplies `path` also fail. `include!` fails because it can add unscanned Ru
 equal.
 
 This remains a lexical compatibility check, not Rust name resolution. It does not expand macros or
-follow a re-export declared in another file. Rust still compiles every Package after this check;
+follow a re-export declared in another file. The compiler and the lint run separately;
 these limits do not turn the Package API into a sandbox.
 
 Comments and string literals are stripped before the scan, so a path quoted in a doc example is
@@ -352,7 +357,7 @@ bare marker does not clear. Every exemption is a gap in this document; raise it 
 so the surface can grow or the Package can move off it.
 
 An exemption cannot enable a whole-crate alias or `#[path]`. Either spelling can hide dependencies
-on other lines or in files the lint cannot locate, so the build always refuses it.
+on other lines or in files the lint cannot locate, so the lint always refuses it.
 
 ## Action observations
 
@@ -368,14 +373,14 @@ have no waiting, cancellation, or expiry phase. Attack requests also return `Act
 Its `kind` identifies actionable Gates and `detail` preserves the client message. `Other` is an
 opaque refusal; Package policy must not classify its text.
 
-`nav::route_step` accepts the same arguments as `nav_step` and returns a `RouteStep`. Its `status`
+`actor::movement::route_step` accepts the same arguments as `nav_step` and returns a `RouteStep`. Its `status`
 is `Complete`, `Partial`, `Blocked`, or `Direct` when navigation is disabled. Complete and Partial
 describe the planned route. `first_waypoint`, `expansions`, and `clipping` retain search and commit
 Gate evidence. `endpoint == from` means no movement was approved, even if a complete path was
 planned. A blocked search holds position. Creature callers retain `nav_step` and its existing
 collision-gated fallback.
 
-`nav::coverage_generation(ctx, map_id)` returns the active complete coverage generation when its
+`actor::movement::coverage_generation(ctx, map_id)` returns the active complete coverage generation when its
 Gate is enabled, or `None`. Include it with map and instance in deferred destination keys. A changed
 generation invalidates a retained route decision; `None` preserves unknown coverage.
 
@@ -392,15 +397,18 @@ living body to that authority check. A pending cast or movement-suppressing crow
 movement. Call it before issuing a movement leg, including continuation between decision turns. The Gate reads
 current state and does not cancel casts or change position.
 
-`creatures::tick::stop_where_rendered(ctx, &mut mover)` stops the mover's current leg where the
-client renders it now, facing along its Route Path. It moves the row to that point and sends a stop
-there. The caller writes the row. A mover's stored position can lag its leg, so a stop at the stored
-position moves the client back. A blocked Route Path segment or changed navigation inputs halt the
-stop where a leg advance would halt, so it never lands past an obstruction.
+`actor::stop_movement(ctx, actor_guid)` stops the current leg where the client renders the Actor
+and writes the resulting position. If the body is absent, it removes the stale leg. The caller
+must check its movement ownership before stopping a leg.
 
-`creatures::tick::emit_creature_path(ctx, mover, points, run)` sends the mover along a checked Route
+`actor::restore_sessionless_body(ctx, character_guid)` returns an existing body or rebuilds a
+missing one from an available Character row. It preserves released ghost state and removes the
+old movement leg when it rebuilds. With no body, an absent or Transfer-fenced Character returns
+`None`. The Package checks controller consent and pending Transfer Intent policy before calling.
+
+`actor::movement::emit_creature_path(ctx, mover, points, run)` sends the mover along a checked Route
 Path and writes the row. A mover on a leg starts the path from the point that
-`stop_where_rendered` would stop it at, so a renewal between two advance firings does not move the
+`actor::stop_movement` would stop it at, so a renewal between two advance firings does not move the
 client back.
 
 `actor::area_trigger_route(ctx, trigger_id)` reads one exact imported AreaTrigger source volume and
@@ -410,7 +418,7 @@ volume, exact existing dungeon instance lease, and a Realm-certified party membe
 partition before it applies the imported landing and writes one Transfer Intent. A Refusal leaves
 the Character, instance binding, and intent unchanged.
 
-`nav::LEG_MAX_EXPANSIONS` is the expansion cap used by `nav::route_step`. A Package can reserve that work before selecting movement.
+`actor::movement::LEG_MAX_EXPANSIONS` is the expansion cap used by `actor::movement::route_step`. A Package can reserve that work before selecting movement.
 
 ## Runtime Scripts
 

@@ -16,7 +16,7 @@ use super::*;
 /// Scheduler-only. A caster or target that becomes ineligible during the cast produces a Refusal,
 /// which is logged and relayed as an interruption. The scheduler auto-deletes the one-shot row.
 #[reducer]
-pub fn fire_pending_cast(ctx: &ReducerContext, sched: PendingCast) {
+pub(crate) fn fire_pending_cast(ctx: &ReducerContext, sched: PendingCast) {
     if ctx.sender() != ctx.database_identity() {
         return;
     }

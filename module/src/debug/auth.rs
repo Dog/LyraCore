@@ -4,7 +4,7 @@ use crate::auth::{game_session, game_session_reaper_schedule};
 
 /// Exercise the real recurring scheduler without waiting for the production interval.
 #[reducer]
-pub fn debug_accelerate_session_reaper(ctx: &ReducerContext) -> Result<(), String> {
+pub(crate) fn debug_accelerate_session_reaper(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
     let schedules = ctx.db.game_session_reaper_schedule();
     let mut schedule = schedules

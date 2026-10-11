@@ -57,6 +57,7 @@ jobs:
       # Share compiled dependencies while keeping each crate's result separate.
       - run: cargo test -p lyracore-importer
       - run: cargo test -p lyracore-module --lib --features=debug_reducers
+      - run: cargo test -p lyracore-module --test build_script
       - run: cargo test -p lyracore-module --test package_api_lint
       - run: cargo test -p lyracore-package-delta
       - run: cargo test -p lyracore-gateway
@@ -84,9 +85,13 @@ jobs:
         env:
           BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          if git ls-remote --exit-code --heads https://github.com/LyraCoreProject/packages "refs/heads/$BRANCH" >/dev/null; then
-            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+          if paired=$(git ls-remote --exit-code --heads https://github.com/LyraCoreProject/packages "refs/heads/$BRANCH"); then
+            echo "ref=${paired%%[[:space:]]*}" >> "$GITHUB_OUTPUT"
           else
+            status=$?
+            if [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
             echo "ref=main" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,4 +103,5 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install the official Packages
         run: for package in official-packages/*/; do ln -s "$PWD/$package" packages/; done
+      - run: cargo test -p lyracore-module --test package_api_lint
       - run: cargo check --target wasm32-unknown-unknown -p lyracore-module --features=debug_reducers

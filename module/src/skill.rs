@@ -83,7 +83,7 @@ pub mod skill_line {
     pub const RIDING: u32 = lyracore_shared::trainer::RIDING_SKILL_LINE;
 }
 
-pub fn is_profession_line(line: u32) -> bool {
+pub(crate) fn is_profession_line(line: u32) -> bool {
     use skill_line::*;
     matches!(
         line,
@@ -109,7 +109,7 @@ pub const APPRENTICE_CAP: u16 = 75;
 
 /// Map a vanilla weapon `ItemTemplate.subclass` to its `skill_line`. Anything unrecognized (or no weapon)
 /// resolves to `UNARMED` — the line an empty-handed swing trains, so a fist/unmapped weapon never errors.
-pub fn weapon_subclass_to_skill_line(subclass: u8) -> u32 {
+pub(crate) fn weapon_subclass_to_skill_line(subclass: u8) -> u32 {
     use skill_line::*;
     match subclass {
         0 => AXE_1H,
@@ -128,19 +128,19 @@ pub fn weapon_subclass_to_skill_line(subclass: u8) -> u32 {
 
 /// The skill cap for a unit of `level` — `level * SKILL_PER_LEVEL`. Both the max a tracked skill can reach
 /// and the baseline value an UNtracked skill reads as (so combat against an equal-level foe nets 0).
-pub fn skill_cap_for_level(level: u32) -> u32 {
+pub(crate) fn skill_cap_for_level(level: u32) -> u32 {
     level * SKILL_PER_LEVEL
 }
 
 /// The attack-table skill difference (in skill points) driving miss/dodge/parry/block: how far the
 /// defender's defense skill exceeds the attacker's weapon skill, clamped at 0 (a higher-skilled attacker
 /// adds nothing — the band floors). The single definition both live combat and the readback use.
-pub fn skill_diff(defense_skill: u32, weapon_skill: u32) -> u32 {
+pub(crate) fn skill_diff(defense_skill: u32, weapon_skill: u32) -> u32 {
     defense_skill.saturating_sub(weapon_skill)
 }
 
 /// One skill-up step: `current + 1`, clamped to `cap`. A skill already at cap is unchanged.
-pub fn next_skill(current: u32, cap: u32) -> u32 {
+pub(crate) fn next_skill(current: u32, cap: u32) -> u32 {
     (current + 1).min(cap)
 }
 
@@ -252,7 +252,7 @@ fn intellect_assist(intellect: u32, level: u32) -> f64 {
 /// grinding a grey mob still trains a lagging weapon skill here. That is a statement about observable
 /// behaviour we match — no implementation of it was copied. Pure → unit-tested at the seam, the
 /// monotonicity contract, and the clamp edges.
-pub fn combat_skillup_chance_bp(
+pub(crate) fn combat_skillup_chance_bp(
     current: u32,
     cap: u32,
     level: u32,
@@ -279,7 +279,7 @@ pub fn combat_skillup_chance_bp(
 /// SENTINEL: `gray <= orange` (notably the default-band `orange=1, gray=0`) means "no difficulty / always
 /// skill up" → returns 10000. The seeded recipes/nodes carry the default band, so every craft/gather
 /// deterministically +1s.
-pub fn skillup_chance_bp(current: u32, orange: u32, gray: u32) -> u32 {
+pub(crate) fn skillup_chance_bp(current: u32, orange: u32, gray: u32) -> u32 {
     if gray <= orange {
         return 10_000; // degenerate/disabled band (incl. the default sentinel) => always skill up
     }
@@ -299,7 +299,7 @@ pub fn skillup_chance_bp(current: u32, orange: u32, gray: u32) -> u32 {
 /// tier (Journeyman 150 over Apprentice 75) lifts the ceiling; re-buying the same/lower tier is a no-op
 /// (the idempotency the trainer's already-known gate also enforces). `learn_profession` uses exactly this
 /// for the present-row case (a NEW row instead just inserts `1/offered_cap`).
-pub fn raised_cap(current_cap: u16, offered_cap: u16) -> u16 {
+pub(crate) fn raised_cap(current_cap: u16, offered_cap: u16) -> u16 {
     current_cap.max(offered_cap)
 }
 
@@ -382,7 +382,7 @@ fn skill_value_or_cap(ctx: &ReducerContext, guid: u64, line: u32, level: u32) ->
 
 /// A unit's EFFECTIVE weapon skill: the trained value of its equipped weapon's line, else the `level*5`
 /// baseline. A creature (no items) always reads the baseline → its swings are unchanged.
-pub fn effective_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
+pub(crate) fn effective_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
     let line = equipped_weapon_skill_line(ctx, attacker.guid);
     skill_value_or_cap(ctx, attacker.guid, line, attacker.level)
 }
@@ -391,7 +391,7 @@ pub fn effective_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) -> u
 /// `A_MOD_COMBAT(COMBAT_DEFENSE)` aura and Defense from working equipped items. More defense raises
 /// `skill_diff` against an attacker, so it tightens the attacker's miss/dodge/parry/block bands — a
 /// defender's avoidance. With neither source, this is exactly the trained or baseline value. [entity]
-pub fn effective_defense_skill(ctx: &ReducerContext, target: &WorldEntity) -> u32 {
+pub(crate) fn effective_defense_skill(ctx: &ReducerContext, target: &WorldEntity) -> u32 {
     let base = skill_value_or_cap(ctx, target.guid, skill_line::DEFENSE, target.level);
     let aura = crate::spell::combat_field_bonus(ctx, target.guid, crate::spell::COMBAT_DEFENSE);
     let gear =
@@ -402,7 +402,11 @@ pub fn effective_defense_skill(ctx: &ReducerContext, target: &WorldEntity) -> u3
 /// The attack-table skill difference for a swing of `attacker` at `target`: the defender's defense skill
 /// minus the attacker's weapon skill (clamped ≥0). With no tracked rows this is exactly
 /// `(target.level - attacker.level) * 5` — the pure level-derived `skill_diff` (baseline-safe). [entity]
-pub fn skill_diff_ctx(ctx: &ReducerContext, attacker: &WorldEntity, target: &WorldEntity) -> u32 {
+pub(crate) fn skill_diff_ctx(
+    ctx: &ReducerContext,
+    attacker: &WorldEntity,
+    target: &WorldEntity,
+) -> u32 {
     skill_diff(
         effective_defense_skill(ctx, target),
         effective_weapon_skill(ctx, attacker),
@@ -475,7 +479,7 @@ fn roll_and_raise_skill(
 /// Skill-up the attacker's equipped weapon line on a landed player→creature hit. Gated by the caller on
 /// `attacker.is_player()` + a real hit; trains the line the swing actually used, at the
 /// headroom/level/intellect chance (`combat_skillup_chance_bp`, `weapon = true`).
-pub fn gain_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) {
+pub(crate) fn gain_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) {
     let line = equipped_weapon_skill_line(ctx, attacker.guid);
     roll_and_raise_skill(
         ctx,
@@ -490,7 +494,7 @@ pub fn gain_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) {
 /// Skill-up the defender's Defense line on a landed hit it survived. Gated by the caller on the defender
 /// being a player, at the headroom/level chance (`combat_skillup_chance_bp`, `weapon = false` — vanilla
 /// gives the intellect assist to weapon lines only, so Defense never gets it).
-pub fn gain_defense_skill(ctx: &ReducerContext, target: &WorldEntity) {
+pub(crate) fn gain_defense_skill(ctx: &ReducerContext, target: &WorldEntity) {
     roll_and_raise_skill(
         ctx,
         target.guid,
@@ -1103,7 +1107,7 @@ pub fn debug_learn_riding_from_trainer(
 /// fresh paladin swords/axes/polearms and made the weapon masters pointless (live find, faladin).
 /// Existing characters are GRANDFATHERED: `ensure_player_skills` only inserts missing lines, never
 /// deletes, so an existing character keeps its wide set.
-pub fn class_starting_weapon_skill_lines(class: u8) -> &'static [u32] {
+pub(crate) fn class_starting_weapon_skill_lines(class: u8) -> &'static [u32] {
     use skill_line::*;
     match class {
         // Warrior: 1H axes, 1H maces, 1H swords (createinfo grants exactly these three).
@@ -1128,7 +1132,7 @@ pub fn class_starting_weapon_skill_lines(class: u8) -> &'static [u32] {
     }
 }
 
-pub fn class_weapon_skill_lines(class: u8) -> &'static [u32] {
+pub(crate) fn class_weapon_skill_lines(class: u8) -> &'static [u32] {
     use skill_line::*;
     match class {
         // Warrior: axes, maces, polearms, swords, fist, daggers (no staves; ranged → UNARMED fallback, not listed).
@@ -1164,7 +1168,7 @@ pub fn class_weapon_skill_lines(class: u8) -> &'static [u32] {
 /// character lacks, so a relog never duplicates (mirrors `grant_starter_item`). Seeding at cap
 /// keeps a fresh login baseline (defense = weapon = level*5 → 0 skill_diff vs an equal-level foe).
 /// `class` is the vanilla class id (1=Warrior … 11=Druid) from `Character.class`. [entity]
-pub fn ensure_player_skills(
+pub(crate) fn ensure_player_skills(
     ctx: &ReducerContext,
     guid: u64,
     owner: Identity,

@@ -5,8 +5,7 @@
 //! module" — is true again: every fn below takes a `ReducerContext` and has a side effect, so none of
 //! them belong in a "pure spell math" file, and (per the `test_scan` playbook) none of them get a direct
 //! unit test here either — there is no `ReducerContext` harness in this crate by design. `mod.rs`
-//! glob re-exports this module (`pub(crate) use effects::*`), so every `crate::spell::<sym>` call site is
-//! unchanged by the move.
+//! names the operations shared with other Module files.
 
 // `Table` provides `.insert()`/`.update()`/`.delete()` on a table handle; `ReducerContext` is the live db
 // handle every fn here threads.

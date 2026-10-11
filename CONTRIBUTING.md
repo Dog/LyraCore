@@ -63,7 +63,7 @@ first commit. A maintainer then marks the issue `in progress`.
 
 New content and behaviour beyond 1.12.1 live in a Package. `lyracore packages new <name>`
 scaffolds one from the Reference Package ladder in the collection. Use `--from` to choose a rung. [`docs/package-api.md`](docs/package-api.md) lists what
-a Package may call, and the build fails on anything else. The Official Package Collection,
+a Package may call, and the `package_api_lint` test reports paths outside it. The Official Package Collection,
 [LyraCoreProject/packages](https://github.com/LyraCoreProject/packages), takes pull requests under
 its own contributing guide.
 

@@ -25,14 +25,15 @@
 //!
 //! Touches every domain, so it imports each table's accessor trait + row type from the crate root.
 
+use crate::creatures::build_creature_entity;
 use lyracore_shared::constants;
 use spacetimedb::{reducer, Identity, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::{
-    build_creature_entity, game_account, game_aura_schedule, game_breath_schedule, game_character,
-    game_config, game_creature_loot, game_creature_move_schedule, game_creature_spawn,
-    game_creature_template, game_creature_waypoint, game_duel_schedule, game_event_reaper_schedule,
-    game_gameobject, game_gameobject_pool, game_gameobject_pool_member, game_gameobject_template,
+    game_account, game_aura_schedule, game_breath_schedule, game_character, game_config,
+    game_creature_loot, game_creature_move_schedule, game_creature_spawn, game_creature_template,
+    game_creature_waypoint, game_duel_schedule, game_event_reaper_schedule, game_gameobject,
+    game_gameobject_pool, game_gameobject_pool_member, game_gameobject_template,
     game_gateway_lease_reaper_schedule, game_graveyard, game_graveyard_zone,
     game_ground_area_schedule, game_instance_reaper_schedule, game_item_template,
     game_melee_schedule, game_motion_publish_schedule, game_pet_care_schedule, game_realm,
@@ -1653,7 +1654,22 @@ fn seed_scheduler_arming(ctx: &ReducerContext) {
 // own file; `init` and the `debug_seed_*` reducers reach them through this re-export, so callers
 // keep the `seed::seed_*_fixture` paths.
 mod fixtures;
-pub(crate) use fixtures::*;
+#[cfg(feature = "debug_reducers")]
+pub(crate) use fixtures::seed_scenario_fixtures;
+pub(crate) use fixtures::{
+    base_effect, base_item, base_spell, profession_trainer_template, seed_demon_skin_fixture,
+    seed_drain_soul_fixture, seed_fixture_catalogue, seed_frost_armor_fixture,
+    seed_hunter_tame_fixture, seed_mana_burn_fixture, seed_mount_fixture, seed_pw_shield_fixture,
+    seed_regen_fixture, seed_soul_shard_item, seed_stacking_probe_fixture, seed_stealth_fixture,
+    seed_taxi_fixture, seed_test_proc_fixtures, tempered_blade_template, test_wolf_template,
+    tough_jerky_template, FIXTURE_BLADE, FIXTURE_DAZED_SPELL, FIXTURE_FACTION, FIXTURE_JERKY,
+    FIXTURE_MOUNT_SPELL, PROFESSION_TRAINER_ENTRY, TEST_PROC_CHARGES, TEST_PROC_COIN,
+    TEST_PROC_COOLDOWN, TEST_PROC_MARK, TEST_PROC_PPM, TEST_PROC_ZAP, TEST_WOLF_ENTRY,
+};
+#[cfg(test)]
+pub(crate) use fixtures::{
+    FIXTURE_REINS, RIDING_TRAINER_ENTRY, TEST_TAME_BEAST_SPELL, TEST_TAME_BOAR_ENTRY,
+};
 
 /// The createinfo starting kits — the spells a fresh character knows before any training, copied
 /// into `game_player_spell` at creation (`grant_createinfo_spells`). `race == 0` rows are class kits

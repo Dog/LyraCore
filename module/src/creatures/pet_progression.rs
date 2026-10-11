@@ -24,7 +24,7 @@ struct PetProgress {
 }
 
 /// Vanilla Hunter pets need one quarter of the player XP for the same level transition.
-pub fn pet_xp_to_next_level(level: u32) -> u32 {
+pub(crate) fn pet_xp_to_next_level(level: u32) -> u32 {
     crate::xp::xp_to_next_level(level) / 4
 }
 
@@ -101,7 +101,7 @@ fn kill_loyalty_bonus(pet_level: u32, loyalty_level: u8) -> u32 {
 
 /// Apply one care tick's loyalty delta to a durable Hunter pet. T2 owns when the tick happens and
 /// how happiness maps to the explicit state; this function owns all threshold and bound behavior.
-pub fn update_pet_loyalty_from_care(
+pub(crate) fn update_pet_loyalty_from_care(
     ctx: &ReducerContext,
     pet_id: u64,
     state: PetHappinessState,

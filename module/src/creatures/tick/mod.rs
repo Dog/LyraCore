@@ -30,9 +30,7 @@ mod lifecycle;
 // three are not behavior — they keep their owner here and the cycle only sequences them.
 pub(crate) use lifecycle::{pass_decay, pass_gameobject_respawn, pass_respawn};
 
-// Re-export so `crate::creatures::tick::despawn_creature_entity` (and, via `creatures::mod.rs`'s own
-// `pub use tick::*`, `crate::creatures::despawn_creature_entity`) still resolves — `encounter.rs`/
-// `instance.rs` call it by that exact path.
+// Encounter and instance removal share the same creature despawn operation.
 pub(crate) use lifecycle::despawn_creature_entity;
 
 // ===========================================================================================

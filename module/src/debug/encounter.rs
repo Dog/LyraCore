@@ -8,7 +8,11 @@ use spacetimedb::{log, reducer, ReducerContext};
 /// nothing — `on_hp_threshold` handlers are compile-time registrations (`game_hook!` markers), so
 /// without one anywhere in the build the kernel's damage probe stays on its zero-cost early-out.
 #[reducer]
-pub fn debug_encounter_watch_hp(ctx: &ReducerContext, entry: u32, pct: u8) -> Result<(), String> {
+pub(crate) fn debug_encounter_watch_hp(
+    ctx: &ReducerContext,
+    entry: u32,
+    pct: u8,
+) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
     crate::encounter::watch_hp_threshold(ctx, entry, pct)
 }
