@@ -89,11 +89,8 @@ fn wmo_tris(chain: &mut PatchChain, name: &str) -> Result<Vec<WmoTri>> {
         let bytes = chain
             .read_file(&gname)
             .with_context(|| format!("reading {gname}"))?;
-        let wow_wmo::ParsedWmo::Group(group) = wow_wmo::parse_wmo(&mut Cursor::new(&bytes))
-            .with_context(|| format!("parsing {gname}"))?
-        else {
-            bail!("{gname} parsed as a root file, expected group");
-        };
+        let group = crate::collision::parse_wmo_group(&bytes, &gname)
+            .with_context(|| format!("parsing {gname}"))?;
         let v = &group.vertex_positions;
         for (t, idx) in group.vertex_indices.chunks_exact(3).enumerate() {
             let collidable = group
