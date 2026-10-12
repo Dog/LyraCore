@@ -974,6 +974,33 @@ fn derive_spell_rows(
     ))
 }
 
+pub(crate) struct SpellCatalogue {
+    pub(crate) ids: std::collections::HashSet<u64>,
+    pub(crate) proc_effects: std::collections::HashMap<u32, Vec<usize>>,
+}
+
+pub(crate) fn read_catalogue(data_dir: &str) -> Result<SpellCatalogue> {
+    let mut chain = open_chain(Path::new(data_dir))?;
+    let spells = read_spells(&chain.read_file("DBFilesClient\\Spell.dbc")?)?;
+    let ids = spells.iter().map(|spell| u64::from(spell.id)).collect();
+    let proc_effects = spells
+        .iter()
+        .map(|spell| {
+            let effects = (0..3)
+                .filter(|&index| {
+                    is_aura_effect(spell.effect[index])
+                        && matches!(
+                            AuraMod::from_int(spell.effect_aura[index]),
+                            Ok(AuraMod::ProcTriggerSpell | AuraMod::ProcTriggerDamage)
+                        )
+                })
+                .collect();
+            (spell.id, effects)
+        })
+        .collect();
+    Ok(SpellCatalogue { ids, proc_effects })
+}
+
 /// The client tables the spell rows derive from, read once per import.
 struct SpellDbc {
     spells: Vec<Spell>,
