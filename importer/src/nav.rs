@@ -539,8 +539,17 @@ pub(crate) fn scan_tiles(
     let mut sources = Vec::new();
     let mut seen_ids = HashMap::new();
     let mut tiles_read = 0u32;
+    let tiles = crate::terrain::map_tiles(chain, map_name)?;
     for tx in tx_min..=tx_max {
         for ty in ty_min..=ty_max {
+            if let Some(tiles) = &tiles {
+                let present = tiles
+                    .get((tx * 64 + ty) as usize)
+                    .context("terrain tile coordinates outside the WDT grid")?;
+                if !present {
+                    continue;
+                }
+            }
             let candidates = [
                 format!("World\\Maps\\{map_name}\\{map_name}_{ty}_{tx}.adt"),
                 format!("World\\Maps\\{map_name}\\{map_name}_{tx}_{ty}.adt"),
@@ -550,6 +559,10 @@ pub(crate) fn scan_tiles(
                 let Ok(bytes) = chain.read_file(name) else {
                     continue;
                 };
+                // Patch archives remove terrain tiles with empty ADT entries.
+                if bytes.is_empty() {
+                    continue;
+                }
                 let wow_adt::ParsedAdt::Root(root) = wow_adt::parse_adt(&mut Cursor::new(&bytes))
                     .with_context(|| format!("parsing {name}"))?
                 else {
@@ -983,6 +996,42 @@ mod tests {
     use super::*;
     use lyracore_shared::nav::{obs_top, sub_center, walk_get};
     use lyracore_shared::terrain::cell_index;
+
+    fn scan_test_adt(bytes: Vec<u8>) -> Result<TileScan> {
+        let path = std::env::temp_dir().join(format!(
+            "lyracore-nav-adt-{}-{}.mpq",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        wow_mpq::ArchiveBuilder::new()
+            .add_file_data(bytes, "World\\Maps\\Azeroth\\Azeroth_32_32.adt")
+            .build(&path)
+            .unwrap();
+        let mut chain = PatchChain::new();
+        chain.add_archive(&path, 0).unwrap();
+        let result = scan_tiles(&mut chain, "Azeroth", 0, (512, 513, 512, 513));
+        drop(chain);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn empty_adt_is_an_absent_navigation_tile() {
+        let scan = scan_test_adt(vec![]).unwrap();
+        assert_eq!(scan.tiles_read, 0);
+        assert!(scan.cells.is_empty());
+        assert!(scan.placements.is_empty());
+        assert!(scan.sources.is_empty());
+    }
+
+    #[test]
+    fn malformed_nonempty_adt_still_fails_navigation_import() {
+        let error = scan_test_adt(vec![1, 2, 3]).err().unwrap();
+        assert!(format!("{error:#}").contains("parsing World"), "{error:#}");
+    }
 
     fn wmo_tri(v: Tri) -> VmapTri {
         VmapTri {

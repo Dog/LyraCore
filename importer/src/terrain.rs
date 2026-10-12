@@ -71,6 +71,40 @@ fn open_terrain_chain(data_dir: &Path) -> Result<PatchChain> {
     Ok(chain)
 }
 
+pub(crate) fn map_tiles(chain: &mut PatchChain, map_name: &str) -> Result<Option<Vec<bool>>> {
+    let name = format!("World\\Maps\\{map_name}\\{map_name}.wdt");
+    let Ok(bytes) = chain.read_file(&name) else {
+        return Ok(None);
+    };
+    parse_map_tiles(&bytes)
+        .with_context(|| format!("parsing {name}"))
+        .map(Some)
+}
+
+fn parse_map_tiles(mut bytes: &[u8]) -> Result<Vec<bool>> {
+    while !bytes.is_empty() {
+        if bytes.len() < 8 {
+            bail!("truncated WDT chunk header");
+        }
+        let length = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+        let payload = bytes
+            .get(8..)
+            .and_then(|remaining| remaining.get(..length))
+            .context("truncated WDT chunk payload")?;
+        if &bytes[..4] == b"NIAM" {
+            if payload.len() != 64 * 64 * 8 {
+                bail!("WDT MAIN must contain 4096 tile entries");
+            }
+            return payload
+                .chunks_exact(8)
+                .map(|entry| Ok(u32::from_le_bytes(entry[..4].try_into()?) & 1 != 0))
+                .collect();
+        }
+        bytes = &bytes[8 + length..];
+    }
+    bail!("WDT has no MAIN tile catalogue")
+}
+
 pub(crate) struct CellRow {
     pub(crate) map_id: u32,
     pub(crate) cell_x: u16,
@@ -224,8 +258,18 @@ fn collect_slice(
     let (ty_min, ty_max) = (cell_y_min / 16, cell_y_max / 16);
     let mut rows: Vec<CellRow> = Vec::new();
     let mut tiles_read = 0u32;
+    let tiles = map_tiles(chain, map_name)?;
     for tx in tx_min..=tx_max {
         for ty in ty_min..=ty_max {
+            // WDT filename axes are the reverse of the world-coordinate cell axes.
+            if let Some(tiles) = &tiles {
+                let present = tiles
+                    .get((tx * 64 + ty) as usize)
+                    .context("terrain tile coordinates outside the WDT grid")?;
+                if !present {
+                    continue;
+                }
+            }
             let candidates = [
                 format!("World\\Maps\\{map_name}\\{map_name}_{ty}_{tx}.adt"),
                 format!("World\\Maps\\{map_name}\\{map_name}_{tx}_{ty}.adt"),
@@ -236,6 +280,10 @@ fn collect_slice(
                 let Ok(bytes) = chain.read_file(name) else {
                     continue;
                 };
+                // Patch archives remove terrain tiles with empty ADT entries.
+                if bytes.is_empty() {
+                    continue;
+                }
                 any_file = true;
                 let wow_adt::ParsedAdt::Root(root) = wow_adt::parse_adt(&mut Cursor::new(&bytes))
                     .with_context(|| format!("parsing {name}"))?
@@ -382,6 +430,69 @@ fn interp_check(rows: &[CellRow], x: f32, y: f32) -> Result<f32> {
 mod tests {
     use super::*;
     use crate::world_import_scope::{WorldImportProfile, WorldImportScope};
+
+    #[test]
+    fn map_tile_flags_retain_the_client_filename_axes() {
+        let mut bytes = b"NIAM".to_vec();
+        bytes.extend_from_slice(&(64u32 * 64 * 8).to_le_bytes());
+        bytes.resize(8 + 64 * 64 * 8, 0);
+        bytes[8 + (53 * 64 + 24) * 8] = 1;
+        let tiles = parse_map_tiles(&bytes).unwrap();
+        assert!(tiles[53 * 64 + 24]);
+        assert!(!tiles[24 * 64 + 53]);
+    }
+
+    #[test]
+    fn truncated_map_tile_catalogue_is_refused() {
+        let mut bytes = b"NIAM".to_vec();
+        bytes.extend_from_slice(&32768u32.to_le_bytes());
+        assert!(parse_map_tiles(&bytes).is_err());
+    }
+
+    fn collect_test_adt(bytes: Vec<u8>) -> Result<(Vec<CellRow>, u32)> {
+        let path = std::env::temp_dir().join(format!(
+            "lyracore-terrain-adt-{}-{}.mpq",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        wow_mpq::ArchiveBuilder::new()
+            .add_file_data(bytes, "World\\Maps\\Azeroth\\Azeroth_32_32.adt")
+            .build(&path)
+            .unwrap();
+        let mut chain = PatchChain::new();
+        chain.add_archive(&path, 0).unwrap();
+        let scope = WorldImportScope::legacy(
+            0,
+            Some((-100.0, -50.0, -100.0, -50.0)),
+            (-75.0, -75.0, 0.0),
+            180.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let result = collect_scope(&mut chain, &scope);
+        drop(chain);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn empty_adt_is_an_absent_terrain_tile() {
+        let error = collect_test_adt(vec![]).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("no MCNK cells intersected"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_nonempty_adt_still_fails_terrain_import() {
+        let error = collect_test_adt(vec![1, 2, 3]).err().unwrap();
+        assert!(format!("{error:#}").contains("parsing World"), "{error:#}");
+    }
 
     /// The operator's own 1.12.1 client `Data/` dir. Client archives never enter the repo, so the
     /// tests that read it are ignored by default.
