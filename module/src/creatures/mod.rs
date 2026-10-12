@@ -24,6 +24,7 @@ mod pet_progression;
 pub(crate) mod population;
 pub(crate) mod presentation;
 mod spawn;
+pub(crate) use spawn::game_creature_spawn_map;
 pub(crate) mod tick;
 
 pub(crate) use ai::{
