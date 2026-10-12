@@ -159,3 +159,6 @@ crate::stdb::relays::declare_relays! {
         insert(Snapshot) => |context, _event, row| rest_state_appeared(&context.view, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;

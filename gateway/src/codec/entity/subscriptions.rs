@@ -2,8 +2,9 @@
 
 use crate::codec::combat::subscriptions::aura_sync;
 use crate::codec::guild::subscriptions::guild_projection_of;
-use crate::codec::movement::subscriptions::append_resident_creature_after_create;
-use crate::codec::movement::subscriptions::unix_now_micros;
+use crate::codec::movement::subscriptions::{
+    append_resident_creature_after_create, unix_now_micros,
+};
 use crate::codec::taxi::subscriptions::append_resident_taxi_after_create;
 use crate::codec::weather::subscriptions::zone_crossed;
 use crate::codec::{self, CreateKind};
@@ -885,6 +886,12 @@ crate::stdb::relays::declare_relays! {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    pub(crate) fn creature_create_outbound() -> Vec<Outbound> {
+        let mut creature = creature_entity();
+        creature.unit_bytes_0 = 0x0000_0101;
+        peer_create_outbound(&entity_view(creature, 0), &[], &[], None).unwrap()
+    }
+
     /// A live-entity row with no pending change; tests clone it and mutate one field at a time.
     /// `type_mask` carries the PLAYER bit by default (most relayed fields are player-only).
     pub(crate) fn player_entity() -> WorldEntity {
@@ -1164,3 +1171,9 @@ pub(crate) mod tests {
         assert_eq!(project_flags(7, &entity, None, None, &[], &[], &[]), 0x42);
     }
 }
+
+#[cfg(test)]
+mod packet_tests;
+
+#[cfg(test)]
+mod audience_tests;

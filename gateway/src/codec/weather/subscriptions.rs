@@ -121,3 +121,6 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event, _old, row| weather_changed(&context.view, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod audience_tests;

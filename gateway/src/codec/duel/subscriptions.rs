@@ -205,3 +205,9 @@ crate::stdb::relays::declare_relays! {
         insert(Live) => |context, _event, row| duel_event_appeared(&context.view, &context.coord, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod packet_tests;
+
+#[cfg(test)]
+mod audience_tests;

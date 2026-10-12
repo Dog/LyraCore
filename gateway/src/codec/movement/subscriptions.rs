@@ -342,3 +342,9 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event, _old, row| creature_leg(&context.view, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod packet_tests;
+
+#[cfg(test)]
+mod audience_tests;

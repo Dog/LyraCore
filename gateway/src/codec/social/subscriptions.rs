@@ -1158,3 +1158,15 @@ fn group_event_callback(
         );
     }
 }
+
+#[cfg(test)]
+mod packet_tests;
+
+#[cfg(test)]
+mod audience_tests;
+
+#[cfg(test)]
+mod realm_chat_relay_tests;
+
+#[cfg(test)]
+mod account_claim_relay_tests;

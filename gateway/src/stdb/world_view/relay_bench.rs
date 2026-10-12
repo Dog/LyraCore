@@ -7,6 +7,11 @@
 //! not a check.
 
 use super::*;
+use crate::codec::combat::subscriptions::{
+    aura_audience, cast_event_appeared, combat_event_appeared, impact_appeared,
+};
+use crate::codec::social::subscriptions::chat_audience;
+
 use crate::codec::property_tests::Rng;
 use crate::stdb::bindings::{Aura, ChatEvent, CombatEvent, SpellCastEvent, SpellImpactEvent};
 use crate::world::{Outbound, SessionTx};

@@ -195,3 +195,6 @@ fn quest_requirements_changed(view: &WorldView, coord: &Coordinator, shard: Shar
         });
     }
 }
+
+#[cfg(test)]
+mod audience_tests;
