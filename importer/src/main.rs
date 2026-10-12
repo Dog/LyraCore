@@ -795,16 +795,7 @@ mod sls {
     pub const ACTIVE: usize = 2; // [V] parsed-but-unused
 }
 mod spe {
-    // spell_proc_event (cmangos classic schema): entry, SchoolMask, SpellFamilyName, SpellFamilyMask,
-    // procFlags, procEx, ppmRate, CustomChance, Cooldown. [V] — anchored against the cmangos classic
-    // schema's column ORDER, NOT verified against an in-repo dump (this sandbox has no cmangos dump —
-    // the same caveat as `sc`/`sls` above). CONFIRM these indices against your own `classic-db` dump's
-    // `spell_proc_event` table before trusting the import.
-    //
-    // Note for the confirm: cmangos classic keeps ONE `SpellFamilyMask` column (a bigint). Later
-    // mangos branches split it into `SpellFamilyMask0/1/2`, which would shift every index from
-    // PROC_FLAGS on. A row whose column count does not match is dropped rather than mis-mapped, so a
-    // schema on the other side of that split reads as an empty table, not as wrong proc data.
+    // Legacy rows carry one family mask. Current rows carry one mask per effect before procFlags.
     pub const ENTRY: usize = 0; // [V]
     pub const SCHOOL_MASK: usize = 1; // [V]
     pub const FAMILY_NAME: usize = 2; // [V]
@@ -2087,37 +2078,81 @@ fn build_spell_learn_sql(dump: &str) -> Vec<String> {
 /// The DELETE stops at `SYNTHETIC_PROC_EVENT_FLOOR` rather than wiping wholesale like its `spell_chain`
 /// sibling: the seeded Proc fixtures own overlay rows in the synthetic range, and a world import must
 /// not silently disarm them (the same rule `importer/src/spell.rs` applies to `game_spell` itself).
-fn build_spell_proc_event_sql(dump: &str) -> Vec<String> {
+fn proc_family_mask(
+    row: &[String],
+    spell_id: u32,
+    proc_effects: Option<&std::collections::HashMap<u32, Vec<usize>>>,
+) -> Result<Option<u64>> {
+    let masks = if row.len() == spe::COLUMNS {
+        [field(row, spe::FAMILY_MASK); 3]
+    } else {
+        [field(row, 3), field(row, 4), field(row, 5)]
+    };
+    let Some(masks) = masks
+        .into_iter()
+        .map(|mask| mask.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    if masks.iter().all(|mask| *mask == masks[0]) {
+        return Ok(Some(masks[0]));
+    }
+    let effects = proc_effects
+        .and_then(|effects| effects.get(&spell_id))
+        .with_context(|| {
+            format!("spell {spell_id} has per-effect proc masks; supply its client Spell.dbc")
+        })?;
+    let mut active = effects.iter().map(|index| {
+        masks
+            .get(*index)
+            .copied()
+            .context("proc effect index outside the three spell effects")
+    });
+    let mask = active.next().transpose()?.with_context(|| {
+        format!("spell {spell_id} has differing masks but no supported Proc effect")
+    })?;
+    for next in active {
+        if next? != mask {
+            bail!("spell {spell_id} needs different masks for active Proc effects; scalar overlay cannot represent it");
+        }
+    }
+    Ok(Some(mask))
+}
+
+fn build_spell_proc_event_sql(
+    dump: &str,
+    proc_effects: Option<&std::collections::HashMap<u32, Vec<usize>>>,
+) -> Result<Vec<String>> {
     let rows: Vec<String> = parse_table(dump, "spell_proc_event")
 .iter()
-.filter_map(|r| {
-            // A row from a schema that split `SpellFamilyMask` into three columns would map every
-            // field past it onto the wrong meaning. Drop a row whose width does not match instead.
-            if r.len() != spe::COLUMNS {
-                return None;
+.map(|r| -> Result<Option<String>> {
+            if r.len() != spe::COLUMNS && r.len() != 11 {
+                return Ok(None);
             }
-            let spell_id: u32 = field(r, spe::ENTRY).parse().ok()?;
+            let shift = if r.len() == 11 { 2 } else { 0 };
+            let Some(spell_id) = field(r, spe::ENTRY).parse::<u32>().ok() else { return Ok(None); };
             if spell_id == 0 || spell_id >= SYNTHETIC_PROC_EVENT_FLOOR {
-                return None; // outside the DELETE's reach — an INSERT here would PK-collide next reload
+                return Ok(None); // outside the DELETE's reach — an INSERT here would PK-collide next reload
             }
-            let school_mask: u8 = field(r, spe::SCHOOL_MASK).parse().ok()?;
-            let family_name: u8 = field(r, spe::FAMILY_NAME).parse().ok()?;
-            let family_flags: u64 = field(r, spe::FAMILY_MASK).parse().ok()?;
-            let proc_flags: u32 = field(r, spe::PROC_FLAGS).parse().ok()?;
-            let proc_ex: u32 = field(r, spe::PROC_EX).parse().ok()?;
-            let ppm_rate: f32 = field(r, spe::PPM_RATE).parse().ok()?;
-            let custom_chance: f32 = field(r, spe::CUSTOM_CHANCE).parse().ok()?;
-            let cooldown_s: u32 = field(r, spe::COOLDOWN).parse().ok()?;
+            let Some(school_mask) = field(r, spe::SCHOOL_MASK).parse::<u8>().ok() else { return Ok(None); };
+            let Some(family_name) = field(r, spe::FAMILY_NAME).parse::<u8>().ok() else { return Ok(None); };
+            let Some(family_flags) = proc_family_mask(r, spell_id, proc_effects)? else { return Ok(None); };
+            let Some(proc_flags) = field(r, spe::PROC_FLAGS + shift).parse::<u32>().ok() else { return Ok(None); };
+            let Some(proc_ex) = field(r, spe::PROC_EX + shift).parse::<u32>().ok() else { return Ok(None); };
+            let Some(ppm_rate) = field(r, spe::PPM_RATE + shift).parse::<f32>().ok() else { return Ok(None); };
+            let Some(custom_chance) = field(r, spe::CUSTOM_CHANCE + shift).parse::<f32>().ok() else { return Ok(None); };
+            let Some(cooldown_s) = field(r, spe::COOLDOWN + shift).parse::<u32>().ok() else { return Ok(None); };
             if !ppm_rate.is_finite() || ppm_rate < 0.0 || !custom_chance.is_finite() {
-                return None; // a corrupt rate would freeze onto every aura of this spell
+                return Ok(None); // a corrupt rate would freeze onto every aura of this spell
             }
             let custom_chance = custom_chance.round().clamp(0.0, 100.0) as u8;
             let icd_ms = cooldown_s.saturating_mul(1000);
-            Some(format!(
+            Ok(Some(format!(
                 "({spell_id},{proc_flags},{proc_ex},{school_mask},{family_name},{family_flags},{ppm_rate},{custom_chance},{icd_ms})"
-            ))
+            )))
         })
-.collect();
+.collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
     let mut stmts = vec![format!(
         "DELETE FROM game_spell_proc_event WHERE spell_id < {SYNTHETIC_PROC_EVENT_FLOOR}"
     )];
@@ -2128,7 +2163,7 @@ fn build_spell_proc_event_sql(dump: &str) -> Vec<String> {
         &rows,
     );
     eprintln!("spell proc events: {} rows", rows.len());
-    stmts
+    Ok(stmts)
 }
 
 /// The reserved synthetic-spell floor, above which the seeded fixtures live and no real vanilla spell
@@ -4007,7 +4042,12 @@ fn build_dump_plan(
         creature_skin_ids,
         class_trainer_count,
     } = build_creature_templates(dump, &entries, display_scales);
-    let (creature_casts, creature_rotation_rows) = build_creature_cast_rows(dump, &entries);
+    let spell_catalogue = args.dbc.as_deref().map(spell::read_catalogue).transpose()?;
+    let (creature_casts, creature_rotation_rows) = build_creature_cast_rows(
+        dump,
+        &entries,
+        spell_catalogue.as_ref().map(|catalogue| &catalogue.ids),
+    );
     let SpawnPayload {
         guid_of,
         packed_spawns,
@@ -4610,6 +4650,7 @@ fn build_creature_templates(
 fn build_creature_cast_rows(
     dump: &str,
     entries: &std::collections::HashSet<u64>,
+    spell_ids: Option<&std::collections::HashSet<u64>>,
 ) -> (Vec<String>, Vec<String>) {
     // 2b) caster-mob cast rows (game_creature_cast, LEGACY) + rotation rows (game_creature_spell, rank 20).
     //
@@ -4627,8 +4668,7 @@ fn build_creature_cast_rows(
     //       the self-cast will fail at resolve_cast_at target-type validation and the engine gracefully falls
     //       through to spell1 — net behaviour is unchanged. Heals and debuffs need a reclassify pass (deferred
     //       content tuning, not a code change).
-    //   All referenced spells (spell2+) must be in game_spell; an un-imported id is a silent no-op (Err in
-    //   resolve_cast_at). The --only allowlist in import-world.sh must cover them. [static]
+    //   With a client catalogue, derived cast rows retain only resolvable spell references.
     //
     // game_creature_spell condition discriminants (mirror module/src/creatures/spawn.rs cast_condition):
     const COND_ALWAYS: u8 = 0; // unconditional — cast at melee target (nuke)
@@ -4652,11 +4692,16 @@ fn build_creature_cast_rows(
         if spell1 == 0 {
             continue; // a row with no primary spell never casts — skip.
         }
+        // An unknown primary has no valid fallback; do not promote a secondary buff into its place.
+        if spell_ids.is_some_and(|ids| !ids.contains(&spell1)) {
+            eprintln!("casts: WARNING creature {entry} has unknown primary spell {spell1}; derived caster rows omitted");
+            continue;
+        }
         // Collect non-zero spell2..spell10 (slots SPELL1+1 through SPELL1+9).
         let secondary: Vec<u64> = (1..=9)
             .filter_map(|i| {
                 let s: u64 = field(&row, cts::SPELL1 + i).parse().unwrap_or(0);
-                if s != 0 {
+                if s != 0 && spell_ids.is_none_or(|ids| ids.contains(&s)) {
                     Some(s)
                 } else {
                     None
@@ -5660,7 +5705,11 @@ fn push_global_statements(args: &Args, dump: &str, stmts: &mut Vec<String>) -> R
             .unwrap_or_default();
         let spell_chain_sql = build_spell_chain_sql(dump, &links)?;
         let spell_learn_sql = build_spell_learn_sql(dump);
-        let spell_proc_event_sql = build_spell_proc_event_sql(dump);
+        let catalogue = args.dbc.as_deref().map(spell::read_catalogue).transpose()?;
+        let spell_proc_event_sql = build_spell_proc_event_sql(
+            dump,
+            catalogue.as_ref().map(|catalogue| &catalogue.proc_effects),
+        )?;
         spellmeta_row_count = insert_row_count(&spell_chain_sql)
             + insert_row_count(&spell_learn_sql)
             + insert_row_count(&spell_proc_event_sql);
@@ -6815,7 +6864,7 @@ mod tests {
         // family, crit-only, no rate) and a rate-plus-cooldown weapon proc.
         let dump = "x INSERT INTO `spell_proc_event` VALUES \
                     (12358,4,3,32,0,2,0,0,0),(20007,0,0,0,20,0,1.5,15,45); y";
-        let stmts = build_spell_proc_event_sql(dump);
+        let stmts = build_spell_proc_event_sql(dump, None).unwrap();
         assert_eq!(
             stmts[0],
             "DELETE FROM game_spell_proc_event WHERE spell_id < 50000"
@@ -6834,10 +6883,45 @@ mod tests {
     }
 
     #[test]
+    fn current_proc_overlay_maps_three_equal_effect_masks_without_shifting_fields() {
+        let dump = "INSERT INTO `spell_proc_event` VALUES (123,4,3,8,8,8,20,2,1.5,15,45);";
+        let sql = build_spell_proc_event_sql(dump, None).unwrap().join("\n");
+        assert!(sql.contains("(123,20,2,4,3,8,1.5,15,45000)"), "{sql}");
+    }
+
+    #[test]
+    fn current_proc_overlay_selects_the_only_active_proc_effect_mask() {
+        let dump = "INSERT INTO `spell_proc_event` VALUES (123,4,3,8,4,4,20,2,0,0,0);";
+        let effects = std::collections::HashMap::from([(123, vec![0])]);
+        let sql = build_spell_proc_event_sql(dump, Some(&effects))
+            .unwrap()
+            .join("\n");
+        assert!(sql.contains("(123,20,2,4,3,8,0,0,0)"), "{sql}");
+        assert!(build_spell_proc_event_sql(dump, None).is_err());
+    }
+
+    #[test]
+    fn different_active_proc_effect_masks_are_refused_instead_of_broadened() {
+        let dump = "INSERT INTO `spell_proc_event` VALUES (123,4,3,8,4,4,20,2,0,0,0);";
+        let effects = std::collections::HashMap::from([(123, vec![0, 1])]);
+        assert!(build_spell_proc_event_sql(dump, Some(&effects)).is_err());
+    }
+
+    #[test]
+    fn unknown_primary_spell_does_not_create_unusable_caster_rows() {
+        let dump = "INSERT INTO `creature_template_spells` VALUES (7,0,2,4,0,0,0,0,0,0,0,0);";
+        let entries = std::collections::HashSet::from([7]);
+        let spells = std::collections::HashSet::from([4]);
+        let (casts, rotation) = build_creature_cast_rows(dump, &entries, Some(&spells));
+        assert!(casts.is_empty());
+        assert!(rotation.is_empty());
+    }
+
+    #[test]
     fn build_spell_proc_event_sql_empty_table_yields_delete_only_no_insert() {
         // A dump with no `spell_proc_event` table at all: the overlay is optional per spell AND as a
         // whole, so the clear still runs and every Proc falls back to its Spell.dbc values.
-        let stmts = build_spell_proc_event_sql("x y");
+        let stmts = build_spell_proc_event_sql("x y", None).unwrap();
         assert_eq!(
             stmts,
             vec!["DELETE FROM game_spell_proc_event WHERE spell_id < 50000".to_string()]
@@ -6847,12 +6931,11 @@ mod tests {
     #[test]
     fn build_spell_proc_event_sql_drops_a_row_the_delete_cannot_reach_or_the_schema_moved() {
         // A synthetic-range entry is a seeded fixture's own overlay row: the DELETE deliberately spares
-        // it, so importing one would PK-collide on the next reload. And a row with the split
-        // SpellFamilyMask0/1/2 shape of a later mangos branch would map procFlags onto the wrong
-        // column, so it is dropped rather than mis-read.
+        // it, so importing one would PK-collide on the next reload. An unknown row width is dropped
+        // rather than mapping shifted columns onto the wrong fields.
         let dump = "x INSERT INTO `spell_proc_event` VALUES \
-                    (50143,0,0,0,0,0,0,0,5),(133,0,0,0,0,0,0,0,0,0,0); y";
-        let stmts = build_spell_proc_event_sql(dump);
+                    (50143,0,0,0,0,0,0,0,5),(133,0,0,0,0,0,0,0,0,0,0,0); y";
+        let stmts = build_spell_proc_event_sql(dump, None).unwrap();
         assert_eq!(
             stmts,
             vec!["DELETE FROM game_spell_proc_event WHERE spell_id < 50000".to_string()]
