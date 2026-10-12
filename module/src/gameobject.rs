@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 use spacetimedb::{reducer, table, ReducerContext, Table, TimeDuration, Timestamp};
 
+use crate::creatures::game_creature_spawn_map;
 use crate::game_gameobject_loot;
 use crate::game_player_skill; // GATHER skill-gate reads the gather skill row (accessor trait)
 use crate::game_world_entity;
@@ -471,18 +472,20 @@ fn activate_point(ctx: &ReducerContext, m: &GameObjectPoolMember) {
     crate::go_collider::register(ctx, &go);
 }
 
-/// Every map id this database currently holds REAL imported spatial content for, read off
-/// `game_terrain_chunk`/`game_nav_chunk` — the same ground-truth signal the fresh-shard guard
-/// uses in `importer/scripts/import-world.sh`'s `db_imported_probe`. `init` seeds neither table (only a real
-/// `importer --apply` run ever writes to them; see both files' module doc comments), so an EMPTY
-/// result here means this database has never received a real import — everything it holds is `init`'s
-/// own demo/test scaffolding.
-fn imported_terrain_maps(ctx: &ReducerContext) -> HashSet<u32> {
+/// Maps with imported creature placements, terrain, or navigation. Instance imports record their
+/// creature maps without a single-floor heightmap, so geometry alone cannot identify a fresh Shard.
+fn imported_spatial_maps(ctx: &ReducerContext) -> HashSet<u32> {
     ctx.db
         .game_terrain_chunk()
         .iter()
         .map(|c| c.map_id)
         .chain(ctx.db.game_nav_chunk().iter().map(|c| c.map_id))
+        .chain(
+            ctx.db
+                .game_creature_spawn_map()
+                .iter()
+                .map(|map| map.map_id),
+        )
         .collect()
 }
 
@@ -512,7 +515,7 @@ pub(crate) fn eligible_pool_candidates(
 pub(crate) fn arm_pool(ctx: &ReducerContext, pool_id: u32) {
     let gos = ctx.db.game_gameobject();
     let members = ctx.db.game_gameobject_pool_member();
-    let imported_maps = imported_terrain_maps(ctx);
+    let imported_maps = imported_spatial_maps(ctx);
     let max_active = ctx
         .db
         .game_gameobject_pool()
