@@ -71,6 +71,70 @@ fn resolve_name<'a>(
     Ok(&names[idx])
 }
 
+pub(crate) fn parse_wmo_group(bytes: &[u8], name: &str) -> Result<wow_wmo::group_parser::WmoGroup> {
+    let parsed = wow_wmo::parse_wmo(&mut Cursor::new(bytes));
+    let parsed = match parsed {
+        Ok(group) => group,
+        Err(error) => {
+            let Some(repaired) = without_truncated_vertex_colors(bytes)? else {
+                return Err(error.into());
+            };
+            eprintln!(
+                "collision: WARN {name} has truncated vertex colors; collision chunks retained"
+            );
+            wow_wmo::parse_wmo(&mut Cursor::new(&repaired))?
+        }
+    };
+    match parsed {
+        wow_wmo::ParsedWmo::Group(group) => Ok(group),
+        wow_wmo::ParsedWmo::Root(_) => bail!("{name} parsed as a root file, expected group"),
+    }
+}
+
+fn without_truncated_vertex_colors(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut offset = 0;
+    while let Some(header) = bytes.get(offset..).and_then(|tail| tail.get(..8)) {
+        let size = u32::from_le_bytes(header[4..8].try_into()?) as usize;
+        let payload = offset + 8;
+        let end = payload
+            .checked_add(size)
+            .context("WMO chunk size overflow")?;
+        if &header[..4] == b"PGOM" {
+            let mut nested = payload + 68;
+            if nested > bytes.len() {
+                return Ok(None);
+            }
+            while let Some(header) = bytes.get(nested..).and_then(|tail| tail.get(..8)) {
+                let size = u32::from_le_bytes(header[4..8].try_into()?) as usize;
+                let nested_end = nested
+                    .checked_add(8)
+                    .and_then(|start| start.checked_add(size))
+                    .context("WMO nested chunk size overflow")?;
+                if nested_end > bytes.len() {
+                    // Only a terminal rendering chunk may be omitted. Geometry stays byte-for-byte.
+                    if &header[..4] != b"VCOM" || !size.is_multiple_of(4) || nested_end != end {
+                        return Ok(None);
+                    }
+                    let mut repaired = bytes[..nested].to_vec();
+                    let size = u32::try_from(nested - payload)?;
+                    repaired[offset + 4..offset + 8].copy_from_slice(&size.to_le_bytes());
+                    return Ok(Some(repaired));
+                }
+                nested = nested_end;
+                if nested >= end {
+                    break;
+                }
+            }
+            return Ok(None);
+        }
+        if end > bytes.len() {
+            return Ok(None);
+        }
+        offset = end;
+    }
+    Ok(None)
+}
+
 /// A WMO's collision-relevant totals across all its group files.
 struct WmoStats {
     groups: u32,
@@ -100,11 +164,8 @@ fn read_wmo(chain: &mut PatchChain, name: &str) -> Result<WmoStats> {
         let bytes = chain
             .read_file(&gname)
             .with_context(|| format!("reading WMO group {gname}"))?;
-        let wow_wmo::ParsedWmo::Group(group) = wow_wmo::parse_wmo(&mut Cursor::new(&bytes))
-            .with_context(|| format!("parsing WMO group {gname}"))?
-        else {
-            bail!("{gname} parsed as a root file, expected group");
-        };
+        let group = parse_wmo_group(&bytes, &gname)
+            .with_context(|| format!("parsing WMO group {gname}"))?;
         stats.tris += group.vertex_indices.len() / 3;
         for m in &group.material_info {
             if m.material_id == 0xFF {
@@ -228,4 +289,50 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
         bail!("every WMO parsed to zero triangles — group-file read path is broken, spike FAILS");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group_with_truncated_tail(colors: bool) -> Vec<u8> {
+        fn chunk(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut bytes = id.to_vec();
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+        let mut group = vec![0; 68];
+        group.extend(chunk(b"YPOM", &[8, 0]));
+        group.extend(chunk(b"IVOM", &[0, 0, 1, 0, 2, 0]));
+        let vertices: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        group.extend(chunk(b"TVOM", &vertices));
+        if colors {
+            group.extend(chunk(b"VCOM", &[0; 12]));
+        }
+        let mut bytes = chunk(b"REVM", &17u32.to_le_bytes());
+        bytes.extend(chunk(b"PGOM", &group));
+        bytes.pop();
+        bytes
+    }
+
+    #[test]
+    fn truncated_rendering_colors_preserve_complete_collision_geometry() {
+        let bytes = group_with_truncated_tail(true);
+        assert!(wow_wmo::parse_wmo(&mut Cursor::new(&bytes)).is_err());
+        let group = parse_wmo_group(&bytes, "synthetic.wmo").unwrap();
+        assert_eq!(group.vertex_indices, [0, 1, 2]);
+        assert_eq!(group.vertex_positions.len(), 3);
+        assert_eq!(group.vertex_positions[1].x, 1.0);
+        assert_eq!(group.material_info[0].flags, 8);
+        assert!(group.vertex_colors.is_empty());
+    }
+
+    #[test]
+    fn truncated_collision_vertices_remain_an_error() {
+        assert!(parse_wmo_group(&group_with_truncated_tail(false), "synthetic.wmo").is_err());
+    }
 }
