@@ -2,12 +2,7 @@
 //! See `docs/binding-schema-parity.md` for the comparison and its platform scope.
 #![cfg(target_os = "linux")]
 
-#[path = "../src/stdb/bindings/mod.rs"]
-#[allow(dead_code)]
-// The SpacetimeDB codegen writes one function per table subscription; several run past any
-// reasonable length ceiling and no edit there survives a regeneration.
-#[allow(clippy::too_many_lines)]
-mod bindings;
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use spacetimedb_lib::db::raw_def::v9::RawModuleDefV9Builder;
 use spacetimedb_lib::{AlgebraicType, ProductType, SpacetimeType, SumType};
@@ -856,16 +851,16 @@ parity_test!(parity_game_gossip_menu, "game_gossip_menu", lyracore_module::Gossi
     entry, text_id,
 });
 parity_test!(parity_game_gossip_option, "game_gossip_option", lyracore_module::GossipOption, bindings::gossip_option_type::GossipOption, {
-    row_id, entry, option_index, icon, text, action, action_menu_id, cond_type, cond_value1,
-    cond_value2,
-});
+    row_id, entry, option_index, icon, text, action, action_menu_id, cond_type, cond_value_1,
+    cond_value_2,
+}, renames: { cond_value1 => cond_value_1, cond_value2 => cond_value_2 });
 parity_test!(parity_game_gossip_menu_profile, "game_gossip_menu_profile", lyracore_module::GossipMenuProfile, bindings::gossip_menu_profile_type::GossipMenuProfile, {
     menu_id, text_id,
 });
 parity_test!(parity_game_gossip_menu_profile_option, "game_gossip_menu_profile_option", lyracore_module::GossipMenuProfileOption, bindings::gossip_menu_profile_option_type::GossipMenuProfileOption, {
-    row_id, menu_id, option_index, icon, text, action, action_menu_id, cond_type, cond_value1,
-    cond_value2,
-});
+    row_id, menu_id, option_index, icon, text, action, action_menu_id, cond_type, cond_value_1,
+    cond_value_2,
+}, renames: { cond_value1 => cond_value_1, cond_value2 => cond_value_2 });
 parity_test!(parity_game_creature_gossip_menu_override, "game_creature_gossip_menu_override", lyracore_module::CreatureGossipMenuOverride, bindings::creature_gossip_menu_override_type::CreatureGossipMenuOverride, {
     creature_guid, menu_id, map_id, instance_id,
 });
@@ -1011,11 +1006,11 @@ parity_test!(parity_game_self_resurrect_option, "game_self_resurrect_option", ly
 });
 parity_test!(parity_game_aura, "game_aura", lyracore_module::Aura, bindings::aura_type::Aura, {
     id, target_guid, caster_guid, spell_id, slot, level, flags, applied_at, expires_at, effect_id,
-    eff_kind, amount, eff_p0, eff_p0_kind, eff_p1, period_ms, amount_remaining, stacks,
+    eff_kind, amount, eff_p_0, eff_p_0_kind, eff_p_1, period_ms, amount_remaining, stacks,
     next_tick_micros, channel_target, enters_combat, proc_flags, proc_chance, proc_ppm, proc_ex,
     proc_school_mask, proc_family_name, proc_family_flags, proc_charges, proc_icd_ms,
     proc_ready_micros,
-});
+}, renames: { eff_p0 => eff_p_0, eff_p0_kind => eff_p_0_kind, eff_p1 => eff_p_1 });
 parity_test!(parity_game_player_reputation, "game_player_reputation", lyracore_module::PlayerReputation, bindings::player_reputation_type::PlayerReputation, {
     id, character_guid, owner_identity, faction_id, standing, reputation_index, at_war,
 });

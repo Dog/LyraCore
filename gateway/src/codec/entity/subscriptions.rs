@@ -111,7 +111,7 @@ pub(crate) fn peer_create_outbound(
         .filter(|aura| aura.target_guid == view.guid)
         .map(|aura| lyracore_shared::aura::AuraAmount {
             kind: aura.eff_kind,
-            parameter: aura.eff_p0,
+            parameter: aura.eff_p_0,
             amount: aura.amount,
             stacks: aura.stacks,
         });

@@ -165,8 +165,8 @@ pub struct Corpse {
     // Gates reclaim (below) and the gateway's corpse CREATE relay by viewer instance; the instance
     // reap deletes any corpse left inside (the ghost's outcome is then spirit-healer-only —
     // vanilla's expired-corpse rule). END-appended + `#[default(0u64)]` (danger-zones §2).
-    // GATEWAY-SUBSCRIBED table → `gateway/src/stdb/bindings/corpse_type.rs` + the
-    // `schema_parity.rs` manifest hand-synced in the SAME change (playbook failure-mode).
+    // After changing this subscribed row, run `./lyracore bindings` and update the
+    // `schema_parity.rs` field manifest.
     #[default(0u64)]
     pub instance_id: u64,
 }

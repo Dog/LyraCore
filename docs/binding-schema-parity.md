@@ -2,7 +2,7 @@
 
 `gateway/tests/schema_parity.rs` checks the ordered names and types of every table in the
 Coordinator subscription list. A Module column change without matching generated bindings
-breaks BSATN row decoding. Regenerate bindings according to [danger zones](danger-zones.md).
+breaks BSATN row decoding. Run `./lyracore bindings` after schema changes. See [danger zones](danger-zones.md).
 
 The test builds native Module table types with `RawModuleDefV9Builder`, then resolves nested type
 references with `Typespace::inline_typerefs_in_type`. This produces the same ordered product shape
@@ -26,5 +26,5 @@ Only Coordinator subscriptions are included. The test reads `stdb/connection.rs`
 completeness. Per-player subscriptions and reducer arguments are outside its scope.
 
 The native Module dependency links on Linux, where the ELF linker removes unused Wasm host
-intrinsics. The Gateway has no library target, so the test includes the self-contained generated
-bindings tree through `#[path]` and compiles it into its own test binary.
+intrinsics. The Gateway has no library target, so the test uses the same build-script wrapper as the Gateway to load the prepared
+bindings outside the source tree and compiles them into its own test binary.

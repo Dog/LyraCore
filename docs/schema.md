@@ -41,10 +41,10 @@ Start at [`architecture.md`](./architecture.md) for how these tables fit into th
    limitation, not a repo convention. Put new string data in a **new table** instead — the same
    one-row-plus-child-rows shape the codebase already uses (`game_creature_waypoint`,
    `game_npc_text_slot`).
-3. **A new table requires regenerating the gateway bindings**, and the generator snake-cases digit
-   suffixes, so a handful of columns must be hand-patched back. The exact patch list is in
-   `danger-zones.md` §1.2. `gateway/tests/schema_parity.rs` structurally checks every subscribed
-   table's binding against the module schema.
+3. After a schema change, run `./lyracore bindings`. The generated Rust files stay outside the
+   source tree. Use the generator's field names, including digit separators. See `danger-zones.md`
+   §1.2. `gateway/tests/schema_parity.rs` checks every Coordinator subscription against the Module
+   schema.
 
 And the one that is not about a single table: **a schema change must reach every shard.** A partial
 publish presents as an unrelated mid-session hang, not a loud "no such table".
