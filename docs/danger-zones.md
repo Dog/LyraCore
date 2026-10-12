@@ -378,6 +378,7 @@ cd <repo-root>
 
 # Build + test BEFORE deploying: the unit commands CI runs (docs/testing.md), every time. This list
 # once omitted lyracore-importer, and two broken tests sat unnoticed through about ten "all green" PRs.
+./lyracore bindings
 cargo test -p lyracore-importer
 cargo test -p lyracore-module --lib --features=debug_reducers
 cargo test -p lyracore-gateway
@@ -422,7 +423,6 @@ cargo build
 # SINGLE-DATABASE gateway — no Kalimdor, no instances, no realm-core — and every one of
 # those degrades SILENTLY rather than refusing to start. Anything that omits a variable below is the
 # single-database dev config, which is not what a sharded realm runs.
-./lyracore bindings
 cargo build -p lyracore-gateway
 TOKEN=$(grep -oP 'spacetimedb_token = "\K[^"]+' ~/.config/spacetime/cli.toml)
 # ⚠ `lyracore-gatewa` is NOT a typo — see the trap note under this block.

@@ -11,8 +11,9 @@ what a real client shows.
   checkout.
 - On Linux, a C toolchain, `pkg-config` and the OpenSSL headers (`build-essential pkg-config
   libssl-dev` on Ubuntu). macOS needs only the Xcode Command Line Tools.
-- For the durable tier: the SpacetimeDB CLI 2.7.1 on `PATH` as `spacetime`, or named by
-  `SPACETIME_BIN`. [`quickstart.md`](./quickstart.md) gives the install.
+- For Gateway binding preparation and the durable tier: the SpacetimeDB CLI 2.7.1 on `PATH`
+  as `spacetime`, with the matching standalone. [`quickstart.md`](./quickstart.md) gives the
+  install. Durable test fixtures also accept `SPACETIME_BIN` to locate the CLI.
 - For the Runtime Script check: Bun 1.3.7.
 
 None of the tiers needs your own client or a world database. Tests that do need one are ignored by
@@ -24,6 +25,7 @@ From `.github/workflows/rust.yml`. No SpacetimeDB node runs.
 
 ```bash
 cargo fmt --all -- --check
+./lyracore bindings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test -p lyracore-importer
 cargo test -p lyracore-module --lib --features=debug_reducers
