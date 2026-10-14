@@ -8,6 +8,8 @@ const STOP: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_STOP;
 const SET_FACING: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_SET_FACING;
 const HEARTBEAT: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT;
 const FALL_LAND: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_FALL_LAND;
+const JUMP: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_JUMP;
+const JUMPING: &str = "[0,32,0,0]";
 const FORWARD: &str = "[1,0,0,0]";
 const STILL: &str = "[0,0,0,0]";
 
@@ -149,6 +151,10 @@ fn moving_ends_shadowmeld_but_keeps_stealth() {
     );
     send_move(&shard, START_FORWARD, FORWARD, [x + 3.0, y, z], 1.0, 20);
     assert_eq!(auras(&shard, SHADOWMELD), 0);
+
+    cast(&shard, SHADOWMELD);
+    send_move(&shard, JUMP, JUMPING, [x + 3.0, y, z], 1.0, 25);
+    assert_eq!(auras(&shard, SHADOWMELD), 0, "a jump in place is movement");
 
     cast(&shard, STEALTH);
     send_move(&shard, START_FORWARD, FORWARD, [x + 6.0, y, z], 1.0, 30);
