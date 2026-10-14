@@ -1443,8 +1443,13 @@ pub(crate) fn apply_movement_update(
 
     // A unit held in place (root, stun, polymorph) does not translate. Its client stops when the
     // Gateway relays the root, and the root receipt reports where it stopped. A heartbeat that still
-    // steers was sent before the root landed. Turning and falling stay allowed.
-    if steers_translation(&movement_info) && crate::spell::is_movement_blocked(ctx, mover.guid) {
+    // steers was sent before the root landed. Turning and falling stay allowed, and a landing keeps
+    // its fall damage.
+    let steers = steers_translation(&movement_info);
+    if steers
+        && opcode as u32 != lyracore_shared::opcodes::movement::MSG_MOVE_FALL_LAND
+        && crate::spell::is_movement_blocked(ctx, mover.guid)
+    {
         return Ok(());
     }
 
@@ -1596,13 +1601,16 @@ pub(crate) fn apply_movement_update(
         crate::mount::dismount(ctx, mover_guid);
     }
 
-    // BREAK the mover's CHANNEL and break-on-move auras on a real move (Arcane Missiles stops and
-    // Shadowmeld ends if you walk). Only on an actual translation — a pure-turn / stationary heartbeat
-    // (same x/y/z, only orientation changed) breaks neither, matching vanilla. Both are no-ops for a
-    // mover with nothing to break (the common path); the `plan.moved` guard skips their table scans on a
-    // non-move heartbeat.
+    // BREAK the mover's CHANNEL on a real move (Arcane Missiles stops if you walk). Only on an actual
+    // translation — a pure-turn / stationary heartbeat (same x/y/z, only orientation changed) does NOT
+    // break it, matching vanilla. `break_channel` is a no-op for a mover with no channel/cast (the common
+    // path), so the `plan.moved` guard is just to skip the table scan on a non-move heartbeat.
     if plan.moved {
         crate::spell::break_channel(ctx, mover_guid);
+    }
+    // Break-on-move auras (Shadowmeld) end when the client steers. The stored row can lag the client,
+    // so a stop that lands after the cast would read as a move under `plan.moved`.
+    if steers {
         crate::spell::break_auras_on_move(ctx, mover_guid);
     }
 

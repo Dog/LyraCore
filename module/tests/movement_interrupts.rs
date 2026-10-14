@@ -6,6 +6,8 @@ const CHARACTER: &str = "1";
 const START_FORWARD: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_START_FORWARD;
 const STOP: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_STOP;
 const SET_FACING: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_SET_FACING;
+const HEARTBEAT: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT;
+const FALL_LAND: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_FALL_LAND;
 const FORWARD: &str = "[1,0,0,0]";
 const STILL: &str = "[0,0,0,0]";
 
@@ -113,9 +115,13 @@ fn a_rooted_character_turns_but_moves_only_after_the_last_root_ends() {
         "a rooted Character still turns"
     );
 
+    // A jump that lands after the root still lands where the client came down.
+    send_move(&shard, FALL_LAND, FORWARD, [x + 2.0, y, z], 2.5, 35);
+    assert_eq!(position(&shard).0, x + 2.0, "a landing is never dropped");
+
     shard.assert_sql(&format!("DELETE FROM game_aura WHERE spell_id = {ROOT_A}"));
     send_move(&shard, START_FORWARD, FORWARD, [x + 4.0, y, z], 2.5, 40);
-    assert_eq!(position(&shard).0, x + 1.0, "the second root still holds");
+    assert_eq!(position(&shard).0, x + 2.0, "the second root still holds");
 
     shard.assert_sql(&format!("DELETE FROM game_aura WHERE spell_id = {ROOT_B}"));
     send_move(&shard, START_FORWARD, FORWARD, [x + 4.0, y, z], 2.5, 50);
@@ -132,6 +138,14 @@ fn moving_ends_shadowmeld_but_keeps_stealth() {
         auras(&shard, SHADOWMELD),
         1,
         "turning in place keeps Shadowmeld"
+    );
+    send_move(&shard, HEARTBEAT, STILL, [x, y, z], 1.0, 15);
+    // The stored row can lag the client; a stop that lands after the cast is not a move.
+    send_move(&shard, STOP, STILL, [x + 3.0, y, z], 1.0, 18);
+    assert_eq!(
+        auras(&shard, SHADOWMELD),
+        1,
+        "standing still keeps Shadowmeld"
     );
     send_move(&shard, START_FORWARD, FORWARD, [x + 3.0, y, z], 1.0, 20);
     assert_eq!(auras(&shard, SHADOWMELD), 0);

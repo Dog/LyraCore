@@ -1354,12 +1354,11 @@ fn dispatch(
         }
     } else {
         if let Some(info) = root_receipt_stop(&msg, conn.self_guid()) {
-            return forward_movement(
-                store,
-                conn,
-                lyracore_shared::opcodes::movement::MSG_MOVE_STOP,
-                info,
-            );
+            let stop = lyracore_shared::opcodes::movement::MSG_MOVE_STOP;
+            for (fwd_opcode, fwd_info) in conn.move_coalesce.on_movement_now(stop, &info) {
+                forward_movement(store, conn, fwd_opcode, &fwd_info)?;
+            }
+            return Ok(());
         }
         if handlers::is_control_receipt(&msg) {
             return Ok(());
@@ -1408,15 +1407,26 @@ fn complete_reply(
 }
 
 /// A root or unroot receipt carries where the client stopped and its new flags. Peers still hold the
-/// last relayed run, so the receipt is relayed to them as a stop. The typed reader uses a later
-/// transport layout, so a receipt on a transport is not relayed.
-fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Option<&MovementInfo> {
-    let (guid, info) = match msg {
-        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => (ack.guid, &ack.info),
-        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(ack) => (ack.guid, &ack.info),
+/// last relayed run, so the receipt is relayed to them as a stop. A root receipt drops any steering
+/// flags so the Module's root gate accepts it. The typed reader skips the build-5875 transport tail,
+/// so a receipt on a transport is not relayed.
+fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Option<MovementInfo> {
+    let (guid, info, rooted) = match msg {
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => (ack.guid, &ack.info, true),
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(ack) => (ack.guid, &ack.info, false),
         _ => return None,
     };
-    (Some(guid.guid()) == self_guid && info.flags.get_on_transport().is_none()).then_some(info)
+    if Some(guid.guid()) != self_guid {
+        return None;
+    }
+    // The build-5875 encoder refuses a transport flag whose tail the typed reader skipped. The
+    // library's `clear_*` flag methods mask with `reverse_bits`, so steering is cleared on the bytes.
+    let mut bytes = codec::movement_info_to_bytes(info).ok()?;
+    if rooted {
+        const FORWARD_BACKWARD_STRAFE: u8 = 0xF;
+        bytes[0] &= !FORWARD_BACKWARD_STRAFE;
+    }
+    codec::bytes_to_movement_info(&bytes).ok()
 }
 
 fn forward_movement<St: SessionStore + ?Sized>(

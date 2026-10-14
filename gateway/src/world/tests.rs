@@ -324,3 +324,53 @@ fn human_speaker() -> SpeakerFacts {
         name: String::new(),
     }
 }
+
+#[test]
+fn a_root_receipt_relays_a_stop_without_steering_flags() {
+    use wow_world_messages::vanilla::{
+        MovementInfo_MovementFlags, Vector3d, CMSG_FORCE_MOVE_ROOT_ACK, CMSG_FORCE_MOVE_UNROOT_ACK,
+    };
+    const FORWARD_ROOT: u32 = 0x1 | 0x1000;
+    let info = |flags| MovementInfo {
+        flags: MovementInfo_MovementFlags::new(flags, None, None, None, None),
+        timestamp: 10,
+        position: Vector3d {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        orientation: 0.0,
+        fall_time: 0.0,
+    };
+    let root = |flags| {
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(Box::new(CMSG_FORCE_MOVE_ROOT_ACK {
+            guid: wow_world_messages::Guid::new(7),
+            movement_counter: 0,
+            info: info(flags),
+        }))
+    };
+    let flags = |info: &MovementInfo| {
+        let bytes = codec::movement_info_to_bytes(info).unwrap();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    let stop = root_receipt_stop(&root(FORWARD_ROOT), Some(7)).expect("own root receipt");
+    assert_eq!(flags(&stop), 0x1000);
+    assert!(root_receipt_stop(&root(FORWARD_ROOT), Some(8)).is_none());
+    assert!(
+        root_receipt_stop(
+            &root(lyracore_shared::env::MOVEMENT_FLAG_ON_TRANSPORT),
+            Some(7)
+        )
+        .is_none(),
+        "a build-5875 transport receipt has a tail the typed reader skipped"
+    );
+
+    let unroot =
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(Box::new(CMSG_FORCE_MOVE_UNROOT_ACK {
+            guid: wow_world_messages::Guid::new(7),
+            movement_counter: 0,
+            info: info(0x1),
+        }));
+    let resumed = root_receipt_stop(&unroot, Some(7)).expect("own unroot receipt");
+    assert_eq!(flags(&resumed), 0x1, "an unroot receipt keeps steering");
+}
