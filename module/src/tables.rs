@@ -124,7 +124,7 @@ pub use crate::gw::{
     game_gateway_lease, game_gateway_lease_reaper_schedule, game_gateway_session, GatewayLease,
     GatewayLeaseReaperSchedule, GatewaySession,
 };
-pub use crate::import_meta::{game_import_meta, ImportMeta};
+pub use crate::import_meta::{game_import_meta, game_world_import, ImportMeta, WorldImport};
 pub use crate::instance::{
     game_instance, game_instance_binding, game_instance_reaper_schedule, game_instance_removal,
     GameInstance, GameInstanceBinding, InstanceReaperSchedule, InstanceRemoval,

@@ -1474,10 +1474,20 @@ pub(crate) fn call_reducer(args: &Args, reducer: &str, payload: &str) -> Result<
     call_reducer_args(args, reducer, &[&payload])
 }
 
+/// The `spacetime` CLI. `lyracore import` passes a temporary owner config through
+/// `LYRACORE_SPACETIME_CONFIG_PATH` when its operator credential is server-issued.
+pub(crate) fn spacetime() -> Command {
+    let mut command = Command::new("spacetime");
+    if let Some(path) = std::env::var_os("LYRACORE_SPACETIME_CONFIG_PATH") {
+        command.arg("--config-path").arg(path);
+    }
+    command
+}
+
 /// Reducer call with separate positional arguments (generation lifecycle reducers carry both
 /// immutable manifest metadata and a packed batch).
 pub(crate) fn call_reducer_args(args: &Args, reducer: &str, values: &[&str]) -> Result<()> {
-    let mut command = Command::new("spacetime");
+    let mut command = spacetime();
     command.args(["call", "-s", &args.server, &args.db, reducer]);
     command.args(values);
     let out = command
@@ -1502,7 +1512,7 @@ pub(crate) fn stamp_family(
     row_count: u64,
 ) -> Result<()> {
     let row_count_s = row_count.to_string();
-    let out = Command::new("spacetime")
+    let out = spacetime()
         .args([
             "call",
             "-s",
@@ -3867,7 +3877,7 @@ pub(crate) fn run_sql_statements(args: &Args, stmts: &[String], label: &str) -> 
             stmts.len(),
             &s[..s.len().min(60)]
         );
-        let out = Command::new("spacetime")
+        let out = spacetime()
             .args(["sql", "-s", &args.server, &args.db, s])
             .output()
             .context("run spacetime sql")?;

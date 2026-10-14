@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use wow_dbc::DbcTable;
 use wow_mpq::PatchChain;
 
@@ -351,7 +350,7 @@ fn sql_column_rows<'a>(
 }
 
 fn sql_query(args: &crate::Args, query: &str) -> Result<String> {
-    let out = Command::new("spacetime")
+    let out = crate::spacetime()
         .args([
             "sql",
             "--format",

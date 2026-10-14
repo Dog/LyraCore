@@ -281,6 +281,53 @@ pub fn set_realm_address(ctx: &ReducerContext, address: String) -> Result<(), St
     Ok(())
 }
 
+/// Write the realm list row whole, creating it when absent. `lyracore dev up` calls this after
+/// it claims the operator, so the advertised address follows the Gateway's client listener.
+#[reducer]
+pub fn provision_realm(
+    ctx: &ReducerContext,
+    id: u8,
+    name: String,
+    address: String,
+    realm_type: u32,
+    timezone: u8,
+) -> Result<(), String> {
+    require_operator(ctx)?;
+    let address = validate_realm_address(&address)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("realm name must not be blank".to_string());
+    }
+    let realms = ctx.db.game_realm();
+    let realm = match realms.id().find(id) {
+        Some(existing) => Realm {
+            name: name.to_string(),
+            address,
+            realm_type,
+            timezone,
+            ..existing
+        },
+        None => Realm {
+            id,
+            name: name.to_string(),
+            address,
+            realm_type,
+            flags: 0,
+            population: 0.0,
+            timezone,
+        },
+    };
+    log::info!(
+        "provision_realm: {} {} at {}",
+        realm.id,
+        realm.name,
+        realm.address
+    );
+    realms.id().delete(id);
+    realms.insert(realm);
+    Ok(())
+}
+
 #[cfg(test)]
 mod realm_address_tests {
     use super::*;

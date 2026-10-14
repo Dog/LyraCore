@@ -612,7 +612,7 @@ pub use tables::{game_guild_invite, GuildInvite};
 pub use tables::{
     game_guild_petition, game_guild_petition_signature, GuildPetition, GuildPetitionSignature,
 };
-pub use tables::{game_import_meta, ImportMeta};
+pub use tables::{game_import_meta, game_world_import, ImportMeta, WorldImport};
 pub use tables::{
     game_instance, game_instance_binding, game_instance_reaper_schedule, game_instance_removal,
     GameInstance, GameInstanceBinding, InstanceReaperSchedule, InstanceRemoval,
