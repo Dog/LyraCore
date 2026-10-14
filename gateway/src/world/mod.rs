@@ -1353,6 +1353,14 @@ fn dispatch(
             }
         }
     } else {
+        if let Some(info) = root_receipt_stop(&msg, conn.self_guid()) {
+            return forward_movement(
+                store,
+                conn,
+                lyracore_shared::opcodes::movement::MSG_MOVE_STOP,
+                info,
+            );
+        }
         if handlers::is_control_receipt(&msg) {
             return Ok(());
         }
@@ -1397,6 +1405,18 @@ fn complete_reply(
             Ok(())
         }
     })
+}
+
+/// A root or unroot receipt carries where the client stopped and its new flags. Peers still hold the
+/// last relayed run, so the receipt is relayed to them as a stop. The typed reader uses a later
+/// transport layout, so a receipt on a transport is not relayed.
+fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Option<&MovementInfo> {
+    let (guid, info) = match msg {
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => (ack.guid, &ack.info),
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(ack) => (ack.guid, &ack.info),
+        _ => return None,
+    };
+    (Some(guid.guid()) == self_guid && info.flags.get_on_transport().is_none()).then_some(info)
 }
 
 fn forward_movement<St: SessionStore + ?Sized>(

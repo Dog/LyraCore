@@ -1358,6 +1358,14 @@ pub(crate) struct MovementPlan {
     pub moved: bool,
 }
 
+/// Does this MovementInfo carry forward, backward or strafe intent? Its leading u32 is the flags.
+pub(crate) fn steers_translation(movement_info: &[u8]) -> bool {
+    const FORWARD_BACKWARD_STRAFE: u32 = 0xF;
+    movement_info.get(0..4).is_some_and(|b| {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & FORWARD_BACKWARD_STRAFE != 0
+    })
+}
+
 /// Whether a movement sample may replace the actor's current motion snapshot.
 pub(crate) fn movement_is_accepted(
     last_move_ms: u32,
@@ -1430,6 +1438,13 @@ pub(crate) fn apply_movement_update(
     // a GHOST (dead + PLAYER_FLAGS_GHOST) CAN move — it has to run back to its corpse — so
     // only the not-yet-released dead state is frozen.
     if mover.dead && mover.player_flags & lyracore_shared::constants::player_flags::GHOST == 0 {
+        return Ok(());
+    }
+
+    // A unit held in place (root, stun, polymorph) does not translate. Its client stops when the
+    // Gateway relays the root, and the root receipt reports where it stopped. A heartbeat that still
+    // steers was sent before the root landed. Turning and falling stay allowed.
+    if steers_translation(&movement_info) && crate::spell::is_movement_blocked(ctx, mover.guid) {
         return Ok(());
     }
 
@@ -1581,12 +1596,14 @@ pub(crate) fn apply_movement_update(
         crate::mount::dismount(ctx, mover_guid);
     }
 
-    // BREAK the mover's CHANNEL on a real move (Arcane Missiles stops if you walk). Only on an actual
-    // translation — a pure-turn / stationary heartbeat (same x/y/z, only orientation changed) does NOT
-    // break it, matching vanilla. `break_channel` is a no-op for a mover with no channel/cast (the common
-    // path), so the `plan.moved` guard is just to skip the table scan on a non-move heartbeat.
+    // BREAK the mover's CHANNEL and break-on-move auras on a real move (Arcane Missiles stops and
+    // Shadowmeld ends if you walk). Only on an actual translation — a pure-turn / stationary heartbeat
+    // (same x/y/z, only orientation changed) breaks neither, matching vanilla. Both are no-ops for a
+    // mover with nothing to break (the common path); the `plan.moved` guard skips their table scans on a
+    // non-move heartbeat.
     if plan.moved {
         crate::spell::break_channel(ctx, mover_guid);
+        crate::spell::break_auras_on_move(ctx, mover_guid);
     }
 
     // Anti-cheat: score this delta for speed / teleport plausibility and LOG (never reject) any
