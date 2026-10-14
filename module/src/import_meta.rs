@@ -11,9 +11,17 @@
 //! regen — docs/danger-zones.md §1.2's "new table → regenerate the gateway bindings" rule applies
 //! to tables the gateway actually reads. The importer and an operator via `spacetime sql` still
 //! read/write it directly against the SpacetimeDB node.
+//!
+//! `game_world_import` records which maps a completed World Import loaded on this database. The CLI's
+//! `import world` brackets each destination with `begin_world_import` and `complete_world_import`;
+//! `dev check`, `import check` and `dev smoke` ask `check_world_content` before play.
 use spacetimedb::{reducer, table, ReducerContext, Table, Timestamp};
 
 use crate::helpers::require_operator;
+
+/// Maps that need imported WMO collision before play. The importer's `--vmap` mode has an
+/// instance slice for Deadmines only; the Deeprun Tram (369) joins once it has one.
+const WMO_MAPS: [u32; 1] = [36];
 
 /// One row per FAMILY (a `--dump`/`--dbc` import family name — e.g. "creatures", "quests" — or a
 /// `debug_seed_<name>` reseed) recording the provenance of its last successful load. `family` is the
@@ -76,4 +84,110 @@ pub fn stamp_import_meta(
     require_operator(ctx)?;
     stamp(ctx, &family, &source_sha, &file_hash, row_count);
     Ok(())
+}
+
+/// One row per map whose World Import completed on this database.
+#[table(accessor = game_world_import)]
+pub struct WorldImport {
+    #[primary_key]
+    pub map_id: u32,
+    pub completed_at: Timestamp,
+}
+
+/// Clear every completion on this database before an import reloads it.
+#[reducer]
+pub fn begin_world_import(ctx: &ReducerContext) -> Result<(), String> {
+    require_operator(ctx)?;
+    let table = ctx.db.game_world_import();
+    let maps: Vec<u32> = table.iter().map(|row| row.map_id).collect();
+    for map_id in maps {
+        table.map_id().delete(map_id);
+    }
+    Ok(())
+}
+
+/// Record `map_ids` as imported, after their content passes the same checks as play.
+#[reducer]
+pub fn complete_world_import(ctx: &ReducerContext, map_ids: Vec<u32>) -> Result<(), String> {
+    require_operator(ctx)?;
+    content_problem(
+        &map_ids,
+        |_| true,
+        |map| crate::vmap::active_generation_id(ctx, map).is_some(),
+    )?;
+    let table = ctx.db.game_world_import();
+    for map_id in map_ids {
+        table.map_id().delete(map_id);
+        table.insert(WorldImport {
+            map_id,
+            completed_at: ctx.timestamp,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse when any of `map_ids` lacks a completed World Import or its required content.
+#[reducer]
+pub fn check_world_content(ctx: &ReducerContext, map_ids: Vec<u32>) -> Result<(), String> {
+    require_operator(ctx)?;
+    let imports = ctx.db.game_world_import();
+    content_problem(
+        &map_ids,
+        |map| imports.map_id().find(map).is_some(),
+        |map| crate::vmap::active_generation_id(ctx, map).is_some(),
+    )
+}
+
+/// The pure half of the content check, so the decision is testable without a database.
+fn content_problem(
+    map_ids: &[u32],
+    completed: impl Fn(u32) -> bool,
+    wmo_active: impl Fn(u32) -> bool,
+) -> Result<(), String> {
+    if map_ids.is_empty() {
+        return Err("no maps named for the content check".to_string());
+    }
+    if let Some(map) = map_ids.iter().copied().find(|&map| !completed(map)) {
+        return Err(format!("no completed world import for map {map}"));
+    }
+    if let Some(map) = map_ids
+        .iter()
+        .copied()
+        .find(|map| WMO_MAPS.contains(map) && !wmo_active(*map))
+    {
+        return Err(format!("missing imported WMO geometry for map {map}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod world_import_tests {
+    use super::content_problem;
+
+    #[test]
+    fn complete_content_passes() {
+        assert_eq!(
+            content_problem(&[0, 1, 36, 369], |_| true, |_| true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_missing_part_names_itself() {
+        let refused = |result: Result<(), String>| result.unwrap_err();
+        assert!(refused(content_problem(&[], |_| true, |_| true)).contains("no maps"));
+        assert_eq!(
+            refused(content_problem(&[0, 1], |map| map == 0, |_| true)),
+            "no completed world import for map 1"
+        );
+        assert_eq!(
+            refused(content_problem(&[0, 36], |_| true, |_| false)),
+            "missing imported WMO geometry for map 36"
+        );
+    }
+
+    #[test]
+    fn maps_without_an_importer_vmap_slice_need_no_wmo_geometry() {
+        assert_eq!(content_problem(&[0, 1, 369], |_| true, |_| false), Ok(()));
+    }
 }

@@ -45,7 +45,7 @@ A World of Warcraft 1.12.1 server. Game state lives in SpacetimeDB; the gateway 
 
 **V** [Verification](#working-method)
 
-**W** [Whereabouts](#chat) · [Will-Not-Be-Traded Slot](#trading) · [World Import Profile](#realm-topology) · [World Import Scope](#realm-topology) · [World Session](#accounts-characters-and-sessions) · [World Session Token](#accounts-characters-and-sessions) · [World Shard](#realm-topology)
+**W** [Whereabouts](#chat) · [Will-Not-Be-Traded Slot](#trading) · [World Import Completion](#realm-topology) · [World Import Profile](#realm-topology) · [World Import Scope](#realm-topology) · [World Session](#accounts-characters-and-sessions) · [World Session Token](#accounts-characters-and-sessions) · [World Shard](#realm-topology)
 
 **Z** [Zone Weather](#world-clock-and-weather)
 
@@ -78,6 +78,12 @@ creatures. The starting profiles retain the Alliance scope and add the Horde sta
 the same continent. Smaller canonical profiles share quest definitions and scripted event
 requirements from both starting profiles and the Instance Pool.
 Quest-giver relations stay within each destination's World Import Scope.
+
+**World Import Completion**:
+The record that a World Import loaded a map on one World Shard or Instance Pool and passed its
+content checks. An import clears the destination's records before it loads. The development CLI
+refuses play checks for a map without one.
+_Avoid_: import done flag, content ready flag
 
 **World Import Scope**:
 The authoritative union of Bounded Map Slices, Instance Vmap Slices, whole maps, and forced
