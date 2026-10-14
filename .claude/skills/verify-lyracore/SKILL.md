@@ -129,7 +129,7 @@ printf 'test123\n' | ./lyracore dev smoke TEST Tester --password-stdin
 ```
 
 It runs the content check before it reads the password. On the seed fixture it stops there with
-`no completed world import for map 36`, so it proves nothing until an import completes.
+`no completed world import for map N`, so it proves nothing until an import completes.
 
 ### Side effects
 

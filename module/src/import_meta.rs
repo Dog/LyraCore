@@ -15,14 +15,13 @@
 //! `game_world_import` records which maps a completed World Import loaded on this database. The CLI's
 //! `import world` brackets each destination with `begin_world_import` and `complete_world_import`;
 //! `dev check`, `import check` and `dev smoke` ask `check_world_content` before play.
-use lyracore_shared::constants::starter_item::HEARTHSTONE_ENTRY;
 use spacetimedb::{reducer, table, ReducerContext, Table, Timestamp};
 
 use crate::helpers::require_operator;
-use crate::tables::game_item_template;
 
-/// Maps that need imported WMO collision before play: Deadmines and the Deeprun Tram.
-const WMO_MAPS: [u32; 2] = [36, 369];
+/// Maps that need imported WMO collision before play. The importer's `--vmap` mode has an
+/// instance slice for Deadmines only; the Deeprun Tram (369) joins once it has one.
+const WMO_MAPS: [u32; 1] = [36];
 
 /// One row per FAMILY (a `--dump`/`--dbc` import family name — e.g. "creatures", "quests" — or a
 /// `debug_seed_<name>` reseed) recording the provenance of its last successful load. `family` is the
@@ -114,7 +113,6 @@ pub fn complete_world_import(ctx: &ReducerContext, map_ids: Vec<u32>) -> Result<
     content_problem(
         &map_ids,
         |_| true,
-        has_hearthstone(ctx),
         |map| crate::vmap::active_generation_id(ctx, map).is_some(),
     )?;
     let table = ctx.db.game_world_import();
@@ -136,24 +134,14 @@ pub fn check_world_content(ctx: &ReducerContext, map_ids: Vec<u32>) -> Result<()
     content_problem(
         &map_ids,
         |map| imports.map_id().find(map).is_some(),
-        has_hearthstone(ctx),
         |map| crate::vmap::active_generation_id(ctx, map).is_some(),
     )
-}
-
-fn has_hearthstone(ctx: &ReducerContext) -> bool {
-    ctx.db
-        .game_item_template()
-        .entry()
-        .find(HEARTHSTONE_ENTRY)
-        .is_some()
 }
 
 /// The pure half of the content check, so the decision is testable without a database.
 fn content_problem(
     map_ids: &[u32],
     completed: impl Fn(u32) -> bool,
-    hearthstone: bool,
     wmo_active: impl Fn(u32) -> bool,
 ) -> Result<(), String> {
     if map_ids.is_empty() {
@@ -161,11 +149,6 @@ fn content_problem(
     }
     if let Some(map) = map_ids.iter().copied().find(|&map| !completed(map)) {
         return Err(format!("no completed world import for map {map}"));
-    }
-    if !hearthstone {
-        return Err(format!(
-            "missing imported Hearthstone item {HEARTHSTONE_ENTRY}"
-        ));
     }
     if let Some(map) = map_ids
         .iter()
@@ -183,29 +166,28 @@ mod world_import_tests {
 
     #[test]
     fn complete_content_passes() {
-        assert_eq!(content_problem(&[0, 369], |_| true, true, |_| true), Ok(()));
+        assert_eq!(
+            content_problem(&[0, 1, 36, 369], |_| true, |_| true),
+            Ok(())
+        );
     }
 
     #[test]
     fn each_missing_part_names_itself() {
         let refused = |result: Result<(), String>| result.unwrap_err();
-        assert!(refused(content_problem(&[], |_| true, true, |_| true)).contains("no maps"));
+        assert!(refused(content_problem(&[], |_| true, |_| true)).contains("no maps"));
         assert_eq!(
-            refused(content_problem(&[0, 1], |map| map == 0, true, |_| true)),
+            refused(content_problem(&[0, 1], |map| map == 0, |_| true)),
             "no completed world import for map 1"
         );
         assert_eq!(
-            refused(content_problem(&[0], |_| true, false, |_| true)),
-            "missing imported Hearthstone item 6948"
-        );
-        assert_eq!(
-            refused(content_problem(&[0, 36], |_| true, true, |_| false)),
+            refused(content_problem(&[0, 36], |_| true, |_| false)),
             "missing imported WMO geometry for map 36"
         );
     }
 
     #[test]
-    fn open_world_maps_need_no_wmo_geometry() {
-        assert_eq!(content_problem(&[0, 1], |_| true, true, |_| false), Ok(()));
+    fn maps_without_an_importer_vmap_slice_need_no_wmo_geometry() {
+        assert_eq!(content_problem(&[0, 1, 369], |_| true, |_| false), Ok(()));
     }
 }
