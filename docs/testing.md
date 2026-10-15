@@ -14,7 +14,7 @@ what a real client shows.
 - For Gateway binding preparation and the durable tier: the SpacetimeDB CLI 2.7.1 on `PATH`
   as `spacetime`, with the matching standalone. [`quickstart.md`](./quickstart.md) gives the
   install. Durable test fixtures also accept `SPACETIME_BIN` to locate the CLI.
-- For the Runtime Script check: Bun 1.3.7.
+- For the Runtime Script check: Bun 1.4.3.
 
 None of the tiers needs your own client or a world database. Tests that do need one are ignored by
 default (see [Client data](#client-data)).
