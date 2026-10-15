@@ -483,6 +483,8 @@ fn gossip_select_on_an_imported_innkeeper_option_binds_home() {
         opt(0, "Chat.", gossip_option::GOSSIP),
         opt(0, "Stay here.", gossip_option::INNKEEPER),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
@@ -541,6 +543,7 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
         vec![gated, always]
     };
     let mut a = quest_store();
+    a.npc.innkeeper = true;
     a.npc.gossip_opts = menu();
     let a = std::sync::Arc::new(a);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(a.clone(), 1);
@@ -562,6 +565,7 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
     server.join().unwrap();
 
     let mut b = quest_store();
+    b.npc.innkeeper = true;
     b.npc.gossip_opts = menu();
     b.quest.quest_log = vec![(60, false)].into();
     let b = std::sync::Arc::new(b);
@@ -823,6 +827,8 @@ fn gossip_hello_shows_unlearn_talents_at_level_10_and_select_routes_to_reset_tal
             gossip_option::UNLEARNTALENTS,
         ),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     CMSG_GOSSIP_HELLO {
@@ -915,6 +921,9 @@ fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() 
         opt(0, "Hidden favor.", gossip_option::GOSSIP),
         opt(0, "Stay here.", gossip_option::INNKEEPER),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
+    s.npc.gossip_opts[2].row_id = 4003;
     s.npc.gossip_opts[1].cond_type = gossip_condition::QUEST_TAKEN;
     s.npc.gossip_opts[1].cond_value1 = 60;
     let store = std::sync::Arc::new(s);
