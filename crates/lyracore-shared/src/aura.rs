@@ -1,5 +1,3 @@
-//! Pure folds over active aura values.
-
 use crate::spell::taxonomy::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -10,7 +8,7 @@ pub struct AuraAmount {
     pub stacks: u8,
 }
 
-/// Legacy zero-stack rows contribute once. Arithmetic follows the Module's signed aura fold.
+// Legacy zero-stack rows contribute once.
 pub fn stacked_amount(amount: i32, stacks: u8) -> i32 {
     amount * i32::from(stacks.max(1))
 }
@@ -34,13 +32,10 @@ pub fn speed_bonus(auras: impl IntoIterator<Item = AuraAmount>, speed_kind: u8) 
         .sum()
 }
 
-/// Movement retains at least ten percent of its base speed.
 pub fn move_speed_with_pct(base: f32, pct: i32) -> f32 {
     base * (100 + pct).max(10) as f32 / 100.0
 }
 
-/// Running combines movement auras with mounted speed only while a mount aura is active.
-/// Unmounted always bonuses multiply; their product competes with the strongest not-stack bonus.
 pub fn run_speed(base: f32, auras: impl IntoIterator<Item = AuraAmount>) -> f32 {
     let (mut movement, mut slow, mut mount, mut mounted) = (0, 0, 0, false);
     let (mut always, mut not_stack) = (1.0_f32, 1.0_f32);
@@ -80,7 +75,6 @@ pub fn moves_run_speed(kind: u8, parameter: i32) -> bool {
             .any(|speed| parameter == i32::from(speed))
 }
 
-/// Swimming uses its strongest positive speed aura and retains the movement floor.
 pub fn swim_speed(base: f32, auras: impl IntoIterator<Item = AuraAmount>) -> f32 {
     let (mut bonus, mut slow) = (0, 0);
     for aura in auras {

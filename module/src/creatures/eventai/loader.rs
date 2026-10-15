@@ -1,5 +1,3 @@
-//! Operator-only loading of normalized EventAI definitions.
-
 use std::collections::HashSet;
 
 use spacetimedb::{reducer, ReducerContext, Table};
@@ -33,14 +31,12 @@ use crate::{
     game_creature_ai_rule_state, game_creature_ai_state, game_melee_attack, game_world_entity,
 };
 
-/// Replace all normalized definitions and load the first batch.
 #[reducer]
 pub fn import_creature_ai_definitions(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
     load_definition_batch(ctx, &packed, true)
 }
 
-/// Append a validated batch after [`import_creature_ai_definitions`].
 #[reducer]
 pub fn import_creature_ai_definitions_append(
     ctx: &ReducerContext,
@@ -480,7 +476,7 @@ fn parse_recurrence(encoded: &str) -> Result<RecurrencePolicy, String> {
     }
 }
 
-#[allow(clippy::too_many_lines)] // One arm per instruction kind.
+#[allow(clippy::too_many_lines)]
 fn parse_instruction(encoded: &str) -> Result<CreatureInstruction, String> {
     let fields: Vec<&str> = encoded.split(':').collect();
     match fields.as_slice() {
@@ -1053,7 +1049,6 @@ fn parse_threat_percent(value: &str) -> Result<i32, String> {
     Ok(percent)
 }
 
-/// Load one definition and keep its creature in combat for the durable integration test.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn debug_stage_eventai_revision_fixture(
@@ -1101,7 +1096,6 @@ pub fn debug_stage_eventai_revision_fixture(
     Ok(())
 }
 
-/// Verify the durable fixture from a separate Module call without exposing private tables.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn debug_verify_eventai_revision_fixture(
@@ -1412,8 +1406,6 @@ mod tests {
         assert!(parse_instruction("no-effect:missing-text-template:0").is_err());
     }
 
-    /// Source chat type 2 is a narrative line, so the importer encodes `emote` beside `say` and
-    /// `yell`. The loader must round-trip all three or an imported emote silently degrades.
     #[test]
     fn every_encoded_speech_mode_round_trips() {
         for (encoded, expected) in [

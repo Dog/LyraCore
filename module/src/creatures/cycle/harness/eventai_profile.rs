@@ -1,5 +1,3 @@
-//! Canonical-profile EventAI capability scenarios.
-
 use super::*;
 use crate::creatures::eventai::*;
 

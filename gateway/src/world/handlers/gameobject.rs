@@ -1,4 +1,3 @@
-//! GameObject use resolves its interaction before entering a quest or loot operation.
 use super::super::*;
 
 pub(crate) struct GameObject;

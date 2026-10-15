@@ -1,23 +1,13 @@
-//! Artifact fragments the behaviour tests share.
-//!
-//! The JSON here is written by hand, the way a Datascript generator would emit it, so the tests
-//! exercise the parser rather than a builder that could drift with it.
-
 #![allow(dead_code)]
 
-/// A source digest, in the shape the importer's BLAKE3 hashes already take.
 pub const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// A second, different source digest.
 pub const HASH_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-/// A spell inside the Package spell range, safe to insert.
 pub const PACKAGE_SPELL: u32 = 6_000_001;
 
-/// A real vanilla spell (Fireball), safe to update and never safe to insert.
 pub const REAL_SPELL: u32 = 133;
 
-/// Every claimable `game_spell` column, so an `insert` carries the whole row.
 pub const WHOLE_SPELL_ROW: &str = r#"{
     "name": { "type": "string", "value": "Kindled Bolt" },
     "power_type": { "type": "u8", "value": 0 },
@@ -45,7 +35,6 @@ pub const WHOLE_SPELL_ROW: &str = r#"{
     "proc_charges": { "type": "u8", "value": 0 }
 }"#;
 
-/// Every claimable `game_spell_effect` column, so an `insert` carries the whole row.
 pub const WHOLE_EFFECT_ROW: &str = r#"{
     "kind": { "type": "u8", "value": 2 },
     "base_points": { "type": "i32", "value": 120 },
@@ -64,13 +53,11 @@ pub const WHOLE_EFFECT_ROW: &str = r#"{
     "enters_combat": { "type": "bool", "value": false }
 }"#;
 
-/// Wraps claims in an artifact envelope.
 #[must_use]
 pub fn artifact(package: &str, claims: &str) -> String {
     format!(r#"{{"version":1,"package":"{package}","source_hash":"{HASH_A}","claims":[{claims}]}}"#)
 }
 
-/// One `game_spell` claim.
 #[must_use]
 pub fn spell_claim(spell_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -78,7 +65,6 @@ pub fn spell_claim(spell_id: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_spell_effect` claim.
 #[must_use]
 pub fn effect_claim(spell_id: u32, effect_index: u8, operation: &str, fields: &str) -> String {
     format!(
@@ -86,19 +72,15 @@ pub fn effect_claim(spell_id: u32, effect_index: u8, operation: &str, fields: &s
     )
 }
 
-/// The shortest artifact that parses: one Package, one partial update on one real spell.
 #[must_use]
 pub fn one_spell_update(package: &str, spell_id: u32, fields: &str) -> String {
     artifact(package, &spell_claim(spell_id, "update", fields))
 }
 
-/// An item inside the Package item range, safe to insert.
 pub const PACKAGE_ITEM: u32 = 7_000_001;
 
-/// A real vanilla item (Worn Shortsword), safe to update and never safe to insert.
 pub const REAL_ITEM: u32 = 25;
 
-/// Every claimable `game_item_template` column, so an `insert` carries the whole row.
 pub const WHOLE_ITEM_ROW: &str = r#"{
     "class": { "type": "u8", "value": 2 },
     "subclass": { "type": "u8", "value": 7 },
@@ -159,7 +141,6 @@ pub const WHOLE_ITEM_ROW: &str = r#"{
     "allowed_race": { "type": "u32", "value": 255 }
 }"#;
 
-/// One `game_item_template` claim.
 #[must_use]
 pub fn item_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -167,19 +148,15 @@ pub fn item_claim(entry: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// The shortest artifact that parses: one Package, one partial update on one real item.
 #[must_use]
 pub fn one_item_update(package: &str, entry: u32, fields: &str) -> String {
     artifact(package, &item_claim(entry, "update", fields))
 }
 
-/// A quest inside the Package quest range, safe to insert.
 pub const PACKAGE_QUEST: u32 = 8_000_001;
 
-/// A real vanilla quest entry, safe to update and never safe to insert.
-pub const REAL_QUEST: u32 = 1; // "Undertaking", the first Elwynn quest, always imported in-box.
+pub const REAL_QUEST: u32 = 1;
 
-/// Every claimable `game_quest_template` column, so an `insert` carries the whole row.
 pub const WHOLE_QUEST_ROW: &str = r#"{
     "min_level": { "type": "u32", "value": 1 },
     "quest_level": { "type": "u32", "value": 3 },
@@ -203,7 +180,6 @@ pub const WHOLE_QUEST_ROW: &str = r#"{
     "quest_type": { "type": "u32", "value": 0 }
 }"#;
 
-/// One `game_quest_template` claim.
 #[must_use]
 pub fn quest_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -211,7 +187,6 @@ pub fn quest_claim(entry: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_quest_text` claim.
 #[must_use]
 pub fn quest_text_claim(quest_entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -219,7 +194,6 @@ pub fn quest_text_claim(quest_entry: u32, operation: &str, fields: &str) -> Stri
     )
 }
 
-/// One `game_quest_objective` claim.
 #[must_use]
 pub fn quest_objective_claim(
     quest_entry: u32,
@@ -232,7 +206,6 @@ pub fn quest_objective_claim(
     )
 }
 
-/// One `game_quest_cast_objective` claim.
 #[must_use]
 pub fn quest_cast_objective_claim(
     quest_entry: u32,
@@ -245,7 +218,6 @@ pub fn quest_cast_objective_claim(
     )
 }
 
-/// One `game_quest_reward_item` claim.
 #[must_use]
 pub fn quest_reward_item_claim(
     quest_entry: u32,
@@ -258,7 +230,6 @@ pub fn quest_reward_item_claim(
     )
 }
 
-/// One `game_quest_reward_choice` claim.
 #[must_use]
 pub fn quest_reward_choice_claim(
     quest_entry: u32,
@@ -271,13 +242,10 @@ pub fn quest_reward_choice_claim(
     )
 }
 
-/// A loot row inside the Package loot range, safe to insert.
 pub const PACKAGE_LOOT: u64 = 9_000_001;
 
-/// A real imported pickpocket-loot row id, safe to update and never safe to insert.
 pub const REAL_PICKPOCKET_LOOT: u64 = 1;
 
-/// Every claimable `game_pickpocket_loot` column, so an `insert` carries the whole row.
 pub const WHOLE_PICKPOCKET_LOOT_ROW: &str = r#"{
     "creature_entry": { "type": "u32", "value": 6 },
     "item_entry": { "type": "u32", "value": 25 },
@@ -287,7 +255,6 @@ pub const WHOLE_PICKPOCKET_LOOT_ROW: &str = r#"{
     "quest_only": { "type": "bool", "value": false }
 }"#;
 
-/// One `game_pickpocket_loot` claim.
 #[must_use]
 pub fn pickpocket_loot_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -295,11 +262,8 @@ pub fn pickpocket_loot_claim(id: u64, operation: &str, fields: &str) -> String {
     )
 }
 
-/// A caster creature's template entry, safe to update on `game_creature_cast`. This table is
-/// update-only, so there is no "safe to insert" identifier at all.
 pub const REAL_CREATURE_CAST: u32 = 6;
 
-/// One `game_creature_cast` claim.
 #[must_use]
 pub fn creature_cast_claim(creature_entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -307,13 +271,10 @@ pub fn creature_cast_claim(creature_entry: u32, operation: &str, fields: &str) -
     )
 }
 
-/// A `game_creature_spell` row inside the Package cast range, safe to insert.
 pub const PACKAGE_CREATURE_SPELL: u64 = 10_000_001;
 
-/// A real imported `game_creature_spell` row id, safe to update and never safe to insert.
 pub const REAL_CREATURE_SPELL: u64 = 1;
 
-/// Every claimable `game_creature_spell` column, so an `insert` carries the whole row.
 pub const WHOLE_CREATURE_SPELL_ROW: &str = r#"{
     "creature_entry": { "type": "u32", "value": 6 },
     "spell_id": { "type": "u32", "value": 133 },
@@ -322,7 +283,6 @@ pub const WHOLE_CREATURE_SPELL_ROW: &str = r#"{
     "condition_value": { "type": "u8", "value": 0 }
 }"#;
 
-/// One `game_creature_spell` claim.
 #[must_use]
 pub fn creature_spell_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -330,14 +290,10 @@ pub fn creature_spell_claim(id: u64, operation: &str, fields: &str) -> String {
     )
 }
 
-/// A `game_trainer_spell` row inside the Package trainer range, safe to insert.
 pub const PACKAGE_TRAINER_SPELL: u64 = 11_000_001;
 
-/// A real imported `game_trainer_spell` row id, safe to update and never safe to insert.
 pub const REAL_TRAINER_SPELL: u64 = 1;
 
-/// Every claimable `game_trainer_spell` column, so an `insert` carries the whole row. A class
-/// offering (`learn_skill_line` 0): `spell_id` names a real `game_spell` row.
 pub const WHOLE_TRAINER_SPELL_ROW: &str = r#"{
     "trainer_entry": { "type": "u32", "value": 100 },
     "spell_id": { "type": "u32", "value": 133 },
@@ -347,7 +303,6 @@ pub const WHOLE_TRAINER_SPELL_ROW: &str = r#"{
     "learn_skill_cap": { "type": "u32", "value": 75 }
 }"#;
 
-/// One `game_trainer_spell` claim.
 #[must_use]
 pub fn trainer_spell_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -355,24 +310,16 @@ pub fn trainer_spell_claim(id: u64, operation: &str, fields: &str) -> String {
     )
 }
 
-// ---- gossip ----
-
-/// A gossip row inside the Package gossip range, safe to insert. One band covers all five
-/// insertable gossip tables, so one constant serves them all.
 pub const PACKAGE_GOSSIP: u64 = 12_000_001;
 
-/// A real creature template entry with a gossip menu, safe to update and never safe to insert.
 pub const REAL_GOSSIP_MENU: u32 = 6;
 
-/// A real imported `game_npc_text` row, safe to update and never safe to insert.
 pub const REAL_NPC_TEXT: u32 = 1;
 
-/// Every claimable `game_npc_text` column, so an `insert` carries the whole row.
 pub const WHOLE_NPC_TEXT_ROW: &str = r#"{
     "text": { "type": "string", "value": "The forge is cold, friend." }
 }"#;
 
-/// Every claimable `game_npc_text_slot` column, so an `insert` carries the whole row.
 pub const WHOLE_NPC_TEXT_SLOT_ROW: &str = r#"{
     "text_id": { "type": "u32", "value": 12000001 },
     "slot_index": { "type": "u8", "value": 0 },
@@ -381,7 +328,6 @@ pub const WHOLE_NPC_TEXT_SLOT_ROW: &str = r#"{
     "probability": { "type": "f32", "value": 1.0 }
 }"#;
 
-/// Every claimable `game_gossip_option` column, so an `insert` carries the whole row.
 pub const WHOLE_GOSSIP_OPTION_ROW: &str = r#"{
     "entry": { "type": "u32", "value": 6 },
     "option_index": { "type": "u32", "value": 0 },
@@ -394,7 +340,6 @@ pub const WHOLE_GOSSIP_OPTION_ROW: &str = r#"{
     "cond_value2": { "type": "u32", "value": 0 }
 }"#;
 
-/// One `game_gossip_menu` claim.
 #[must_use]
 pub fn gossip_menu_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -402,7 +347,6 @@ pub fn gossip_menu_claim(entry: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_npc_text` claim.
 #[must_use]
 pub fn npc_text_claim(text_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -410,7 +354,6 @@ pub fn npc_text_claim(text_id: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_npc_text_slot` claim.
 #[must_use]
 pub fn npc_text_slot_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -418,7 +361,6 @@ pub fn npc_text_slot_claim(id: u64, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_gossip_option` claim.
 #[must_use]
 pub fn gossip_option_claim(row_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -426,29 +368,22 @@ pub fn gossip_option_claim(row_id: u32, operation: &str, fields: &str) -> String
     )
 }
 
-// ---- globals ----
-
-/// A globals row inside the Package globals range, safe to insert.
 pub const PACKAGE_GLOBALS: u64 = 13_000_001;
 
-/// A real imported `game_graveyard_zone` row, safe to update and never safe to insert.
 pub const REAL_GRAVEYARD_ZONE: u64 = 1;
 
-/// Every claimable `game_graveyard_zone` column, so an `insert` carries the whole row.
 pub const WHOLE_GRAVEYARD_ZONE_ROW: &str = r#"{
     "safe_loc_id": { "type": "u32", "value": 105 },
     "zone_id": { "type": "u32", "value": 12 },
     "faction": { "type": "u32", "value": 0 }
 }"#;
 
-/// Every claimable `game_createinfo_spell` column, so an `insert` carries the whole row.
 pub const WHOLE_CREATEINFO_SPELL_ROW: &str = r#"{
     "race": { "type": "u8", "value": 1 },
     "class": { "type": "u8", "value": 1 },
     "spell_id": { "type": "u32", "value": 133 }
 }"#;
 
-/// One `game_class_level_stats` claim.
 #[must_use]
 pub fn class_level_stats_claim(class: u8, level: u8, operation: &str, fields: &str) -> String {
     format!(
@@ -456,7 +391,6 @@ pub fn class_level_stats_claim(class: u8, level: u8, operation: &str, fields: &s
     )
 }
 
-/// One `game_start_position` claim.
 #[must_use]
 pub fn start_position_claim(race: u8, class: u8, operation: &str, fields: &str) -> String {
     format!(
@@ -464,7 +398,6 @@ pub fn start_position_claim(race: u8, class: u8, operation: &str, fields: &str) 
     )
 }
 
-/// One `game_graveyard_zone` claim.
 #[must_use]
 pub fn graveyard_zone_claim(row_id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -472,7 +405,6 @@ pub fn graveyard_zone_claim(row_id: u64, operation: &str, fields: &str) -> Strin
     )
 }
 
-/// One `game_createinfo_spell` claim.
 #[must_use]
 pub fn createinfo_spell_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -480,7 +412,6 @@ pub fn createinfo_spell_claim(id: u64, operation: &str, fields: &str) -> String 
     )
 }
 
-/// One `game_areatrigger_teleport` claim.
 #[must_use]
 pub fn areatrigger_teleport_claim(trigger_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -488,15 +419,10 @@ pub fn areatrigger_teleport_claim(trigger_id: u32, operation: &str, fields: &str
     )
 }
 
-// ---- spellmeta ----
-
-/// A `game_spell_learn` row inside the Package spell metadata range, safe to insert.
 pub const PACKAGE_SPELL_LEARN: u64 = 14_000_001;
 
-/// A real imported `game_spell_learn` row, safe to update and never safe to insert.
 pub const REAL_SPELL_LEARN: u64 = 1;
 
-/// Every claimable `game_spell_chain` column, so an `insert` carries the whole row.
 pub const WHOLE_SPELL_CHAIN_ROW: &str = r#"{
     "prev_spell": { "type": "u32", "value": 133 },
     "first_spell": { "type": "u32", "value": 133 },
@@ -504,13 +430,11 @@ pub const WHOLE_SPELL_CHAIN_ROW: &str = r#"{
     "req_spell": { "type": "u32", "value": 0 }
 }"#;
 
-/// Every claimable `game_spell_learn` column, so an `insert` carries the whole row.
 pub const WHOLE_SPELL_LEARN_ROW: &str = r#"{
     "parent_spell": { "type": "u32", "value": 133 },
     "learn_spell": { "type": "u32", "value": 168 }
 }"#;
 
-/// One `game_spell_chain` claim.
 #[must_use]
 pub fn spell_chain_claim(spell_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -518,7 +442,6 @@ pub fn spell_chain_claim(spell_id: u32, operation: &str, fields: &str) -> String
     )
 }
 
-/// One `game_spell_learn` claim.
 #[must_use]
 pub fn spell_learn_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(
@@ -526,7 +449,6 @@ pub fn spell_learn_claim(id: u64, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_spell_proc_event` claim.
 #[must_use]
 pub fn spell_proc_event_claim(spell_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -534,25 +456,16 @@ pub fn spell_proc_event_claim(spell_id: u32, operation: &str, fields: &str) -> S
     )
 }
 
-// ---- creatures ----
-
-/// A creature identifier inside the Package creature range, safe to insert. One band covers the
-/// template and the spawn.
 pub const PACKAGE_CREATURE: u32 = 15_000_001;
 
-/// A real imported creature template, safe to update and never safe to insert.
-pub const REAL_CREATURE: u32 = 6; // Kobold Vermin.
+pub const REAL_CREATURE: u32 = 6;
 
-/// A real imported spawn identifier, safe to update and never safe to insert.
 pub const REAL_CREATURE_SPAWN: u32 = 4_242;
 
-/// The map a spatial fixture claim sits on: Eastern Kingdoms, which every in-box scope owns.
 pub const REAL_MAP: u32 = 0;
 
-/// A map no in-box World Import Scope owns, so a claim on it routes to no Shard in this build.
 pub const FOREIGN_MAP: u32 = 571;
 
-/// Every claimable `game_creature_template` column, so an `insert` carries the whole row.
 pub const WHOLE_CREATURE_TEMPLATE_ROW: &str = r#"{
     "name": { "type": "string", "value": "Kindled Sentinel" },
     "subname": { "type": "string", "value": "Forge Guard" },
@@ -582,7 +495,6 @@ pub const WHOLE_CREATURE_TEMPLATE_ROW: &str = r#"{
     "trainer_class": { "type": "u8", "value": 0 }
 }"#;
 
-/// Every claimable `game_creature_spawn` column, so an `insert` carries the whole row.
 pub const WHOLE_CREATURE_SPAWN_ROW: &str = r#"{
     "x": { "type": "f32", "value": -8949.95 },
     "y": { "type": "f32", "value": -132.493 },
@@ -592,7 +504,6 @@ pub const WHOLE_CREATURE_SPAWN_ROW: &str = r#"{
     "respawn_secs": { "type": "u32", "value": 300 }
 }"#;
 
-/// One `game_creature_template` claim.
 #[must_use]
 pub fn creature_template_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -600,7 +511,6 @@ pub fn creature_template_claim(entry: u32, operation: &str, fields: &str) -> Str
     )
 }
 
-/// One `game_creature_spawn` claim.
 #[must_use]
 pub fn creature_spawn_claim(
     map_id: u32,
@@ -614,19 +524,12 @@ pub fn creature_spawn_claim(
     )
 }
 
-// ---- gameobjects ----
-
-/// A gameobject identifier inside the Package gameobject range, safe to insert. One band covers
-/// the template, the trap and the spawn.
 pub const PACKAGE_GAMEOBJECT: u32 = 16_000_001;
 
-/// A real imported gameobject template, safe to update and never safe to insert.
-pub const REAL_GAMEOBJECT: u32 = 1_731; // Copper Vein.
+pub const REAL_GAMEOBJECT: u32 = 1_731;
 
-/// A real imported gameobject spawn identifier.
 pub const REAL_GAMEOBJECT_SPAWN: u32 = 7_777;
 
-/// Every claimable `game_gameobject_template` column, so an `insert` carries the whole row.
 pub const WHOLE_GAMEOBJECT_TEMPLATE_ROW: &str = r#"{
     "type_id": { "type": "u8", "value": 3 },
     "display_id": { "type": "u32", "value": 259 },
@@ -640,13 +543,11 @@ pub const WHOLE_GAMEOBJECT_TEMPLATE_ROW: &str = r#"{
     "size": { "type": "f32", "value": 1.0 }
 }"#;
 
-/// Every claimable `game_gameobject_trap` column, so an `insert` carries the whole row.
 pub const WHOLE_GAMEOBJECT_TRAP_ROW: &str = r#"{
     "spell_id": { "type": "u32", "value": 133 },
     "cooldown_secs": { "type": "u32", "value": 4 }
 }"#;
 
-/// Every claimable `game_gameobject` column, so an `insert` carries the whole row.
 pub const WHOLE_GAMEOBJECT_SPAWN_ROW: &str = r#"{
     "template_entry": { "type": "u32", "value": 16000001 },
     "x": { "type": "f32", "value": -8949.95 },
@@ -660,7 +561,6 @@ pub const WHOLE_GAMEOBJECT_SPAWN_ROW: &str = r#"{
     "rotation_3": { "type": "f32", "value": 0.0 }
 }"#;
 
-/// One `game_gameobject_template` claim.
 #[must_use]
 pub fn gameobject_template_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -668,7 +568,6 @@ pub fn gameobject_template_claim(entry: u32, operation: &str, fields: &str) -> S
     )
 }
 
-/// One `game_gameobject_trap` claim.
 #[must_use]
 pub fn gameobject_trap_claim(entry: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -676,7 +575,6 @@ pub fn gameobject_trap_claim(entry: u32, operation: &str, fields: &str) -> Strin
     )
 }
 
-/// One `game_gameobject` claim.
 #[must_use]
 pub fn gameobject_spawn_claim(map_id: u32, spawn_id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -684,13 +582,10 @@ pub fn gameobject_spawn_claim(map_id: u32, spawn_id: u32, operation: &str, field
     )
 }
 
-/// A broadcast text, summon placement or quest event requirement inside the Package EventAI range.
 pub const PACKAGE_CREATURE_AI: u32 = 17_000_001;
 
-/// A real imported broadcast text identifier.
 pub const REAL_BROADCAST_TEXT: u32 = 900;
 
-/// Every claimable `game_creature_ai_broadcast_text` column, so an `insert` carries the whole row.
 pub const WHOLE_BROADCAST_TEXT_ROW: &str = r#"{
     "male_text": { "type": "string", "value": "The forge remembers." },
     "female_text": { "type": "string", "value": "The forge remembers." },
@@ -704,7 +599,6 @@ pub const WHOLE_BROADCAST_TEXT_ROW: &str = r#"{
     "emote_id_3": { "type": "u32", "value": 0 }
 }"#;
 
-/// Every claimable `game_creature_ai_summon` column, so an `insert` carries the whole row.
 pub const WHOLE_SUMMON_ROW: &str = r#"{
     "x": { "type": "f32", "value": -8949.95 },
     "y": { "type": "f32", "value": -132.493 },
@@ -713,12 +607,10 @@ pub const WHOLE_SUMMON_ROW: &str = r#"{
     "lifetime_ms": { "type": "u32", "value": 30000 }
 }"#;
 
-/// Every claimable `game_quest_event_requirement` column, so an `insert` carries the whole row.
 pub const WHOLE_QUEST_EVENT_REQUIREMENT_ROW: &str = r#"{
     "quest_entry": { "type": "u32", "value": 8000001 }
 }"#;
 
-/// One `game_creature_ai_broadcast_text` claim.
 #[must_use]
 pub fn broadcast_text_claim(id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -726,7 +618,6 @@ pub fn broadcast_text_claim(id: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_creature_ai_summon` claim.
 #[must_use]
 pub fn summon_claim(id: u32, operation: &str, fields: &str) -> String {
     format!(
@@ -734,7 +625,6 @@ pub fn summon_claim(id: u32, operation: &str, fields: &str) -> String {
     )
 }
 
-/// One `game_quest_event_requirement` claim.
 #[must_use]
 pub fn quest_event_requirement_claim(id: u64, operation: &str, fields: &str) -> String {
     format!(

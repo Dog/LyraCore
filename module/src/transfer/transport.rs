@@ -1,13 +1,3 @@
-//! The row TRANSPORT: what crosses a database boundary, and in what shape.
-//!
-//! `mod.rs` owns the escrow protocol — when a character may move and what each step is allowed to
-//! do. This file owns the cargo: the manifest that says WHICH tables travel, the [`RowIo`] direction
-//! marker and [`move_rows`] shim every `character_owned!(transfer, ..)` arm flows through, the bsatn
-//! codec underneath it, and [`ExportBlob`], the one value that crosses the wire.
-//!
-//! Everything here is `ReducerContext`-generic or `ReducerContext`-free, which is what lets
-//! `harness.rs` execute the real export/import loops against a fake store. [server]
-
 use spacetimedb::{log, ReducerContext, SpacetimeType};
 
 use super::TransferOut;
@@ -19,8 +9,7 @@ use crate::items::{game_item_instance, ItemInstance};
 #[path = "legacy_item_rows.rs"]
 mod legacy_item_rows;
 
-/// Manifest tables marked hot for first-frame state. The current protocol carries every
-/// table in one blob and does not stream cold tables separately.
+// Hot marks describe first-frame state; every table still travels in one blob.
 pub(crate) const HOT_TABLES: &[&str] = &[
     "game_item_instance",
     "game_player_action",
@@ -29,15 +18,9 @@ pub(crate) const HOT_TABLES: &[&str] = &[
     "game_character_talent",
     "game_party_command_issuer",
     "game_party_command_receipt",
-    // Hot-state audit: a buff/debuff bar (and Stealth, which is presence-only — no timer
-    // to stream in "behind" anything) is exactly the first-frame-visible state this mark describes.
     "game_aura",
 ];
 
-/// Manifest entries that are transfer MACHINERY rather than character data. `game_transfer_out`
-/// earns a `character_owned!` delete sweep (a deleted character must not leave escrow rows behind)
-/// and therefore lands in the generated enumeration — but exporting the escrow inside its own
-/// export blob is nonsense.
 pub(crate) const MANIFEST_EXCLUDE: &[&str] = &["game_transfer_out"];
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -57,31 +40,19 @@ pub(crate) const NOT_TRANSPORTED: &[&str] = &[
     "game_taxi_flight_schedule",
     "game_taxi_passenger_spline",
     "game_taxi_service_reply",
-    // A Trade Session (+ its slot rows) is a live dialog with a partner who is by definition NOT
-    // transferring too — carrying it would import a negotiation the destination's partner copy
-    // cannot see. It dies with the source, exactly as the logout teardown would.
     "game_trade_session",
     "game_trade_slot",
-    // A Duel and its one-shot relay rows are live state tied to two players on one shard. Moving
-    // either participant interrupts it; no source snapshot is meaningful on the destination.
     "game_duel",
     "game_duel_event",
 ];
 
-// ===========================================================================================
-//  Export blob
-// ===========================================================================================
-
-/// One manifest row: a character-owned table plus its hot/cold mark.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct ManifestEntry {
     pub table: String,
     pub hot: bool,
 }
 
-/// One manifest table's rows, encoded as BSATN. Item-bearing tables use an explicit row-format
-/// suffix so an older Shard refuses data whose fields it cannot preserve. The schema manifest
-/// keeps the canonical table names. Untagged item rows are upgraded when old Escrow arrives.
+// Item row-format suffixes make older Shards refuse fields they cannot preserve.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct TableRows {
     pub table: String,
@@ -138,35 +109,12 @@ pub(crate) fn admit_command_issuer_import(
     Ok(())
 }
 
-// ===========================================================================================
-//  Cross-database row transport
-// ===========================================================================================
-
-/// The direction a `character_owned!(transfer, ..)` arm is running in. ONE body serves both, so a
-/// table cannot ship rows it does not know how to receive (the drift that would silently drop a
-/// table's data at the destination).
 pub enum RowIo<'a> {
-    /// Collect this table's rows for the character into `0` (bsatn of `Vec<Row>`).
     Export(&'a mut Vec<u8>),
-    /// Apply the rows in `0`; `1` accumulates the first decode failure.
     Import(&'a [u8], &'a mut Result<(), String>),
 }
 
-/// The body of every transport arm: `export` yields the character's rows on THIS database,
-/// `insert` puts one arriving row back. Pure plumbing — the arm supplies the two table-typed
-/// halves and nothing else.
-///
-/// IMPORT IS DELETE-THEN-INSERT at the call site level: [`import_rows`] does not clear the table,
-/// because a destination that already holds rows for this guid is either (a) an import REPLAY,
-/// which `import_character_blob` short-circuits before reaching here, or (b) a same-guid character
-/// that never left — which cannot happen, since `begin_transfer` refuses to escrow a character
-/// twice. Inserting into a table that already has the row would be a PK panic, which is a loud
-/// failure and not a silent dupe; see `import_character_blob`'s wipe-first guard.
-///
-/// `C` is the context type. In production it is ALWAYS `ReducerContext` (inferred at every arm, so
-/// no arm changed shape when this parameter appeared) — it is generic solely so the execution
-/// harness in `mod harness` can drive this exact body against a fake store. See that
-/// module's header for the seam and its ceiling.
+// The import caller must clear existing rows before inserting this table's payload.
 pub(crate) fn move_rows<C, R>(
     ctx: &C,
     io: &mut RowIo<'_>,
@@ -200,16 +148,12 @@ where
     }
 }
 
-/// The IMPORT codec, the counterpart of [`encode_rows`]. An EMPTY payload means "this table had no
-/// rows for this character" and yields nothing; anything that fails to decode records the FIRST
-/// failure in `outcome` (which `import_rows` turns into a whole-transaction abort) and yields
-/// nothing, so a table is never half-applied.
 pub(crate) fn decode_rows<R>(bytes: &[u8], outcome: &mut Result<(), String>) -> Vec<R>
 where
     R: spacetimedb::SpacetimeType + for<'de> spacetimedb::sats::Deserialize<'de>,
 {
     if bytes.is_empty() {
-        return Vec::new(); // the table had no rows for this character
+        return Vec::new();
     }
     let mut remaining = bytes;
     match spacetimedb::sats::bsatn::from_reader::<Vec<R>>(&mut remaining) {
@@ -229,12 +173,6 @@ where
     }
 }
 
-/// A transport arm for a table whose rows deliberately do NOT cross: one-shot relay/event rows with
-/// a GC TTL, whose durable half lives elsewhere (usually on the character row itself). Exports
-/// nothing and ignores anything that arrives.
-///
-/// This exists so "not transported" is a DECISION written at the table, rather than a missing arm
-/// that the ratchet would have to distinguish from an oversight — which it cannot.
 pub(crate) fn not_transported(io: &mut RowIo<'_>) {
     match io {
         RowIo::Export(out) => out.clear(),
@@ -242,22 +180,8 @@ pub(crate) fn not_transported(io: &mut RowIo<'_>) {
     }
 }
 
-/// One entry of a transport registry: a table name and the `character_owned!(transfer, ..)` arm
-/// that moves its rows. `crate::CHARACTER_OWNED_TRANSFERS` is `&[TransportArm<ReducerContext>]`;
-/// the harness supplies its own slice over a fake context.
 pub(crate) type TransportArm<'a, C> = (&'a str, fn(&C, u64, &mut RowIo<'_>));
 
-/// Serialize every manifest table's rows for `character_guid` — the payload half of the export
-/// blob. Tables with no transport arm are ABSENT from the result (and caught by
-/// `every_manifest_table_can_cross_a_database_boundary`, not silently).
-///
-/// The registry is a PARAMETER so this loop can be executed by `mod harness` — it is the
-/// only seam by which a test in this crate can run the real export body, since the arms themselves
-/// need a `ReducerContext`.
-///
-/// Export manufactures one entry per transported registry table. Import checks payload coverage
-/// because it receives data from another database. An empty encoded buffer is indistinguishable
-/// from a legal empty table, so a coverage check cannot detect a serialization failure here.
 pub(crate) fn export_rows_via<C>(
     ctx: &C,
     character_guid: u64,
@@ -278,7 +202,6 @@ pub(crate) fn export_rows_via<C>(
     out
 }
 
-/// The production binding of [`export_rows_via`]: this build's generated registry.
 pub(crate) fn export_rows(ctx: &ReducerContext, character_guid: u64) -> Vec<TableRows> {
     let mut payload = export_rows_via(ctx, character_guid, crate::CHARACTER_OWNED_TRANSFERS);
     legacy_item_rows::mark_current(&mut payload);
@@ -291,8 +214,7 @@ pub(crate) fn import_rows_via<C>(
     payload: &[TableRows],
     arms: &[TransportArm<'_, C>],
 ) -> Result<(), String> {
-    // COVERAGE FIRST — before a single row is applied, so a short payload aborts having written
-    // nothing rather than half a character.
+    // Check full payload coverage before applying any rows.
     let missing: Vec<&str> = arms
         .iter()
         .map(|(table, _)| *table)
@@ -300,8 +222,6 @@ pub(crate) fn import_rows_via<C>(
         .filter(|table| !payload.iter().any(|entry| entry.table == *table))
         .collect();
     if !missing.is_empty() {
-        // Loud: the names are the whole diagnosis (which build shipped it, and what the character
-        // would have lost had this been accepted).
         log::error!(
             "transfer import: arriving payload is MISSING {} manifest table(s) for character \
              {character_guid}: {} — refusing the import so the source copy survives",
@@ -333,7 +253,6 @@ pub(crate) fn import_rows_via<C>(
     Ok(())
 }
 
-/// The production binding of [`import_rows_via`]: this build's generated registry.
 pub(crate) fn import_rows(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -436,56 +355,23 @@ pub(crate) fn import_rows(
     )
 }
 
-/// What crosses the seam. The character itself travels whole, as `character_row` — the
-/// `game_character` row serialized bsatn — so a column added to `Character` travels without anyone
-/// remembering to add a field here. The character-owned TABLES travel as the manifest, derived from
-/// `CHARACTER_OWNED_TABLES` (the build-time enumeration generated from the `character_owned!` delete
-/// markers, so it can never drift from the sweep registry) plus the `payload` of actual rows.
-///
-/// The manifest is the load-bearing SCHEMA half: the destination compares it against its OWN build
-/// (`manifest()`) and refuses an import from a shard whose character-owned table set differs. The
-/// `payload` alongside it is the DATA half — the actual rows, one entry per manifest
-/// table, produced by that table's `character_owned!(transfer, ..)` arm.
-///
-/// **Nothing that is already inside `character_row` gets a second field here.** Until then
-/// the blob ALSO carried `name`/`level`/`map_id`/`instance_id`/`x`/`y`/`z`/`o`/`health`/`power` as
-/// typed copies — earlier remnants from when the blob was a manifest and there was no serialized
-/// row to read them off. Not one of them was read by anything: `apply_import_blob` builds the
-/// arrival copy from `character_row` and overwrites the position from `dest_*`, `import_character`
-/// (same-database) reads only the manifest, and the gateway treats the whole blob as opaque bytes.
-/// A duplicated value that nothing reads is strictly worse than no value, because the next reader
-/// cannot tell which copy is authoritative — the same reasoning that keeps `owner_identity` out
-/// (see the REGENERATE verdict). `money` stays, and is the exception that shows the rule: it is the
-/// one field that is deliberately NOT just a copy of the row, because `defer_money_delta` folds
-/// post-freeze credits into it (the DEFER verdict) and `apply_import_blob` replays it at the
-/// destination.
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
 pub struct ExportBlob {
     pub transfer_id: u64,
     pub character_guid: u64,
-    /// The escrowed purse PLUS every `defer_money_delta` folded in after the freeze. Not redundant
-    /// with `character_row`'s own `money` — that one is the value at `begin_transfer`.
+    // Includes post-freeze credits absent from character_row.money.
     pub money: u32,
     pub manifest: Vec<ManifestEntry>,
-    // --- what makes the blob a real cross-DATABASE move rather than a manifest ---
-    /// Where the character is going. Carried in the blob (not just the source's out-row) because
-    /// cross-database the blob is the ONLY thing that reaches the destination.
     pub dest_map_id: u32,
     pub dest_instance_id: u64,
     pub dest_x: f32,
     pub dest_y: f32,
     pub dest_z: f32,
     pub dest_o: f32,
-    /// bsatn of the whole `Character` row. Opaque here on purpose: `import_character_blob` decodes
-    /// it with the destination's `Character` type. Legacy rows that predate the watched slot
-    /// receive -1; unknown trailing columns refuse the import.
     pub character_row: Vec<u8>,
-    /// One entry per manifest table, in `CHARACTER_OWNED_TRANSFERS` order.
     pub payload: Vec<TableRows>,
 }
 
-/// Where a transfer is going. Six positional `dest_*` arguments in a row is the shape that makes a
-/// transposed pair invisible, and `build_export_blob` is now called from two places.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Destination {
     pub map_id: u32,
@@ -497,9 +383,6 @@ pub(crate) struct Destination {
 }
 
 impl TransferOut {
-    /// The escrow's destination, as one value. Same-database `import_character` reads it off the
-    /// local out-row; cross-database the blob carries its own copy (below), because the out-row is
-    /// on the other node.
     pub(crate) fn destination(&self) -> Destination {
         Destination {
             map_id: self.dest_map_id,
@@ -513,7 +396,6 @@ impl TransferOut {
 }
 
 impl ExportBlob {
-    /// Where the blob says the character is going.
     pub(crate) fn destination(&self) -> Destination {
         Destination {
             map_id: self.dest_map_id,
@@ -527,14 +409,6 @@ impl ExportBlob {
 }
 
 impl crate::character::Character {
-    /// Move the durable row to `dest` — the SIX fields an arrival overwrites, and no others.
-    ///
-    /// Both halves of step 2 land here: same-database `import_character` re-partitions the shared
-    /// row, cross-database `apply_import_blob` relocates the freshly decoded arrival copy. They used
-    /// to be two hand-written six-line blocks a hundred lines apart, which is exactly the shape
-    /// where one of them silently keeps writing `y` twice and never writes `z`. It is inherent on
-    /// `Character` rather than free in this module because "relocate a character row" is a fact
-    /// about the row; the transfer protocol is only its most dangerous caller.
     pub(crate) fn relocate(&mut self, dest: Destination) {
         self.map_id = dest.map_id;
         self.pending_instance_id = dest.instance_id;
@@ -545,15 +419,12 @@ impl crate::character::Character {
     }
 }
 
-/// Decode an escrowed [`ExportBlob`]. One spelling of the error, in one place, for the two callers
-/// that read a blob (`import_character` off the local out-row, `apply_import_blob` off the wire).
 pub(crate) fn decode_blob(transfer_id: u64, bytes: &[u8]) -> Result<ExportBlob, String> {
     spacetimedb::sats::bsatn::from_slice(bytes)
         .map_err(|e| format!("transfer {transfer_id}: corrupt export blob: {e}"))
 }
 
-/// Old Escrow predates the watched slot. Only a missing final i32 receives its default;
-/// partial fields, malformed rows and unknown trailing columns refuse the import.
+// Only a missing final watched-slot i32 receives its legacy default.
 pub(crate) fn decode_character_row(
     transfer_id: u64,
     bytes: &[u8],
@@ -586,12 +457,7 @@ pub(crate) fn decode_character_row(
     }
 }
 
-/// Manifest tables that a blob from an older build may lack. Each one joined the manifest after
-/// Core commit `decd7821` (2026-09-22). Production may run any build from that commit on, and we
-/// do not pin which, so a blob may lack any subset of these tables. A build that had no such table
-/// had no rows for it either, so each missing one imports empty. That lets a Transfer in flight
-/// across a publish finish instead of freezing its Character. Remove an entry only once every
-/// Shard runs a build that has the table.
+// Keep each compatibility entry until every Shard can export that table.
 pub(crate) const TRANSFER_TABLES_OLD_BLOBS_MAY_LACK: &[&str] = &[
     "game_auction_bid_hold",
     "game_auction_hold",
@@ -601,14 +467,6 @@ pub(crate) const TRANSFER_TABLES_OLD_BLOBS_MAY_LACK: &[&str] = &[
     "game_instance_removal",
 ];
 
-/// The SCHEMA-DRIFT gate: the destination compares the arriving manifest against its OWN build and
-/// refuses an import from a shard whose character-owned table set differs, because such a shard
-/// would otherwise silently drop the tables it does not know — with the source copy cascade-deleted
-/// moments later. The one exception is a manifest that lacks some of
-/// [`TRANSFER_TABLES_OLD_BLOBS_MAY_LACK`] and is otherwise this build's own, entry for entry and in
-/// order. [`payload_for_this_build`] fills each missing table in as empty.
-///
-/// Check the arriving manifest against this build's transport registry.
 pub(crate) fn check_manifest(transfer_id: u64, arriving: &[ManifestEntry]) -> Result<(), String> {
     let mine = manifest();
     let named = |table: &str| arriving.iter().any(|entry| entry.table == table);
@@ -631,9 +489,6 @@ pub(crate) fn check_manifest(transfer_id: u64, arriving: &[ManifestEntry]) -> Re
     Ok(())
 }
 
-/// `payload` as this build imports it: a table from [`TRANSFER_TABLES_OLD_BLOBS_MAY_LACK`] that
-/// `arriving` does not name arrives as an empty entry. Any other gap still fails the coverage check
-/// in [`import_rows_via`].
 pub(crate) fn payload_for_this_build(
     arriving: &[ManifestEntry],
     payload: &[TableRows],
@@ -652,10 +507,6 @@ pub(crate) fn payload_for_this_build(
     complete
 }
 
-/// Build the export blob for `character`. `ReducerContext`-free, so the harness can produce a REAL
-/// blob from a fixture character and feed it to the REAL importer — the export half of
-/// the round-trip property. `payload` comes from [`export_rows`], the only part that needs a
-/// database.
 pub(crate) fn build_export_blob(
     transfer_id: u64,
     character: &crate::character::Character,
@@ -680,8 +531,6 @@ pub(crate) fn build_export_blob(
     })
 }
 
-/// THE transfer manifest: every character-owned table this build knows about, hot/cold marked.
-/// Pure (reads only the generated const), so the tripwire tests below can assert it natively.
 pub(crate) fn manifest() -> Vec<ManifestEntry> {
     crate::CHARACTER_OWNED_TABLES
         .iter()

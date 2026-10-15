@@ -1,6 +1,3 @@
-//! `/who`: a pure filter over [`presence::in_world_characters`], plus the `SMSG_WHO` response
-//! builder `CMSG_WHO` (`social.rs`) drives. Behavior pinned against cm:MiscHandler.cpp:71-268.
-
 use crate::world::{GuildActionStore, ShardRoutingStore, SocialStore};
 use anyhow::Result;
 
@@ -9,18 +6,12 @@ use crate::codec;
 use lyracore_shared::faction;
 use wow_world_messages::vanilla::CMSG_WHO;
 
-/// More than this many zones gets no answer (cm:MiscHandler.cpp:90-91).
 const MAX_ZONES: usize = 10;
-/// More than this many search strings gets no answer (cm:MiscHandler.cpp:107-108).
 const MAX_SEARCH_STRINGS: usize = 4;
-/// A maximum level at or above this means no upper bound (cm:MiscHandler.cpp:133-136).
 const NO_UPPER_BOUND_AT: u8 = 100;
 
-/// One in-world Character as the filter judges it. Borrowed, so [`matches`] can be exercised with
-/// rows written by hand from the cited behavior, with no Store involved.
 pub(crate) struct WhoCandidate<'a> {
     pub name: &'a str,
-    /// Empty outside a Guild.
     pub guild_name: &'a str,
     pub race: u8,
     pub class: u8,
@@ -29,7 +20,6 @@ pub(crate) struct WhoCandidate<'a> {
     pub zone_name: &'a str,
 }
 
-/// `CMSG_WHO`'s filters, unpacked once per request.
 pub(crate) struct WhoFilter<'a> {
     pub requester_team: u32,
     pub min_level: u8,
@@ -42,7 +32,6 @@ pub(crate) struct WhoFilter<'a> {
     pub search_strings: &'a [String],
 }
 
-/// Case-insensitive substring match; an empty filter matches everything (cm:MiscHandler.cpp:206-222).
 fn name_matches(filter: &str, value: &str) -> bool {
     filter.is_empty()
         || value
@@ -50,10 +39,6 @@ fn name_matches(filter: &str, value: &str) -> bool {
             .contains(&filter.to_ascii_lowercase())
 }
 
-/// Does any NON-EMPTY search string match the guild name, the Character name, or the zone name?
-/// An empty list, or a list holding only empty strings, matches every row
-/// (cm:MiscHandler.cpp:228-243, vm:MiscHandler.cpp:187-202) — this is an ANY across the strings a
-/// client actually typed, not a rule that every string must itself find something.
 fn search_strings_match(strings: &[String], candidate: &WhoCandidate) -> bool {
     let real_strings = strings.iter().filter(|s| !s.is_empty());
     let mut any_real = false;
@@ -69,8 +54,6 @@ fn search_strings_match(strings: &[String], candidate: &WhoCandidate) -> bool {
     !any_real
 }
 
-/// Does `candidate` pass every `/who` rule the requester sent? One clause per cited rule
-/// (cm:MiscHandler.cpp:156-244).
 pub(crate) fn matches(filter: &WhoFilter, candidate: &WhoCandidate) -> bool {
     faction::team_for_race(candidate.race) == filter.requester_team
         && candidate.level >= filter.min_level
@@ -83,13 +66,11 @@ pub(crate) fn matches(filter: &WhoFilter, candidate: &WhoCandidate) -> bool {
         && search_strings_match(filter.search_strings, candidate)
 }
 
-/// More than 10 zones or more than 4 search strings gets no answer at all
-/// (cm:MiscHandler.cpp:90-91, cm:MiscHandler.cpp:107-108).
 fn is_oversized(request: &CMSG_WHO) -> bool {
     request.zones.len() > MAX_ZONES || request.search_strings.len() > MAX_SEARCH_STRINGS
 }
 
-/// A wire maximum level at or above 100 means no upper bound (cm:MiscHandler.cpp:133-136).
+/// A wire maximum level of 100 or more means no upper bound.
 fn effective_max_level(wire_max_level: u8) -> u8 {
     if wire_max_level >= NO_UPPER_BOUND_AT {
         u8::MAX
@@ -98,15 +79,6 @@ fn effective_max_level(wire_max_level: u8) -> u8 {
     }
 }
 
-/// Build the RAW `SMSG_WHO` reply for `request` — `(opcode, body)` for
-/// [`Outbound::Raw`](super::Outbound::Raw) — or `None` when the request itself is oversized (see
-/// [`is_oversized`]). `requester_race` decides the team every listed Character must share. Source
-/// is [`presence::in_world_characters`], so bots stay listed, as today.
-///
-/// A zone name is looked up only when the request carries a search string, since it is the only
-/// rule that reads one — the common case (no search string) then costs no zone lookups at all.
-/// The Guild name is two keyed reads of the Realm-core cache per row. When Realm-core cannot
-/// answer, every row lists with an empty Guild name rather than the reply failing.
 pub(crate) fn respond<St: GuildActionStore + ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     requester_race: u8,
@@ -175,8 +147,6 @@ mod tests {
     use super::*;
     use lyracore_shared::faction::{TEAM_ALLIANCE, TEAM_HORDE};
 
-    /// A Human Warrior in Elwynn (zone 12), Alliance, level 10 — the baseline every rule test
-    /// starts from and narrows by overriding one field.
     fn baseline() -> (WhoFilter<'static>, WhoCandidate<'static>) {
         let filter = WhoFilter {
             requester_team: TEAM_ALLIANCE,
@@ -184,8 +154,8 @@ mod tests {
             max_level: 60,
             name: "",
             guild_name: "",
-            race_mask: 1 << 1,  // Human
-            class_mask: 1 << 1, // Warrior
+            race_mask: 1 << 1,
+            class_mask: 1 << 1,
             zones: &[],
             search_strings: &[],
         };
@@ -212,19 +182,17 @@ mod tests {
         let (mut filter, mut candidate) = baseline();
         filter.requester_team = TEAM_HORDE;
         assert!(!matches(&filter, &candidate));
-        candidate.race = 2; // Orc
+        candidate.race = 2;
         filter.requester_team = TEAM_ALLIANCE;
         assert!(!matches(&filter, &candidate));
     }
 
-    /// The team rule is symmetric: a Horde requester matches a Horde row the same way an Alliance
-    /// one matches an Alliance row, not just "excludes the other side" as seen from Alliance.
     #[test]
     fn a_horde_requester_matches_a_horde_candidate() {
         let (mut filter, mut candidate) = baseline();
         filter.requester_team = TEAM_HORDE;
-        filter.race_mask = 1 << 2; // Orc
-        candidate.race = 2; // Orc
+        filter.race_mask = 1 << 2;
+        candidate.race = 2;
         assert!(matches(&filter, &candidate));
     }
 
@@ -243,7 +211,7 @@ mod tests {
     #[test]
     fn a_maximum_level_at_or_above_100_removes_the_upper_bound() {
         let (mut filter, mut candidate) = baseline();
-        filter.max_level = u8::MAX; // `respond` maps a wire 100+ to this
+        filter.max_level = u8::MAX;
         candidate.level = 60;
         assert!(matches(&filter, &candidate));
     }
@@ -251,14 +219,14 @@ mod tests {
     #[test]
     fn class_mask_is_a_bit_test() {
         let (mut filter, candidate) = baseline();
-        filter.class_mask = 1 << 2; // Paladin only
+        filter.class_mask = 1 << 2;
         assert!(!matches(&filter, &candidate));
     }
 
     #[test]
     fn race_mask_is_a_bit_test() {
         let (mut filter, candidate) = baseline();
-        filter.race_mask = 1 << 3; // Dwarf only
+        filter.race_mask = 1 << 3;
         assert!(!matches(&filter, &candidate));
     }
 
@@ -308,8 +276,6 @@ mod tests {
         assert!(matches(&filter, &candidate));
     }
 
-    /// Any ONE non-empty search string matching is enough — the rest may miss
-    /// (cm:MiscHandler.cpp:228-243, vm:MiscHandler.cpp:187-202). Not every string must match.
     #[test]
     fn any_non_empty_search_string_matching_is_enough() {
         let (mut filter, candidate) = baseline();
@@ -329,8 +295,6 @@ mod tests {
         assert!(!matches(&filter, &candidate));
     }
 
-    /// When every search string is empty, every row passes — the same "empty filter matches all"
-    /// rule as a blank name or guild filter.
     #[test]
     fn every_string_empty_matches_every_row() {
         let (mut filter, candidate) = baseline();
@@ -346,7 +310,6 @@ mod tests {
         assert_eq!(effective_max_level(255), u8::MAX);
     }
 
-    /// **AC 5 (zones): oversized zone or string lists get no answer.**
     #[test]
     fn more_than_ten_zones_is_oversized() {
         assert!(is_oversized(&CMSG_WHO {
@@ -362,7 +325,6 @@ mod tests {
         );
     }
 
-    /// **AC 5 (search strings): oversized zone or string lists get no answer.**
     #[test]
     fn more_than_four_search_strings_is_oversized() {
         assert!(is_oversized(&CMSG_WHO {

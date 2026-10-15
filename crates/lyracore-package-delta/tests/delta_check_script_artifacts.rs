@@ -1,12 +1,3 @@
-//! `lyracore-delta-check <file>...` over a MIXED set of artifacts.
-//!
-//! A Package ships every artifact kind it has into one generated directory, so the set
-//! `lyracore packages build` hands this binary holds Package Deltas and Script Artifacts together.
-//! Each file is routed on its own `kind` member, each kind is traced with its own tracer, and the
-//! exit status covers both.
-//!
-//! These run the real binary: the routing lives in its argument handling, not in the library.
-
 use std::process::{Command, Output};
 
 const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -66,8 +57,6 @@ fn a_script_artifact_and_a_package_delta_check_out_together() {
     assert!(report.contains("bolt.greet"), "{report}");
 }
 
-/// A Package Event of the artifact's OWN Package is bindable; nothing has to teach this binary
-/// about it, because the parser already knows whose event it is.
 #[test]
 fn a_package_event_of_the_artifacts_own_package_checks_out() {
     let dir = temp_dir("package-event");
@@ -105,8 +94,6 @@ fn an_event_outside_the_catalogue_refuses_the_run() {
     );
 }
 
-/// The collision the tracer exists for: two Packages claiming one Runtime Script identity. It has
-/// to fail the run exactly the way a Claim Conflict does.
 #[test]
 fn two_packages_shipping_one_script_id_fail_the_run() {
     let dir = temp_dir("collision");
@@ -150,8 +137,6 @@ fn two_artifacts_for_one_package_fail_even_when_the_scripts_do_not_collide() {
     assert!(stdout.contains("more than one Script Artifact"), "{stdout}");
 }
 
-/// A kind this build does not read still meets the Package Delta parser, which names it rather than
-/// complaining about a missing `claims` member.
 #[test]
 fn an_artifact_of_an_unknown_kind_is_refused_by_name() {
     let dir = temp_dir("unknown-kind");

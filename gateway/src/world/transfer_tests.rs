@@ -1,24 +1,8 @@
-//! Cross-database Transfer tests through the shared WorldFake topology.
-
 use super::shard_routing_tests::{drive_routed_session, sharded_stores, ShardCallLog};
 use super::*;
 
-// ===========================================================================================
-//  Cross-database Transfer and Shard routing
-//
-//  `FakeShardDb` is a faithful re-implementation of the MODULE's escrow guards
-//  (`module/src/transfer/mod.rs`'s `plan_begin`/`plan_import`/`plan_finish` + `release_transfer`'s
-//  source check), so these tests exercise the one thing the module cannot check for itself: the
-//  ORDER the gateway drives two databases in, because each database can only see its own ledger.
-//  Two `FakeShardDb`s stand for two SpacetimeDB databases — the same shape `sharded_stores`
-//  uses for routing.
-//
-
 fn no_hang<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
     let h = std::thread::spawn(f);
-    // Poll `is_finished` rather than shipping the result through a channel, so a body that PANICS
-    // still propagates its own panic message (via `resume_unwind`) instead of being reported as a
-    // hang. The hang is the only thing this wrapper is allowed to rename.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     while !h.is_finished() {
         assert!(
@@ -35,8 +19,6 @@ fn no_hang<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
-/// A store handle over a `FakeShardDb`, with an optional injected failure at one named step — how
-/// "the gateway was killed here" is simulated (that step's transaction never commits).
 fn xstore(
     shard: &str,
     db: std::sync::Arc<FakeShardDb>,
@@ -60,9 +42,6 @@ fn xstore(
 
 const XGUID: u64 = 1;
 
-/// A fresh two-database topology: the character is resident on `world`, and its durable row already
-/// names the instance destination — which is what `teleport_player` writes before it despawns the
-/// entity for a cross-map hop, i.e. the state the WORLDPORT_ACK handler finds.
 #[allow(clippy::type_complexity)]
 fn xdb_pair(
     kill_at: Option<&str>,
@@ -88,9 +67,6 @@ fn xdb_pair(
     (src, dst, src_db, dst_db, calls)
 }
 
-///
-/// This test asserts the property directly: hold a guard, take the same mutex again, and the
-/// process must come back with a failure rather than never coming back at all.
 #[test]
 fn a_re_entrant_lock_on_the_fake_shard_db_fails_instead_of_hanging() {
     let db = FakeShardDb::with_character(
@@ -102,7 +78,6 @@ fn a_re_entrant_lock_on_the_fake_shard_db_fails_instead_of_hanging() {
         },
     );
     let _held = lk(&db.in_rows);
-    // `live()` reads `in_rows`. With `lock()` this call never returns.
     let hit = no_hang(5, {
         let db = db.clone();
         move || {
@@ -129,7 +104,6 @@ fn a_re_entrant_lock_on_the_fake_shard_db_fails_instead_of_hanging() {
 
 #[test]
 fn a_character_moves_whole_between_two_databases_with_its_rows() {
-    // Wall-clock net: a wedged driver must FAIL, not hang the suite.
     no_hang(30, || {
         let (src, dst, src_db, dst_db, calls) = xdb_pair(None);
         super::transfer::settle_transfer(src.as_ref(), dst.as_ref(), XGUID)
@@ -166,22 +140,13 @@ fn a_character_moves_whole_between_two_databases_with_its_rows() {
         assert_eq!(
             log,
             vec![
-                // The speculative fence-clear on the SOURCE, before anything else: the transfer id is
-                // the character guid, so an arrival in-row left here by an earlier hop would make
-                // `begin_transfer` replay into a no-op (see
-                // `a_second_transfer_of_the_same_character_is_never_swallowed_as_a_replay`). It costs
-                // one no-op reducer call on a fresh transfer and is the same cheap release the
-                // already-home path makes.
                 ("world".to_string(), "release_transfer".to_string()),
-                // Realm-core's pending phase is mirrored before the source can disappear.
                 ("world".to_string(), "sync_transfer_pending".to_string()),
                 ("world".to_string(), "begin_transfer".to_string()),
                 ("instances".to_string(), "ensure_instance".to_string()),
                 ("instances".to_string(), "import_character_blob".to_string()),
                 ("world".to_string(), "confirm_import".to_string()),
                 ("world".to_string(), "finish_transfer".to_string()),
-                // realm-core learns where the character settled HERE — after the escrow's own
-                // transaction committed, before the arrival copy goes live.
                 ("world".to_string(), "publish_shard_index".to_string()),
                 ("instances".to_string(), "sync_transfer_arrival".to_string()),
                 ("instances".to_string(), "release_transfer".to_string()),
@@ -192,10 +157,6 @@ fn a_character_moves_whole_between_two_databases_with_its_rows() {
     });
 }
 
-/// `begin_transfer` answers over a call-pipe connection while the escrow row travels over the
-/// coordinator's own socket, so the first read after the reply can miss a row the module already
-/// wrote. The driver waits the lag out instead of refusing a character it has just frozen — the
-/// refusal was 5 of 5 crossings on a loaded realm, each leaving a character stuck in escrow.
 #[test]
 fn an_escrow_row_that_lags_the_reducer_reply_is_waited_for_not_refused() {
     no_hang(30, || {
@@ -219,15 +180,6 @@ fn an_escrow_row_that_lags_the_reducer_reply_is_waited_for_not_refused() {
     });
 }
 
-/// The realm-core character→shard index is written BY THE TRANSFER, not left for
-/// a future login's probe to discover.
-///
-/// Before this, `set_character_shard` had exactly one caller in the whole gateway — the login
-/// self-heal — so a completed cross-database transfer updated the SOURCE database's copy of the
-/// index (transactionally, inside `finish_transfer`) and nothing else. The copy world entry
-/// actually reads is realm-core's, and it learned about the move at the character's next login, by
-/// probing every shard. The requirement that realm-core's index be correct without relying on that
-/// probe was unmet, and looked correct only because the probe masked it.
 #[test]
 fn a_completed_transfer_publishes_the_destination_to_the_realm_core_index() {
     no_hang(30, || {
@@ -251,14 +203,11 @@ fn a_completed_transfer_publishes_the_destination_to_the_realm_core_index() {
 fn a_resumed_transfer_publishes_the_escrow_destination_not_the_callers_plan() {
     no_hang(30, || {
         let (src, dst, _src_db, _dst_db, _calls) = xdb_pair(None);
-        // Open the escrow against the destination the durable row names (map 36 / instance 7).
         let opened = src
             .character_destination(XGUID)
             .expect("the durable row names a destination");
         src.begin_transfer(Actor::new(XGUID).unwrap(), &opened)
             .expect("the escrow opens");
-        // Now drive with a plan naming somewhere ELSE. `begin_transfer` answers `Replay` — the row
-        // on disk is the authority and the plan is ignored — so the transfer settles at 36/7.
         let stale = super::transfer::TransferPlan {
             dest_map_id: 0,
             dest_instance_id: 0,
@@ -279,8 +228,6 @@ fn a_resumed_transfer_publishes_the_escrow_destination_not_the_callers_plan() {
     });
 }
 
-/// The write is a REQUIRED step of the drive, not a best-effort side call: an unreachable
-/// realm-core fails the transfer rather than silently leaving the directory wrong.
 #[test]
 fn a_transfer_whose_index_publish_fails_does_not_report_success() {
     no_hang(30, || {
@@ -317,9 +264,6 @@ fn a_transfer_whose_index_publish_fails_does_not_report_success() {
              this fix exists to remove. Got: {err:#}"
         );
 
-        // …and the failure is RECOVERABLE, which is what makes propagating it safe: the character
-        // is already whole at the destination, only fenced, so a fresh driver with a working
-        // realm-core finishes the job. Nothing is lost and nothing is duplicated.
         assert!(!src_db.has(XGUID) && dst_db.has(XGUID) && !dst_db.live(XGUID));
         let src2 = xstore("world", src_db.clone(), calls.clone(), None);
         let dst2 = xstore("instances", dst_db.clone(), calls, None);
@@ -332,23 +276,11 @@ fn a_transfer_whose_index_publish_fails_does_not_report_success() {
 
 #[test]
 fn a_gateway_kill_at_every_transfer_step_recovers_to_exactly_one_whole_copy() {
-    // Wall-clock net: a wedged driver must FAIL, not hang the suite.
     no_hang(30, || {
-        // Headless half: kill the driver at every step boundary, then let a fresh STATELESS
-        // driver re-run — the character ends whole on exactly one shard, every time.
-        //
-        // Driven off `ABORT_STEPS` itself rather than a literal copy of it. The index-publish fix
-        // added step 5b (`publish_shard_index`) to `ABORT_STEPS` and to the drive, but the literal
-        // list here was not updated — so the one boundary that fix introduced was the one boundary
-        // this matrix did not kill at, while that fix's own PR reported the matrix as covering it.
-        // A hand-copied list of the thing under test can only ever drift in the direction that
-        // loses coverage.
         for kill_at in super::transfer::ABORT_STEPS {
             let (src, dst, src_db, dst_db, _) = xdb_pair(Some(kill_at));
             let first = super::transfer::settle_transfer(src.as_ref(), dst.as_ref(), XGUID);
             if kill_at == "evict_instance_population" {
-                // The eviction is deliberately best-effort: the character is already whole by then, so
-                // failing the player's login over a performance wart would be strictly worse.
                 first.expect("an eviction failure must not fail the transfer");
             } else {
                 assert!(
@@ -357,7 +289,6 @@ fn a_gateway_kill_at_every_transfer_step_recovers_to_exactly_one_whole_copy() {
                 );
             }
 
-            // INVARIANT AT THE CRASH POINT.
             assert!(
                 src_db.has(XGUID) || dst_db.has(XGUID),
                 "ZERO durable copies after a kill at {kill_at} — the character was lost"
@@ -367,9 +298,6 @@ fn a_gateway_kill_at_every_transfer_step_recovers_to_exactly_one_whole_copy() {
                 "the character is LIVE on both databases after a kill at {kill_at} — a dupe"
             );
 
-            // A brand-new driver with NO memory of the interrupted attempt: it re-derives the plan from
-            // durable state alone (the escrow row, or the character row's own destination), which is
-            // the whole of gateway-restart recovery.
             let calls: ShardCallLog = Default::default();
             let src2 = xstore("world", src_db.clone(), calls.clone(), None);
             let dst2 = xstore("instances", dst_db.clone(), calls.clone(), None);
@@ -402,10 +330,6 @@ fn a_gateway_kill_at_every_transfer_step_recovers_to_exactly_one_whole_copy() {
     });
 }
 
-/// `LYRACORE_TRANSFER_ABORT_AFTER=<step>` must let the named step COMMIT and then kill the driver
-/// before the next one — that is the only way the live crash-recovery matrix can aim at a specific
-/// crash boundary in a drive that completes in ~17ms. In a `cargo test` build the injected death is
-/// a panic rather than `process::abort()` (see `transfer::die_by_injection`), so it is observable here.
 #[test]
 fn an_injected_abort_stops_the_driver_after_the_named_step_and_before_the_next() {
     for (i, step) in super::transfer::ABORT_STEPS.iter().enumerate() {
@@ -423,7 +347,6 @@ fn an_injected_abort_stops_the_driver_after_the_named_step_and_before_the_next()
             outcome.as_ref().map(|r| r.is_ok())
         );
 
-        // The step named must have RUN (its transaction committed), and nothing after it may have.
         let log = calls.lock().unwrap().clone();
         let names: Vec<&str> = log.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(
@@ -442,7 +365,6 @@ fn an_injected_abort_stops_the_driver_after_the_named_step_and_before_the_next()
             i + 1
         );
 
-        // And the same invariant the live matrix asserts against the two real databases.
         assert!(
             src_db.has(XGUID) || dst_db.has(XGUID),
             "ZERO durable copies after an injected abort at {step} — the character was lost"
@@ -454,9 +376,6 @@ fn an_injected_abort_stops_the_driver_after_the_named_step_and_before_the_next()
     }
 }
 
-/// The unconfigured default must be indistinguishable from having no injection point at all: same
-/// shard calls, same order, same result. (This repo has shipped three "unconfigured is
-/// byte-identical" violations already; this is the guard against a fourth.)
 #[test]
 fn an_unset_transfer_abort_injection_changes_nothing() {
     assert_eq!(
@@ -493,10 +412,6 @@ fn an_unset_transfer_abort_injection_changes_nothing() {
 
 #[test]
 fn the_driver_never_attests_an_import_that_did_not_commit() {
-    // `confirm_import` files the in-row that licenses `finish_transfer` to CASCADE-DELETE the
-    // source copy. Attesting before the destination copy is durable is the one unrecoverable
-    // ordering bug in the protocol — and it is the GATEWAY's to prevent, because the source
-    // database cannot see the destination.
     let (src, dst, src_db, dst_db, calls) = xdb_pair(Some("import_character_blob"));
     let err = super::transfer::settle_transfer(src.as_ref(), dst.as_ref(), XGUID)
         .expect_err("a failed import must abort the drive");
@@ -520,8 +435,6 @@ fn the_driver_never_attests_an_import_that_did_not_commit() {
 
 #[test]
 fn a_transfer_is_never_finished_before_the_destination_copy_is_durable() {
-    // The module's own guard, driven through the gateway: `finish_transfer` refuses while the
-    // in-row is absent, so even a driver that skipped `confirm_import` cannot destroy the source.
     let (_, _, src_db, dst_db, _) = xdb_pair(None);
     let calls: ShardCallLog = Default::default();
     let src = xstore("world", src_db.clone(), calls.clone(), None);
@@ -541,8 +454,6 @@ fn a_transfer_is_never_finished_before_the_destination_copy_is_durable() {
 
 #[test]
 fn the_arrival_copy_is_fenced_until_the_source_copy_is_destroyed() {
-    // Delete-last, observed from the outside: at every prefix of the drive there is at most ONE
-    // live copy, and the destination only goes live after the source copy is gone.
     let (_, _, src_db, dst_db, _) = xdb_pair(None);
     let calls: ShardCallLog = Default::default();
     let src = xstore("world", src_db.clone(), calls.clone(), None);
@@ -586,15 +497,6 @@ fn the_arrival_copy_is_fenced_until_the_source_copy_is_destroyed() {
     assert!(dst_db.live(XGUID));
 }
 
-/// The regression this test exists for: the SECOND party member walking
-/// into a dungeon whose instance the first member already opened.
-///
-/// Live, this was the case that broke — the first player transferred perfectly, repeatedly, and the
-/// party member behind her hung on the loading screen forever with `run_transfer` never entered.
-/// The driver half of that is here: two characters whose durable rows name the SAME instance both
-/// have to land on the instances shard, in that one instance, with the destination mirroring it
-/// once and spawning its population once. A second `ensure_instance` that re-created the dungeon
-/// would be a party playing in two copies of Deadmines.
 #[test]
 fn a_second_party_member_transfers_into_the_instance_the_first_one_opened() {
     no_hang(30, || {
@@ -609,9 +511,6 @@ fn a_second_party_member_transfers_into_the_instance_the_first_one_opened() {
                 payload: "leader-gear".into(),
             },
         );
-        // The second member resolved to the SAME instance id at the portal — that is what the
-        // module's party-first resolution (and the `game_instance_binding` each member carries in
-        // their blob) is for. Both rows sit on the world shard; both are owed a transfer.
         lk(&src_db.characters).insert(
             MEMBER,
             FakeChar {
@@ -673,9 +572,6 @@ fn a_second_party_member_transfers_into_the_instance_the_first_one_opened() {
 
 #[test]
 fn the_instance_is_mirrored_before_the_character_arrives_in_it() {
-    // Ordering, not just presence: `player_login`'s stranding guard DIVERTS a character whose
-    // `pending_instance_id` names an instance that does not exist on this shard — so an import
-    // that landed before the mirror would put the player outside the dungeon they walked into.
     let (src, dst, _, _, calls) = xdb_pair(None);
     super::transfer::settle_transfer(src.as_ref(), dst.as_ref(), XGUID).unwrap();
     let log = calls.lock().unwrap().clone();
@@ -695,8 +591,6 @@ fn the_instance_is_mirrored_before_the_character_arrives_in_it() {
 
 #[test]
 fn an_open_world_destination_mirrors_and_evicts_nothing() {
-    // Zoning OUT: instance 0 is the open world, which is not an instance and must never be
-    // "mirrored" (the module refuses id 0) or evicted (that would tear down the open world).
     let calls: ShardCallLog = Default::default();
     let src_db = FakeShardDb::with_character(
         XGUID,
@@ -722,10 +616,6 @@ fn an_open_world_destination_mirrors_and_evicts_nothing() {
 
 #[test]
 fn a_character_already_on_its_home_shard_is_not_transferred_but_is_unfenced() {
-    // The steady state (every login that does not cross a boundary), PLUS the one crash window
-    // that leaves an arrival fence behind with no escrow anywhere to re-drive from: killed between
-    // `finish_transfer` and `release_transfer`. Without the speculative release the character would
-    // be fenced out of its own login forever.
     let calls: ShardCallLog = Default::default();
     let db = FakeShardDb::with_character(
         XGUID,
@@ -735,7 +625,7 @@ fn a_character_already_on_its_home_shard_is_not_transferred_but_is_unfenced() {
             payload: "gear+spells".into(),
         },
     );
-    lk(&db.in_rows).insert(XGUID, XGUID); // the orphaned arrival fence
+    lk(&db.in_rows).insert(XGUID, XGUID);
     let home = xstore("instances", db.clone(), calls.clone(), None);
     assert!(!db.live(XGUID), "precondition: the character is fenced");
 
@@ -783,14 +673,6 @@ fn a_normal_resident_does_not_need_transfer_arrival_repair() {
 
 #[test]
 fn a_second_transfer_of_the_same_character_is_never_swallowed_as_a_replay() {
-    //
-    // Reachable state: the character hopped world -> instances and the driver died between
-    // `finish_transfer` and `release_transfer`, so the instances shard holds the character AND an
-    // unreleased arrival in-row under id == guid. Now it has to hop OUT again (its location is
-    // owned by another shard: a shard-map edit, or a diverted
-    // instance re-entry). Without the fence being cleared first, `begin_transfer` on the instances
-    // shard replays into `Ok(())` while escrowing NOTHING — and the character is stuck on a shard
-    // it can never leave, failing its own login on every attempt, with no operator recourse.
     let calls: ShardCallLog = Default::default();
     let src_db = FakeShardDb::with_character(
         XGUID,
@@ -800,7 +682,7 @@ fn a_second_transfer_of_the_same_character_is_never_swallowed_as_a_replay() {
             payload: "gear+spells".into(),
         },
     );
-    lk(&src_db.in_rows).insert(XGUID, XGUID); // the previous hop's unreleased fence
+    lk(&src_db.in_rows).insert(XGUID, XGUID);
     let dst_db = FakeShardDb::empty();
     let src = xstore("instances", src_db.clone(), calls.clone(), None);
     let dst = xstore("world", dst_db.clone(), calls.clone(), None);
@@ -837,10 +719,6 @@ fn a_second_transfer_of_the_same_character_is_never_swallowed_as_a_replay() {
 
 #[test]
 fn a_failed_transfer_fails_the_login_instead_of_entering_the_world_anyway() {
-    // A half-moved character must never be let into the world on whichever shard happened to
-    // answer. Both outcomes are recoverable (the escrow holds and the next login re-drives it), but
-    // only refusing is honest — and entering anyway is how a character ends up live on the shard
-    // that is about to have its copy destroyed.
     let (store, _) = sharded_stores();
     let failing = std::sync::Arc::new(WorldFake {
         topology: TopologyState {
@@ -866,7 +744,6 @@ fn a_failed_transfer_fails_the_login_instead_of_entering_the_world_anyway() {
     CMSG_PLAYER_LOGIN { guid: Guid::new(1) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    // No login sequence arrives; the session ends with the transfer's error.
     let _ = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec);
     drop(client);
     let outcome = server.join().unwrap();
@@ -879,10 +756,6 @@ fn a_failed_transfer_fails_the_login_instead_of_entering_the_world_anyway() {
 
 #[test]
 fn entering_the_world_binds_this_accounts_identity_on_the_shard_it_landed_on() {
-    // A character that arrived via `import_character_blob` has only a SHADOW account row on the
-    // destination, with no identity bound — and `world::player_login` resolves its caller through
-    // `account_by_identity`. Without this bind the arriving player cannot log in at all, on a
-    // database the logon tier never touched.
     let (store, calls) = sharded_stores();
     let home = store
         .topology
@@ -910,9 +783,6 @@ fn entering_the_world_binds_this_accounts_identity_on_the_shard_it_landed_on() {
 
 #[test]
 fn a_resumed_transfer_reuses_the_escrowed_destination_not_the_character_row() {
-    // Resume authority: once an escrow exists, ITS destination is the one the destination shard may
-    // already hold an imported copy for. Re-deriving from the (frozen) character row instead would
-    // drive the second half of the transfer at a different place than the first half imported into.
     let calls: ShardCallLog = Default::default();
     let src_db = FakeShardDb::with_character(
         XGUID,
@@ -928,7 +798,7 @@ fn a_resumed_transfer_reuses_the_escrowed_destination_not_the_character_row() {
             transfer_id: XGUID,
             character_guid: XGUID,
             dest_map_id: 36,
-            dest_instance_id: 42, // ← the escrow's destination, deliberately NOT the row's
+            dest_instance_id: 42,
             blob: fake_blob(XGUID, 36, 42, "gear+spells"),
         },
     );
@@ -948,17 +818,6 @@ fn a_resumed_transfer_reuses_the_escrowed_destination_not_the_character_row() {
     );
 }
 
-// ===========================================================================================
-//  Session-less crossings — the intent row a Package writes and the coordinator relay executes.
-//
-//  A bot is a real character with no session, so nothing drove it through the escrowed transfer:
-//  the driver was always the client's own loading-screen ack. These tests drive `run_bot_transfer`
-//  against the same two `FakeShardDb`s the player-side tests above use, so the transfer they assert
-//  is the real one, module guards and all.
-// ===========================================================================================
-
-/// The bot's guid. Deliberately not [`XGUID`]: these tests share the party fixture's numbering,
-/// where 5 is the playerbot.
 const BOT_GUID: u64 = super::party_tests::BOT;
 const SOURCE_MODULE: spacetimedb_sdk::Identity =
     spacetimedb_sdk::Identity::from_byte_array([7; 32]);
@@ -980,10 +839,6 @@ fn bot_intent() -> super::transfer::BotTransferIntent {
     }
 }
 
-/// A source shard holding a session-less character that has ALREADY been placed at
-/// `(dest_map, dest_instance)`, plus the shard the Shard Map serves that destination from. This is
-/// the state `transfer::emit_bot_transfer_intent` leaves behind: the durable row names the
-/// destination, the live entity is gone, and the intent row is on its way to the gateway.
 #[allow(clippy::type_complexity)]
 fn bot_pair(
     dest_map: u32,
@@ -1033,7 +888,6 @@ fn bot_pair(
     (src, src_db, dst_db, calls)
 }
 
-/// **AC: an intent row moves a session-less character to the shard that serves the destination.**
 #[test]
 fn an_intent_row_crosses_a_session_less_character_to_the_destination_shard() {
     let (src, src_db, dst_db, _calls) = bot_pair(36, 7);
@@ -1135,9 +989,6 @@ fn a_bot_abort_at_every_transfer_step_recovers_from_durable_witnesses() {
         );
 
         let mut resumed = intent.clone();
-        // A real restarted worker receives these two fields from its retained source intent. This
-        // lower-rung Fake supplies the same durable resume input explicitly; the process caller
-        // must query the row instead.
         resumed.source_locator_revision = 3;
         resumed.arrival_ready = index
             >= super::transfer::BOT_ABORT_STEPS
@@ -1548,7 +1399,6 @@ fn a_ready_intent_completes_after_the_bot_has_crossed_onward() {
         .expect("the first crossing settles");
     assert!(!src_db.has(BOT_GUID) && dst_db.live(BOT_GUID));
 
-    // The next crossing has already removed the Character from this intent's first destination.
     lk(&dst_db.characters).remove(&BOT_GUID);
     let ready = super::transfer::BotTransferIntent {
         arrival_ready: true,
@@ -1578,8 +1428,6 @@ fn an_old_ready_intent_does_not_release_a_newer_arrival_fence() {
         .expect("the first crossing settles");
     assert!(!src_db.has(BOT_GUID) && dst_db.live(BOT_GUID));
 
-    // A later crossing has brought the same Character back behind a new fence. Transfer ids reuse
-    // the Character guid, so only the destination's exact intent identity distinguishes this row.
     lk(&dst_db.in_rows).insert(BOT_GUID, BOT_GUID);
     let new_source = spacetimedb_sdk::Identity::from_byte_array([8; 32]);
     lk(&dst_db.bot_arrivals).insert(BOT_GUID, (new_source, 92, 5, 5_000));
@@ -1674,8 +1522,6 @@ fn a_blank_migrated_arrival_fence_is_not_adopted() {
     assert!(!dst_db.live(BOT_GUID));
 }
 
-/// **AC: the return crossing uses the same row.** The instance shard writes an intent naming the
-/// open world, and the identical relay drives it back.
 #[test]
 fn the_same_intent_row_carries_the_bot_back_out() {
     let (src, src_db, dst_db, _calls) = bot_pair(0, 0);
@@ -1685,9 +1531,6 @@ fn the_same_intent_row_carries_the_bot_back_out() {
     assert_eq!(dst_db.get(BOT_GUID).unwrap().map_id, 0);
 }
 
-/// **AC: a stale intent is refused with a log line, not a crash.** The module places a bot before
-/// it records the crossing, so a row whose destination the character row does not name describes a
-/// move that never happened — a dead bot teleports nowhere.
 #[test]
 fn an_intent_the_character_row_does_not_name_is_refused() {
     let (src, src_db, dst_db, calls) = bot_pair(0, 0);
@@ -1711,7 +1554,6 @@ fn an_intent_the_character_row_does_not_name_is_refused() {
     );
 }
 
-/// **AC: a dead bot is refused.** Its character row is gone, so there is nothing to escrow.
 #[test]
 fn an_intent_for_a_character_this_shard_does_not_hold_is_refused() {
     let (src, src_db, dst_db, calls) = bot_pair(36, 7);
@@ -1730,9 +1572,6 @@ fn an_intent_for_a_character_this_shard_does_not_hold_is_refused() {
         .any(|(_, c)| c == "begin_transfer"));
 }
 
-/// A realm with one Shard: the module's teleport WAS the whole crossing, so the relay has nothing
-/// to do and must not treat that as a failure. This is the common dev and test topology, and the
-/// same Package code runs on it.
 #[test]
 fn a_destination_this_shard_already_serves_is_a_completed_crossing() {
     let calls: ShardCallLog = Default::default();
@@ -1751,12 +1590,6 @@ fn a_destination_this_shard_already_serves_is_a_completed_crossing() {
     assert!(calls.lock().unwrap().is_empty(), "and no step may run");
 }
 
-/// **AC: group membership survives a mirror failure during the crossing.**
-///
-/// The bot is invited on the open-world shard and answers for itself (it has no client), then
-/// crosses. Realm-core owns the membership the whole time; what this pins is that the shard the bot
-/// ARRIVES on can read its party, which is what its kill-XP split, quest credit and loot rules run
-/// against.
 #[test]
 fn the_bots_arrival_fence_survives_a_party_mirror_failure_and_retry() {
     use super::party_tests::{character, GINGER};
@@ -1820,7 +1653,6 @@ fn the_bots_arrival_fence_survives_a_party_mirror_failure_and_retry() {
         },
         characters: vec![character(GINGER, "Ginger"), character(BOT_GUID, "Botty")],
         session: SessionState {
-            // The production shape of a playerbot: a live entity that never logged in.
             live_guids: vec![GINGER, BOT_GUID],
             ..Default::default()
         },

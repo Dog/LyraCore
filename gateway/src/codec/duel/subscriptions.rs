@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::{CellKey, ShardId};
@@ -11,8 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Project one Duel lifecycle edge for one recipient. The module inserts one row per participant,
-/// so this function deliberately builds one copy of each typed protocol packet per row.
 pub(crate) fn duel_event_outbound(
     row: &DuelEvent,
     template: Option<&codec::GameObjectTemplateView>,
@@ -75,9 +71,7 @@ pub(crate) fn duel_event_outbound(
         }
         event_kind::COUNTDOWN => vec![Outbound::One(ServerOpcodeMessage::SMSG_DUEL_COUNTDOWN(
             SMSG_DUEL_COUNTDOWN {
-                // The library labels this Duration as seconds, but writes `as_secs()` directly.
-                // Vanilla's field is milliseconds and CMaNGOS writes 3000, so 3000 seconds here
-                // is the typed API spelling that produces the correct u32 wire value.
+                // The binding writes as_secs(), but vanilla reads the value as milliseconds.
                 time: Duration::from_secs(3_000),
             },
         ))],
@@ -112,8 +106,6 @@ pub(crate) fn duel_event_outbound(
     }
 }
 
-/// The one winner announcement for a completed Duel. Participant relays include it after
-/// `SMSG_DUEL_COMPLETE`; the shared view also fans it to nearby non-participants.
 pub(crate) fn duel_winner_outbound(row: &DuelEvent) -> Vec<Outbound> {
     use lyracore_shared::duel::completion_kind;
     use wow_world_base::shared::duel_winner_reason_vanilla_tbc_wrath::DuelWinnerReason;
@@ -131,8 +123,7 @@ pub(crate) fn duel_winner_outbound(row: &DuelEvent) -> Vec<Outbound> {
         completion_kind::FLED => DuelWinnerReason::Fled,
         _ => return Vec::new(),
     };
-    // `opponent_name` is the first CString on the wire and carries the WINNER: mangos sends
-    // this packet from the loser, announcing its opponent as victor.
+    // The first CString, named opponent_name by the binding, carries the winner.
     vec![Outbound::One(ServerOpcodeMessage::SMSG_DUEL_WINNER(
         Box::new(SMSG_DUEL_WINNER {
             reason,
@@ -142,8 +133,6 @@ pub(crate) fn duel_winner_outbound(row: &DuelEvent) -> Vec<Outbound> {
     ))]
 }
 
-/// A Duel lifecycle edge landed for one participant. Private packets go only to that participant;
-/// the initiator-addressed completion row also drives the one nearby winner announcement.
 pub(crate) fn duel_event_appeared(
     view: &WorldView,
     coord: &Coordinator,
@@ -169,8 +158,6 @@ pub(crate) fn duel_event_appeared(
         });
     }
 
-    // The module writes two participant rows. Use the initiator-addressed copy as the one AOI fan
-    // trigger, and exclude both private recipients so each client receives one winner packet.
     if row.kind != lyracore_shared::duel::event_kind::COMPLETE
         || row.recipient_guid != row.initiator_guid
         || row.winner_guid == 0
@@ -190,8 +177,6 @@ pub(crate) fn duel_event_appeared(
     }
 }
 
-/// The AOI bystander leg of the winner announcement: both participants get their own copy, so the
-/// fan-out must skip them (and the unregistered zero guid).
 pub(crate) fn duel_winner_audience(
     viewer_guid: u64,
     initiator_guid: u64,

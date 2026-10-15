@@ -1,16 +1,3 @@
-//! World listener (TCP 8085): handshake, header crypto, char enum, login, movement,
-//! disconnect.
-//!
-//! Like `logon`, the protocol is a transport- and storage-agnostic state machine over a
-//! blocking `Read + Write` stream, driven by `wow_world_messages` (vanilla) codecs and
-//! `wow_srp`'s vanilla header cipher. Storage/coordination is behind the [`WorldStore`] trait
-//! so the handshake + crypto can be unit-tested end-to-end without a database or a real
-//! socket (see the tests below, which drive a full handshake with `wow_srp`'s client side).
-//!
-//! Per-connection protocol state lives in [`WorldConn`] — none of it is game state, so a
-//! gateway restart costs only a client reconnect: K is read back
-//! from `game_session` and the same handshake re-runs.
-
 use crate::accept::{classify_accept_error, AcceptBackoff, AcceptOutcome};
 use crate::codec::auth_session::{read_auth_session, CMSG_AUTH_SESSION_OPCODE};
 use crate::read_deadline::{
@@ -92,78 +79,23 @@ pub use store::{InteractionOutcome, WorldSessionToken, WorldStore};
 pub(crate) use store::{SessionStore, ShardRoutingStore};
 pub(crate) use transfer::TransferStore;
 
-/// One unit of outbound traffic for the single writer thread. A `Batch` is written contiguously so
-/// the login sequence + self-spawn can never be spliced by an async peer event mid-sequence.
+/// A Batch must stay contiguous so peer Relays cannot interrupt world entry.
 pub enum Outbound {
     One(ServerOpcodeMessage),
     Batch(Vec<ServerOpcodeMessage>),
-    /// A pre-serialized packet body sent under a RAW opcode — the escape hatch past gtker's
-    /// `pub(crate)` update-mask wall (auras 1..47, multi-field item descriptors). `body` is the
-    /// packet body WITHOUT the 4-byte server header; the writer frames it exactly like the gtker path
-    /// (`[size:u16 BE][opcode:u16 LE]`, `size = 2 + body.len()`, then encrypts the header via the same
-    /// `EncrypterHalf`), so the header-cipher stream stays in lockstep with the typed sends. Built by
-    /// `codec::build_values_update_raw` from the hand-rolled `update_mask::UpdateMaskValues`.
     Raw {
         opcode: u16,
         body: Vec<u8>,
     },
-    /// DEFERRED relay work. The shared AOI dispatch runs on ONE coordinator pump per shard
-    /// that every session now depends on, and the SDK forbids parallel `advance_one_message`
-    /// callers — so the pump must never encode. It pushes this instead: a closure that does the
-    /// per-viewer gating, cache reads and encoding LATER, on this session's own writer thread.
-    ///
-    /// Ordering is preserved because a job travels the same queue as everything else: whatever the
-    /// job produces is written exactly where the job was enqueued, so a CREATE queued before a
-    /// VALUES still reaches the wire first.
-    ///
-    /// The writer runs it inside `catch_unwind`, and it may produce zero packets (the common case
-    /// for a row a gate rejects — a job is enqueued per candidate viewer, and rejecting a candidate
-    /// costs one dequeue instead of pump time).
+    /// SDK advancement is serial per shard; defer encoding to each World Session's writer.
     Job(RelayJob),
 }
 
-/// One unit of deferred relay work — see [`Outbound::Job`]. Returns the packets to write, in order;
-/// nested jobs are not expanded (nothing produces one, and honouring them would make the queue's
-/// ordering guarantee depend on recursion depth).
 pub type RelayJob = Box<dyn FnOnce() -> Vec<Outbound> + Send>;
 
-/// Queued-but-unwritten `Outbound` items past which the two N²-shaped relays stop enqueueing
-/// (see [`SessionTx`] and `subscriptions::shed_motion_at_depth`).
-///
-/// Sizing, so this is a reasoned number and not a vibe. One `Outbound` is one packet (a `Batch` is
-/// one item carrying several), and a writer keeping up with its socket holds this in the single
-/// digits — the queue only grows while the socket is refusing bytes. The two costs it sits between:
-///   * **Too low → shedding legitimate bursts.** Entering a crowded AOI box queues one
-///     `CREATE_OBJECT` per peer in one go (~100 at the 5×5 box's practical occupancy, and every one
-///     of them matters — a dropped CREATE means an invisible player until the next re-entry). Login
-///     queues its own burst on top. 512 is several times that headroom.
-///   * **Too high → the memory path this bounds.** At 371 co-located clients each session receives
-///     ~740 peer-motion packets/s (~2 heartbeats/s × ~370 movers), so 512 items ≈ 0.7 s of crowd
-///     movement, and at ~50 bytes of body plus `Vec`/enum overhead ≈ 50 KB per session — ~18 MB
-///     across 371 sessions, bounded, instead of a queue that grows for as long as the socket stalls.
-///
-/// So: a session that is more than ~0.7 s behind on peer movement is not "bursting", it is losing,
-/// and the newest heartbeat is worth more than the 512 stale ones ahead of it.
 pub const EGRESS_SHED_DEPTH: usize = 512;
 
-/// The session's egress sender plus a live count of items **queued but not yet written**.
-///
-/// The channel stays `std::sync::mpsc` UNBOUNDED on purpose. ~110 of the send sites live in
-/// `subscriptions.rs` inside SpacetimeDB SDK `on_insert`/`on_update` callbacks running on the SDK's
-/// own pump thread: a blocking send from there (what a bounded channel gives you on a full queue)
-/// would stall the pump that feeds every table callback for this connection and deadlock it. So
-/// instead of bounding the channel, we MEASURE it and let only the traffic that can safely be lost
-/// shed itself — see `subscriptions::shed_motion_at_depth` for which traffic that is and why.
-///
-/// The counter is the entire new hot-path cost: one `Relaxed` `fetch_add` per enqueue here, one
-/// `fetch_sub` per item the writer takes off the queue ([`spawn_writer`]). Nothing is logged,
-/// nothing is locked — the standing rule at `subscriptions.rs:208` (a `log::info!` on the relay
-/// path made an intermittent failure vanish across six consecutive runs) still holds.
-///
-/// Every enqueue goes through [`SessionTx::send`], so `depth()` is the true queue length rather
-/// than an estimate: the wrapper is what makes that invariant hold without touching ~180 call
-/// sites, because `tx.send(..)` resolves to this inherent method with the same signature
-/// `Sender::send` had.
+/// Blocking sends from SDK callbacks can deadlock the pump; keep this channel unbounded.
 #[derive(Clone)]
 pub struct SessionTx {
     tx: Sender<Outbound>,
@@ -184,17 +116,13 @@ impl SessionTx {
         }));
     }
 
-    /// Close both socket directions even when the writer is blocked or its queue is full.
     pub(crate) fn close(&self) {
         if let Some(close) = &self.close_socket {
             close();
         }
     }
 
-    /// Enqueue one outbound unit. Same signature as `mpsc::Sender::send`, so existing call sites
-    /// read identically; the only addition is the depth accounting. Incremented BEFORE the send so
-    /// the depth can never read low while an item is on the queue, and rolled back when the send
-    /// fails (a dead writer half means nothing was queued and nothing will be drained).
+    // Count before sending so depth cannot read low; undo the count if the send fails.
     pub fn send(&self, out: Outbound) -> std::result::Result<(), SendError<Outbound>> {
         self.depth.fetch_add(1, Ordering::Relaxed);
         match self.tx.send(out) {
@@ -206,24 +134,16 @@ impl SessionTx {
         }
     }
 
-    /// Items queued but not yet handed to the socket.
     pub fn depth(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
     }
 
-    /// The shared depth counter, for an observer that must NOT keep the channel alive (holding a
-    /// `SessionTx` clone would stop the writer's `rx.recv()` from ever returning `Err`).
-    ///
-    /// Test-only today: the shed path's production observer reads [`SessionTx::depth`] directly, and
-    /// the only consumer that needs a detached handle is `world::tests`' fake store.
     #[cfg(test)]
     pub fn depth_handle(&self) -> Arc<AtomicUsize> {
         self.depth.clone()
     }
 }
 
-/// One session's egress: the counted sender, the writer's receiver, and the shared depth the writer
-/// decrements as it drains. Test seam too — a test can pre-load the depth to drive the shed path.
 pub fn session_channel() -> (SessionTx, Receiver<Outbound>, Arc<AtomicUsize>) {
     let (tx, rx) = channel::<Outbound>();
     let depth = Arc::new(AtomicUsize::new(0));
@@ -240,8 +160,6 @@ pub fn session_channel() -> (SessionTx, Receiver<Outbound>, Arc<AtomicUsize>) {
 
 #[cfg(test)]
 impl SessionTx {
-    /// Test-only: a sender whose queue already claims `depth` items, for driving the shed path
-    /// without queueing half a thousand real packets.
     pub fn with_depth(depth: usize) -> (Self, Receiver<Outbound>) {
         let (tx, rx, d) = session_channel();
         d.store(depth, Ordering::Relaxed);
@@ -249,10 +167,6 @@ impl SessionTx {
     }
 }
 
-/// A stream that can be split into an independent write handle and shut down to unblock a blocked
-/// reader. Implemented for the production `TcpStream` and (test-only) `UnixStream`; both share the
-/// underlying fd across clones, so the writer thread can own a clone while the reader keeps the
-/// original.
 pub trait DuplexStream: Read + Write + IoDeadline + Send + Sized + 'static {
     fn try_clone(&self) -> std::io::Result<Self>;
     fn shutdown_both(&self) -> std::io::Result<()>;
@@ -277,116 +191,52 @@ impl DuplexStream for std::os::unix::net::UnixStream {
     }
 }
 
-/// Shared session material for one account, read from `game_session` (+ `game_account`).
 #[derive(Clone, Debug)]
 pub struct WorldSession {
     pub account_id: u64,
-    /// The 40-byte SRP6 session key K shared with the logon listener via `game_session`.
     pub session_key: [u8; 40],
 }
 
-/// How an ITEM-target enchanting cast routes, derived from the spell's effect kind (not a spell id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnchantRoute {
-    /// E_ENCHANT_ITEM — apply this enchant id to the targeted item.
     Enchant(u32),
-    /// E_DISENCHANT — disenchant the targeted item into reagents.
     Disenchant,
 }
 
-/// Activity floor for motion diagnostics. Counts below this leave short windows unclassified;
-/// even high activity can legitimately have no peer audience.
 pub const MOVE_ACTIVITY_FLOOR: u64 = 100;
 
-/// Accepted movements handed to shard-local shared batches. Fan-out diagnostics use this
-/// process-wide count as their activity denominator.
 pub static MOVE_SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The connection's world-phase sub-state. Encodes the in-world invariant in the TYPE: the relay
-/// subscriptions and combat/loot targets exist only while in-world, so the
-/// dispatch arms match on the state instead of guarding scattered `Option`s. `CMSG_PLAYER_LOGIN`
-/// moves `CharSelect → InWorld`; logout / socket teardown moves back, dropping `InWorld` and its
-/// shared-view registration via `PlayerSubscriptions`.
-// `InWorld` is ~400 bytes against `CharSelect`'s zero, which is exactly what
-// `clippy::large_enum_variant` flags — deliberately NOT boxed. There is exactly ONE `WorldState`
-// per connection (it lives in `WorldConn`, one per session thread), so boxing saves ~400 bytes per
-// logged-OUT session and buys an extra pointer hop on every in-world dispatch arm, which is the
-// hot path. The memory this enum is sized against is the per-session egress queue, orders of
-// magnitude larger (see `EGRESS_SHED_DEPTH`).
 #[allow(clippy::large_enum_variant)]
 pub enum WorldState {
-    /// Character-select: post-handshake, pre-`CMSG_PLAYER_LOGIN`, or after a logout.
     CharSelect,
-    /// In the world with a selected character.
     InWorld(InWorld),
 }
 
-/// The gossip menu one client is looking at. `options` is indexed by the `gossip_list_id` the client
-/// echoes back; past the end is the trailing Farewell line, or a stale click.
 pub struct GossipMenuSnapshot {
     pub npc_guid: u64,
-    /// `(game_gossip_option.row_id, action)` per menu position. `row_id` is
-    /// `codec::SYNTHESIZED_ROW_ID` for the vendor/innkeeper lines the gateway added itself.
     pub options: Vec<(u32, u32)>,
 }
 
-/// State that exists only while the player is in the world (the `InWorld` variant payload).
 pub struct InWorld {
-    /// The selected character's guid (names `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP`).
     pub self_guid: u64,
-    /// Shared-view lifetime guard. Its RAII `Drop` unregisters this viewer on logout or socket
-    /// teardown, so a relogin cannot inherit the old routing entry.
     pub subs: PlayerSubscriptions,
-    /// The guid being melee auto-attacked (combat C1), so `CMSG_ATTACKSTOP` can name it. The
-    /// authoritative engagement lives in `game_melee_attack`; this is protocol state.
     pub attacking_target: Option<u64>,
     pub open_loot: OpenLootState,
-    /// A ranged auto-repeat (Auto Shot / wand Shoot) is armed. Melee and ranged share one
-    /// `game_melee_attack` row keyed by attacker, so the melee-stop `CMSG_ATTACKSTOP` the client
-    /// sends when switching to ranged would collaterally kill the auto-shot. While this is set,
-    /// `CMSG_ATTACKSTOP` is ignored — the ranged loop is stopped only by
-    /// `CMSG_CANCEL_AUTO_REPEAT_SPELL`.
     pub ranged_repeat: bool,
 }
 
-/// Established per-connection protocol state after a successful handshake, owned by the reader
-/// thread. The `EncrypterHalf` is NOT here — it moves to the single writer thread, which is the
-/// sole writer of the socket (the header cipher is a stateful stream, so exactly one writer may
-/// advance it). NOT game state: the cipher is re-derivable from K on reconnect.
+/// One writer must own the stateful header cipher; concurrent writes corrupt its stream.
 pub struct WorldConn {
     pub(crate) protocol: ProtocolSession,
-    /// Retained before world entry so failed routing or admission is also cleaned up.
     session_claim: Option<WorldSessionToken>,
-    /// Decrypts inbound CMSG headers (reader-thread only).
     pub decrypt: DecrypterHalf,
-    /// Per-connection movement coalescing. Lives directly on `WorldConn` (not
-    /// `InWorld`) so it survives a world-port/relogin boundary uneventfully — it only ever sees
-    /// traffic while `InWorld` movement is being dispatched, but there's no correctness reason to
-    /// tear it down on a state transition, and keeping it here avoids re-plumbing it through
-    /// `enter_world`.
     move_coalesce: CoalesceState,
-    /// Automatic client requests announce each missing feature once per World Session.
     unavailable_notices: std::collections::HashSet<handlers::UnavailableNotice>,
-    /// The Store every message of this session runs against.
     store: RoutedStore,
-    /// The shared session key K, kept from the world handshake so a session that lands on a NON-
-    /// realm shard can call `establish_session` THERE — the module's `account_by_identity`
-    /// gate on `player_login` needs the account row on that database bound to this connection's
-    /// identity, and the logon tier only ever bound it on the realm database.
-    ///
-    /// NOT game state, and not a new secret: it is the same K the header cipher on this very socket
-    /// is already keyed by, read from `game_session` moments earlier in `world_handshake`. `None`
-    /// for sessions built by tests that never handshake.
     session_key: Option<[u8; 40]>,
-    /// The Character that signed on to its Guild in this World Session. `leave_world` signs it
-    /// off even when a failed world-port left the state at CharSelect.
     guild_signed_on: Option<u64>,
-    /// Consecutive movement packets dropped because the coordinator cache has no live entity.
-    /// Reset by the first movement whose entity is present. See
-    /// [`MOVE_DESYNC_TOLERANCE`] for why the tolerance is bounded rather than unconditional.
     move_desync_drops: u32,
-    /// The Chat Flood Limiter. It lives on the connection, as cmangos keeps the mute on its
-    /// session, so a relog does not clear it.
     chat_flood: chat_flood::ChatFloodLimiter,
 }
 
@@ -403,29 +253,10 @@ impl std::ops::DerefMut for WorldConn {
     }
 }
 
-/// How many CONSECUTIVE desynced movement packets a session may drop before the desync is treated
-/// as real and the session ends.
-///
-/// The tail of a cross-map port is a handful of packets: the client stops sending movement the
-/// instant `SMSG_TRANSFER_PENDING` puts it on the loading screen, so only what was already in
-/// flight (hundreds of ms at ~10 packets/s) can land on the despawned entity. A desync that keeps
-/// answering past that is the OTHER kind — the entity is gone for good (a schema-change publish tore
-/// down the coordinator subscription; the row was deleted under this socket) — and for that one,
-/// closing the socket IS the fix: the client shows "Disconnected" and re-materialises everything
-/// from durable state on relog. Swallowing it forever would trade the loading-screen hang for a
-/// worse one: a player walking around a frozen world, invisible to peers, never disconnected, with
-/// no error and no recourse — which is exactly what `is_desync_error`'s session-fatal treatment
-/// exists to prevent. 32 is ~3 s of a moving client, an order of magnitude more than any port tail.
 const MOVE_DESYNC_TOLERANCE: u32 = 32;
 
-/// The cooldown one World Session's `CMSG_WHO` answers respect — a second request inside this
-/// window is dropped, unanswered, matching vm:MiscHandler.cpp:230's concurrent-request drop for
-/// the one Gateway-side realm-wide scan `/who` runs.
 const WHO_THROTTLE: Duration = Duration::from_secs(1);
 
-/// The Store a World Session talks to: the listener's handle until world entry pins the
-/// Character's Home Shard. Re-resolved from durable state on every world entry (login and
-/// world-port), so a gateway restart mid-session re-derives it on the client's relog.
 pub(crate) struct RoutedStore {
     default: Arc<dyn WorldStore>,
     home: Option<Arc<dyn WorldStore>>,
@@ -439,8 +270,6 @@ impl RoutedStore {
         }
     }
 
-    /// The pinned Home Shard, else the listener's handle. A clone, so the caller can hold it
-    /// while it mutates the session.
     pub(crate) fn current(&self) -> Arc<dyn WorldStore> {
         self.home.as_ref().unwrap_or(&self.default).clone()
     }
@@ -455,18 +284,7 @@ impl RoutedStore {
 }
 
 impl WorldConn {
-    /// Re-pin this session to the shard that owns `character_guid`'s location. Asked of the
-    /// handle currently in use, so a `None` answer means "this handle already owns it" and the
-    /// current pin is KEPT — clearing it would silently drop the session back to the default shard.
-    /// Called at every world entry (login and world-port), never in between: routing is derived
-    /// from durable state, so nothing here survives a gateway restart that shouldn't.
-    /// Returns the transfer's error rather than swallowing it: a half-moved character must
-    /// fail its login loudly, never proceed into the world on whichever shard happened to answer.
-    /// Both are recoverable — the escrow holds and the next login re-drives it — but only one of
-    /// them is honest to the player.
     fn route_home(&mut self, character_guid: u64) -> Result<()> {
-        // For a session that actually crosses a database boundary this RUNS the escrowed transfer
-        // before answering.
         let resolved = self.store.current().settle_home_shard(character_guid)?;
         if let Some(h) = resolved {
             log::info!(
@@ -476,22 +294,13 @@ impl WorldConn {
             );
             self.store.pin(h);
         }
-        // Bind this account's identity on the shard we ended up on. On the realm shard the logon
-        // tier already did it; on an instance shard the character arrived through
-        // `import_character_blob`, which created only a SHADOW account row with no identity — and
-        // `world::player_login` resolves its caller through `account_by_identity`, so without this
-        // the arriving player cannot log in at all. Idempotent, and re-run on every world entry
-        // because a gateway restart establishes a fresh bound identity.
         if let (Some(h), Some(key)) = (&self.store.home, &self.session_key) {
             h.bind_shard_session(self.account_id, key)?;
         }
         Ok(())
     }
 
-    /// Leave the world and release the matching durable Account claim, including failed entry.
-    /// A Guild member signs off first, while Realm-core still accepts the Account Claim. The
-    /// Character that signed on this session signs off even when a failed world-port left the
-    /// state at CharSelect.
+    /// Sign off from the Guild before releasing the Account Claim.
     fn leave_world(&mut self) -> Result<()> {
         let previous = std::mem::replace(&mut self.state, WorldState::CharSelect);
         let signed_on = self.guild_signed_on.take();
@@ -514,29 +323,13 @@ impl WorldConn {
     }
 }
 
-/// How often a queued connection re-checks whether it has been admitted. Cheap — one mutex
-/// lock, no I/O — so this can be short without costing anything measurable even under a full queue.
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How often a queued connection actually WRITES a refreshed `AUTH_WAIT_QUEUE` to the wire (as
-/// opposed to just checking, above). Bounded below by the spec's "every 5-10s or on position
-/// change" — resending on every poll tick would spam the socket for no client-visible benefit,
-/// since the position number is the only thing that can change. This is ALSO how promptly a clean
-/// disconnect while queued is noticed (the write attempt is what surfaces the broken pipe), so the
-/// test build uses a much shorter interval — real production behavior is unaffected either way,
-/// since a queued connection holds no seat and wastes nothing by lingering briefly after a hangup.
 #[cfg(not(test))]
 const QUEUE_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const QUEUE_RESEND_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Run the world auth handshake over `stream` (gateway-translation.md §3), gated by the unlimited
-/// [`LoginQueue`] (`LoginQueue::unlimited()`) — see [`world_handshake_with_queue`] for the
-/// admission gate itself. On success returns the established per-connection crypto + account id; on
-/// a clean auth failure sends the failure response and returns `Ok(None)`; on a clean disconnect
-/// also returns `Ok(None)`.
-/// Test-only: the listener in [`run`] supplies the process-wide [`LoginQueue`] and the deadline it
-/// started at accept, so an unqueued handshake exists purely for tests.
 #[cfg(test)]
 pub fn world_handshake<S: Read + Write + IoDeadline>(
     stream: &mut S,
@@ -545,22 +338,6 @@ pub fn world_handshake<S: Read + Write + IoDeadline>(
     world_handshake_with_queue(stream, store, &LoginQueue::unlimited())
 }
 
-/// Run the world auth handshake over `stream` (gateway-translation.md §3), gated by `queue`.
-/// On success returns the established per-connection crypto + account id; on a clean auth failure
-/// sends the failure response and returns `Ok(None)`; on a clean disconnect also returns `Ok(None)`.
-///
-/// Sequence: plaintext `SMSG_AUTH_CHALLENGE` (server seed) -> read plaintext
-/// `CMSG_AUTH_SESSION` -> look up K -> validate the client proof digest via `wow_srp` (which
-/// also yields the header cipher) -> **admission gate** (queue here if the world is full,
-/// resending `AUTH_WAIT_QUEUE` with the caller's position until a seat opens) -> **encrypted**
-/// `SMSG_AUTH_RESPONSE` (AUTH_OK). From the AUTH_OK packet on, every header is encrypted — and so is
-/// every `AUTH_WAIT_QUEUE` resend, since the cipher already exists by the time the gate is consulted.
-///
-/// A seat taken from `queue` is held for the lifetime of the returned session; the caller (normally
-/// [`run_world_session_with_queue`]) MUST call `queue.depart()` exactly once when that session ends.
-/// The final `AUTH_OK` write is the only failure mode inside this function after admission; it
-/// departs its own seat before propagating the error. A caller that never sees `Ok(Some(..))` never
-/// owes a `depart()` call.
 #[cfg(test)]
 pub fn world_handshake_with_queue<S: Read + Write + IoDeadline>(
     stream: &mut S,
@@ -577,17 +354,12 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
     queue: &LoginQueue,
     deadline: &mut PreAuthDeadline<C>,
 ) -> Result<Option<(WorldConn, EncrypterHalf)>> {
-    // 1. Plaintext SMSG_AUTH_CHALLENGE with a fresh, single-use server seed (gateway-local
-    //    RNG — protocol state, not game state).
     let seed = ProofSeed::new();
     let server_seed = seed.seed();
     SMSG_AUTH_CHALLENGE { server_seed }.write_unencrypted_server(&mut deadline.io(stream))?;
 
-    // 2. Read the plaintext CMSG_AUTH_SESSION (account, client_seed, client_proof). Hand-decoded:
-    //    the typed decoder sizes a buffer from a client field and unwraps the addon zlib.
     let session = match read_auth_session(&mut deadline.io(stream)) {
         Ok(claim) => claim,
-        // Clean client disconnect before sending the session.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) if is_io_deadline(&e) => {
             return Err(anyhow!(
@@ -597,22 +369,17 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
         Err(e) => return Err(anyhow!("world auth read error: {e}")),
     };
 
-    // 3. Map account -> K (read from game_session via the privileged coordinator connection).
     let username = session.username.to_uppercase();
     let Some(WorldSession {
         account_id,
         session_key,
     }) = store.lookup_session(&username)?
     else {
-        // No session for this account: the client never authenticated (or it expired). No
-        // cipher yet, so the rejection goes out plaintext.
         SMSG_AUTH_RESPONSE::AuthUnknownAccount
             .write_unencrypted_server(&mut deadline.io(stream))?;
         return Ok(None);
     };
 
-    // 4. Validate the client proof digest against K. Success also constructs the header
-    //    cipher keyed by K (a mismatch == the client does not actually hold K -> reject).
     let ns = NormalizedString::new(&username).map_err(|e| anyhow!("bad username: {e}"))?;
     let crypto = match seed.into_server_header_crypto(
         &ns,
@@ -622,34 +389,23 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
     ) {
         Ok(c) => c,
         Err(_) => {
-            // Bad digest. No cipher established, so the failure goes out plaintext.
             SMSG_AUTH_RESPONSE::AuthFailed.write_unencrypted_server(&mut deadline.io(stream))?;
             return Ok(None);
         }
     };
     let (mut encrypt, decrypt) = crypto.split();
 
-    // The peer has proven it holds K. Queue waits and the World Session that follows are
-    // authenticated traffic, so neither keeps the pre-auth socket timeouts or watchdog.
     deadline
         .finish(stream)
         .map_err(|e| anyhow!("clear world pre-auth I/O deadline: {e}"))?;
 
-    // 4.5. Admission gate. `queue.request()` on an unlimited queue (the default —
-    // `LYRACORE_MAX_SESSIONS` unset) returns `Admitted` immediately with no bookkeeping: a no-op for
-    // every gateway that hasn't opted in. Otherwise a full house queues the connection here, BEFORE
-    // it can reach CMSG_CHAR_ENUM or CMSG_PLAYER_LOGIN's `subscribe_player_events` — the expensive
-    // part measured at 38% of the writer at 500 sessions.
     if let Admission::Queued(ticket) = queue.request() {
         if !wait_for_admission(&mut *stream, &mut encrypt, queue, ticket)? {
-            // Clean disconnect while queued: leave the line (no seat was ever taken) and end the
-            // session exactly like the pre-auth disconnect path above — no AUTH_OK is ever sent.
             queue.cancel(ticket);
             return Ok(None);
         }
     }
 
-    // 5. SMSG_AUTH_RESPONSE = AUTH_OK + zeroed billing. From here on every header is encrypted.
     if let Err(e) = (SMSG_AUTH_RESPONSE::AuthOk {
         billing_flags: 0,
         billing_rested: 0,
@@ -657,9 +413,6 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
     })
     .write_encrypted_server(&mut *stream, &mut encrypt)
     {
-        // A seat was granted (immediately above, or via the queue) but the client vanished in the
-        // instant before we could tell it so. Release the seat here — we're about to return `Err`
-        // instead of `Ok(Some(..))`, so no caller will ever see this session to `depart()` it.
         queue.depart();
         return Err(anyhow!("world auth write error (AUTH_OK): {e}"));
     }
@@ -671,8 +424,8 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
             decrypt,
             move_coalesce: CoalesceState::default(),
             unavailable_notices: Default::default(),
-            store: RoutedStore::new(store), // pinned at CMSG_PLAYER_LOGIN
-            session_key: Some(session_key), // for establish_session on a non-realm shard
+            store: RoutedStore::new(store),
+            session_key: Some(session_key),
             guild_signed_on: None,
             move_desync_drops: 0,
             chat_flood: Default::default(),
@@ -712,9 +465,6 @@ fn wait_for_admission<S: Write>(
     }
 }
 
-/// Corruption-diagnosis probe: cheap FNV-1a-64 over a byte slice — not cryptographic, just enough to tell "same
-/// bytes" from "different bytes" across two independently-captured rings (this one and
-/// the wire harness's) without paying for anything stronger than a multiply-xor per byte.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -724,10 +474,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// One traced frame: the wire-visible `(opcode, declared size)` pair plus a checksum of the body
-/// bytes — the same triple the wire harness's own crash ring reports (opcode,
-/// declared_body_len, actual_body_len), plus the one field that ring can't have (it only ever
-/// sees bytes after the client's decoder already trusts them): whether the CONTENT matches.
 #[derive(Clone, Copy)]
 struct WriterTraceEntry {
     opcode: u16,
@@ -735,19 +481,6 @@ struct WriterTraceEntry {
     checksum: u64,
 }
 
-/// Corruption-diagnosis probe: per-session black box for [`spawn_writer`] — the last [`WriterTrace::CAPACITY`]
-/// frames handed to the socket, gated behind `LYRACORE_WRITER_TRACE=1` (see
-/// `config::writer_trace_enabled`). Recorded from the CONSTRUCTED frame just before the write
-/// (unencrypted representation for the typed `One`/`Batch` arms — cheap only because tracing is
-/// off by default — matched byte-for-byte against `Outbound::Raw`'s own `(opcode, body)`, since
-/// `Raw` never touches gtker's codec at all), not a tee of the physical socket call: a *partial*
-/// write cannot silently masquerade as success here (`write_all` is complete-or-`Err` on a
-/// blocking socket, and this connection's writer treats every `Err` as session-fatal — see the
-/// dump call site), so recording pre-write and recording post-write carry the same information
-/// for every frame that reaches this ring. What this DOES catch: the gateway constructing wrong
-/// bytes for a frame (a content/data bug) — diff this ring's `(opcode, size)` sequence against
-/// the harness's `(opcode, declared_body_len)` sequence at the corruption offset: if they still
-/// agree past the last frame this ring saw, the corruption is downstream of the writer.
 struct WriterTrace {
     ring: std::collections::VecDeque<WriterTraceEntry>,
 }
@@ -772,8 +505,6 @@ impl WriterTrace {
         });
     }
 
-    /// Record one [`Outbound`] just before it is handed to the writer's match arm. `Batch`
-    /// expands to one entry per contained message — each is its own frame on the wire.
     fn record(&mut self, out: &Outbound) {
         match out {
             Outbound::One(m) => self.record_typed(m),
@@ -785,33 +516,20 @@ impl WriterTrace {
             Outbound::Raw { opcode, body } => {
                 self.push(*opcode, (2 + body.len()) as u16, fnv1a64(body));
             }
-            // Jobs are expanded before the trace sees them (`spawn_writer`), so this arm is
-            // unreachable for a real frame; it exists so a future caller cannot silently skip the
-            // ring by wrapping a packet in a job.
             Outbound::Job(_) => {}
         }
     }
 
-    /// `write_unencrypted_server` is the exact plaintext framing gtker's `write_encrypted_server`
-    /// builds internally before encrypting only the 4 header bytes (traits/vanilla.rs) — so this
-    /// reproduces `[size_be:2][opcode_le:2][body]` without needing to invert the header cipher,
-    /// at the cost of one extra serialization pass. That cost is real but exists ONLY behind
-    /// `LYRACORE_WRITER_TRACE=1` — see its doc comment for why production pays nothing for this.
     fn record_typed(&mut self, m: &ServerOpcodeMessage) {
         let mut buf = Vec::new();
         if m.write_unencrypted_server(&mut buf).is_err() || buf.len() < 4 {
-            return; // can't happen on a real message; never worth crashing the trace over
+            return;
         }
         let size = u16::from_be_bytes([buf[0], buf[1]]);
         let opcode = u16::from_le_bytes([buf[2], buf[3]]);
         self.push(opcode, size, fnv1a64(&buf[4..]));
     }
 
-    /// Dump the ring to `/tmp/gw-writer-crash/<account_id>.txt` on abnormal session end (a write
-    /// error — the only ending `spawn_writer` treats as abnormal; a clean disconnect drops `tx`
-    /// and the loop just ends via `rx.recv()` returning `Err`, which calls nothing here). Mirrors
-    /// the wire harness's own crash-dump shape so the two files sit next to each other for a
-    /// diff. Best-effort: a dump failing must never be why the writer thread panics.
     fn dump(&self, account_id: u64, reason: &str) {
         self.dump_to(
             std::path::Path::new("/tmp/gw-writer-crash"),
@@ -848,19 +566,6 @@ impl WriterTrace {
     }
 }
 
-/// The single writer thread: the SOLE owner of the `EncrypterHalf` and a write-clone of the
-/// socket. It drains the channel and writes each `Outbound` in dequeue order, so the header
-/// cipher's keystream advances deterministically and no two writers ever interleave. On a write
-/// error it shuts the socket down to unblock the reader's blocking read.
-///
-/// `account_id` exists ONLY to name the `LYRACORE_WRITER_TRACE=1` crash dump — every other
-/// behavior here is byte-for-byte what it was before that flag existed.
-///
-/// Returns `Err` (rather than panicking) when the OS refuses the thread: at the session counts this
-/// gateway is built for, thread/FD exhaustion is a REACHABLE operational state, and the honest
-/// response is to fail THIS connection — the caller `?`s it exactly like the socket clone above it,
-/// so the session closes cleanly and its queue seat is released — instead of unwinding a session
-/// thread and taking whatever it holds with it.
 fn spawn_writer<S: DuplexStream>(
     mut wsock: S,
     mut encrypt: EncrypterHalf,
@@ -874,15 +579,6 @@ fn spawn_writer<S: DuplexStream>(
 .spawn(move || {
             let mut trace = trace_enabled.then(WriterTrace::new);
             while let Ok(out) = rx.recv() {
-                // The other half of the depth counter (`SessionTx::send` adds): this item is off the
-                // queue, so it no longer counts against `EGRESS_SHED_DEPTH` — decrement BEFORE the
-                // (possibly slow, possibly blocking) write, so a session stuck inside one `write_all`
-                // is not charged for the packet it is actively pushing.
-                //
-                // Cannot underflow, and that matters because a wrapped `usize` would shed every
-                // peer-motion packet for the rest of the session: the increment happens strictly
-                // BEFORE `tx.send`, so an item can only be received after it has been counted, and
-                // this thread is the only decrementer. `depth >= queued` therefore holds always.
                 depth.fetch_sub(1, Ordering::Relaxed);
 
                 let batch: Vec<Outbound> = match out {
@@ -907,43 +603,20 @@ fn spawn_writer<S: DuplexStream>(
                 }
                 let res = match out {
                     Outbound::One(m) => {
-                        log::debug!("OUT {m}"); // SMSG variant name → crash attribution (tail 'OUT SMSG_*')
+                        log::debug!("OUT {m}");
                         m.write_encrypted_server(&mut wsock, &mut encrypt)
                     }
                     Outbound::Batch(v) => v.into_iter().try_for_each(|m| {
                         log::debug!("OUT {m}");
                         m.write_encrypted_server(&mut wsock, &mut encrypt)
                     }),
-                    // Expanded above; a job can never reach here.
                     Outbound::Job(_) => Ok(()),
                     Outbound::Raw { opcode, body } => {
                         log::debug!("OUT RAW opcode=0x{opcode:04X} ({} body bytes)", body.len());
-                        // Packet lint (testing-hardening §3.2): every hand-rolled body is checked
-                        // against the root-caused 5875 crash classes; a hit is a loud ERROR the
-                        // suite greps for — never a drop (the frame still sends: prod behavior is
-                        // observability, the WALL is the suite failing on the grep).
                         for v in packet_lint::lint_raw(opcode, &body) {
                             log::error!("packet-lint VIOLATION opcode=0x{opcode:04X}: {v}");
                         }
-                        // Same framing gtker's write_encrypted_server emits: a `size` of
-                        // opcode(2) + body, big-endian, then the LE opcode, the 4 bytes encrypted
-                        // through the SAME header cipher (so the stream never desyncs), then the body.
-                        // size counts opcode(2) + body, NOT the 2 size bytes — matches gtker's
-                        // server framing.
-                        //
-                        // Hardening: a body that overflows the u16 size field would
-                        // silently WRAP via `as u16` — the header would then declare a small size
-                        // while `write_all` below still sends the full (large) body, so the client's
-                        // reader consumes the wrong number of bytes for this frame and every LATER
-                        // header on this connection decrypts from the wrong stream offset (a real
-                        // desync, indistinguishable from the crowd-scale corruption class investigated
-                        // earlier). This used
-                        // to be a `debug_assert!`, which compiles out entirely in the release profile
-                        // the capacity benchmark and any live deploy actually run — i.e. the one guard
-                        // against this class was absent exactly where it would matter. No current
-                        // builder produces a body anywhere near this size, so this arm is not known to
-                        // fire; it exists so that if one ever does, the connection dies cleanly
-                        // instead of corrupting itself and every packet after it.
+                        // Size counts the two-byte opcode and body, excluding itself.
                         if body.len() > u16::MAX as usize - 2 {
                             log::error!(
                                 "packet-lint VIOLATION opcode=0x{opcode:04X}: raw body is {} bytes — \
@@ -978,17 +651,11 @@ fn spawn_writer<S: DuplexStream>(
 .map_err(|e| anyhow!("spawn world writer thread for account {account_id}: {e}"))
 }
 
-/// Drive one world connection, gated by the unlimited [`LoginQueue`] — see
-/// [`run_world_session_with_queue`] for the admission gate itself. Every existing call site
-/// (tests, and anything that doesn't care about it) stays byte-identical to the pre-queue behavior.
-/// Test-only, for the same reason as [`world_handshake`]: production supplies the listener's shared
-/// queue and the deadline started at accept.
 #[cfg(test)]
 pub fn run_world_session<S: DuplexStream>(stream: S, store: Arc<dyn WorldStore>) -> Result<()> {
     run_world_session_with_queue(stream, store, &LoginQueue::unlimited())
 }
 
-/// A successful handshake owns one seat until its writer has stopped.
 struct AdmissionSeat<'a> {
     queue: &'a LoginQueue,
 }
@@ -999,19 +666,6 @@ impl Drop for AdmissionSeat<'_> {
     }
 }
 
-/// Drive one world connection: handshake (synchronous, sole writer), then split into a reader
-/// (this thread, owns `DecrypterHalf`) and a writer thread (owns `EncrypterHalf` + a socket clone)
-/// bridged by an mpsc channel. The reader handles requests and pushes responses; the per-player
-/// subscription callbacks (on the SDK pump thread) push peer spawn/move/destroy. On disconnect the
-/// reader tears down the subscriptions, logs the player out (removes the entity → peers see
-/// `DESTROY`), drops its sender (ending the writer), and joins it.
-///
-/// `world_handshake_with_queue` may block here (before any of the above starts) if the world
-/// is full — the client sees native "Position in queue" screens and this thread just waits, which
-/// costs nothing but ITS OWN thread (the listener in `run` spawns one `spawn_blocking` task per
-/// accepted socket, so a queued connection never holds up anyone else's accept or handshake). Once
-/// admitted (`Ok(Some(..))`), this connection holds a seat in `queue` for the rest of the function —
-/// released by its [`AdmissionSeat`] exactly once, no matter which branch got there.
 #[cfg(test)]
 pub fn run_world_session_with_queue<S: DuplexStream>(
     stream: S,
@@ -1047,13 +701,6 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
     let writer = spawn_writer(wsock, encrypt, rx, depth, conn.account_id)?;
 
     let result = (|| -> Result<()> {
-        // Frames are read raw (header hand-decrypted) so an addon chat frame with the bridge's
-        // own prefix can go to the bridge before typed parsing. Every other frame, addon frames
-        // from other prefixes included, is re-framed unencrypted and handed to the gtker parser
-        // (one memcpy per packet).
-        // Addon-bridge rate limit: token bucket per connection, 2 tokens/s, burst 20.
-        // Excess frames drop with one log line per offense window; module handlers stay
-        // unthrottled (they trust this edge like every other opcode).
         let mut addon_tokens: f32 = 20.0;
         let mut addon_refill_at = std::time::Instant::now();
         let mut addon_drop_logged_at: Option<std::time::Instant> = None;
@@ -1063,7 +710,7 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(anyhow!("world read error: {e}")),
             };
-            // `hdr.size` counts the u32 opcode + body.
+            // Client size counts the four-byte opcode and body.
             let body_len = (hdr.size as usize).saturating_sub(4);
             let mut body = vec![0u8; body_len];
             stream
@@ -1089,14 +736,11 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                                 conn.account_id
                             );
                         }
-                        continue; // bridge frames never reach the normal chat path or other players
+                        continue;
                     }
                     if !codec::addon::typed_addon_chat_type(chat_type) {
-                        continue; // no addon traffic reaches this chat type; drop, as before
+                        continue;
                     }
-                    // A PARTY, RAID, GUILD or OFFICER frame from another addon's prefix: fall
-                    // through below so the typed reader and the ordinary chat path deliver it to
-                    // real players, addon language and all.
                 }
             }
             if hdr.opcode == CMSG_AUCTION_LIST_ITEMS_OPCODE {
@@ -1113,7 +757,6 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                 continue;
             }
             if hdr.opcode == CMSG_AUTH_SESSION_OPCODE {
-                // Auth is over, and the typed decoder would size a buffer from the body.
                 return Err(anyhow!("world read error: CMSG_AUTH_SESSION after auth"));
             }
             if hdr.opcode == 0x0125 {
@@ -1157,16 +800,11 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                         .map_err(|e| anyhow!("world read error: {e}"))?
                 }
             };
-            // Every in-world message is dispatched against the player's HOME shard; until
-            // CMSG_PLAYER_LOGIN resolves one (and always, with a single-entry shard map) this is
-            // the handle the listener passed in.
             let store = conn.store.current();
             dispatch(&tx, &*store, &mut conn, hdr.opcode, msg.into())?;
         }
     })();
 
-    // Movement-coalescing measurement: how much did coalescing actually cut? Logged once per
-    // connection at disconnect, not per-packet — a live run's tail shows the ratio directly.
     log::debug!(
         "world: movement coalescing account={} received={} forwarded={}",
         conn.account_id,
@@ -1174,22 +812,16 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
         conn.move_coalesce.forwarded(),
     );
 
-    // Teardown: if still in-world, drop the relay subs (stops callbacks; peers get DESTROY via the
-    // entity delete) and delete the entity ONLY if THIS session still owns it — a stale socket whose
-    // player already re-logged on a newer session declines, so we don't vanish the live player.
-    // Teardown is already ending the session, so a `logout` failure is logged + swallowed (not fatal).
     if let Err(e) = conn.leave_world() {
         log::warn!("logout for account {} failed: {e:#}", conn.account_id);
     }
     drop(tx);
     let _ = writer.join();
-    // The seat covers relay shutdown and releases exactly once after the writer stops.
+    // Release the seat exactly once, after the writer and Relays stop.
     drop(seat);
     result
 }
 
-/// Does the Character hold a GM level on its Home Shard? A failed read counts as no: the only
-/// effect is that a flooding game master is muted like any other speaker.
 fn is_game_master<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64) -> bool {
     match store.speaker_gm_level(character_guid) {
         Ok(gm_level) => gm_level > 0,
@@ -1200,9 +832,6 @@ fn is_game_master<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64)
     }
 }
 
-/// The speaker's race, for the Chat Flood Limiter's language check. `None` when the read fails or
-/// the speaker has no live entity here: the line still counts as usual, and the Module's own
-/// language Gate stays the fallback authority.
 fn speaker_race<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64) -> Option<u8> {
     match store.speaker_facts(character_guid) {
         Ok(facts) => facts.map(|facts| facts.race),
@@ -1213,11 +842,6 @@ fn speaker_race<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64) -
     }
 }
 
-/// Route one bridge-prefixed addon chat frame: parse the `STC` v1 envelope and forward to the
-/// module's `client_command` reducer as the player. The caller already checked the prefix; a
-/// malformed envelope past that point still drops silently-with-a-debug-line (a truncated or
-/// hand-edited frame is not session-fatal), and so does a frame outside the world or a Refusal.
-/// A Transport Loss ends the World Session.
 fn handle_addon_message<St: SessionStore + ?Sized>(
     store: &St,
     conn: &WorldConn,
@@ -1249,26 +873,11 @@ fn handle_addon_message<St: SessionStore + ?Sized>(
     }
 }
 
-/// Does this reducer error mean the player DESYNCED from the module — their `game_world_entity` row is
-/// gone? This happens when a schema-change publish tears down the gateway's coordinator subscription
-/// mid-session (the gateway keeps the old, now-stale view, so `entity_by_owner` resolves nothing), or the
-/// entity was deleted out from under this socket. Unlike a TRANSIENT per-action failure (a dead target,
-/// an out-of-range cast, a retarget race), a desync means NO further action can ever be served on this
-/// session — so callers propagate it as session-FATAL to force a clean disconnect: `run_world_session`
-/// unwinds, closes the socket, and the client shows "Disconnected" and re-materializes everything on
-/// relog from durable state, instead of the player silently hanging (can't attack, can't log out). Matched
-/// on the module's `entity_by_owner` failure text ("… not in world" / "no live entity …").
-///
-/// ONE caller does not propagate it immediately: `forward_movement` tolerates
-/// [`MOVE_DESYNC_TOLERANCE`] consecutive desynced movement packets first, because the tail of a
-/// cross-map port lands on a legitimately despawned entity and killing the socket there hangs the
-/// client on a loading screen. Past that bound it is fatal like everything else.
 fn is_desync_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_ascii_lowercase();
     s.contains("not in world") || s.contains("no live entity")
 }
 
-/// Flush movement and apply the Chat Flood Limiter before selecting one opcode owner.
 fn dispatch(
     tx: &SessionTx,
     store: &dyn WorldStore,
@@ -1301,22 +910,8 @@ fn dispatch(
         return complete_reply(tx, store, conn, reply);
     }
     let msg = request.message()?;
-    // MSG_MOVE_* -> movement_update (persist + relay). The relayed peer events
-    // come back on this player's game_movement_event subscription and are re-emitted (same
-    // opcode + verbatim MovementInfo) to other players by their own subscription callbacks.
-    //
-    // Every inbound movement packet is classified + coalesced by `CoalesceState`
-    // before it ever reaches the module — a STATE-CHANGE (or a heartbeat whose flags/heading
-    // drifted) forwards immediately, byte-identical to before this item; a pure same-vector
-    // heartbeat is HELD until the cadence window elapses (or something else flushes it), dropping
-    // the sub-yard same-vector intermediates the item targets. See `coalesce.rs` for the decision
-    // table and unit tests, and `docs/` for the item's write-up.
     if let Some(opcode) = codec::relayed_move_opcode(&msg) {
-        // 058: a landing may hurt. The MODULE applies the damage inside movement_update (it parses
-        // fall_time from the raw MovementInfo body); this sends only the "You fall and lose N
-        // health" flavor line — computed from the SAME lyracore_shared::env curve, so the line and the
-        // health drop can never disagree. gtker types the wire's u32-ms fall time as f32 (a
-        // field-TYPE lie; cmangos reads u32) — reinterpret the raw bits.
+        // gtker types fall_time as f32, but vanilla stores u32 milliseconds; reinterpret the bits.
         if let ClientOpcodeMessage::MSG_MOVE_FALL_LAND(mv) = &msg {
             if let WorldState::InWorld(iw) = &conn.state {
                 let fall_time_ms = if mv.info.flags.get_on_transport().is_some() {
@@ -1406,10 +1001,7 @@ fn complete_reply(
     })
 }
 
-/// A root or unroot receipt carries where the client stopped and its new flags. Peers still hold the
-/// last relayed run, so the receipt is relayed to them as a stop. A root receipt drops any steering
-/// flags so the Module's root gate accepts it. The typed reader skips the build-5875 transport tail,
-/// so a receipt on a transport is not relayed.
+/// For receipt and transport constraints, see docs/benilla-compatibility.md#root-receipts.
 fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Option<MovementInfo> {
     let (guid, info, rooted) = match msg {
         ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => (ack.guid, &ack.info, true),
@@ -1419,8 +1011,7 @@ fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Optio
     if Some(guid.guid()) != self_guid {
         return None;
     }
-    // The build-5875 encoder refuses a transport flag whose tail the typed reader skipped. The
-    // library's `clear_*` flag methods mask with `reverse_bits`, so steering is cleared on the bytes.
+    // The library clears flags with reverse_bits, so clear steering in the encoded bytes.
     let mut bytes = codec::movement_info_to_bytes(info).ok()?;
     if rooted {
         const FORWARD_BACKWARD_STRAFE: u8 = 0xF;
@@ -1435,7 +1026,6 @@ fn forward_movement<St: SessionStore + ?Sized>(
     opcode: u32,
     info: &MovementInfo,
 ) -> Result<()> {
-    // The shared-call path names the mover by guid instead of by connection.
     let self_guid = match &conn.state {
         WorldState::InWorld(iw) => iw.self_guid,
         _ => 0,
@@ -1462,25 +1052,16 @@ fn forward_movement<St: SessionStore + ?Sized>(
     };
     conn.move_desync_drops = 0;
     store.movement_update(actor, opcode, info)?;
-    // AOI: recenter this player's grid-scoped entity subscription if they crossed a cell. No-op
-    // when AOI is disabled (no tracker) or the player stayed in-cell. Same-map (the tracker holds
-    // the login map; teleport/zone changes re-anchor in a later phase).
     if let WorldState::InWorld(iw) = &mut conn.state {
         iw.subs.aoi_update(info.position.x, info.position.y);
     }
     Ok(())
 }
 
-/// Push one outbound unit to the writer; a closed channel means the writer/socket is gone, so end
-/// the session cleanly.
 fn send(tx: &SessionTx, out: Outbound) -> Result<()> {
     tx.send(out)
         .map_err(|_| anyhow!("world writer gone (client disconnected)"))
 }
-
-// ===========================================================================================
-//  Async listener (bridges accepted sockets to the blocking handler)
-// ===========================================================================================
 
 pub async fn run(
     cfg: GatewayConfig,
@@ -1490,7 +1071,6 @@ pub async fn run(
     let listener = TcpListener::bind(&cfg.world_bind).await?;
     log::info!("world listening on {}", cfg.world_bind);
 
-    // gateway::run validates admission limits before the Coordinator connects or either listener starts.
     if login_queue.max_sessions() > 0 {
         log::info!(
             "world: login queue ARMED — max_sessions={} admit_concurrency={}",
@@ -1507,29 +1087,17 @@ pub async fn run(
         );
     }
 
-    // Dump the motion-relay counters every 10s from a background task, so a failing
-    // run is localised WITHOUT touching the relay hot path (a log there masks the race entirely).
     let queuestat_queue = login_queue.clone();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
         let (mut pc, mut ps, mut pd) = (0u64, 0u64, 0u64);
         let mut idle_logged = false;
         let mut prev_sub = 0u64;
-        // The AOI churn counter, read the same way MOTION_* is above — one atomic, one
-        // 10s delta, no hot-path log line.
         let mut prev_recenters = 0u64;
-        // Trailing fan-out baseline + collapsed-window run, for the fan-out-collapse warning at the
-        // bottom of the loop. Task-local: this is the only place it lives, and nothing on the relay
-        // path reads it.
         let mut fan = crate::stdb::subscriptions::FanoutHealth::default();
-        // QUEUESTAT baseline — same "diff against last reading" convention as MOTIONSTAT.
         let mut prev_admitted = queuestat_queue.admitted_total();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            // QUEUESTAT: printed only while the line is NONEMPTY — an unconfigured or
-            // uncontended gateway must not print this every 10s forever, same rule as AOISTAT.
-            // Also serves as a drain backstop (`LoginQueue::tick`) in case every queued
-            // connection's own poll cadence is somehow slower than this.
             queuestat_queue.tick();
             let depth = queuestat_queue.depth();
             let admitted = queuestat_queue.admitted_total();
@@ -1550,13 +1118,7 @@ pub async fn run(
                 crate::stdb::subscriptions::MOTION_DROPPED.load(Relaxed),
             );
             let sub = MOVE_SUBMITTED.load(Relaxed);
-            // Only on CHANGE, plus one line on the transition to idle — a long-lived server with
-            // nobody moving must not print this forever.
             if c != pc || s != ps || d != pd {
-                // The ratios are FORMATTED here, not left to the operator's
-                // arithmetic — 371 co-located clients under-delivered peer movement by 37 % and
-                // this line said nothing, because raw totals climb just as fast when each one is
-                // reaching fewer observers than it should.
                 log::info!(
                     "{}",
                     crate::stdb::subscriptions::motionstat_line(
@@ -1575,10 +1137,6 @@ pub async fn run(
                 log::info!("MOTIONSTAT calls={c} sent={s} dropped={d} — relay went idle");
                 idle_logged = true;
             }
-            // AOI subscription-churn counter — recenters (cell crossings → box
-            // re-subscribes) across every session in the last 10s. Only printed on change, same
-            // rule as MOTIONSTAT above; a server with nobody crossing a cell boundary must not
-            // print this every 10s forever.
             let recenters = crate::stdb::aoi::AOI_RECENTERS.load(Relaxed);
             let d_recenters = recenters.saturating_sub(prev_recenters);
             if d_recenters > 0 {
@@ -1589,8 +1147,6 @@ pub async fn run(
             }
             prev_recenters = recenters;
             let submitted_delta = sub.saturating_sub(prev_sub);
-            // Compare per-viewer fan-out with its recent baseline. Coordinator watchdogs measure
-            // incoming motion separately, before audience selection and writer work.
             let fanout =
                 crate::stdb::subscriptions::fanout_ratio(c.saturating_sub(pc), submitted_delta);
             let (next_fan, fanout_warn) =
@@ -1615,9 +1171,6 @@ pub async fn run(
             (pc, ps, pd) = (c, s, d);
         }
     });
-    // The loop that `Error: Too many open files (os error 24)` came out of on 2026-08-07,
-    // taking every session on the realm with it. A transient accept errno now costs ONE connection.
-    // See `crate::accept` for which errnos are fatal and why the list is shaped that way.
     let mut backoff = AcceptBackoff::new();
     let mut capacity_was_full = false;
     loop {
@@ -1652,7 +1205,6 @@ pub async fn run(
                 }
             },
         };
-        // The budget begins at accept, before this socket can wait for a blocking-pool thread.
         let mut deadline = PreAuthDeadline::after(WORLD_AUTH_DEADLINE);
         let Some(task_permit) = cfg.blocking_task_capacity.try_admit() else {
             if !capacity_was_full {
@@ -1667,12 +1219,6 @@ pub async fn run(
         capacity_was_full = false;
         let coord = coordinator.clone();
         let queue = login_queue.clone();
-        // wow_world_messages uses blocking std::io codecs, so run the per-connection state
-        // machine on a blocking task with the socket in blocking mode (mirrors `logon`).
-        // Per-SOCKET calls (a dup and an fcntl on the fd we just accepted), so they fail for the
-        // same reasons accept does — EMFILE above all. Drop the one connection, keep the realm.
-        // The session clears both socket timeouts and cancels the watchdog after client proof,
-        // before any legitimate wait in the login queue.
         let std_sock = match sock.into_std().and_then(|s| {
             s.set_nonblocking(false)?;
             Ok(s)
@@ -1689,8 +1235,6 @@ pub async fn run(
         }
         tokio::task::spawn_blocking(move || {
             let _task_permit = task_permit;
-            // `queue` gates admission INSIDE the handshake — a queued connection just blocks
-            // this one `spawn_blocking` thread, never the accept loop above.
             if let Err(e) = run_world_session_with_queue_and_deadline(
                 std_sock,
                 Arc::new(coord),

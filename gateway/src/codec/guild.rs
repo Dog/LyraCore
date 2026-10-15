@@ -1,6 +1,3 @@
-//! Guild wire mapping: the query response, roster, guild info, command result, the raw
-//! SMSG_GUILD_EVENT, the Guild Projection values update and the petition messages.
-
 use super::*;
 use wow_world_messages::vanilla::{
     GuildCommand, GuildCommandResult, GuildMember, GuildMember_GuildMemberStatus, PetitionResult,
@@ -9,14 +6,11 @@ use wow_world_messages::vanilla::{
     SMSG_PETITION_SHOWLIST, SMSG_PETITION_SHOW_SIGNATURES, SMSG_PETITION_SIGN_RESULTS,
 };
 
-/// SMSG_GUILD_EVENT. gtker's vanilla type has no trailing guid, so the event is encoded raw.
+// SMSG_GUILD_EVENT needs a trailing guid that gtker's vanilla type omits.
 pub const SMSG_GUILD_EVENT_OPCODE: u16 = 0x0092;
 
-/// The largest SMSG_GUILD_ROSTER body the 1.12 client accepts: the packet limit minus the header
-/// (`vm:src/game/Guild/Guild.h:41`).
 pub const GUILD_ROSTER_MAX_BODY: usize = 0x8000 - 4;
 
-/// One Guild Rank as the Gateway reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuildRankView {
     pub rank_id: u32,
@@ -24,13 +18,11 @@ pub struct GuildRankView {
     pub rights: u32,
 }
 
-/// One Guild as the Gateway reads it from Realm-core. `ranks` is ordered by `rank_id`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuildView {
     pub guild_id: u32,
     pub name: String,
     pub leader_guid: u64,
-    /// `lyracore_shared::faction::TEAM_*`, fixed at founding.
     pub team: u32,
     pub motd: String,
     pub info: String,
@@ -44,7 +36,6 @@ pub struct GuildView {
 }
 
 impl GuildView {
-    /// The Rank Rights of `rank_id`. An unknown rank grants nothing (`cm:Guild.cpp:660-666`).
     pub fn rank_rights(&self, rank_id: u32) -> u32 {
         self.ranks
             .iter()
@@ -53,20 +44,17 @@ impl GuildView {
     }
 }
 
-/// One membership row as the Gateway reads it from Realm-core.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuildMemberView {
     pub character_guid: u64,
     pub guild_id: u32,
     pub rank_id: u32,
-    /// The name snapshot Realm-core keeps for the member.
     pub name: String,
     pub public_note: String,
     pub officer_note: String,
     pub realm_account_id: u64,
 }
 
-/// One SMSG_GUILD_ROSTER line, already resolved for one viewer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GuildRosterLine {
     pub guid: u64,
@@ -75,15 +63,11 @@ pub struct GuildRosterLine {
     pub level: u8,
     pub class: u8,
     pub zone_id: u32,
-    /// `None` when online; otherwise days since the member's last logout.
     pub days_offline: Option<f32>,
     pub public_note: String,
-    /// Empty unless the viewer's Guild Rank holds VIEWOFFNOTE.
     pub officer_note: String,
 }
 
-/// SMSG_GUILD_QUERY_RESPONSE: the name, ten rank names (empty past the last rank) and the emblem
-/// (`cm:Guild.cpp:760-783`).
 pub fn build_guild_query_response(guild: &GuildView) -> SMSG_GUILD_QUERY_RESPONSE {
     let mut rank_names: [String; 10] = Default::default();
     for (slot, rank) in rank_names.iter_mut().zip(&guild.ranks) {
@@ -101,7 +85,6 @@ pub fn build_guild_query_response(guild: &GuildView) -> SMSG_GUILD_QUERY_RESPONS
     }
 }
 
-/// SMSG_GUILD_COMMAND_RESULT for `command`, naming `name` where the client line has a `%s`.
 pub fn build_guild_command_result(
     command: GuildCommand,
     name: String,
@@ -114,8 +97,6 @@ pub fn build_guild_command_result(
     }
 }
 
-/// SMSG_GUILD_INFO: the name, the founding day, month (1..=12) and year on the Realm Clock, the
-/// member count and the Account count (`cm:GuildHandler.cpp:240-259`).
 pub fn build_guild_info(
     guild: &GuildView,
     member_count: u32,
@@ -133,8 +114,6 @@ pub fn build_guild_info(
     }
 }
 
-/// SMSG_GUILD_ROSTER. Lines are added in order until the next one would push the body past
-/// [`GUILD_ROSTER_MAX_BODY`] (`vm:src/game/Guild/Guild.cpp:803-860`); the rest are left out.
 pub fn build_guild_roster(
     guild: &GuildView,
     lines: impl IntoIterator<Item = GuildRosterLine>,
@@ -172,8 +151,6 @@ pub fn build_guild_roster(
     }
 }
 
-/// Bytes one roster line takes on the wire: guid, status, name, rank, level, class, zone, the
-/// offline time when offline, and both notes.
 fn roster_line_size(line: &GuildRosterLine) -> usize {
     const FIXED: usize = 8 + 1 + 4 + 1 + 1 + 4;
     let offline = if line.days_offline.is_some() { 4 } else { 0 };
@@ -181,8 +158,6 @@ fn roster_line_size(line: &GuildRosterLine) -> usize {
     FIXED + offline + strings.iter().map(|s| s.len() + 1).sum::<usize>()
 }
 
-/// SMSG_GUILD_INVITE (`gtker:shared/smsg_guild_invite_vanilla_tbc_wrath.rs`): the inviter's name and
-/// the Guild's name (`cm:GuildHandler.cpp:124-131`).
 pub fn build_guild_invite(player_name: String, guild_name: String) -> SMSG_GUILD_INVITE {
     SMSG_GUILD_INVITE {
         player_name,
@@ -190,9 +165,7 @@ pub fn build_guild_invite(player_name: String, guild_name: String) -> SMSG_GUILD
     }
 }
 
-/// SMSG_GUILD_DECLINE (opcode 0x086). No vanilla type in gtker (TBC and Wrath only), so encoded
-/// raw: one CString, the declining Character's name (`cm:GuildHandler.cpp:229-231`,
-/// `cm:Opcodes.cpp:162`).
+/// SMSG_GUILD_DECLINE is 0x086 with one CString; gtker has no vanilla type.
 pub const SMSG_GUILD_DECLINE_OPCODE: u16 = 0x0086;
 
 pub fn build_guild_decline_raw(player_name: &str) -> (u16, Vec<u8>) {
@@ -201,8 +174,6 @@ pub fn build_guild_decline_raw(player_name: &str) -> (u16, Vec<u8>) {
     (SMSG_GUILD_DECLINE_OPCODE, body)
 }
 
-/// SMSG_GUILD_EVENT as `(opcode, body)`: `u8 event`, `u8 count`, the strings, then the subject guid
-/// when nonzero (`cm:Guild.cpp:886-911`).
 pub fn build_guild_event_raw(kind: u8, strings: &[String], subject_guid: u64) -> (u16, Vec<u8>) {
     let strings = &strings[..strings.len().min(usize::from(u8::MAX))];
     let mut body = vec![kind, strings.len() as u8];
@@ -216,19 +187,15 @@ pub fn build_guild_event_raw(kind: u8, strings: &[String], subject_guid: u64) ->
     (SMSG_GUILD_EVENT_OPCODE, body)
 }
 
-/// One open Petition as the Gateway reads it from Realm-core.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PetitionView {
     pub petition_id: u32,
     pub charter_item_guid: u64,
     pub owner_guid: u64,
     pub name: String,
-    /// The signers, in slot order. A lost Signature frees its slot for the next signer.
     pub signers: Vec<u64>,
 }
 
-/// SMSG_PETITION_SHOWLIST: the one Guild Charter a Petitioner sells. The entry flag is 1, which the
-/// client needs to show the entry (`vm:src/game/Handlers/PetitionsHandler.cpp:495-500`).
 pub fn build_petition_showlist(npc_guid: u64) -> SMSG_PETITION_SHOWLIST {
     use lyracore_shared::guild::{CHARTER_COST_COPPER, CHARTER_DISPLAY_ID, GUILD_CHARTER_ENTRY};
     SMSG_PETITION_SHOWLIST {
@@ -243,8 +210,6 @@ pub fn build_petition_showlist(npc_guid: u64) -> SMSG_PETITION_SHOWLIST {
     }
 }
 
-/// SMSG_PETITION_SHOW_SIGNATURES: the Charter, its owner, the Petition id and each signer with a
-/// zero word (`cm:PetitionsHandler.cpp:201-217`).
 pub fn build_petition_show_signatures(petition: &PetitionView) -> SMSG_PETITION_SHOW_SIGNATURES {
     SMSG_PETITION_SHOW_SIGNATURES {
         item: Guid::new(petition.charter_item_guid),
@@ -261,8 +226,6 @@ pub fn build_petition_show_signatures(petition: &PetitionView) -> SMSG_PETITION_
     }
 }
 
-/// SMSG_PETITION_QUERY_RESPONSE: the id, owner and name, an empty body, flags 1, nine signatures
-/// minimum and maximum, and zero for every restriction (`cm:PetitionsHandler.cpp:260-279`).
 pub fn build_petition_query_response(petition: &PetitionView) -> SMSG_PETITION_QUERY_RESPONSE {
     use lyracore_shared::guild::{MAX_PETITION_SIGNATURES, MIN_PETITION_SIGNATURES};
     SMSG_PETITION_QUERY_RESPONSE {
@@ -276,8 +239,7 @@ pub fn build_petition_query_response(petition: &PetitionView) -> SMSG_PETITION_Q
     }
 }
 
-/// SMSG_PETITION_SIGN_RESULTS: the Charter, the signer and the result
-/// (`cm:PetitionsHandler.cpp:384-387`). gtker names the signer field `owner`.
+/// gtker's `owner` field carries the signer guid.
 pub fn build_petition_sign_results(
     charter_item_guid: u64,
     signer_guid: u64,
@@ -416,7 +378,6 @@ mod tests {
         let entity = EntityView {
             guid: 1,
             type_mask: lyracore_shared::constants::type_mask::PLAYER_BIT,
-            // Human Warrior: the CREATE encoder refuses race 0.
             unit_bytes_0: 1 | (1 << 8) | (1 << 24),
             guild_id,
             guild_rank,
@@ -474,7 +435,6 @@ mod tests {
     #[test]
     fn guild_info_reads_the_founding_date_in_whole_utc_days() {
         let mut guild = guild();
-        // 2026-09-23T23:59:59Z
         guild.created_micros = 1_790_207_999_000_000;
         let info = build_guild_info(&guild, 3, 2);
         assert_eq!(
@@ -503,14 +463,10 @@ mod tests {
         let message = ServerOpcodeMessage::SMSG_GUILD_ROSTER(Box::new(roster.clone()));
         let mut wire = Vec::new();
         message.write_unencrypted_server(&mut wire).unwrap();
-        // Header: count 4 + MOTD 16 + info 1 + rank count 4 + five rank words 20 = 45 bytes.
-        // Each line: 8 + 1 + 11 + 4 + 1 + 1 + 4 + 4 + 32 + 32 = 98 bytes.
-        // (32764 - 45) / 98 = 333 lines, 45 + 333 * 98 = 32679 bytes.
         assert_eq!(roster.members.len(), 333);
         assert_eq!(wire.len() - 4, 32_679);
     }
 
-    /// Frame a client body the way the 1.12 client sends it: u16 big-endian size, u32 opcode.
     fn client_packet(opcode: u32, body: &[u8]) -> ClientOpcodeMessage {
         let mut framed = ((body.len() + 4) as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&opcode.to_le_bytes());
@@ -524,7 +480,6 @@ mod tests {
         (u16::from_le_bytes([wire[2], wire[3]]), wire[4..].to_vec())
     }
 
-    /// `cm:GuildHandler.cpp:722-723`: the vendor guid, then five u32 design values.
     #[test]
     fn save_guild_emblem_reads_the_vendor_then_five_design_values() {
         let mut body = 0xF130_0000_0000_0042u64.to_le_bytes().to_vec();
@@ -547,7 +502,6 @@ mod tests {
         );
     }
 
-    /// `cm:GuildHandler.cpp:766-771` writes one u32; `cm:Guild.h:146-151` numbers the results.
     #[test]
     fn save_guild_emblem_answers_one_result_word() {
         use wow_world_messages::vanilla::{GuildEmblemResult, MSG_SAVE_GUILD_EMBLEM_Server};
@@ -564,8 +518,6 @@ mod tests {
         }
     }
 
-    /// `cm:NPCHandler.cpp:49-50,62-67`: the client sends the NPC's full guid and the server echoes
-    /// it unpacked.
     #[test]
     fn tabard_vendor_activate_carries_the_full_npc_guid_both_ways() {
         use wow_world_messages::vanilla::MSG_TABARDVENDOR_ACTIVATE;
@@ -582,7 +534,6 @@ mod tests {
         assert_eq!(server_body(window), (0x01F2, guid.to_le_bytes().to_vec()));
     }
 
-    /// GE_TABARDCHANGE is event 9 with no strings and no guid (`cm:Guild.h:111`).
     #[test]
     fn tabard_changed_is_event_nine_with_nothing_after_it() {
         let (opcode, body) =
@@ -600,8 +551,6 @@ mod tests {
         }
     }
 
-    /// `vm:src/game/Server/Packets/Petition.cpp:175-187`: the NPC guid, a u8 count, then index 1,
-    /// entry 5863, display 16161, cost 1000 and entry flag 1.
     #[test]
     fn petition_showlist_lists_the_guild_charter_at_ten_silver() {
         let mut expected = 0xF130_0000_0000_0042u64.to_le_bytes().to_vec();
@@ -615,8 +564,6 @@ mod tests {
         assert_eq!(server_body(message), (0x01BC, expected));
     }
 
-    /// `cm:PetitionsHandler.cpp:201-217`: Charter guid, owner guid, u32 petition id, u8 count,
-    /// then each signer guid with a zero word.
     #[test]
     fn petition_show_signatures_lists_each_signer_with_a_zero_word() {
         let mut expected = vec![0x01, 0x01, 0, 0, 0, 0, 0, 0x40];
@@ -631,22 +578,17 @@ mod tests {
         assert_eq!(server_body(message), (0x01BF, expected));
     }
 
-    /// `cm:PetitionsHandler.cpp:260-279`.
     #[test]
     fn petition_query_response_matches_the_mangos_layout() {
         let mut expected = vec![0x2A, 0, 0, 0];
         expected.extend_from_slice(&[0x02, 0x01, 0, 0, 0, 0, 0, 0]);
         expected.extend_from_slice(b"Night Watch\0");
-        // Empty body text, then flags 1, minimum 9 and maximum 9 signatures.
         expected.push(0);
         for word in [1u32, 9, 9] {
             expected.extend_from_slice(&word.to_le_bytes());
         }
-        // Deadline, issue date, guild id, classes and races: five zero words.
         expected.extend_from_slice(&[0; 20]);
-        // Genders, a u16.
         expected.extend_from_slice(&[0; 2]);
-        // Minimum and maximum level, choice text, number of choices: four zero words.
         expected.extend_from_slice(&[0; 16]);
         let message = ServerOpcodeMessage::SMSG_PETITION_QUERY_RESPONSE(Box::new(
             build_petition_query_response(&night_watch()),
@@ -654,8 +596,6 @@ mod tests {
         assert_eq!(server_body(message), (0x01C7, expected));
     }
 
-    /// `cm:PetitionsHandler.cpp:384-387`: Charter guid, signer guid, u32 result. ALREADY_SIGNED
-    /// is 1 (`cm:Guild.h:118-132`).
     #[test]
     fn petition_sign_results_carry_the_charter_the_signer_and_the_result() {
         let mut expected = vec![0x01, 0x01, 0, 0, 0, 0, 0, 0x40];
@@ -670,7 +610,6 @@ mod tests {
         assert_eq!(server_body(message), (0x01C1, expected));
     }
 
-    /// `cm:PetitionsHandler.cpp:631-633`: one u32 result. NEED_MORE is 4 (`cm:Guild.h:118-132`).
     #[test]
     fn turn_in_petition_results_are_one_word() {
         use wow_world_messages::vanilla::SMSG_TURN_IN_PETITION_RESULTS;
@@ -681,8 +620,6 @@ mod tests {
         assert_eq!(server_body(message), (0x01C5, vec![4, 0, 0, 0]));
     }
 
-    /// `cm:PetitionsHandler.cpp:49-73`: CMSG_PETITION_BUY carries the NPC guid, skips a u32 and a
-    /// u64, then the name, ten u32, a u16, a u8, the index and a last u32.
     #[test]
     fn petition_buy_reads_the_npc_and_the_name() {
         let mut body = 0xF130_0000_0000_0042u64.to_le_bytes().to_vec();

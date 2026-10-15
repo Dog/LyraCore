@@ -1,7 +1,3 @@
-//! Raid chat, Raid Leader chat and Raid Warning through the Realm Chat path, on a private
-//! Standalone. Party chat narrows to the speaker's Subgroup inside a Raid; Raid, Raid Leader and
-//! Raid Warning reach the whole Raid, gated by who may send each one.
-
 mod support;
 
 use serde_json::json;
@@ -41,7 +37,6 @@ fn join(node: &Standalone, inviter: u64, guid: u64) {
     group_op(node, ACCEPT, guid, 0, 0);
 }
 
-/// A request of `kind` from a Human (race 1) speaking Universal, tagged NONE.
 fn request(kind: u8, message: &str) -> String {
     json!({
         "kind": kind,
@@ -54,9 +49,6 @@ fn request(kind: u8, message: &str) -> String {
     .to_string()
 }
 
-/// One accepted `realm_chat` call's recipients, sorted. Waits for the event GC to reap the row
-/// before returning, so the next capture never races a stray delete transaction — the same
-/// discipline `realm_chat.rs`'s durable test follows.
 fn recipients_of(node: &Standalone, actor_guid: u64, kind: u8, message: &str) -> Vec<u64> {
     let req = request(kind, message);
     let updates = node.capture_updates(REALM_CHAT_ROWS, 1, || {
@@ -83,7 +75,6 @@ fn recipients_of(node: &Standalone, actor_guid: u64, kind: u8, message: &str) ->
     recipients
 }
 
-/// The whole error text of a refused `realm_chat` call, which carries the Refusal tag.
 fn refusal(node: &Standalone, actor_guid: u64, kind: u8) -> String {
     let req = request(kind, "anyone?");
     let output = node.call("realm_chat", &[&actor(&actor_guid.to_string()), &req]);
@@ -107,9 +98,6 @@ fn assert_refused(node: &Standalone, actor_guid: u64, kind: u8, tag: &str) {
     );
 }
 
-/// A 7-member Raid: Subgroup 0 holds the leader and members 2-5, who joined as a Party before the
-/// convert and stay in Subgroup 0 (cm:GroupHandler.cpp:473-490). Members 6 and 7 join afterward,
-/// find Subgroup 0 full, and fill Subgroup 1 (cm:Group.cpp:817-838).
 fn seven_member_raid(node: &Standalone) {
     for guid in 2..=5 {
         join(node, 1, guid);
@@ -120,7 +108,6 @@ fn seven_member_raid(node: &Standalone) {
     }
 }
 
-/// **AC 1**: in a Raid, Party chat reaches only the speaker's Subgroup, the speaker included.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn party_chat_in_a_raid_reaches_only_the_speakers_subgroup() {
@@ -141,7 +128,6 @@ fn party_chat_in_a_raid_reaches_only_the_speakers_subgroup() {
     );
 }
 
-/// **AC 2**: in a Party (no Raid), Party chat still reaches every member, unchanged.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn party_chat_outside_a_raid_still_reaches_everyone() {
@@ -154,7 +140,6 @@ fn party_chat_outside_a_raid_still_reaches_everyone() {
     assert_eq!(recipients_of(&realm, 2, KIND_PARTY, "form up"), [1, 2, 3]);
 }
 
-/// **AC 3**: `/ra` reaches every Raid member across both Subgroups; refused in a Party.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn raid_chat_reaches_the_whole_raid_and_is_refused_in_a_party() {
@@ -176,7 +161,6 @@ fn raid_chat_reaches_the_whole_raid_and_is_refused_in_a_party() {
     assert_refused(&party, 1, KIND_RAID, "chat:not_raid");
 }
 
-/// **AC 4**: a Raid Leader line from the leader reaches everyone; from anyone else it is refused.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn raid_leader_chat_is_leader_only() {
@@ -192,8 +176,6 @@ fn raid_leader_chat_is_leader_only() {
     assert_refused(&realm, 3, KIND_RAID_LEADER, "chat:not_raid_leader");
 }
 
-/// **AC 5**: a Raid Warning from the leader or an Assistant reaches everyone; from a plain member,
-/// or in a Party, it is refused.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn raid_warning_needs_the_leader_or_an_assistant() {

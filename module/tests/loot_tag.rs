@@ -2,7 +2,6 @@ mod support;
 
 use support::Standalone;
 
-/// Runs the canonical Loot Tag paths against live durable rows in an isolated standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn loot_tag_owns_threat_lifetime_rewards_and_corpse_eligibility() {

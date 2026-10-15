@@ -1,40 +1,28 @@
-//! Item table definitions + RLS filter + the guid/slot primitives. The `game_item_template` static
-//! definition, the per-player `game_item_instance` owned-item row, the owner-scoped RLS filter, and the
-//! small pure-ish primitives every op builds on: guid composition/minting and the per-slot scans.
-
 use spacetimedb::{table, Identity, ReducerContext, Table, Timestamp};
 
-/// The nine class bits playable by the 1.12 client.  Class ids skip 6 and 10, so Druid (11) is bit
-/// 0x400; the client hides the tooltip "Classes:" line only when every playable bit is set.
-/// Item-template masks retain unknown bits from imported content; this value exists only to make
-/// the source dump's unrestricted sentinel durable.
+// Playable class IDs skip 6 and 10; Druid is bit 10.
 pub const ALL_PLAYABLE_CLASS_MASK: u32 = 0x5df;
-/// The eight race bits playable by the 1.12 client.  As with class masks, imported restrictions are
-/// otherwise opaque `u32` values and are never reconstructed from local variants.
 pub const ALL_PLAYABLE_RACE_MASK: u32 = 0xff;
 
-/// Static item definition (the cmangos `item_template` analogue) — hand-authored, public + read-only
-/// to clients (answered via `CMSG_ITEM_QUERY_SINGLE`). A small subset of the ~130 vanilla
-/// `item_template` columns: only the fields the slice's query response + bag render need. [reference]
 #[table(accessor = game_item_template, public)]
 pub struct ItemTemplate {
     #[primary_key]
     pub entry: u32,
-    pub class: u8,    // item class — 2 = Weapon
-    pub subclass: u8, // weapon subclass — 7 = Sword (one-hand)
+    pub class: u8,
+    pub subclass: u8,
     pub name: String,
-    pub display_id: u32,    // inventory-icon / model display id
-    pub quality: u8,        // 0 = Poor (grey)
-    pub inventory_type: u8, // equip slot type — 21 = INVTYPE_WEAPONMAINHAND
+    pub display_id: u32,
+    pub quality: u8,
+    pub inventory_type: u8,
     pub item_level: u8,
     pub required_level: u8,
     pub max_durability: u32,
-    pub buy_price: u32,  // copper
-    pub sell_price: u32, // copper
-    pub max_stack: u32,  // 1 for a non-stackable weapon
-    pub damage_min: f32, // physical melee damage range (tooltip)
+    pub buy_price: u32,  // Copper.
+    pub sell_price: u32, // Copper.
+    pub max_stack: u32,
+    pub damage_min: f32,
     pub damage_max: f32,
-    pub delay_ms: u32, // weapon swing speed (ms)
+    pub delay_ms: u32,
 
     #[default(0)]
     pub stat_strength: i32,
@@ -47,30 +35,17 @@ pub struct ItemTemplate {
     #[default(0)]
     pub stat_spirit: i32,
     #[default(0)]
-    pub stat_crit: i32, // crit RATING in attack-table basis points (CRIT_BP += this)
+    pub stat_crit: i32, // Attack-table basis points.
     #[default(0)]
-    pub stat_hit: i32, // hit RATING in attack-table basis points (miss band -= this)
+    pub stat_hit: i32, // Attack-table basis points.
     #[default(0)]
-    pub stat_armor: i32, // bonus armor, added ON TOP of the agility*2 base (not double-counted)
-    /// SHIELD base block value: the flat physical damage a blocked melee swing absorbs (item-only — the
-    /// Strength term is added live in `combat::effective_block_value`). 0 for every non-shield template,
-    /// so a unit without a shield blocks nothing. END-appended + `#[default(0)]` → additive auto-migration.
+    pub stat_armor: i32,
+    // Item contribution only; combat::effective_block_value adds Strength.
     #[default(0)]
     pub block_value: i32,
-    /// A DRINK: this consumable restores POWER (mana) instead of HEALTH when used. Vanilla splits
-    /// food (E_HEAL) from drink (E_ENERGIZE) by the on-use spell, which we don't import — so the
-    /// importer derives this from the item's class/subclass + name. `apply_item_use` reads it to pick
-    /// health vs power; the restore AMOUNT reuses the same `consumable_heal(item_level)` formula.
-    /// END-appended + `#[default(false)]` → additive auto-migration (existing food rows stay food). [reference]
     #[default(false)]
     pub restores_power: bool,
-    /// On-use / on-equip spell slots 1-2 (vanilla items carry up to 5; slots 1-2 cover every 1-10
-    /// consumable — food/drink/potion/scroll on-use + the common on-equip proc). Sent in
-    /// SMSG_ITEM_QUERY_SINGLE_RESPONSE so the CLIENT renders the green "Use:/Equip:/Chance on hit:" text
-    /// from its OWN Spell.dbc — we don't need the spell server-side (`restores_power` still drives the
-    /// actual food/drink effect). `spelltrigger` is the vanilla ItemSpellTriggerType (0=on-use, 1=on-equip,
-    /// 2=chance-on-hit). END-appended + `#[default(0)]` → additive auto-migration. Deliberate
-    /// simplification: add slots 3-5 only if an on-equip trinket at 1-10 needs them. [reference]
+    // Spell triggers: 0 = on use, 1 = on equip, 2 = chance on hit.
     #[default(0)]
     pub spellid_1: u32,
     #[default(0)]
@@ -79,36 +54,13 @@ pub struct ItemTemplate {
     pub spellid_2: u32,
     #[default(0)]
     pub spelltrigger_2: u8,
-    /// Number of container slots this item provides when equipped in a bag slot (19..=22).
-    /// 0 = not a bag (every existing template → additive auto-migration baseline-safe). A bag with
-    /// N slots expands the player's inventory by N: `store_item` searches these after the 16-slot
-    /// backpack is full (see `first_free_bag_slot` in ops.rs). Vanilla max is 18 (Portable Hole).
-    /// END-appended + `#[default(0)]` → additive auto-migration. [reference]
     #[default(0)]
     pub container_slots: u8,
-    /// Vanilla item_template.sheath — where the item visually stows when sheathed. Read by the
-    /// gateway item view and passed VERBATIM to `SMSG_ITEM_QUERY_SINGLE_RESPONSE.sheathe_type`
-    /// (cmangos sends `pProto->Sheath` the same way). The byte is an opaque client posture index —
-    /// gtker's `SheatheType` variant names do NOT describe the rendered posture, so trust dump
-    /// values, not names: Worn Shortsword (25) = 3, Dented Buckler (1166, shield) = 4, 0 = no stow.
-    /// END-appended + `#[default(0)]` → additive auto-migration. [reference]
+    // Preserve raw sheath values; gtker variant names do not describe the rendered posture.
     #[default(0)]
     pub sheath: u8,
-    /// Item binding: the cmangos `item_template.bonding` value — 0 = NoBind, 1 = Bind on Pickup (BoP),
-    /// 2 = Bind on Equip (BoE), 3 = Bind on Use, 4/5 = Quest Item (see [`super::rules::bonding`]).
-    /// Drives the client's "Binds when picked up/equipped" tooltip line via
-    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE.bonding`. Trade and mail enforcement are
-    /// out of scope here — this is the data model only.
-    /// END-appended + `#[default(0)]` → additive auto-migration (every existing template reads
-    /// NoBind, baseline-safe). [reference]
     #[default(0)]
     pub bonding: u8,
-    /// The 6 vanilla resistance schools (cmangos `item_template.holyres/fireres/natureres/frostres/
-    /// shadowres/arcaneres`) — resist gear is dead weight until these land; the effective-resistance
-    /// combat math already exists and can fold these in once a consumer reads them.
-    /// DATA PLUMBING ONLY — no consumer reads these yet, so every existing template stays at 0
-    /// (baseline-safe). i32 matching `stat_armor`'s sibling convention (a future negative
-    /// suffix-enchant fits). END-appended + `#[default(0)]` → additive auto-migration. [reference]
     #[default(0)]
     pub holy_res: i32,
     #[default(0)]
@@ -121,11 +73,6 @@ pub struct ItemTemplate {
     pub shadow_res: i32,
     #[default(0)]
     pub arcane_res: i32,
-    /// On-use/on-equip spell slots 3-5 (vanilla items carry up to 5; slots 1-2 already cover every
-    /// 1-10 consumable). Completes the proc engine's item half — no consumer reads these yet
-    /// (data plumbing only). Same shape as `spellid_1`/`spelltrigger_1`: `u32` id,
-    /// `u8` `ItemSpellTriggerType`. END-appended + `#[default(0)]` → additive auto-migration.
-    /// [reference]
     #[default(0)]
     pub spellid_3: u32,
     #[default(0)]
@@ -138,24 +85,15 @@ pub struct ItemTemplate {
     pub spellid_5: u32,
     #[default(0)]
     pub spelltrigger_5: u8,
-    /// Weapon-skill proficiency gate (cmangos `RequiredSkill`/`RequiredSkillRank`) — mail/plate
-    /// proficiency + weapon-skill requirements beyond the class tables. Data
-    /// plumbing only, no consumer reads these yet (0 = no skill gate, baseline-safe).
-    /// END-appended + `#[default(0)]` → additive auto-migration. [reference]
     #[default(0)]
     pub required_skill: u32,
     #[default(0)]
     pub required_skill_rank: u32,
-    /// Reputation gate (cmangos `RequiredReputationFaction`/`RequiredReputationRank`).
-    /// Data plumbing only, no consumer reads these yet (0 = no rep gate,
-    /// baseline-safe). END-appended + `#[default(0)]` → additive auto-migration. [reference]
     #[default(0)]
     pub required_reputation_faction: u32,
     #[default(0)]
     pub required_reputation_rank: u32,
-    /// Unique-count cap (`maxcount`), item flags, readable-item page, quest starter, and bag family.
-    /// Storage enforces `max_count` across carried and banked copies. Zero means no limit.
-    /// END-appended defaults keep existing items unrestricted. [reference]
+    // Zero means unlimited; the cap includes carried and banked copies.
     #[default(0)]
     pub max_count: u32,
     #[default(0)]
@@ -166,18 +104,12 @@ pub struct ItemTemplate {
     pub start_quest: u32,
     #[default(0)]
     pub bag_family: u32,
-    /// cmangos `BuyCount`: the stack a vendor hands over per purchase (water/food ×5, ammo
-    /// ×200). Defaulted 1 so un-reimported rows keep single-unit sales. END-appended + defaulted →
-    /// additive auto-migration.
     #[default(1u32)]
     pub buy_count: u32,
-    /// Vanilla item_template.FoodType. Zero is not pet food; 1..=8 select the matching bit in a
-    /// creature family's pet_food_mask. Kept at the end for additive schema migration.
+    // Zero means no pet food; 1..=8 select a bit in pet_food_mask.
     #[default(0)]
     pub food_type: u8,
-    /// Explicit class/race eligibility masks.  The importer turns ClassicDB's `-1` unrestricted
-    /// sentinel into the complete playable masks before rows become durable; zero remains a
-    /// restrictive/malformed durable value.  END-appended defaults make existing rows unrestricted.
+    // Import maps the source -1 sentinel to playable masks; durable zero remains restrictive.
     #[default(ALL_PLAYABLE_CLASS_MASK)]
     pub allowed_class: u32,
     #[default(ALL_PLAYABLE_RACE_MASK)]
@@ -186,55 +118,35 @@ pub struct ItemTemplate {
     pub random_property: u32,
 }
 
-/// A per-player owned item. Public but RLS-restricted to the owner (like `game_character`), so a
-/// connection only ever sees its own items. The `guid` carries `HIGHGUID_ITEM` (0x4000) in its high
-/// bits so the client routes it as an item. Timestamp-bearing → born only in [`grant_starter_item`]
-/// at login (no SQL import path — see the no-Timestamp-literal rule). [entity]
 #[table(accessor = game_item_instance, public, index(accessor = by_owner_guid, btree(columns = [owner_guid])))]
 pub struct ItemInstance {
     #[primary_key]
     pub guid: u64,
-    pub entry: u32,               // -> ItemTemplate.entry
-    pub owner_identity: Identity, // RLS scope: the connection that owns this item
-    pub owner_guid: u64,          // the owning character's guid (ITEM_FIELD_OWNER / _CONTAINED)
-    pub slot: u8,                 // the player inventory slot it occupies (ItemSlot ordinal)
+    pub entry: u32,
+    pub owner_identity: Identity,
+    pub owner_guid: u64,
+    pub slot: u8,
     pub stack_count: u32,
     pub durability: u32,
     pub created_at: Timestamp,
-    /// Applied enchantment, resolved through the item enchantment catalogue. Zero means none.
     #[default(0)]
     pub enchant_id: u32,
-    /// Item binding state: true once this SPECIFIC instance has bound to its owner and cannot be
-    /// traded or mailed away (trade and mail enforcement gate on this
-    /// column). Set `true` at grant time for a BoP-templated item (quest reward, starter
-    /// kit, loot, vendor buy — any `store_item`/`grant_starter_item` insert) and on first EQUIP for a
-    /// BoE-templated item (`apply_item_move`'s equip-validation branch). A BoU/unbound-type template
-    /// never flips this today (binds-on-use is a future add).
-    /// END-appended + `#[default(false)]` → additive auto-migration (every existing item reads
-    /// unbound, baseline-safe). [entity]
     #[default(false)]
     pub soulbound: bool,
     #[default(0)]
     pub random_property_id: u32,
-    /// `ITEM_FIELD_ITEM_TEXT_ID` — nonzero on a Letter Copy's Plain Letter (the mail id narrowed
-    /// to u32, `lyracore_shared::mail::item_text_id_for`). Zero means the item carries no readable
-    /// text, true of every item that is not a copied letter.
-    /// END-appended + `#[default(0u32)]` → additive auto-migration (every existing item reads no
-    /// text, baseline-safe).
+    // ITEM_FIELD_ITEM_TEXT_ID; zero except on a Letter Copy.
     #[default(0u32)]
     pub item_text_id: u32,
 }
 
-// Character-owned sweeps: items are deleted on character delete, re-owned (identity re-stamp) on a
-// relog under a changed gateway identity.
 crate::character_owned!(delete, fn sweep_delete_game_item_instance(ctx, character_guid) {
     let items = ctx.db.game_item_instance();
     for r in items.by_owner_guid().filter(&character_guid).collect::<Vec<_>>() {
         items.guid().delete(r.guid);
     }
 });
-// Transfer preserves the item identity the client already knows. New items consume the Shard's
-// GUID Range; import also checks collisions because legacy GUIDs can overlap.
+// Transfer preserves item GUIDs; legacy formats still need collision checks.
 crate::character_owned!(transfer, fn sweep_transfer_game_item_instance(ctx, character_guid, io) {
     table = game_item_instance,
     by = by_owner_guid,
@@ -250,9 +162,6 @@ crate::character_owned!(restamp, fn sweep_restamp_game_item_instance(ctx, charac
     }
 });
 
-/// The owner's item instance occupying inventory `slot`, or `None` if that slot is empty. A point scan
-/// over the owner's rows (the inventory model has no per-slot index, so this matches each call site's
-/// existing `by_owner_guid().filter(&owner).find(|i| i.slot == slot)` exactly).
 pub(crate) fn item_in_slot(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -265,8 +174,6 @@ pub(crate) fn item_in_slot(
         .find(|i| i.slot == slot)
 }
 
-/// Whether any of the owner's items occupies inventory `slot` — the boolean twin of [`item_in_slot`]
-/// for the call sites that only need occupancy (an `.any(|i| i.slot == slot)` over the owner's rows).
 pub(crate) fn slot_occupied(ctx: &ReducerContext, owner_guid: u64, slot: u8) -> bool {
     ctx.db
         .game_item_instance()
@@ -275,19 +182,10 @@ pub(crate) fn slot_occupied(ctx: &ReducerContext, owner_guid: u64, slot: u8) -> 
         .any(|i| i.slot == slot)
 }
 
-/// Whether an equipped item is BROKEN — it HAS a durability concept (`max_durability > 0`) AND has worn
-/// to 0. A broken item grants none of its damage/stats until repaired (`apply_repair_item`). Items with
-/// no durability concept (`max_durability == 0` — trinkets/consumables) are never broken. The single
-/// source of the rule, shared by [`equipped_stat_bonus`] (stats) and `combat::equipped_weapon_damage`
-/// (weapon damage) so the two readouts can never desync.
 pub(crate) fn item_is_broken(tmpl: &ItemTemplate, inst: &ItemInstance) -> bool {
     tmpl.max_durability > 0 && inst.durability == 0
 }
 
-/// One row of a creature's vendor inventory: vendor `creature_entry` sells `item_entry`. Loaded from
-/// cmangos `npc_vendor` by the importer; read by the gateway to build `SMSG_LIST_INVENTORY` and by
-/// `apply_buy_item` to gate purchases (you can only buy what a vendor *in range* actually stocks).
-/// `slot` orders the window; `max_count` is the stock limit (0 = unlimited — the common case). [static]
 #[table(accessor = game_npc_vendor, public, index(accessor = by_vendor, btree(columns = [creature_entry])))]
 pub struct NpcVendor {
     #[primary_key]
@@ -295,14 +193,10 @@ pub struct NpcVendor {
     pub id: u64,
     pub creature_entry: u32,
     pub item_entry: u32,
-    pub slot: u32,      // display order in the vendor window
-    pub max_count: u32, // stock limit (0 = unlimited)
+    pub slot: u32,
+    pub max_count: u32, // Zero means unlimited stock.
 }
 
-/// Per-player buyback ring — the last ≤12 items sold to any vendor. Newest = highest id; the client
-/// numbers slots 69–81 (SLOT1 = 0-index 0 = most recent). On sell: oldest is evicted if at capacity,
-/// new row inserted. On buyback: the player pays `price` copper and the item is granted back via
-/// `store_item`. The gateway subscribes (coordinator) to build the vendor-window buyback tab.
 #[table(accessor = game_character_buyback, index(accessor = by_player_guid, btree(columns = [player_guid])))]
 pub struct BuybackEntry {
     #[primary_key]
@@ -311,28 +205,21 @@ pub struct BuybackEntry {
     pub player_guid: u64,
     pub item_entry: u32,
     pub stack_count: u32,
-    pub price: u32, // copper paid at sell time = buy-back cost
-    // Per-instance bind state at sell time: without this, buyback would re-derive soulbound from the
-    // template alone (BoP-only), silently un-binding an already-bound BoE item on a sell→buyback round
-    // trip. END-appended + `#[default(false)]` → auto-migrates.
+    pub price: u32, // Copper paid at sell time.
+    // Buyback must preserve an already-bound BoE item independently of template binding.
     #[default(false)]
     pub soulbound: bool,
     #[default(0)]
     pub random_property_id: u32,
 }
 
-// Character-owned sweep: the buyback ring is deleted (not re-owned) on character delete — there's no
-// restamp counterpart for this one.
 crate::character_owned!(delete, fn sweep_delete_game_character_buyback(ctx, character_guid) {
     let buybacks = ctx.db.game_character_buyback();
     for r in buybacks.by_player_guid().filter(&character_guid).collect::<Vec<_>>() {
         buybacks.id().delete(r.id);
     }
 });
-// CROSS-DATABASE transport: the buyback ring is real value the player can still reclaim
-// (they paid for the item once). Dropping it at a shard boundary is a silent refund window closing.
-// `id` orders the ring (newest = highest), so re-minting preserves the order: `move_rows` inserts in
-// export order, and export order is index order.
+// Re-minted buyback IDs must preserve export order because IDs order the ring.
 crate::character_owned!(transfer, fn sweep_transfer_game_character_buyback(ctx, character_guid, io) {
     table = game_character_buyback,
     by = by_player_guid,

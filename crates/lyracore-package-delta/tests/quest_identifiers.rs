@@ -1,10 +1,3 @@
-//! The quest identifier policy: which rows a Package may claim. Mirrors `item_identifiers.rs`, and
-//! the packed child keys mirror `spell_identifiers.rs`'s `game_spell_effect` cases.
-//!
-//! One band covers the whole family: `game_quest_text` and every child table below name their
-//! owning quest by `quest_entry`, so a child row is only ever as Package-owned as the quest it
-//! belongs to. There is no separate child band to test.
-
 mod common;
 
 use common::{
@@ -136,8 +129,6 @@ fn an_incomplete_quest_insert_is_refused() {
     }
 }
 
-// ---- quest text: 1:1 with the header by `quest_entry`, same band ----
-
 #[test]
 fn quest_text_shares_the_quest_header_band() {
     let json = artifact(
@@ -168,8 +159,6 @@ fn quest_text_outside_the_package_range_may_not_be_inserted() {
         DeltaError::QuestIdNotClientSafe { entry: 1 }
     );
 }
-
-// ---- packed child keys ----
 
 #[test]
 fn an_objectives_packed_key_derives_from_the_quest_and_the_slot() {
@@ -248,8 +237,6 @@ fn a_reward_choice_index_past_six_is_refused() {
     );
 }
 
-/// The key columns (`quest_entry`, `obj_index`/`item_entry`/`choice_index`) may never also appear
-/// in `fields`. The key already names them.
 #[test]
 fn a_child_table_refuses_its_own_key_column_as_a_field() {
     let json = artifact(

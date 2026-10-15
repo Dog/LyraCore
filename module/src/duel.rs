@@ -1,5 +1,3 @@
-//! Server-authoritative Duel lifecycle and its recipient-keyed gateway relay.
-
 use spacetimedb::{reducer, table, Identity, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use crate::game_world_entity;
@@ -14,7 +12,6 @@ pub(crate) const DUEL_BOUNDARY_YARDS: f32 = 50.0;
 pub(crate) const FLEE_GRACE_MICROS: i64 = 10_000_000;
 pub(crate) const REQUEST_TIMEOUT_MICROS: i64 = 60_000_000;
 
-/// One live Duel, indexed from either participant. Clients learn it only through [`DuelEvent`].
 #[table(
     accessor = game_duel,
     index(accessor = by_initiator, btree(columns = [initiator_guid])),
@@ -37,15 +34,11 @@ pub struct Duel {
     pub flag_orientation: f32,
     pub state: u8,
     pub countdown_deadline_micros: i64,
-    // Reserved by the boundary slice. End-appending later would be migration-safe, but landing
-    // the fields with the lifecycle row lets both participants share one authoritative timer.
     pub initiator_out_of_bounds_deadline_micros: i64,
     pub challenged_out_of_bounds_deadline_micros: i64,
     pub created_at_micros: i64,
 }
 
-/// One lifecycle edge for one recipient. The full Duel snapshot makes every packet projection
-/// independent of the private row, including the completion edge emitted after that row is gone.
 #[table(
     accessor = game_duel_event,
     public,
@@ -77,7 +70,6 @@ pub struct DuelEvent {
     pub loser_name: String,
 }
 
-/// The module clock that advances accepted Duels after their three-second countdown.
 #[table(accessor = game_duel_schedule, scheduled(tick_duels))]
 pub struct DuelSchedule {
     #[primary_key]
@@ -137,7 +129,6 @@ impl From<&crate::WorldEntity> for RequestParticipant {
     }
 }
 
-/// Pure request gate. The reducer supplies membership facts from both Duel indexes.
 pub(crate) fn request_verdict(
     initiator: Option<RequestParticipant>,
     challenged: Option<RequestParticipant>,
@@ -159,7 +150,6 @@ pub(crate) fn request_verdict(
     if initiator.map_id != challenged.map_id || initiator.instance_id != challenged.instance_id {
         return Err(RequestDenied::DifferentPartition);
     }
-    // Vanilla only duels within one team; same race-team rule as the mail gate.
     if !lyracore_shared::faction::same_team(initiator.race, challenged.race) {
         return Err(RequestDenied::CrossFaction);
     }
@@ -169,7 +159,6 @@ pub(crate) fn request_verdict(
     Ok(())
 }
 
-/// The Duel containing `guid`, from either participant index.
 pub(crate) fn duel_involving(ctx: &ReducerContext, guid: u64) -> Option<Duel> {
     let duels = ctx.db.game_duel();
     duels
@@ -179,13 +168,10 @@ pub(crate) fn duel_involving(ctx: &ReducerContext, guid: u64) -> Option<Duel> {
         .or_else(|| duels.by_challenged().filter(&guid).next())
 }
 
-/// Whether these two characters are the two sides of the same active Duel. This is the sole
-/// friendly-fire exception: requested and countdown Duels deliberately do not authorize damage.
 pub(crate) fn active_opponents(ctx: &ReducerContext, attacker_guid: u64, target_guid: u64) -> bool {
     active_duel_between(ctx, attacker_guid, target_guid).is_some()
 }
 
-/// The active Duel shared by this exact pair, if any.
 pub(crate) fn active_duel_between(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -204,9 +190,7 @@ fn active_pair(duel: &Duel, attacker_guid: u64, target_guid: u64) -> bool {
 fn duel_flag_guid(initiator_guid: u64, duel_id: u64) -> Option<u64> {
     const HIGHGUID_GAMEOBJECT: u64 = 0xF110u64 << 48;
     const DUEL_FLAG_BAND: u64 = 1u64 << 45;
-    // Character GUID range slots are realm-wide and Duel ids are shard-local. Packing both makes
-    // the arbiter unique across shards and across successive Duels, so a stale client action can
-    // never name a later Duel. Refuse after a billion Duels on one shard instead of wrapping.
+    // Shard-local Duel ids need the realm-wide GUID slot to make their arbiters unique.
     let range_size = crate::realm_core::GUID_RANGE_SIZE;
     if duel_id >= range_size {
         return None;
@@ -261,8 +245,6 @@ fn push_both(ctx: &ReducerContext, duel: &Duel, kind: u8) {
     push_event(ctx, duel, duel.challenged_guid, kind, 0, 0, 0);
 }
 
-/// Spell effect 83's state mutation. Invalid requests are benign no-ops: the cast itself still
-/// resolves normally, but no Duel or duel flag is created.
 pub(crate) fn request_duel(
     ctx: &ReducerContext,
     initiator_guid: u64,
@@ -318,7 +300,6 @@ pub(crate) fn accept_allowed(duel: &Duel, actor_guid: u64, flag_guid: u64) -> bo
         && duel.flag_guid == flag_guid
 }
 
-/// Accept only the proposal addressed to the challenged character and only for its exact arbiter.
 pub(crate) fn accept_duel(ctx: &ReducerContext, actor_guid: u64, flag_guid: u64) {
     let Some(mut duel) = duel_involving(ctx, actor_guid) else {
         return;
@@ -466,7 +447,6 @@ fn apply_boundary_transition(
     }
 }
 
-/// The one teardown path. Deleting before emitting makes repeated calls idempotent.
 pub(crate) fn complete_duel(
     ctx: &ReducerContext,
     duel_id: u64,
@@ -519,8 +499,6 @@ fn cancellation_result(duel: &Duel, actor_guid: u64) -> (u8, u64, u64) {
     (duel_completion_kind::FLED, winner, actor_guid)
 }
 
-/// Before activation cancel means interruption. Once active it is a fled result, with the other
-/// participant already recorded as winner for the combat slice to project.
 pub(crate) fn cancel_duel(ctx: &ReducerContext, actor_guid: u64, flag_guid: u64) {
     let Some(duel) = duel_involving(ctx, actor_guid) else {
         return;
@@ -564,8 +542,6 @@ pub fn tick_duels(ctx: &ReducerContext, _schedule: DuelSchedule) {
             continue;
         }
 
-        // Tie rule: if both flee deadlines expire on the same tick, the initiator is
-        // processed first and loses.
         let initiator_transition = boundary_transition(
             outside_duel_boundary(
                 &duel,
@@ -603,7 +579,7 @@ mod tests {
             dead: false,
             map_id,
             instance_id,
-            race: 1, // Human
+            race: 1,
         }
     }
 
@@ -673,7 +649,7 @@ mod tests {
     fn request_gate_rejects_cross_faction_pairs() {
         let a = entity(1, 0, 4);
         let mut b = entity(2, 0, 4);
-        b.race = 2; // Orc
+        b.race = 2;
         assert_eq!(
             request_verdict(Some(a), Some(b), false, false),
             Err(RequestDenied::CrossFaction)

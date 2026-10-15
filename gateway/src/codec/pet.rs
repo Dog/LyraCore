@@ -1,5 +1,3 @@
-//! Hunter-pet identity packets and descriptor updates.
-
 use super::*;
 use wow_world_messages::vanilla::SMSG_PET_NAME_QUERY_RESPONSE;
 
@@ -27,8 +25,7 @@ pub struct PetNameView {
     pub name_timestamp: u32,
 }
 
-/// Publish only Hunter-specific fields after the live creature exists. Loyalty occupies byte 1 of
-/// UNIT_FIELD_BYTES_1; happiness is the otherwise hidden POWER5 pair in build 5875.
+/// Loyalty uses UNIT_FIELD_BYTES_1 byte 1; happiness uses the hidden POWER5 pair.
 pub fn build_hunter_pet_values(pet: &HunterPetProtocolView) -> SMSG_UPDATE_OBJECT {
     values::unit_values(pet.live_pet_guid, |unit| {
         unit.set_unit_level(pet.level as i32);
@@ -95,11 +92,8 @@ mod tests {
         let mut bytes = Vec::new();
         msg.write_unencrypted_server(&mut bytes).unwrap();
         let mut tail = vec![
-            5, // five update-mask words through UNIT_FIELD_PETNEXTLEVELEXP
-            0x00, 0x00, 0x00, 0x08, // POWER5, descriptor 27
-            0x06, 0x00, 0x00, 0x00, // MAXPOWER5 + LEVEL, descriptors 33–34
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x00,
-            0x00, // BYTES_1 through PETNEXTLEVELEXP, 138–142
+            5, 0x00, 0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x7c, 0x00, 0x00,
         ];
         for value in [
             166_500u32,

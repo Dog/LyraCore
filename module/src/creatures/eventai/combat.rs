@@ -1,7 +1,3 @@
-//! Engaged EventAI conditions, target selection and combat actions. The decisions here are pure
-//! logic over the [`EventAiWorld`] Seam, shared by the durable world and the test Scenario. Only
-//! `definition_for` and `authored_combat` read durable definitions directly.
-
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -62,8 +58,7 @@ fn contexts_for_actors<W: EventAiWorld>(world: &W, actors: Vec<CycleActor>) -> V
         .collect()
 }
 
-/// Checks the rule's event condition and may name the actor selected by that condition.
-#[allow(clippy::too_many_lines)] // One arm per EventAI event kind.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn condition<W: EventAiWorld>(
     world: &W,
     context: &EventContext,
@@ -394,10 +389,6 @@ pub(super) fn execute<W: EventAiWorld>(
             let Some(rout_ends_ms) = world.eventai_rout_ends_ms(context.creature_guid) else {
                 return ActionResult::Refused;
             };
-            // A spent window bars the FIXED low-health rout, which is once per engagement. An
-            // authored flee is not: the source re-runs the action every time its rule fires, so the
-            // window re-opens once the previous run has finished. Re-stamping an OPEN window would
-            // instead extend one flee forever.
             if !rout_window_open(context.now_ms as u32, rout_ends_ms) {
                 world.stamp_eventai_rout(
                     context.creature_guid,
@@ -562,20 +553,13 @@ pub(super) fn cast<W: EventAiWorld>(
     }
 }
 
-/// Which compatibility behaviors EventAI owns for this creature.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthoredCombat {
-    /// An engaged cycle rule owns casting for this creature.
     pub casting: bool,
-    /// The definition marks at least one spell for authored ranged-mode posture. T8 consumes this
-    /// metadata with the Set Ranged Mode action.
     pub main_spell_posture: bool,
-    /// The script owns breaking off: the fixed low-health rout is off, and the authored window runs
-    /// the creature whatever its health and whatever its creature type.
     pub flee: bool,
 }
 
-/// Read compatibility ownership from the creature's composed definition.
 pub(crate) fn authored_combat(ctx: &ReducerContext, creature_guid: u64) -> AuthoredCombat {
     let mut authored = AuthoredCombat::default();
     let definition = definition_for(ctx, creature_guid);
@@ -764,8 +748,6 @@ fn actor_is_behind_target(actor: &EventAiUnit, target: &EventAiUnit) -> bool {
     (direction - target.orientation).cos() < 0.0
 }
 
-/// The creature's threat list, hostiles first by threat then by guid, with every target the
-/// action could never take already gone.
 fn ranked_threat<W: EventAiWorld>(
     world: &W,
     creature: &EventAiUnit,
@@ -1007,7 +989,6 @@ fn call_for_help<W: EventAiWorld>(
     ActionResult::Applied
 }
 
-/// One candidate at random, or `None` when there are none to choose between.
 fn pick<T: Copy>(choice: u64, candidates: &[T]) -> Option<T> {
     if candidates.is_empty() {
         return None;
@@ -1024,7 +1005,6 @@ fn distance_sq(first: &EventAiUnit, second: &EventAiUnit) -> f32 {
     dx * dx + dy * dy + dz * dz
 }
 
-/// The source zone-combat pulse admits living Characters throughout a dungeon instance.
 pub(super) fn zone_combat<W: EventAiWorld>(world: &mut W, creature_guid: u64) -> ActionResult {
     let Some(creature) = world
         .eventai_unit(creature_guid)

@@ -1,11 +1,3 @@
-//! `Coordinator`'s Store family adapters, one file per Protocol Family.
-//!
-//! Each file holds the family's trait impl and the inherent methods only that family calls.
-//! Inherent methods with other callers stay in `reads`, `reducers`, `subscriptions` and
-//! `connection`. Rust method resolution prefers inherent methods over trait methods, so
-//! `self.characters(..)` here calls the inherent `Coordinator::characters`, not the trait method:
-//! these are thin views, not recursion.
-
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 
@@ -44,8 +36,6 @@ mod transfer;
 mod vendor;
 mod weather;
 
-/// Wait up to two seconds for a row a value-flow reducer just committed to reach this handle's
-/// cache.
 fn wait_for_cache_row<T>(
     operation_id: u64,
     row_name: &str,
@@ -62,7 +52,6 @@ fn wait_for_cache_row<T>(
     ))
 }
 
-/// A random nonzero operation id for one auction or guild fee value flow.
 fn next_operation_id() -> Result<u64> {
     loop {
         let mut bytes = [0; 8];
@@ -75,7 +64,6 @@ fn next_operation_id() -> Result<u64> {
     }
 }
 
-/// A Character request whose Refusal the client reads as a system message.
 fn interaction_outcome(result: Result<()>) -> Result<InteractionOutcome> {
     match result {
         Ok(()) => Ok(InteractionOutcome::Done),

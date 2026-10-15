@@ -1,15 +1,8 @@
-//! Cast opcodes through their dispatcher. Route selection, target decoding and durable dispatch
-//! are covered per route by the focused seam tests in `handlers/cast`; these tests pin what the
-//! session sees: the ordered batch, the ranged auto-repeat state it carries between casts, and
-//! the effect of each cancellation.
-
 use super::family::{ProtocolFamily, ProtocolSession};
 use super::handlers::InMemoryCasts;
 use super::*;
 use std::sync::Mutex;
 
-/// `SMSG_CAST_RESULT`, a raw frame. The synchronous ORDER across raw and typed packets is the
-/// contract under test.
 const OP_CAST_RESULT: u16 = 0x0130;
 
 fn run(
@@ -26,7 +19,6 @@ fn repeating(session: &ProtocolSession) -> bool {
     matches!(&session.state, WorldState::InWorld(world) if world.ranged_repeat)
 }
 
-/// `SpellCastTargets` carrying a UNIT target (the client's selected mob).
 fn unit_targets(guid: u64) -> SpellCastTargets {
     SpellCastTargets {
         target_flags: SpellCastTargets_SpellCastTargetFlags::new_unit(
@@ -39,10 +31,6 @@ fn unit_targets(guid: u64) -> SpellCastTargets {
 
 #[test]
 fn instant_cast_sends_start_then_raw_cast_result_ok_then_go_and_threads_the_target() {
-    // Root-cause client-wedge fix: an INSTANT cast must emit START(0) -> raw CAST_RESULT(OK,
-    // opcode 0x0130, 5-byte body) -> GO, IN THAT ORDER. That order is a real invariant: the 5875
-    // client needs the OK ack between START and GO to clear its cast slot. The unit target must
-    // reach the cast, which shows in the GO's hit list.
     let store = InMemoryCasts::instant();
     let sent = run(
         &store,
@@ -54,7 +42,7 @@ fn instant_cast_sends_start_then_raw_cast_result_ok_then_go_and_threads_the_targ
     );
 
     let mut want = 100u32.to_le_bytes().to_vec();
-    want.push(0x00); // SPELL_RESULT_STATUS_OKAY: 5 bytes, NO trailing reason byte
+    want.push(0x00); // SPELL_RESULT_STATUS_OKAY has no trailing reason byte.
     match sent.as_slice() {
         [Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(_)), Outbound::Raw {
             opcode: OP_CAST_RESULT,
@@ -76,11 +64,6 @@ fn instant_cast_sends_start_then_raw_cast_result_ok_then_go_and_threads_the_targ
 
 #[test]
 fn auto_shot_intercept_starts_the_ranged_attack_instead_of_casting() {
-    // Vanilla shape: Auto Shot (75) and wand Shoot (5019) are auto-repeat ranged attacks. The
-    // activation arms the loop with the cast's unit target, then the ack is SMSG_SPELL_START ALONE
-    // with timer 0 (no CAST_RESULT, no GO: the cast parks in the client's AUTOREPEAT slot and
-    // never resolves; each shot's GO comes from the swing-tick relay). The ordinary cast route
-    // would send all three packets, so a lone START also shows `cast_spell` did not run.
     for spell in [75u32, 5019] {
         let store = InMemoryCasts {
             ranged_auto_repeat: vec![75, 5019],
@@ -132,9 +115,6 @@ fn auto_shot_intercept_starts_the_ranged_attack_instead_of_casting() {
 
 #[test]
 fn a_cast_before_entering_the_world_makes_no_request_and_does_not_fail() {
-    // A cast can arrive while the session is still at character select: a stale addon macro, a
-    // reconnect race. The seam has no Actor to cast as, so it makes no durable request and
-    // answers a failed cast. The dispatcher returns Ok, so the session serves the next opcode.
     let store = InMemoryCasts::instant();
     let sent = run(
         &store,
@@ -156,8 +136,6 @@ fn a_cast_before_entering_the_world_makes_no_request_and_does_not_fail() {
 
 #[test]
 fn cancelling_auto_repeat_still_tears_the_ranged_loop_down_through_stop_attack() {
-    // The cancel tears the loop down only when one is armed (the `was_repeat` gate). Arm Auto
-    // Shot, then cancel, and check that the durable engagement for this attacker is gone.
     let store = InMemoryCasts {
         ranged_auto_repeat: vec![75],
         ..InMemoryCasts::instant()
@@ -173,7 +151,6 @@ fn cancelling_auto_repeat_still_tears_the_ranged_loop_down_through_stop_attack()
     );
     assert_eq!(store.engaged.lock().unwrap().as_slice(), &[1]);
 
-    // The cancel sends no ack of its own (the on_delete relay does).
     let sent = run(&store, &mut caster, CMSG_CANCEL_AUTO_REPEAT_SPELL {});
     assert!(sent.is_empty());
     assert!(!repeating(&caster));

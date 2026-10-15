@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`DuelActionStore`] adapter.
-
 use anyhow::Result;
 
 use crate::stdb::bindings::*;

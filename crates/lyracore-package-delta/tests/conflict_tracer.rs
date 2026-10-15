@@ -1,5 +1,3 @@
-//! Tracing several Packages together: what merges, what conflicts, and what the report says.
-
 mod common;
 
 use common::{
@@ -132,8 +130,6 @@ fn one_package_inserting_and_another_updating_the_same_row_is_not_a_key_collisio
 
     let traced = trace(&[owner, tuner]);
 
-    // `gcd_ms` is one of the columns the complete insert carries, so the two Packages do collide on
-    // that column. What they must NOT collide on is the primary key.
     assert!(
         !traced
             .conflicts()
@@ -165,7 +161,6 @@ fn a_spell_header_and_its_child_effect_are_different_rows() {
 
     assert!(traced.is_clear(), "{:?}", traced.conflicts());
     assert_eq!(traced.rows().len(), 2);
-    // 133 for the header, 133 * 4 + 0 for the effect.
     assert_eq!(traced.rows()[0].row_id(), 133);
     assert_eq!(traced.rows()[1].row_id(), 532);
 }
@@ -246,7 +241,6 @@ fn the_conflict_report_reads_the_same_way_for_the_same_input() {
     };
 
     assert_eq!(render(&build()), render(&build()));
-    // Sorted by row, then by column: spell 133 before spell 200, cooldown before gcd.
     let report = render(&build());
     let lines: Vec<&str> = report.lines().collect();
     assert_eq!(lines.len(), 4);
@@ -290,8 +284,6 @@ fn tracing_nothing_is_clear() {
     assert!(traced.rows().is_empty());
 }
 
-/// The item family traces the same way the spell family does: two Packages tuning different
-/// columns of one item merge, cleanly.
 #[test]
 fn two_packages_claiming_different_columns_of_one_item_merge() {
     let first = delta(
@@ -310,8 +302,6 @@ fn two_packages_claiming_different_columns_of_one_item_merge() {
     assert_eq!(traced.rows()[0].table(), Table::Item);
 }
 
-/// Two Packages inventing the same item entry conflict the same way two Packages inventing the
-/// same spell do.
 #[test]
 fn two_packages_inserting_the_same_item_entry_conflict() {
     let first = delta(

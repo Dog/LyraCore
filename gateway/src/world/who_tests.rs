@@ -1,17 +1,7 @@
-//! `/who`'s Store-Fake tests: the multi-shard listing and the 49-cap/oversized-request rules that
-//! need real Realm Presence rows. `who.rs`'s own `#[cfg(test)]` module covers every filter rule
-//! against hand-written candidates; this file covers what only a Store can exercise.
-//!
-//! What EXECUTES here is production `world::who`, against the same in-memory multi-database
-//! topology `party_tests::party_topology` builds, and a plain single-shard `WorldFake` for the
-//! unsharded case.
-
 use super::party_tests::{character, party_topology};
 use super::*;
 use wow_world_messages::vanilla::{Level, CMSG_WHO};
 
-/// Every filter wide open — level 0 through "no upper bound", every race and class bit set, no
-/// zone or name restriction. What a client sends with nothing filtered in the `/who` panel.
 fn wide_open_who() -> CMSG_WHO {
     CMSG_WHO {
         minimum_level: Level::new(0),
@@ -25,9 +15,6 @@ fn wide_open_who() -> CMSG_WHO {
     }
 }
 
-/// Decode a RAW `SMSG_WHO` body ([`codec::build_who_response_raw`]'s layout) into
-/// `(listed_players, online_players, names)`, in wire order — enough for these tests without
-/// duplicating a full reader.
 fn decode_who(body: &[u8]) -> (u32, u32, Vec<String>) {
     let listed_players = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let online_players = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -39,13 +26,11 @@ fn decode_who(body: &[u8]) -> (u32, u32, Vec<String>) {
         rest = &rest[name_end + 1..];
         let guild_end = rest.iter().position(|&b| b == 0).unwrap();
         rest = &rest[guild_end + 1..];
-        rest = &rest[16..]; // level, class, race, zone: u32 each
+        rest = &rest[16..];
     }
     (listed_players, online_players, names)
 }
 
-/// **AC 1: a requester on a World Shard sees a Character standing in an instance on the Instance
-/// Pool, and the reverse.**
 #[test]
 fn who_lists_a_character_on_the_instance_pool_from_the_world_shard_and_back() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -78,7 +63,6 @@ fn who_lists_a_character_on_the_instance_pool_from_the_world_shard_and_back() {
     );
 }
 
-/// **AC 4: fifty matches list 49 and report 50.**
 #[test]
 fn fifty_matches_list_forty_nine_and_report_fifty() {
     let characters: Vec<_> = (0..50u64)
@@ -103,8 +87,6 @@ fn fifty_matches_list_forty_nine_and_report_fifty() {
     assert_eq!(online_players, 50, "the match count is uncapped");
 }
 
-/// **AC 8: an unsharded Gateway answers `/who` from its one database with the same filters** — no
-/// `world_stores()` fan-out, but the level-range rule still applies exactly as it would sharded.
 #[test]
 fn an_unsharded_gateway_answers_who_with_the_same_filters() {
     let store = std::sync::Arc::new(WorldFake {
@@ -147,9 +129,6 @@ fn an_unsharded_gateway_answers_who_with_the_same_filters() {
     assert_eq!(names, ["High"]);
 }
 
-/// A search string matches a zone name read from the Store — proves the wiring from
-/// `store.zone_name` through to the filter, not just the pure rule `who.rs`'s own tests pin. A
-/// zone the Fake was never told about stays blank and fails the match.
 #[test]
 fn a_search_string_matches_a_zone_name_the_store_resolves() {
     let store = std::sync::Arc::new(WorldFake {
@@ -184,8 +163,6 @@ fn a_search_string_matches_a_zone_name_the_store_resolves() {
         "the seeded zone name must resolve and match: {names:?}"
     );
 
-    // The same request against a Store that never learned the zone's name: the blank lookup must
-    // fail the match rather than matching everything by accident.
     let blank = std::sync::Arc::new(WorldFake {
         characters: vec![codec::CharacterView {
             guid: 1,
@@ -227,9 +204,6 @@ fn who_reply_lists_every_online_player_with_guild_level_and_zone() {
         ..Default::default()
     }];
     s.characters = vec![
-        // The requester. Human like Alpha/Bravo (so the team gate passes them), but a class
-        // outside the request's `class_mask` — the requester is not exempt from its own filters,
-        // so this keeps the assertions below at exactly the two matches.
         codec::CharacterView {
             guid: 1,
             name: "Tester".into(),
@@ -265,15 +239,13 @@ fn who_reply_lists_every_online_player_with_guild_level_and_zone() {
         maximum_level: Level::new(60),
         player_name: String::new(),
         guild_name: String::new(),
-        race_mask: 1 << 1,  // Human
-        class_mask: 1 << 1, // Warrior
+        race_mask: 1 << 1,
+        class_mask: 1 << 1,
         zones: Vec::new(),
         search_strings: Vec::new(),
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // RAW-encoded (codec::build_who_response_raw): gtker's typed reader assumes the wrong 5875
-    // layout (see that builder's doc comment), so this reads the cmangos body by hand.
     let (opcode, body) = read_raw_frame(&mut client, &mut c_dec);
     assert_eq!(opcode, codec::social::SMSG_WHO_OPCODE);
     let online_players = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -287,7 +259,7 @@ fn who_reply_lists_every_online_player_with_guild_level_and_zone() {
         assert_eq!(std::str::from_utf8(&rest[..guild_end]).unwrap(), guild);
         rest = &rest[guild_end + 1..];
         assert_eq!(u32::from_le_bytes(rest[0..4].try_into().unwrap()), level);
-        rest = &rest[16..]; // level, class, race, zone: u32 each
+        rest = &rest[16..];
     }
     assert!(rest.is_empty(), "exactly two listed rows");
     drop(client);

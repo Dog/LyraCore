@@ -1,22 +1,3 @@
-//! The canonical form of a Package Delta.
-//!
-//! Two artifacts that say the same thing must produce the same bytes, so that a source hash, a diff
-//! and a signature all mean what they look like they mean. The writer is hand-built rather than
-//! derived, because the byte stability is this crate's promise and must not move under a library's
-//! formatting default.
-//!
-//! The rules, all of them:
-//!
-//!  * No whitespace anywhere, and no trailing newline.
-//!  * Object members appear in a fixed declared order; `fields` members appear sorted by name.
-//!  * Claims appear sorted by table, then spell, then effect index.
-//!  * Integers are plain decimal. An integer column written as `100.0` or `1e2` is refused at the
-//!    parse rather than rounded here, so there is only ever one spelling to write.
-//!  * An unsigned 64-bit value is a decimal string with no sign, no padding and no separators.
-//!  * A float is the shortest decimal that reads back as the same `f32`, always with a decimal
-//!    point, so `1`, `1.0` and `1.00` all become `1.0`.
-//!  * A string escapes only what JSON requires, using the short escape where one exists.
-
 use core::fmt;
 
 use crate::delta::{Claim, PackageDelta, PrimaryKey, DELTA_VERSION};
@@ -60,9 +41,6 @@ fn write_claim(out: &mut String, claim: &Claim) {
     out.push_str("}}");
 }
 
-// One arm per key shape, and no wildcard: the canonical member order IS this crate's promise, so a
-// key that arrives without stating its order must fail the build rather than fall into a fallback.
-// That is what makes this function long; splitting it would trade the guarantee for the line count.
 #[allow(clippy::too_many_lines)]
 fn write_key(out: &mut String, key: PrimaryKey) {
     match key {
@@ -186,9 +164,6 @@ fn write_key(out: &mut String, key: PrimaryKey) {
     }
 }
 
-/// A key object, its members in the order the key declares them. That order is part of the
-/// canonical form: two artifacts that name the same row have to hash the same, so it is fixed here
-/// rather than left to whatever a generator emitted.
 fn write_members(out: &mut String, members: &[(&str, u64)]) {
     out.push('{');
     for (index, (name, value)) in members.iter().enumerate() {
@@ -210,8 +185,6 @@ fn write_value(out: &mut String, value: &FieldValue) {
     out.push('}');
 }
 
-/// One claimed value in its canonical JSON spelling, without the surrounding type tag. Shared with
-/// `FieldValue`'s `Display`, so a conflict report quotes a value exactly as the artifact writes it.
 pub(crate) fn scalar_literal(value: &FieldValue) -> String {
     let mut out = String::new();
     match value {
@@ -231,9 +204,6 @@ pub(crate) fn scalar_literal(value: &FieldValue) -> String {
     out
 }
 
-/// `f32` `Display` already gives the shortest decimal that reads back as the same value and never
-/// uses exponent form. The only thing missing is a decimal point on a whole number, which keeps a
-/// float column visually and textually distinct from an integer one.
 fn write_f32(out: &mut String, value: f32) {
     let text = value.to_string();
     out.push_str(&text);

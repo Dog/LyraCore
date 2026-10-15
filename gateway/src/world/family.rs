@@ -1,5 +1,3 @@
-//! Protocol Family handlers share session state and return replies to the World Session.
-
 use super::*;
 
 pub(crate) trait ProtocolFamily<St: ?Sized> {
@@ -48,7 +46,6 @@ impl From<Vec<Outbound>> for ProtocolReply {
 }
 
 impl ProtocolReply {
-    /// Queue all replies before running the next World Session operation on the reader thread.
     pub(super) fn complete(
         self,
         tx: &SessionTx,
@@ -72,7 +69,6 @@ pub(crate) enum WorldSessionAction {
     RedriveMail(Actor),
 }
 
-/// Protocol state shared by handlers. Crypto, routing and Account Claims stay on WorldConn.
 pub struct ProtocolSession {
     pub(crate) account_id: u64,
     pub(crate) account_name: String,
@@ -105,9 +101,6 @@ impl ProtocolSession {
         }
     }
 
-    /// Admit one `CMSG_WHO`, or refuse it because the last one this session sent was inside
-    /// [`WHO_THROTTLE`]. Advances the cooldown on every admitted request, including a malformed
-    /// one that answers nothing — the request itself is what cost the scan.
     pub(super) fn admit_who(&mut self) -> bool {
         let now = Instant::now();
         if self.who_throttled_until.is_some_and(|until| now < until) {
@@ -117,7 +110,6 @@ impl ProtocolSession {
         true
     }
 
-    /// [`party::GroupBroadcastCooldowns::admit_at`] now.
     pub(super) fn admit_group_broadcast(&mut self, op: party::Op) -> bool {
         self.group_broadcast_cooldowns.admit_at(op, Instant::now())
     }

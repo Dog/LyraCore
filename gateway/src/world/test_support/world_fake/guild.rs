@@ -2,15 +2,10 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct GuildState {
-    /// Realm-core Guilds the guild query answers from.
     pub(crate) guilds: Vec<codec::GuildView>,
-    /// Realm-core member rows. Guild ops are recorded in `calls` as `guild_op:<request>`.
     pub(crate) guild_memberships: Vec<codec::GuildMemberView>,
-    /// A Fee Hold left on this Home Shard. Fee steps are recorded in `calls` as `guild_fee_<step>`.
     pub(crate) guild_fee_hold: std::sync::Mutex<Option<crate::world::guild_fee::FeeHold>>,
-    /// Realm-core Petitions.
     pub(crate) guild_petitions: Vec<codec::PetitionView>,
-    /// A Character whose guild lookup fails, as when one Realm-core read errors.
     pub(crate) guild_lookup_error_for: Option<u64>,
 }
 
@@ -187,7 +182,6 @@ impl GuildActionStore for WorldFake {
     }
 }
 
-/// Realm-core refuses every fee: the socket tests only watch a leftover hold finish.
 impl crate::world::guild_fee::GuildFeeStore for WorldFake {
     fn guild_fee_held(&self, _actor: Actor) -> Result<Option<crate::world::guild_fee::FeeHold>> {
         Ok(self.guild.guild_fee_hold.lock().unwrap().clone())

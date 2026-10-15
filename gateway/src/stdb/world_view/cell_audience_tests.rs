@@ -1,5 +1,3 @@
-//! The cell-anchored relays against the whole-shard-then-gate path they replaced.
-
 use super::*;
 use crate::codec::breath::subscriptions::breath_relay_appeared;
 use crate::codec::combat::subscriptions::{
@@ -29,11 +27,9 @@ const PLAYER_BASE: u64 = 0x1000;
 const CREATURE_BASE: u64 = 0xF130_0000_0000_2000;
 const YELL: u8 = 1;
 const EMOTE: u8 = lyracore_shared::chat::broadcast_chat::EMOTE;
-const HUMAN_RACE: u8 = 1; // Alliance
-const ORC_RACE: u8 = 2; // Horde
+const HUMAN_RACE: u8 = 1;
+const ORC_RACE: u8 = 2;
 
-/// A randomised realm: players and creatures at random positions inside a `span_yd` square, one
-/// partition, every viewer's `created` set holding exactly what its box shows it plus itself.
 struct Realm {
     view: Arc<WorldView>,
     viewers: Vec<Arc<Viewer>>,
@@ -128,7 +124,6 @@ fn realm(rng: &mut Rng, players: usize, creatures: usize, span_yd: f32) -> Realm
 }
 
 impl Realm {
-    /// A random unit: a player two times in three, else a creature.
     fn actor(&self, rng: &mut Rng) -> u64 {
         if rng.below(3) < 2 {
             self.viewers[rng.below(self.viewers.len())].self_guid
@@ -146,7 +141,6 @@ impl Realm {
         self.viewers.iter().map(|v| v.session).collect()
     }
 
-    /// The whole-shard path: every viewer, filtered by `gate`.
     fn shard_then_gate(&self, gate: impl Fn(&Viewer) -> bool) -> HashSet<SessionId> {
         self.viewers
             .iter()
@@ -155,7 +149,6 @@ impl Realm {
             .collect()
     }
 
-    /// The sessions whose writer queue holds at least one job, drained.
     fn jobs_landed(&self) -> HashSet<SessionId> {
         let mut landed = HashSet::new();
         for (v, rx) in self.viewers.iter().zip(&self.queues) {
@@ -334,18 +327,10 @@ fn aura(id: u64, target: u64, eff_kind: u8) -> Aura {
     }
 }
 
-/// 24 players and 40 creatures over a 600 yd square: twelve cells a side, so a box covers well
-/// under half of it and the whole-shard path and the cell path differ on most events.
 fn spread_realm(rng: &mut Rng) -> Realm {
     realm(rng, 24, 40, 600.0)
 }
 
-// ===============================================================================================
-//  Gated relays: the candidates filtered by the job's gate equal the shard filtered by the gate.
-// ===============================================================================================
-
-/// A swing reaches exactly the viewers whose `created` set holds the attacker, and the pump
-/// enqueues for the attacker's box and the two owners only.
 #[test]
 fn combat_candidates_gate_to_exactly_the_whole_shard_recipients() {
     let mut rng = Rng::new(0xC0A7_0001);
@@ -380,8 +365,6 @@ fn combat_candidates_gate_to_exactly_the_whole_shard_recipients() {
     );
 }
 
-/// An engagement row has no cell of its own; the attacker's indexed cell stands in, and the
-/// `created` gate still admits exactly the whole-shard recipients.
 #[test]
 fn melee_candidates_gate_to_exactly_the_whole_shard_recipients() {
     let mut rng = Rng::new(0x3E1E_E002);
@@ -413,8 +396,6 @@ fn melee_candidates_gate_to_exactly_the_whole_shard_recipients() {
     );
 }
 
-/// An aura job passes its gate for the target itself, for a viewer showing the target, or (the
-/// stealth reveal) for a viewer whose box covers the target. The target's cell admits all three.
 #[test]
 fn aura_candidates_gate_to_exactly_the_whole_shard_recipients() {
     let mut rng = Rng::new(0xA07A_0003);
@@ -446,8 +427,6 @@ fn aura_candidates_gate_to_exactly_the_whole_shard_recipients() {
     assert!(skipped_someone);
 }
 
-/// A unit that is already gone from the index (its row deleted in the same transaction) can be
-/// on nobody's screen, so only the owner leg remains.
 #[test]
 fn an_aura_on_an_unindexed_unit_reaches_its_owner_only() {
     let mut rng = Rng::new(0xA07A_0004);
@@ -469,12 +448,6 @@ fn an_aura_on_an_unindexed_unit_reaches_its_owner_only() {
     assert!(aura_audience(&realm.view, 0, &aura(2, creature, 0xA0)).is_empty());
 }
 
-// ===============================================================================================
-//  Ungated relays: the audience is the actor's box plus the two named owners.
-// ===============================================================================================
-
-/// The viewers showing the actor (their `created` sets were seeded from the index's forward
-/// direction) plus the actor's and target's own sessions, whether or not they can see the cell.
 fn box_plus_owners(realm: &Realm, actor: u64, target: u64) -> HashSet<SessionId> {
     let mut want: HashSet<SessionId> = realm
         .viewers
@@ -527,11 +500,6 @@ fn cast_impact_and_emote_reach_the_actors_box_and_both_owners() {
     assert!(skipped_someone);
 }
 
-// ===============================================================================================
-//  Chat: the widened span never loses a listener the yard-range gate would admit.
-// ===============================================================================================
-
-/// The job's gate, over the positions the fixture placed the units at.
 fn hears(realm: &Realm, speaker: u64, listener: &Viewer, chat_type: u8) -> bool {
     if listener.self_guid == speaker {
         return true;
@@ -547,7 +515,6 @@ fn say_and_yell_candidates_gate_to_exactly_the_whole_shard_listeners() {
     let mut rng = Rng::new(0x5A11_0006);
     let mut yell_skipped_someone = false;
     for trial in 0..300 {
-        // 1200 yd a side: a yell (300 yd) reaches a corner of it, never all of it.
         let realm = realm(&mut rng, 30, 20, 1200.0);
         let speaker = realm.actor(&mut rng);
         let chat_type = if trial % 2 == 0 { YELL } else { 0 };
@@ -578,8 +545,6 @@ fn say_and_yell_candidates_gate_to_exactly_the_whole_shard_listeners() {
     assert!(yell_skipped_someone);
 }
 
-/// A speaker with no indexed row cannot be placed, so nobody but the speaker hears it, which is
-/// what the job's gate decides for the others too (no speaker row, no packet).
 #[test]
 fn chat_from_an_unindexed_speaker_reaches_the_speaker_only() {
     let mut rng = Rng::new(0x5A11_0007);
@@ -595,12 +560,6 @@ fn chat_from_an_unindexed_speaker_reaches_the_speaker_only() {
     );
 }
 
-// ===============================================================================================
-//  EMOTE (`/e`) and text emote (`/wave`): T8's 25 yd range, EMOTE's same-team-only gate.
-// ===============================================================================================
-
-/// Register one viewer at `(x, y)` and return its session id — the candidate side of the same
-/// composed gate `chat_event_outbound`/`emote_event_outbound` run against a live coordinator cache.
 fn place(view: &WorldView, guid: u64, x: f32, y: f32) -> SessionId {
     let key = CellKey::of_position(0, 0, x, y);
     view.spatial
@@ -611,17 +570,13 @@ fn place(view: &WorldView, guid: u64, x: f32, y: f32) -> SessionId {
     v.session
 }
 
-/// Criterion 2 (T8): a same-team `/e` listener 20 yd away hears it, one 30 yd away does not, and
-/// neither does an opposite-team listener at 5 yd — [`chat_audience`]'s candidate set combined with
-/// the exact `chat_in_range` + [`lyracore_shared::faction::same_team`] gate `chat_event_outbound`
-/// applies.
 #[test]
 fn emote_reaches_a_same_team_20_yd_listener_not_30_yd_nor_a_5_yd_enemy() {
     let view = WorldView::new(true);
-    place(&view, PLAYER_BASE, 0.0, 0.0); // the speaker, Human
-    let near = place(&view, PLAYER_BASE + 1, 20.0, 0.0); // same team, 20 yd
-    let far = place(&view, PLAYER_BASE + 2, 30.0, 0.0); // same team, 30 yd
-    let enemy = place(&view, PLAYER_BASE + 3, 0.0, 5.0); // opposite team, 5 yd
+    place(&view, PLAYER_BASE, 0.0, 0.0);
+    let near = place(&view, PLAYER_BASE + 1, 20.0, 0.0);
+    let far = place(&view, PLAYER_BASE + 2, 30.0, 0.0);
+    let enemy = place(&view, PLAYER_BASE + 3, 0.0, 5.0);
 
     let candidates = sessions(chat_audience(&view, 0, &chat(PLAYER_BASE, EMOTE)));
     let range = chat_range_yd(EMOTE);
@@ -645,13 +600,10 @@ fn emote_reaches_a_same_team_20_yd_listener_not_30_yd_nor_a_5_yd_enemy() {
     );
 }
 
-/// Criterion 5 (T8): `/wave` reaches a listener at 20 yd of either team; one at 30 yd gets neither
-/// packet — [`emote_audience`]'s widened span combined with the same `chat_in_range` gate
-/// `emote_event_outbound` applies, with no team check.
 #[test]
 fn text_emote_reaches_20_yd_of_either_team_not_30_yd() {
     let view = WorldView::new(true);
-    place(&view, PLAYER_BASE, 0.0, 0.0); // the speaker
+    place(&view, PLAYER_BASE, 0.0, 0.0);
     let near_same_team = place(&view, PLAYER_BASE + 1, 20.0, 0.0);
     let near_other_team = place(&view, PLAYER_BASE + 2, 0.0, 20.0);
     let far = place(&view, PLAYER_BASE + 3, 30.0, 0.0);
@@ -689,23 +641,18 @@ fn text_emote_reaches_20_yd_of_either_team_not_30_yd() {
     );
 }
 
-// ===============================================================================================
-//  The aura index
-// ===============================================================================================
-
 #[test]
 fn aura_index_insert_update_delete_by_shard_and_id() {
     let index = AuraIndex::default();
     index.upsert(0, &aura(1, 77, A_STEALTH));
     index.upsert(0, &aura(2, 77, 0xA0));
-    index.upsert(1, &aura(1, 78, 0xA0)); // shard 1 reuses id 1 for another unit
+    index.upsert(1, &aura(1, 78, 0xA0));
     assert_eq!(index.stealth_count(0, 77), 1);
     assert!(index.is_stealthed(0, 77));
     assert!(!index.is_stealthed(1, 78));
     assert_eq!(index.on_target(0, 77).len(), 2);
     assert_eq!(index.stats(), (3, 2));
 
-    // An update lands on the same (shard, id) and replaces the row.
     let mut refreshed = aura(2, 77, 0xA0);
     refreshed.amount = 25;
     index.upsert(0, &refreshed);
@@ -719,13 +666,12 @@ fn aura_index_insert_update_delete_by_shard_and_id() {
         Some(25)
     );
 
-    // A delete on shard 1 of id 1 must not touch shard 0's id 1.
     index.remove(1, &aura(1, 78, 0xA0));
     assert!(index.on_target(1, 78).is_empty());
     assert_eq!(index.stealth_count(0, 77), 1);
     index.remove(0, &aura(1, 77, A_STEALTH));
     assert_eq!(index.stealth_count(0, 77), 0);
-    index.remove(0, &aura(1, 77, A_STEALTH)); // idempotent
+    index.remove(0, &aura(1, 77, A_STEALTH));
     assert_eq!(index.on_target(0, 77).len(), 1);
     index.remove(0, &aura(2, 77, 0xA0));
     assert_eq!(index.stats(), (0, 0));
@@ -901,7 +847,6 @@ fn old_shard_combat_cannot_address_a_transferred_character() {
     assert!(realm.queues[0].try_recv().is_err());
     assert!(aura_audience(&realm.view, 0, &aura(1, transferred.self_guid, 0xA0)).is_empty());
 
-    // A current-shard owner still receives its private stop with no indexed anchor.
     realm
         .view
         .spatial
@@ -939,7 +884,6 @@ fn jobs_selected_before_worldport_cannot_reach_the_replacement_world_session() {
     melee_engaged(&view, 0, &row);
     drop(old_registration);
 
-    // WORLDPORT writes destination entry on the same socket before registering its fresh Viewer.
     tx.send(Outbound::Raw {
         opcode: 0xCAFE,
         body: vec![],
@@ -1279,8 +1223,6 @@ fn distant_characters_do_not_add_jobs_to_a_local_combat_event() {
     assert!(distant.iter().all(|rx| rx.try_recv().is_err()));
 }
 
-/// The aura audience follows the viewer's anchor: walking into the target's box adds the viewer,
-/// walking out removes it, with nothing re-registered.
 #[test]
 fn aura_audience_follows_a_viewer_recenter() {
     let view = WorldView::new(true);
@@ -1304,7 +1246,6 @@ fn aura_audience_follows_a_viewer_recenter() {
     view.spatial
         .move_viewer_delta(watcher.session, CellKey::at(0, 0, 20, 20));
     assert!(aura_audience(&view, 0, &row).is_empty());
-    // The target moves under a resident viewer.
     view.spatial.upsert_entity(
         EntityLayer::WorldEntity,
         stealther,
@@ -1376,7 +1317,6 @@ fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
     for seq in 2..=172 {
         latest = queue_motion(&batch, seq);
     }
-    // The Module may coalesce several queued movements into one row. The writer has not run.
     motion(&view, 0, &latest, &batch.delivery);
 
     assert!(matches!(rx.try_recv().unwrap(), Outbound::Job(_)));

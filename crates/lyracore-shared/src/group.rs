@@ -1,22 +1,11 @@
-//! The module↔gateway GROUP wire contract — event-kind codes, the roster-payload grammar, and the
-//! typed [`GroupRefusal`] the gateway turns into `PARTY_COMMAND_RESULT`. Cross-boundary constants
-//! live HERE, both crates import: a module-side renumber, delimiter change, or new refusal becomes
-//! a compile error on the gateway side instead of a runtime mismatch. Same precedent as
-//! `type_mask`/`npc_flags`.
-
-/// Vanilla party size (cm:Group.h:40). Realm authority and Gateway projections share this bound.
 pub const GROUP_MAX_MEMBERS: usize = 5;
 
-/// Vanilla raid size (cm:Group.h:41).
 pub const RAID_MAX_MEMBERS: usize = 40;
 
-/// A Raid has 8 Subgroups, numbered 0 to 7 (cm:Group.h:42).
 pub const RAID_SUBGROUPS: u8 = 8;
 
-/// Members in one Subgroup (cm:Group.h:42).
 pub const SUBGROUP_SIZE: usize = 5;
 
-/// A Group is a Party until its leader converts it to a Raid. It never converts back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GroupKind {
     #[default]
@@ -25,7 +14,6 @@ pub enum GroupKind {
 }
 
 impl GroupKind {
-    /// The `SMSG_GROUP_LIST` group-type byte (cm:Group.h:60-64), stored as `game_group.group_type`.
     pub const fn wire(self) -> u8 {
         match self {
             Self::Party => 0,
@@ -33,7 +21,6 @@ impl GroupKind {
         }
     }
 
-    /// `None` for a byte no vanilla group type uses.
     pub const fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Party),
@@ -42,8 +29,6 @@ impl GroupKind {
         }
     }
 
-    /// A stored `group_type`. Only [`Self::wire`] writes the column, so the Party fallback is
-    /// unreachable. It is the safe reading because it keeps the smaller member cap.
     pub fn from_wire_or_default(byte: u8) -> Self {
         Self::from_wire(byte).unwrap_or_default()
     }
@@ -56,16 +41,13 @@ impl GroupKind {
     }
 }
 
-/// A member's Subgroup and Assistant flag, kept as the `SMSG_GROUP_LIST` member-flags byte
-/// `subgroup | 0x80 if assistant` (cm:Group.cpp:685, 695). Stored as `game_group_member.raid_slot`.
-/// A Party member holds the default slot: Subgroup 0, no Assistant.
+// SMSG_GROUP_LIST member flags encode subgroup | 0x80 for an Assistant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RaidSlot(u8);
 
 impl RaidSlot {
     const ASSISTANT: u8 = 0x80;
 
-    /// `None` for a Subgroup outside 0 to 7.
     pub const fn new(subgroup: u8, assistant: bool) -> Option<Self> {
         if subgroup >= RAID_SUBGROUPS {
             return None;
@@ -77,9 +59,6 @@ impl RaidSlot {
         }))
     }
 
-    /// The slot a member joining a Raid takes: the first Subgroup with fewer than
-    /// [`SUBGROUP_SIZE`] members, without the Assistant flag (cm:Group.cpp:817-838). `current` is
-    /// every current member's slot. `None` when every Subgroup is full.
     pub fn for_raid_joiner(current: impl IntoIterator<Item = Self>) -> Option<Self> {
         let mut sizes = [0usize; RAID_SUBGROUPS as usize];
         for slot in current {
@@ -90,13 +69,10 @@ impl RaidSlot {
             .and_then(|subgroup| Self::new(subgroup, false))
     }
 
-    /// `None` for a byte with a bit set outside the Subgroup and the Assistant flag.
     pub const fn from_wire(byte: u8) -> Option<Self> {
         Self::new(byte & !Self::ASSISTANT, byte & Self::ASSISTANT != 0)
     }
 
-    /// A stored `raid_slot`. Only [`Self::wire`] writes the column, so the fallback to Subgroup 0
-    /// without the Assistant flag is unreachable.
     pub fn from_wire_or_default(byte: u8) -> Self {
         Self::from_wire(byte).unwrap_or_default()
     }
@@ -113,7 +89,6 @@ impl RaidSlot {
         self.0
     }
 
-    /// The same Subgroup with the Assistant flag set or cleared.
     pub const fn with_assistant(self, assistant: bool) -> Self {
         Self(if assistant {
             self.0 | Self::ASSISTANT
@@ -122,16 +97,7 @@ impl RaidSlot {
         })
     }
 
-    /// The result of moving this Raid Slot's member to `destination` Subgroup
-    /// (cm:GroupHandler.cpp:492-525, cm:Group.cpp:1203-1251), shared by the Module and the Gateway
-    /// Fake so cmangos's capacity-and-destination rule lives in exactly one place. `destination_size`
-    /// counts the OTHER members already in `destination`, not the mover, since moving into the
-    /// Subgroup you already hold can never be blocked by your own presence there.
-    ///
-    /// `Err(InvalidSubgroup)` for a Subgroup of 8 or more. `Ok(None)` is the same-Subgroup no-op
-    /// (cm:Group.cpp:1234), which succeeds regardless of `destination_size`. `Err(SubgroupFull)` when
-    /// `destination_size` already holds [`SUBGROUP_SIZE`] members. Otherwise `Ok(Some(slot))` is the
-    /// mover's new Raid Slot, its Assistant bit kept.
+    // destination_size excludes the mover, so its current Subgroup cannot refuse itself.
     pub fn moved_to_subgroup(
         self,
         destination: u8,
@@ -151,11 +117,7 @@ impl RaidSlot {
         )))
     }
 
-    /// This Raid Slot and `other` after a Swap Subgroup between them (cm:GroupHandler.cpp:901-944).
-    /// `None` when both already sit in the same Subgroup. cmangos still answers that as success
-    /// (cm:GroupHandler.cpp:939), it just has nothing to swap. One atomic swap can never overfill a
-    /// Subgroup, so unlike [`moved_to_subgroup`](Self::moved_to_subgroup) this needs no capacity
-    /// argument.
+    // An atomic swap cannot overfill either Subgroup.
     pub fn swapped_with(self, other: Self) -> Option<(Self, Self)> {
         if self.subgroup() == other.subgroup() {
             return None;
@@ -169,213 +131,80 @@ impl RaidSlot {
     }
 }
 
-/// Group-event kinds (`game_group_event.kind`), what SMSG the gateway relays. Every producer shares
-/// this one byte space:
-///
-/// - 0-3: membership, below.
-/// - 4-8: loot rolls and money shares, `crate::loot_roll::event_kind`.
-/// - 9: retired. It was party chat, now a Realm Chat Line, and is never reused.
-/// - 10-11: quest sharing, `crate::quest::share_event_kind`.
-/// - 12-19: unassigned, left for the Realm-core chat seam.
-/// - 20: the leader announcement, below.
-/// - 21-26: Group Broadcasts, below.
-/// - 27-30: the Meeting Stone Queue, `crate::meeting_stone::event_kind`.
+// game_group_event kind 9 is retired and must not be reused.
 pub mod event_kind {
-    /// You are invited (`other_*` = the inviter) → `SMSG_GROUP_INVITE`.
     pub const INVITE: u8 = 0;
-    /// Your group's roster changed → the gateway sends `SMSG_GROUP_LIST` from the row's payload
-    /// (payload-carry: the roster is serialized in the SAME transaction as the membership change).
+    // The roster payload and membership change commit in the same transaction.
     pub const LIST: u8 = 1;
-    /// Your invite was declined (`other_*` = the decliner) → `SMSG_GROUP_DECLINE`.
     pub const DECLINE: u8 = 2;
-    /// You are no longer in a group (left / kicked / disbanded) → `SMSG_GROUP_DESTROYED`.
     pub const DESTROYED: u8 = 3;
-    // --- (group loot methods) / (money-loot split), the roll/master-
-    // loot/money-share relay REUSES this same per-recipient event table + relay (see
-    // `crate::loot_roll`'s module doc for why: identical shape — one recipient, a kind byte, a small
-    // payload — so a parallel new table would only add binding-checklist ceremony for zero
-    // behavioral gain). Kinds/payload grammar for these five live in `crate::loot_roll`, not here
-    // (loot is a distinct concern from group membership) — listed here too ONLY as the reserved
-    // kind-byte range so a future group-event kind can never collide with a loot-roll kind sharing
-    // the same table.
-    /// Reserved range start for `crate::loot_roll::event_kind` — kinds `4..=8` are loot-roll/money-
-    /// share kinds relayed through `game_group_event`, not group-membership kinds. The module doc
-    /// above lists every range on this table.
     pub const LOOT_ROLL_RESERVED_START: u8 = 4;
-    // Kind 9 was party chat, now a Realm Chat Line. It is retired and never reused.
-    /// The Group has a new leader (`other_guid`) → `SMSG_GROUP_SET_LEADER` with that leader's name.
-    /// Every member receives it before the LIST that names the new leader (cm:Group.cpp:464-470,
-    /// 498-501).
+    // Send SMSG_GROUP_SET_LEADER before the LIST naming the new leader.
     pub const SET_LEADER: u8 = 20;
-    /// A Ready Check started (`other_guid` = the starter) → the empty `MSG_RAID_READY_CHECK`.
     pub const READY_CHECK: u8 = 21;
-    /// A member answered the Ready Check (`other_guid` = the answerer, payload
-    /// [`super::encode_ready_check_answer`]) → `MSG_RAID_READY_CHECK` with the state, to the leader.
     pub const READY_CHECK_ANSWER: u8 = 22;
-    /// One Target Icon changed (payload [`super::TargetIcon::encode`]) → the partial
-    /// `MSG_RAID_TARGET_UPDATE`.
     pub const TARGET_ICON_UPDATE: u8 = 23;
-    /// Every Target Icon the Group holds (payload [`super::encode_target_icons`]) → the full
-    /// `MSG_RAID_TARGET_UPDATE`, to the member who asked.
     pub const TARGET_ICON_LIST: u8 = 24;
-    /// A member pinged the minimap (`other_guid` = the pinger, payload
-    /// [`super::encode_minimap_ping`]) → `MSG_MINIMAP_PING`.
     pub const MINIMAP_PING: u8 = 25;
-    /// A `/roll` result (`other_guid` = the roller, payload [`super::encode_random_roll`]) →
-    /// `MSG_RANDOM_ROLL`.
     pub const RANDOM_ROLL: u8 = 26;
 }
 
-/// The REALM-CORE party ops: the `op` byte of the single operator-gated `realm_group_op` reducer the
-/// gateway drives realm-wide membership with.
-///
-/// One reducer with an op byte, rather than one reducer per op, keeps one generated binding and one
-/// signature for every Gateway and durable-test caller. The ARGUMENT SHAPE is pinned here, in the
-/// one file both crates import, so a renumber or an argument-slot change is a compile-visible edit
-/// on both sides rather than a silent mis-dispatch.
-///
-/// Argument slots (`realm_group_op(op, actor_guid, target_guid, arg_a, arg_b, arg_c)`), per op:
-/// - [`INVITE`] / [`UNINVITE`]: `target_guid` is the invitee/kicked member; the rest unused.
-/// - [`ACCEPT`]: `arg_a` is the acceptor's class, 0 when the Gateway cannot read it. Realm-core
-///   holds no Character rows, so the Seeker row a queued party gains needs it. The rest unused.
-/// - [`DECLINE`]: `actor_guid` alone; every other slot unused.
-/// - [`LEAVE`]: `actor_guid` leaves; `arg_a` = a [`super::leave_cause`] value.
-/// - [`LOOT_METHOD`]: `arg_a` = loot setting, `target_guid` = the master looter, `arg_b` = the
-///   quality threshold. (That is `CMSG_LOOT_METHOD`'s own field order, kept so the gateway hands the
-///   three values straight through.)
-/// - [`RAID_CONVERT`]: `actor_guid` alone.
-/// - [`SET_LEADER`]: `target_guid` is the new leader.
-/// - [`SET_ASSISTANT`]: `target_guid` is the member, `arg_a` is 1 to promote and 0 to demote.
-/// - [`CHANGE_SUBGROUP`]: `target_guid` is the member to move, `arg_a` is the destination Subgroup.
-/// - [`SWAP_SUBGROUP`]: `target_guid` is one member, `arg_c` the other.
-/// - [`READY_CHECK_START`]: `actor_guid` alone.
-/// - [`READY_CHECK_ANSWER`]: `arg_a` = the client's answer state.
-/// - [`TARGET_ICON`]: `arg_a` = the Target Icon, or [`super::TARGET_ICON_LIST_REQUEST`];
-///   `target_guid` = the marked unit, 0 to clear the icon.
-/// - [`MINIMAP_PING`]: `target_guid` = `x.to_bits()`, `arg_c` = `y.to_bits()`, so the floats
-///   cross unchanged.
-/// - [`RANDOM_ROLL`]: `target_guid` = the minimum, `arg_c` = the maximum.
-///
-/// `arg_c` is a `u64` for an op that needs a second guid or a wide value: the subgroup swap's
-/// second member, the minimap ping's `y` and the roll's maximum. Every other op sends 0 there.
 pub mod realm_op {
-    /// `CMSG_GROUP_INVITE`: `actor_guid`, ungrouped, the leader or an Assistant, invites
-    /// `target_guid`.
     pub const INVITE: u8 = 0;
-    /// `CMSG_GROUP_ACCEPT`: `actor_guid` accepts its pending invite.
     pub const ACCEPT: u8 = 1;
-    /// `CMSG_GROUP_DECLINE`: `actor_guid` declines its pending invite.
     pub const DECLINE: u8 = 2;
-    /// `CMSG_GROUP_DISBAND` (the client's "Leave Party"): `actor_guid` leaves its group.
     pub const LEAVE: u8 = 3;
-    /// `CMSG_GROUP_UNINVITE` and `CMSG_GROUP_UNINVITE_GUID`: the leader or an Assistant,
-    /// `actor_guid`, kicks `target_guid`.
     pub const UNINVITE: u8 = 4;
-    /// `CMSG_LOOT_METHOD`: leader `actor_guid` sets the party's loot rules.
     pub const LOOT_METHOD: u8 = 5;
-    /// `CMSG_GROUP_RAID_CONVERT`: leader `actor_guid` converts its Party to a Raid.
     pub const RAID_CONVERT: u8 = 6;
-    /// `CMSG_GROUP_SET_LEADER`: leader `actor_guid` passes the lead to `target_guid`.
     pub const SET_LEADER: u8 = 7;
-    /// `CMSG_GROUP_ASSISTANT_LEADER`: Raid leader `actor_guid` promotes or demotes an Assistant.
     pub const SET_ASSISTANT: u8 = 8;
-    /// `CMSG_GROUP_CHANGE_SUB_GROUP`: the leader or an Assistant moves `target_guid` to Subgroup
-    /// `arg_a`.
     pub const CHANGE_SUBGROUP: u8 = 9;
-    /// `CMSG_GROUP_SWAP_SUB_GROUP`: the leader or an Assistant swaps the Subgroups of `target_guid`
-    /// and `arg_c`.
     pub const SWAP_SUBGROUP: u8 = 10;
-    /// `MSG_RAID_READY_CHECK` without a body: the leader or an Assistant starts a Ready Check.
     pub const READY_CHECK_START: u8 = 11;
-    /// `MSG_RAID_READY_CHECK` with a body: `actor_guid` answers the Ready Check.
     pub const READY_CHECK_ANSWER: u8 = 12;
-    /// `MSG_RAID_TARGET_UPDATE`: `actor_guid` sets a Target Icon or asks for the full list.
     pub const TARGET_ICON: u8 = 13;
-    /// `MSG_MINIMAP_PING`: `actor_guid` pings a point on the minimap.
     pub const MINIMAP_PING: u8 = 14;
-    /// `MSG_RANDOM_ROLL`: `actor_guid` rolls a random number.
     pub const RANDOM_ROLL: u8 = 15;
 }
 
-/// Why a [`realm_op::LEAVE`] runs, sent in `arg_a`.
 pub mod leave_cause {
-    /// The Character leaves, or the Gateway leaves for a session-less Character.
     pub const LEFT: u8 = 0;
-    /// The Character was deleted. The party authority also drops every Target Icon on it, because
-    /// the delete sweep on the Character's World Shard cannot reach Realm-core's icon rows.
     pub const CHARACTER_DELETED: u8 = 1;
 }
 
-/// The group op one `game_bot_invite_intent` row asks the Gateway to run.
-///
-/// A Package writes that row for a Character with no Session, so there is no client behind it and no
-/// `ctx.sender()` to resolve; the Gateway turns the byte into the matching [`realm_op`] against the
-/// party authority. Two values rather than a reuse of [`realm_op`]: those are what a CLIENT may
-/// ask for, and a Package may only ask for these two. [`INVITE`] is `0` because the column was
-/// END-appended to a table that had only ever carried invites, so a pre-existing row reads correctly
-/// under the migration's own default.
+// Older game_bot_invite_intent rows default to INVITE.
 pub mod bot_op {
-    /// `inviter_guid` invites `target_guid` into a party.
     pub const INVITE: u8 = 0;
-    /// `inviter_guid` leaves its party. `target_guid` is unused.
     pub const LEAVE: u8 = 1;
 }
 
-/// Durable companion-command queues are partitioned into this many fair lanes on every source
-/// Module. Gateway reads at most one head from each lane per dispatch turn.
 pub const COMMAND_DISPATCH_LANES: u8 = 8;
 
 pub const COMMAND_RESULT_WINDOW_MICROS: i64 = 30_000_000;
 
-/// Why the Module refused a party Durable Request. The tag is the whole reducer error text, so
-/// neither tier matches on human prose. Most variants become a `PartyResult` the client renders;
-/// [`GroupRefusal::IntentAlreadyClaimed`] instead tells a losing Gateway callback to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupRefusal {
-    /// The acting Character is temporarily unable to perform a party action.
     ActorUnavailable,
-    /// A Character may not invite itself.
     InviteSelf,
-    /// No Character row holds a guid the op named.
     NoSuchPlayer,
-    /// The invited Character has no live entity.
     TargetOffline,
-    /// The invited Character is already in a party.
     AlreadyInGroup,
-    /// The party is at its member cap.
     GroupFull,
-    /// The actor is in a Group but may not run the op there: it does not lead the Group, or is not
-    /// an Assistant where one may act. Also the answer when an Assistant names the leader for
-    /// removal (cm:GroupHandler.cpp:274-276).
     NotLeader,
-    /// The actor is in no party.
     NotInGroup,
-    /// The named target is in no party, or in a different one.
     TargetNotInGroup,
-    /// Accept or decline ran with no invite standing.
     NoPendingInvite,
-    /// The inviter is gone, or no longer leads its Group or assists in it.
     InviterUnavailable,
-    /// The actor tried to kick itself; leaving is the op for that.
     KickSelf,
-    /// The loot method, threshold, or master looter is not a legal setting.
     InvalidLootRules,
-    /// Another Gateway already claimed this bot invite intent.
     IntentAlreadyClaimed,
-    /// The Package has suppressed session-less actions for this Character.
     ActionSuppressed,
-    /// The invited Character belongs to the other team. Vanilla's default refuses a party across
-    /// factions (cm:GroupHandler.cpp:80). The Gateway applies this Gate realm-wide.
     WrongFaction,
-    /// The op needs a Raid, and the actor's Group is a Party.
     NotRaid,
-    /// A leader named itself as the new leader or as an Assistant (vm:GroupHandler.cpp:311, 554).
     TargetIsSelf,
-    /// A Change Subgroup or Swap Subgroup destination named a Subgroup outside 0 to 7.
     InvalidSubgroup,
-    /// A Change Subgroup destination already holds [`SUBGROUP_SIZE`] members.
     SubgroupFull,
-    /// A Target Icon index outside 0 to 7 that is not the list request (cm:Group.cpp:585-586).
     InvalidTargetIcon,
 }
 
@@ -437,14 +266,11 @@ impl GroupRefusal {
     }
 }
 
-/// A Group holds 8 Target Icons, numbered 0 to 7 (cm:Group.h:43).
 pub const TARGET_ICON_COUNT: u8 = 8;
 
-/// The `MSG_RAID_TARGET_UPDATE` index that asks for every Target Icon instead of setting one
-/// (cm:GroupHandler.cpp:457-459).
+// MSG_RAID_TARGET_UPDATE index 0xFF requests the full list.
 pub const TARGET_ICON_LIST_REQUEST: u8 = 0xFF;
 
-/// One Target Icon on one unit. `target_guid` 0 means the icon is clear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TargetIcon {
     pub icon: u8,
@@ -452,12 +278,10 @@ pub struct TargetIcon {
 }
 
 impl TargetIcon {
-    /// `icon,target_guid`, the `TARGET_ICON_UPDATE` payload.
     pub fn encode(self) -> String {
         format!("{},{}", self.icon, self.target_guid)
     }
 
-    /// `None` for a malformed payload or an icon outside 0 to 7.
     pub fn decode(payload: &str) -> Option<Self> {
         let (icon, target_guid) = payload.split_once(',')?;
         let icon = icon.parse().ok().filter(|&icon| icon < TARGET_ICON_COUNT)?;
@@ -468,8 +292,6 @@ impl TargetIcon {
     }
 }
 
-/// `icon,target_guid;...`, the `TARGET_ICON_LIST` payload and a Party roster's icon segment. An
-/// empty list is an empty string.
 pub fn encode_target_icons(icons: &[TargetIcon]) -> String {
     icons
         .iter()
@@ -478,8 +300,6 @@ pub fn encode_target_icons(icons: &[TargetIcon]) -> String {
         .join(";")
 }
 
-/// `None` for a malformed entry, a clear icon, or two entries sharing an icon or a unit: a Group
-/// holds each icon once and a unit carries one icon at most.
 pub fn decode_target_icons(payload: &str) -> Option<Vec<TargetIcon>> {
     let mut icons: Vec<TargetIcon> = Vec::new();
     for entry in payload.split(';').filter(|entry| !entry.is_empty()) {
@@ -495,7 +315,6 @@ pub fn decode_target_icons(payload: &str) -> Option<Vec<TargetIcon>> {
     Some(icons)
 }
 
-/// The `READY_CHECK_ANSWER` payload: the client's state byte in decimal.
 pub fn encode_ready_check_answer(state: u8) -> String {
     state.to_string()
 }
@@ -504,8 +323,7 @@ pub fn decode_ready_check_answer(payload: &str) -> Option<u8> {
     payload.parse().ok()
 }
 
-/// `x,y` as `f32` bit patterns, the `MINIMAP_PING` payload. Bits rather than decimals, so every
-/// float the client sent reaches the other members unchanged.
+// Float bit patterns preserve the exact MINIMAP_PING coordinates.
 pub fn encode_minimap_ping(x: f32, y: f32) -> String {
     format!("{},{}", x.to_bits(), y.to_bits())
 }
@@ -518,12 +336,10 @@ pub fn decode_minimap_ping(payload: &str) -> Option<(f32, f32)> {
     ))
 }
 
-/// `min,max,result`, the `RANDOM_ROLL` payload.
 pub fn encode_random_roll(min: u32, max: u32, result: u32) -> String {
     format!("{min},{max},{result}")
 }
 
-/// `None` for a malformed payload or a result outside its range.
 pub fn decode_random_roll(payload: &str) -> Option<(u32, u32, u32)> {
     let mut parts = payload.split(',');
     let min = parts.next()?.parse().ok()?;
@@ -535,12 +351,7 @@ pub fn decode_random_roll(payload: &str) -> Option<(u32, u32, u32)> {
     Some((min, max, result))
 }
 
-/// One roster as a LIST event carries it: what `SMSG_GROUP_LIST` shows, except presence.
-///
-/// The Module writes this in the same transaction as the change it reports, so the roster and the
-/// loot rules always agree. Presence is not in it: on Realm-core the Module has no live entities to
-/// read, so the Gateway reads presence from the shard caches when it renders the list. Names are
-/// blank on Realm-core for the same reason and the Gateway fills them the same way.
+// The roster commits with its change; the Gateway supplies presence and missing names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RosterPayload {
     pub leader: u64,
@@ -548,11 +359,8 @@ pub struct RosterPayload {
     pub loot_threshold: u8,
     pub master_looter_guid: u64,
     pub kind: GroupKind,
-    /// Every member in join order, the recipient included.
     pub members: Vec<RosterMember>,
-    /// A Party's Target Icons, sent again right after the list. In a Party the client clears its
-    /// marks on every `SMSG_GROUP_LIST`, and vmangos resends them after the list
-    /// (vm:Group.cpp:1343-1360). A Raid keeps its marks, so a Raid's roster carries none.
+    // A Party clears Target Icons on SMSG_GROUP_LIST, so resend them after the list.
     pub target_icons: Vec<TargetIcon>,
 }
 
@@ -564,10 +372,6 @@ pub struct RosterMember {
 }
 
 impl RosterPayload {
-    /// `leader,loot_method,loot_threshold,master_looter_guid,kind|guid,name,slot;...`, with `kind`
-    /// and `slot` as wire bytes, then `|` and [`encode_target_icons`] when there are Target Icons.
-    /// The encoder owns the grammar, so it also strips the delimiters from names. Character
-    /// creation admits only letters today, but that rule lives elsewhere.
     pub fn encode(&self) -> String {
         let members: Vec<String> = self
             .members
@@ -593,9 +397,6 @@ impl RosterPayload {
         payload
     }
 
-    /// `None` for a malformed or extra field, an unknown kind, an invalid Raid Slot, no members,
-    /// more members than a Raid holds, or a malformed icon segment. The Gateway fails closed rather
-    /// than render a corrupt roster.
     pub fn decode(payload: &str) -> Option<Self> {
         let mut segments = payload.split('|');
         let head = segments.next()?;
@@ -646,7 +447,6 @@ impl RosterPayload {
 mod tests {
     use super::*;
 
-    /// Every producer of `game_group_event` shares one kind byte space, and kind 9 stays retired.
     #[test]
     fn every_group_event_kind_is_distinct_and_none_reuses_kind_9() {
         use crate::loot_roll::event_kind as roll;
@@ -705,7 +505,6 @@ mod tests {
         }
     }
 
-    /// cm:Group.h:40-43: a party of 5, a raid of 40 in 8 Subgroups of 5.
     #[test]
     fn a_raid_is_eight_subgroups_of_five_and_a_party_caps_at_five() {
         assert_eq!(GROUP_MAX_MEMBERS, 5);
@@ -716,8 +515,6 @@ mod tests {
         assert_eq!(GroupKind::Raid.member_cap(), 40);
     }
 
-    /// The group-type byte is `GROUP_FLAG_NORMAL = 0`, `GROUP_FLAG_RAID = 1` (cm:Group.h:60-64). It
-    /// is also the stored column, whose END-appended default 0 must read as a Party.
     #[test]
     fn the_group_kind_byte_is_the_vanilla_group_type() {
         assert_eq!(GroupKind::default(), GroupKind::Party);
@@ -728,8 +525,6 @@ mod tests {
         assert_eq!(GroupKind::from_wire(2), None);
     }
 
-    /// The flags byte is `group | (assistant ? 0x80 : 0)` (cm:Group.cpp:685, 695). The stored
-    /// column's default 0 is Subgroup 0 without the Assistant flag.
     #[test]
     fn a_raid_slot_is_the_vanilla_member_flags_byte() {
         assert_eq!(RaidSlot::default().wire(), 0);
@@ -743,8 +538,6 @@ mod tests {
         assert!(!RaidSlot::from_wire(0x03).unwrap().is_assistant());
     }
 
-    /// The slots of a Raid whose Subgroup `n` holds `sizes[n]` members, the first of each an
-    /// Assistant.
     fn raid_of(sizes: [u8; 8]) -> Vec<RaidSlot> {
         (0u8..8)
             .flat_map(|subgroup| {
@@ -754,8 +547,6 @@ mod tests {
             .collect()
     }
 
-    /// cm:Group.cpp:817-838: the first Subgroup below 5 members, else no room. An Assistant
-    /// counts like any member, and the joiner is never an Assistant.
     #[test]
     fn a_raid_joiner_takes_the_first_subgroup_with_room() {
         let joiner = |sizes| RaidSlot::for_raid_joiner(raid_of(sizes));
@@ -781,8 +572,6 @@ mod tests {
         }
     }
 
-    /// 3, 4: a full destination Subgroup refuses, an out-of-range one refuses, and the
-    /// Assistant bit survives an accepted move.
     #[test]
     fn a_subgroup_move_refuses_a_full_or_out_of_range_destination() {
         let mover = RaidSlot::new(0, true).unwrap();
@@ -803,16 +592,12 @@ mod tests {
         );
     }
 
-    /// cm:Group.cpp:1234: moving to your own Subgroup succeeds and changes nothing, even when that
-    /// Subgroup is already full. The mover is presumably one of the five already counted there.
     #[test]
     fn a_subgroup_move_to_the_same_subgroup_is_a_no_op() {
         let mover = RaidSlot::new(3, false).unwrap();
         assert_eq!(mover.moved_to_subgroup(3, 5), Ok(None));
     }
 
-    /// 6: a swap between two full Subgroups needs no capacity Gate: the pair trade places
-    /// atomically, so neither Subgroup ever holds six members mid-swap.
     #[test]
     fn a_subgroup_swap_needs_no_capacity_gate() {
         let first = RaidSlot::new(0, true).unwrap();
@@ -827,7 +612,6 @@ mod tests {
         );
     }
 
-    /// 7: cm:GroupHandler.cpp:939: two members already in one Subgroup swap to a no-op.
     #[test]
     fn a_subgroup_swap_within_one_subgroup_is_a_no_op() {
         let first = RaidSlot::new(4, true).unwrap();
@@ -835,8 +619,6 @@ mod tests {
         assert_eq!(first.swapped_with(second), None);
     }
 
-    /// Pinned against the grammar, not recomputed: kind `1` in the head, and each member's flags
-    /// byte in decimal, `0x81` = 129 for an Assistant in Subgroup 1.
     #[test]
     fn a_raid_roster_encodes_its_kind_and_slots_and_strips_hostile_names() {
         let roster = RosterPayload {
@@ -893,34 +675,29 @@ mod tests {
     fn roster_decode_fails_closed_on_garbage() {
         for payload in [
             "",
-            "x,3,2,0,0|1,A,0",   // non-numeric leader
-            "2,3,2,0,0|",        // no members
-            "2|1,A,0",           // no loot rules
-            "2,3,2,0|1,A,1",     // the old grammar, which had no kind
-            "2,3,2,0,2|1,A,0",   // unknown kind
-            "2,3,2,0,0,9|1,A,0", // extra head field
-            "2,3,2,0,0|x,Bob,0", // non-numeric guid
-            "2,3,2,0,0|5,Bob",   // no slot
-            "2,3,2,0,0|5",       // no name, no slot
-            "2,3,2,0,0|5,Bob,8", // ninth Subgroup
+            "x,3,2,0,0|1,A,0",
+            "2,3,2,0,0|",
+            "2|1,A,0",
+            "2,3,2,0|1,A,1",
+            "2,3,2,0,2|1,A,0",
+            "2,3,2,0,0,9|1,A,0",
+            "2,3,2,0,0|x,Bob,0",
+            "2,3,2,0,0|5,Bob",
+            "2,3,2,0,0|5",
+            "2,3,2,0,0|5,Bob,8",
             "2,3,2,0,0|5,Bob,maybe",
-            "2,3,2,0,0|5,Bob,0,1",         // extra member field
-            "2,3,2,0,0|5,Bob,0|7",         // an icon with no unit
-            "2,3,2,0,0|5,Bob,0|8,99",      // a ninth icon
-            "2,3,2,0,0|5,Bob,0|7,99;7,98", // one icon twice
-            "2,3,2,0,0|5,Bob,0|7,99;6,99", // one unit with two icons
-            "2,3,2,0,0|5,Bob,0|7,0",       // a clear icon in a held list
-            "2,3,2,0,0|5,Bob,0|7,99|6,98", // a fourth segment
+            "2,3,2,0,0|5,Bob,0,1",
+            "2,3,2,0,0|5,Bob,0|7",
+            "2,3,2,0,0|5,Bob,0|8,99",
+            "2,3,2,0,0|5,Bob,0|7,99;7,98",
+            "2,3,2,0,0|5,Bob,0|7,99;6,99",
+            "2,3,2,0,0|5,Bob,0|7,0",
+            "2,3,2,0,0|5,Bob,0|7,99|6,98",
         ] {
             assert_eq!(RosterPayload::decode(payload), None, "{payload:?}");
         }
     }
 
-    // ---- Realm-core party ops (group slice) ----
-
-    /// The intent op byte is a MIGRATION value as well as a wire one: `op` was END-appended to
-    /// `game_bot_invite_intent` with a `0` default, so every row written before the column existed
-    /// reads as an INVITE. Renumbering would turn those rows into leaves.
     #[test]
     fn bot_group_intent_op_codes_are_stable_and_distinct() {
         assert_eq!(bot_op::INVITE, 0, "the END-appended column defaults to 0");
@@ -928,9 +705,6 @@ mod tests {
         assert_ne!(bot_op::INVITE, bot_op::LEAVE);
     }
 
-    /// The op byte is a WIRE value: the gateway sends it, the module dispatches on it, and the two
-    /// are deployed separately. A renumber that only one side learns about silently runs the wrong
-    /// op — an ACCEPT arriving as a LEAVE — so the numbering is pinned, not merely defined.
     #[test]
     fn realm_group_op_codes_are_stable_and_distinct() {
         assert_eq!(realm_op::INVITE, 0);
@@ -977,7 +751,6 @@ mod tests {
         );
     }
 
-    /// Promoting sets only the Assistant bit and demoting clears only it; the Subgroup stays.
     #[test]
     fn promoting_or_demoting_keeps_the_subgroup() {
         let plain = RaidSlot::new(3, false).unwrap();
@@ -986,8 +759,6 @@ mod tests {
         assert_eq!(plain.with_assistant(false), plain);
     }
 
-    /// The leader announcement is kind 20 and collides with no kind another producer writes to
-    /// the same table.
     #[test]
     fn the_leader_announcement_kind_is_20_and_distinct() {
         use crate::loot_roll::event_kind as roll;
@@ -1017,10 +788,6 @@ mod tests {
         assert_eq!(GroupRefusal::TargetIsSelf.as_tag(), "group:target_is_self");
     }
 
-    // ---- Group Broadcasts ----
-
-    /// Every producer of `game_group_event` shares one kind byte, so a Group Broadcast kind that
-    /// collided with a membership, loot or quest-share kind would render the wrong packet.
     #[test]
     fn group_broadcast_kinds_are_pinned_and_distinct_from_every_other_kind() {
         use crate::loot_roll::event_kind as roll;
@@ -1065,7 +832,6 @@ mod tests {
         );
     }
 
-    /// `arg_a` defaults to 0 in every older LEAVE caller, so 0 must stay a plain leave.
     #[test]
     fn a_plain_leave_is_cause_zero_and_a_deleted_character_is_one() {
         assert_eq!(leave_cause::LEFT, 0);
@@ -1084,14 +850,12 @@ mod tests {
         TargetIcon { icon, target_guid }
     }
 
-    /// cm:Group.h:43 holds 8 icons; 0xFF asks for the list (cm:GroupHandler.cpp:457).
     #[test]
     fn a_group_holds_eight_target_icons_and_0xff_asks_for_the_list() {
         assert_eq!(TARGET_ICON_COUNT, 8);
         assert_eq!(TARGET_ICON_LIST_REQUEST, 0xFF);
     }
 
-    /// Pinned against the grammar: the icon segment follows the members only when there is one.
     #[test]
     fn a_party_roster_carries_its_target_icons_after_the_members() {
         let mut roster = RosterPayload {
@@ -1150,7 +914,6 @@ mod tests {
         }
     }
 
-    /// Decimal text would round a float; bit patterns carry every value the client sent.
     #[test]
     fn a_minimap_ping_carries_each_float_bit_for_bit() {
         assert_eq!(encode_minimap_ping(0.5, -0.25), "1056964608,3196059648");

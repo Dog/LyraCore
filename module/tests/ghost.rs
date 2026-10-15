@@ -17,7 +17,6 @@ fn fixture(name: &str, race: u8) -> Standalone {
     shard.assert_sql(
         "UPDATE game_creature_template SET entry = 12861, display_id = 1825 WHERE entry = 51000",
     );
-    // Normalized build 5875 spell effects. Transform names a creature entry, not a display.
     for (spell, effects) in [
         (
             8326,

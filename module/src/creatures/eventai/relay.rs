@@ -283,11 +283,6 @@ pub struct RelayRun {
     pub concurrency: RelayConcurrency,
     pub lifetime: RelayLifetime,
     pub parent_run_id: u64,
-    /// Which life of `source_guid` started this run. The guid is reused when the creature respawns,
-    /// so a run that outlives its source would otherwise resolve to whichever creature holds the
-    /// guid next. Cleanup at the respawn boundary removes such a run; this field is what makes a
-    /// run that survives anyway refuse to act instead of acting on the wrong creature.
-    /// END-appended + defaulted (migration rule).
     #[default(0u64)]
     pub source_life_seq: u64,
 }
@@ -305,7 +300,6 @@ pub struct RelayContinuation {
     pub run_id: u64,
 }
 
-/// A dynamic movement completion that starts another relay from the same catalogue. Module only.
 #[table(
     accessor = game_creature_ai_relay_arrival,
     index(accessor = by_instance, btree(columns = [instance_id])),
@@ -405,7 +399,6 @@ pub(crate) fn replace_single_relay_for_debug(
     replace_relays_for_debug(ctx, &[(relay_id, "source>source", instruction)])
 }
 
-/// Replace the catalogue with one-step relays, each `(relay_id, participants, instruction)`.
 #[cfg(feature = "debug_reducers")]
 pub(crate) fn replace_relays_for_debug(
     ctx: &ReducerContext,
@@ -1272,10 +1265,7 @@ fn advance_run(ctx: &ReducerContext, run_id: u64) -> Result<(), String> {
     let Some(mut run) = runs.id().find(run_id) else {
         return Ok(());
     };
-    // The source creature keeps its guid across death and respawn. A run started by an earlier life
-    // must not act on the creature standing here now, so it ends here rather than continuing against
-    // the wrong one. Cleanup at the respawn boundary normally removes such a run first; this is what
-    // holds if one reaches this point anyway.
+    // A respawn reuses its guid; an earlier life's Relay Run must end here.
     if run.source_life_seq != crate::creatures::current_life_seq(ctx, run.source_guid) {
         cancel_run_tree(ctx, run_id);
         reap_unused_definitions(ctx);
@@ -1317,9 +1307,6 @@ fn advance_run(ctx: &ReducerContext, run_id: u64) -> Result<(), String> {
                     let present = subject_present(ctx, &fresh, terminate.subject);
                     let terminate_now = termination_matches(terminate.when, present);
                     if terminate_now {
-                        // An authored terminate ends the whole invocation, not just this run: its
-                        // nested relays and pending arrivals belong to the same invocation and
-                        // would otherwise keep playing after the script said stop.
                         cancel_run_tree(ctx, run_id);
                         return Ok(());
                     }
@@ -1395,7 +1382,7 @@ fn apply_leaf(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // One arm per relay leaf kind.
+#[allow(clippy::too_many_lines)]
 fn apply_leaf_for_pair(
     ctx: &ReducerContext,
     run: &mut RelayRun,
@@ -1716,9 +1703,7 @@ fn schedule_arrival(
             parent_run_id: run.id,
             relay_id,
             catalogue_version: run.catalogue_version,
-            // The cleanup policy recorded here must be the one the arrival will actually run under.
-            // `start_relay` takes it from the arrival relay's own definition, so reading the parent
-            // run's lifetime would let cleanup apply a policy the resulting run never has.
+            // Record the arrival relay's own cleanup policy, which may differ from its parent.
             lifetime: arrival_lifetime,
             saved_random_state: child_state,
             spline_id,
@@ -1729,15 +1714,10 @@ fn schedule_arrival(
     Ok(())
 }
 
-/// Where a due Relay Arrival finds its mover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArrivalCheck {
-    /// The mover died, left the partition, took a newer leg or stands off the destination.
     Stale,
-    /// The mover's live leg is still the arrival leg. It has landed, but the creature tick has not
-    /// stored its end yet.
     LegLanded,
-    /// The mover has no leg of its own and stands on the destination.
     OnDestination,
 }
 
@@ -1756,7 +1736,6 @@ fn check_arrival(
     )
 }
 
-/// A newer leg carries another spline id, so a matching leg needs no time check.
 fn arrival_motion(
     source_position: (f32, f32, f32),
     current_spline_id: Option<u32>,
@@ -1777,7 +1756,6 @@ fn arrival_motion(
     }
 }
 
-/// Source dynamic movement is accepted but does not replace an active combat movement generator.
 fn dynamic_move_should_start(engaged: bool) -> bool {
     !engaged
 }
@@ -1790,7 +1768,6 @@ pub fn resume_relay_arrival(ctx: &ReducerContext, arrival: RelayArrival) {
     run_relay_arrival(ctx, arrival);
 }
 
-/// Start the arrival relay if the mover still waits on this arrival.
 pub(crate) fn run_relay_arrival(ctx: &ReducerContext, arrival: RelayArrival) {
     let Some(mut source) = ctx.db.game_world_entity().guid().find(arrival.source_guid) else {
         reap_unused_definitions(ctx);
@@ -1808,8 +1785,7 @@ pub(crate) fn run_relay_arrival(ctx: &ReducerContext, arrival: RelayArrival) {
         }
         ArrivalCheck::OnDestination => {}
         ArrivalCheck::LegLanded => {
-            // Land the leg as the creature tick would, so the arrival relay reads the mover on the
-            // destination and not on a moving leg.
+            // Land the leg before the arrival relay reads the mover's position.
             crate::creatures::tick::place_stopped(
                 &mut source,
                 crate::creatures::cycle::Stop {
@@ -2147,12 +2123,6 @@ pub(crate) fn cancel_relay_runs_for_instance(ctx: &ReducerContext, instance_id: 
     reap_unused_definitions(ctx);
 }
 
-/// End every Relay Run and arrival held by one source creature, whatever its lifetime.
-///
-/// A creature respawns under the guid it already had, so a run started by an earlier life would
-/// otherwise resolve its source to the new creature and play the rest of the previous life's script
-/// against it. Death is the wrong boundary for this: a death-triggered relay is authored to act on
-/// the corpse, and the corpse window is the whole point. Respawn is the boundary no run may cross.
 pub(crate) fn cancel_relay_runs_for_new_life(ctx: &ReducerContext, source_guid: u64) {
     let arrivals = ctx.db.game_creature_ai_relay_arrival();
     let mut removed_reference = false;
@@ -2628,7 +2598,6 @@ mod tests {
             y: destination.1,
             z: destination.2,
         };
-        // (mover position, mover's spline id, the arrival leg's spline id, expected check)
         let cases = [
             (destination, Some(7), 7, LegLanded),
             (away, Some(7), 7, LegLanded),

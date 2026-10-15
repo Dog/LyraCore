@@ -1,9 +1,3 @@
-//! Artifact fragments the tests in this module tree share.
-//!
-//! The JSON here is written by hand, the way a Datascript generator would emit it, so the tests
-//! exercise the parser rather than a builder that could drift with it. A family that lands adds its
-//! own fragments beside these.
-
 use lyracore_package_delta::{Column, FieldType, FieldValue};
 
 use super::{ApplyPlan, ARTIFACT_SEPARATOR};
@@ -57,8 +51,6 @@ pub(super) const WHOLE_EFFECT_ROW: &str = r#"{
     "enters_combat": { "type": "bool", "value": false }
 }"#;
 
-/// Wraps claims in an artifact envelope, on ONE line. The fixtures above are indented so a reader
-/// can follow them; an artifact in a payload never is.
 pub(super) fn artifact(package: &str, claims: &str) -> String {
     let claims: String = claims.lines().map(str::trim).collect();
     format!(r#"{{"version":1,"package":"{package}","source_hash":"{HASH_A}","claims":[{claims}]}}"#)
@@ -82,7 +74,7 @@ pub(super) fn effect_claim(
 }
 
 pub(super) const PACKAGE_ITEM: u32 = 7_000_001;
-pub(super) const REAL_ITEM: u32 = 25; // Worn Shortsword — a real imported item template.
+pub(super) const REAL_ITEM: u32 = 25;
 
 pub(super) const WHOLE_ITEM_ROW: &str = r#"{
     "class": { "type": "u8", "value": 2 },
@@ -151,7 +143,7 @@ pub(super) fn item_claim(entry: u32, operation: &str, fields: &str) -> String {
 }
 
 pub(super) const PACKAGE_QUEST: u32 = 8_000_001;
-pub(super) const REAL_QUEST: u32 = 1; // "Undertaking", the first Elwynn quest, always imported in-box.
+pub(super) const REAL_QUEST: u32 = 1;
 
 pub(super) const WHOLE_QUEST_ROW: &str = r#"{
     "min_level": { "type": "u32", "value": 1 },
@@ -223,7 +215,7 @@ pub(super) fn pickpocket_loot_claim(id: u64, operation: &str, fields: &str) -> S
 }
 
 pub(super) const PACKAGE_CREATURE_SPELL: u64 = 10_000_001;
-pub(super) const REAL_CREATURE_CAST: u32 = 6; // Kobold Vermin — a real imported creature template with a cast row.
+pub(super) const REAL_CREATURE_CAST: u32 = 6;
 pub(super) const REAL_CREATURE_SPELL: u64 = 1;
 
 pub(super) const WHOLE_CREATURE_SPELL_ROW: &str = r#"{
@@ -264,13 +256,8 @@ pub(super) fn trainer_spell_claim(id: u64, operation: &str, fields: &str) -> Str
     )
 }
 
-// ---- gossip ----
-
-/// A gossip row inside the Package gossip range, safe to insert. One band covers all five
-/// insertable gossip tables.
 pub(super) const PACKAGE_GOSSIP: u64 = 12_000_001;
 
-/// A real imported `game_npc_text` row, safe to update and never safe to insert.
 pub(super) const REAL_NPC_TEXT: u32 = 1;
 
 pub(super) const WHOLE_NPC_TEXT_ROW: &str = r#"{
@@ -301,12 +288,8 @@ pub(super) fn gossip_option_claim(row_id: u32, operation: &str, fields: &str) ->
     )
 }
 
-// ---- globals ----
-
-/// A globals row inside the Package globals range, safe to insert.
 pub(super) const PACKAGE_GLOBALS: u64 = 13_000_001;
 
-/// A real imported `game_graveyard_zone` row, safe to update and never safe to insert.
 pub(super) const REAL_GRAVEYARD_ZONE: u64 = 1;
 
 pub(super) const WHOLE_GRAVEYARD_ZONE_ROW: &str = r#"{
@@ -332,12 +315,8 @@ pub(super) fn class_level_stats_claim(
     )
 }
 
-// ---- spellmeta ----
-
-/// A `game_spell_learn` row inside the Package spell metadata range, safe to insert.
 pub(super) const PACKAGE_SPELL_LEARN: u64 = 14_000_001;
 
-/// A real imported `game_spell_learn` row, safe to update and never safe to insert.
 pub(super) const REAL_SPELL_LEARN: u64 = 1;
 
 pub(super) const WHOLE_SPELL_CHAIN_ROW: &str = r#"{
@@ -364,19 +343,12 @@ pub(super) fn spell_learn_claim(id: u64, operation: &str, fields: &str) -> Strin
     )
 }
 
-// ---- creatures ----
-
-/// A creature identifier inside the Package creature range, safe to insert. One band covers the
-/// template and the spawn.
 pub(super) const PACKAGE_CREATURE: u32 = 15_000_001;
 
-/// A real imported creature template, safe to update and never safe to insert.
-pub(super) const REAL_CREATURE: u32 = 6; // Kobold Vermin.
+pub(super) const REAL_CREATURE: u32 = 6;
 
-/// A real imported spawn identifier.
 pub(super) const REAL_CREATURE_SPAWN: u32 = 4_242;
 
-/// The map a spatial fixture claim sits on: Eastern Kingdoms.
 pub(super) const REAL_MAP: u32 = 0;
 
 pub(super) const WHOLE_CREATURE_TEMPLATE_ROW: &str = r#"{
@@ -426,13 +398,8 @@ pub(super) fn creature_spawn_claim(
     )
 }
 
-// ---- gameobjects ----
-
-/// A gameobject identifier inside the Package gameobject range, safe to insert. One band covers
-/// the template, the trap and the spawn.
 pub(super) const PACKAGE_GAMEOBJECT: u32 = 16_000_001;
 
-/// A real imported gameobject spawn identifier.
 pub(super) const REAL_GAMEOBJECT_SPAWN: u32 = 7_777;
 
 pub(super) const WHOLE_GAMEOBJECT_TEMPLATE_ROW: &str = r#"{
@@ -465,19 +432,12 @@ pub(super) fn gameobject_spawn_claim(
     )
 }
 
-// ---- creature-ai ----
-
-/// A broadcast text inside the Package EventAI range, safe to insert. One band covers the text,
-/// the summon placement and the quest event requirement.
 pub(super) const PACKAGE_BROADCAST_TEXT: u32 = 17_000_001;
 
-/// A summon placement inside the Package EventAI range.
 pub(super) const PACKAGE_SUMMON: u32 = 17_000_002;
 
-/// A quest event requirement inside the Package EventAI range.
 pub(super) const PACKAGE_QUEST_EVENT_REQUIREMENT: u64 = 17_000_003;
 
-/// A real imported broadcast text identifier.
 pub(super) const REAL_BROADCAST_TEXT: u32 = 900;
 
 pub(super) const WHOLE_BROADCAST_TEXT_ROW: &str = r#"{
@@ -523,8 +483,6 @@ pub(super) fn quest_event_requirement_claim(id: u64, operation: &str, fields: &s
     )
 }
 
-/// A value of the column's declared type, so a test can claim any column without spelling out what
-/// it holds.
 pub(super) fn some_value(column: Column) -> FieldValue {
     match column.ty {
         FieldType::U8 => FieldValue::U8(7),
@@ -538,7 +496,6 @@ pub(super) fn some_value(column: Column) -> FieldValue {
     }
 }
 
-/// Reads a set of artifacts as one payload, the way the reducer does.
 pub(super) fn plan(artifacts: &[String]) -> Result<ApplyPlan, String> {
     ApplyPlan::read(&artifacts.join(&ARTIFACT_SEPARATOR.to_string()))
 }

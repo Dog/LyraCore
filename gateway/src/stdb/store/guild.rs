@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`GuildActionStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::guild::GuildRefusal;
 
@@ -13,7 +11,6 @@ use crate::world::{
 };
 
 impl GuildActionStore for Coordinator {
-    /// The membership row of `character_guid` on Realm-core.
     fn guild_member(&self, character_guid: u64) -> Result<Option<codec::GuildMemberView>> {
         let realm = self.realm_core()?;
         let member = realm
@@ -28,7 +25,6 @@ impl GuildActionStore for Coordinator {
         Ok(member)
     }
 
-    /// One Guild and its Guild Ranks on Realm-core, ranks ordered by `rank_id`.
     fn guild(&self, guild_id: u32) -> Result<Option<codec::GuildView>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -65,7 +61,6 @@ impl GuildActionStore for Coordinator {
         }))
     }
 
-    /// Every member row of one Guild on Realm-core, ordered by guid.
     fn guild_members(&self, guild_id: u32) -> Result<Vec<codec::GuildMemberView>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -91,7 +86,6 @@ impl GuildActionStore for Coordinator {
         Ok(self.home_gm_level(actor_guid))
     }
 
-    /// The unit `actor_guid` has selected, from this Home Shard's live entity. 0 for none.
     fn guild_selected_target(&self, actor_guid: u64) -> u64 {
         self.0
             .coord()
@@ -107,8 +101,6 @@ impl GuildActionStore for Coordinator {
         whisper::ignored_anywhere(self, owner_guid, other_guid)
     }
 
-    /// `realm_guild_op`: one guild op on Realm-core, or on the one database of an unsharded
-    /// Realm.
     fn guild_op(&self, actor: Actor, request: GuildRequest) -> Result<GuildOutcome> {
         let realm = self.realm_core()?;
         let op = match request {
@@ -227,7 +219,6 @@ impl GuildActionStore for Coordinator {
             .guild_petition_of_charter(charter_item_guid))
     }
 
-    /// The open Petition `owner_guid` owns on Realm-core.
     fn guild_petition_of_owner(&self, owner_guid: u64) -> Result<Option<codec::PetitionView>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -239,7 +230,6 @@ impl GuildActionStore for Coordinator {
             .map(|row| petition_view(db, row)))
     }
 
-    /// Does a Guild on Realm-core hold `name`, without regard to case?
     fn guild_name_taken(&self, name: &str) -> Result<bool> {
         let realm = self.realm_core()?;
         let taken = realm
@@ -254,7 +244,6 @@ impl GuildActionStore for Coordinator {
         Ok(taken)
     }
 
-    /// Does `actor_guid` hold the Guild Charter `charter_item_guid` on this Home Shard?
     fn guild_holds_charter(&self, actor_guid: u64, charter_item_guid: u64) -> Result<bool> {
         Ok(self
             .0
@@ -270,7 +259,6 @@ impl GuildActionStore for Coordinator {
             }))
     }
 
-    /// `gw_destroy_guild_charter` on this Home Shard. A Charter already gone is Ok.
     fn guild_destroy_charter(&self, actor: Actor, charter_item_guid: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -279,9 +267,6 @@ impl GuildActionStore for Coordinator {
         )
     }
 
-    /// Every Character that a Guild, a Petition or a Signature on Realm-core names: the
-    /// Characters the deleted-Character reconciliation checks. It fails while the subscription
-    /// is unhealthy, so a stale cache never hides a Character.
     fn guild_character_guids(&self) -> Result<Vec<u64>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -295,8 +280,6 @@ impl GuildActionStore for Coordinator {
         Ok(named.into_iter().collect())
     }
 
-    /// Does a Guild, a Petition or a Signature on Realm-core name `character_guid`? Keyed reads
-    /// only. Fails while the subscription is unhealthy.
     fn guild_names_character(&self, character_guid: u64) -> Result<bool> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -322,8 +305,6 @@ impl GuildActionStore for Coordinator {
                 .contains_key(&character_guid))
     }
 
-    /// The name of the Guild `character_guid` belongs to on Realm-core, if any. Two keyed reads,
-    /// cheap enough for every `/who` row.
     fn guild_name_of_member(&self, character_guid: u64) -> Result<Option<String>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
@@ -343,8 +324,6 @@ impl GuildActionStore for Coordinator {
     }
 }
 
-/// The Module's typed guild Refusal. Only a reducer the Module rejected carries a tag; a timeout,
-/// transport, or SDK failure stays an error with an unknown outcome.
 fn guild_outcome(result: Result<()>) -> Result<GuildOutcome> {
     match result {
         Ok(()) => Ok(GuildOutcome::Ran),

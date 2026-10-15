@@ -1,16 +1,3 @@
-//! Cast-lifecycle seam: one entry point owns `CMSG_CAST_SPELL` route selection, client target
-//! decoding, durable dispatch and the ordered client-visible messages.
-//!
-//! The module root holds the seam types, the route decision tree and the ordinary cast route
-//! (instant, timed, next-swing, ground-area and ground-targeted casts). Ranged auto-repeat lives in
-//! [`ranged`], the routes whose reducers emit no cast event — enchant, disenchant, fishing and lock
-//! opening — in [`manual`], and both cancellations in [`cancel`].
-//!
-//! Deleting this module does not delete the decisions in it. Spell taxonomy routing, client target
-//! decoding, durable-operation selection, ranged auto-repeat state, failure mapping and the
-//! message-order rules would spread back across the broad combat handler and the store adapters,
-//! which is where they lived before and why one cast change needed edits in several files.
-
 mod cancel;
 mod manual;
 mod ranged;
@@ -21,40 +8,26 @@ use crate::stdb::{classify, DurableFailure};
 use crate::world::family::{ProtocolFamily, ProtocolReply, ProtocolRequest, ProtocolSession};
 use wow_world_messages::vanilla::CMSG_CAST_SPELL;
 
-/// `SMSG_CAST_RESULT`. Both bodies are hand-rolled (gtker's typed message inverts the status
-/// semantics), so they ride `Outbound::Raw` under this opcode.
+// gtker inverts CAST_RESULT status semantics; encode both result bodies raw.
 const OP_CAST_RESULT: u16 = 0x0130;
 
-/// Imported spell taxonomy and the durable cast operations the module needs. Narrow on purpose:
-/// nothing here exposes a coordinator read, a reducer handle or a spell table to the caller.
 pub(crate) trait CastStore: MeleeActionStore + Send + Sync {
-    /// True iff `spell_id` is an auto-repeat ranged attack (Auto Shot / wand Shoot) — the
-    /// `RANGED_AUTO_REPEAT` cast_flags bit, so a new ranged ability onboards as data.
     fn spell_is_ranged_auto_repeat(&self, spell_id: u32) -> bool;
 
-    /// Enchant/disenchant routing from `spell_id`'s effect rows; `None` for every other cast.
     fn enchant_route(&self, spell_id: u32) -> Option<EnchantRoute>;
 
-    /// True iff `spell_id` is a Fishing cast (E_FISH).
     fn spell_is_fishing(&self, spell_id: u32) -> bool;
 
-    /// True iff `spell_id` is an Open-Lock cast (E_OPEN_LOCK).
     fn spell_is_open_lock(&self, spell_id: u32) -> bool;
 
-    /// True iff `spell_id` spawns a ground area (E_PERSISTENT_AREA) — its GO carries no hit list.
     fn spell_is_ground_area(&self, spell_id: u32) -> bool;
 
-    /// The spell's cast time in ms — 0 is instant, `None` is unknown metadata.
     fn spell_cast_time(&self, spell_id: u32) -> Option<u32>;
 
-    /// True iff `spell_id` queues on the caster's next melee swing (Heroic Strike/Cleave).
     fn spell_queues_next_swing(&self, spell_id: u32) -> bool;
 
-    /// Cast a spell at a unit. `target_guid` 0 means no unit target — the module then applies its
-    /// own self-cast rule.
     fn cast_spell(&self, actor: Actor, spell_id: u32, target_guid: u64) -> Result<()>;
 
-    /// Cast a ground-targeted spell at the exact point the client clicked.
     fn cast_spell_at(
         &self,
         actor: Actor,
@@ -65,63 +38,32 @@ pub(crate) trait CastStore: MeleeActionStore + Send + Sync {
         z: f32,
     ) -> Result<()>;
 
-    /// Cast a spell whose explicit target is an owned inventory item. The module validates the
-    /// effect kind and consumes the item only after the gameplay gates pass.
     fn cast_item_target(&self, actor: Actor, spell_id: u32, slot: u8) -> Result<()>;
 
-    /// Arm the ranged auto-repeat loop on `target_guid` with `spell_id`. The module requires an
-    /// equipped ranged weapon; `Err` is the Refusal the client sees as a cast failure.
     fn start_ranged_attack(&self, actor: Actor, target_guid: u64, spell_id: u32) -> Result<()>;
 
-    /// The bag slot holding the item instance a client spell-target names, so the enchant and
-    /// disenchant operations receive a slot rather than a guid.
     fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8>;
 
-    /// Disenchant the item in `slot`. The module validates skill and disenchantability, and yields
-    /// the resulting reagents into the bag.
     fn disenchant_item(&self, actor: Actor, slot: u8) -> Result<()>;
 
-    /// Apply `enchant_id` to the item in `slot`. The module validates skill, consumes the reagent
-    /// and stamps the enchant on the item instance.
     fn enchant_item_on_slot(&self, actor: Actor, slot: u8, enchant_id: u32) -> Result<()>;
 
-    /// The instant-resolve Fishing catch.
     fn fish(&self, actor: Actor) -> Result<()>;
 
-    /// Pick the lock on GameObject `go_guid`. The module gates range, the lock requirement and the
-    /// caller's skill; `Err` is the Refusal the client sees as a cast failure.
     fn pick_lock(&self, actor: Actor, go_guid: u64) -> Result<()>;
 
-    /// Drop the caller's pending cast, so a scheduled completion cannot fire later. Under the
-    /// one-pending-cast rule the caller identifies the cast, so the client's spell id is unused.
     fn cancel_cast(&self, actor: Actor) -> Result<()>;
 
-    /// Remove the caller's own aura named by the wire spell id. The aura relay re-syncs the buff bar.
     fn cancel_aura(&self, actor: Actor, spell_id: u32) -> Result<()>;
 
-    // The two reads below are shared with the character, vendor and query paths. They are declared
-    // on this family only, because a second declaration of the same name on another family would
-    // make every call through the `WorldStore` umbrella ambiguous. The
-    // ranged teardown comes from `MeleeActionStore`: melee and ranged share one durable row, so it
-    // has one declaration, on the seam that owns that row.
-
-    /// Every item a character owns. The ranged route reads the equipped launcher and the projectile
-    /// stacks from it.
     fn player_items(&self, owner_guid: u64) -> Result<Vec<codec::ItemInstanceView>>;
 
-    /// One item template by entry — the launcher's class/subclass and the projectile's display id.
     fn item_template(&self, entry: u32) -> Result<Option<codec::ItemTemplateView>>;
 }
 
-/// Which route a `CMSG_CAST_SPELL` takes, selected from imported taxonomy alone.
 enum CastRoute {
-    /// Auto Shot and wand Shoot: an auto-repeat attack loop, not a one-shot cast.
     RangedAutoRepeat,
-    /// Enchant, disenchant, fishing and lock opening. Their reducers emit no cast event, so the
-    /// route sends the completion sequence itself. The payload is the one classification decision,
-    /// made once here instead of re-testing the same effect metadata inside the route.
     ManualCompletion(manual::ManualRoute),
-    /// Every other cast: instant, timed, next-swing, ground-area and ground-targeted.
     Ordinary,
 }
 
@@ -139,11 +81,8 @@ fn route_for<St: CastStore + ?Sized>(store: &St, spell_id: u32) -> CastRoute {
     }
 }
 
-/// What the cast failure mapping reads when the session has no Actor to cast as.
 const NO_ACTOR: &str = "no resolved actor";
 
-/// The Module's reason for a Refusal, which the client sees as a cast failure. A Transport Loss
-/// cannot serve any further request, so it ends the World Session.
 fn refusal_reason(error: anyhow::Error) -> Result<String> {
     match classify(&error) {
         DurableFailure::Refusal { reason } => Ok(reason.to_string()),
@@ -151,7 +90,6 @@ fn refusal_reason(error: anyhow::Error) -> Result<String> {
     }
 }
 
-/// The client's unit target, or 0 for "none" — the module substitutes the caster.
 fn unit_target(c: &CMSG_CAST_SPELL) -> u64 {
     c.targets
         .target_flags
@@ -159,7 +97,6 @@ fn unit_target(c: &CMSG_CAST_SPELL) -> u64 {
         .map_or(0, |u| u.unit_target.guid())
 }
 
-/// The ground point the client clicked (`DEST_LOCATION`), if the cast carries one.
 fn dest_target(c: &CMSG_CAST_SPELL) -> Option<(f32, f32, f32)> {
     c.targets
         .target_flags
@@ -167,7 +104,6 @@ fn dest_target(c: &CMSG_CAST_SPELL) -> Option<(f32, f32, f32)> {
         .map(|d| (d.destination.x, d.destination.y, d.destination.z))
 }
 
-/// Handle cast requests, cancellations and ranged auto-repeat state.
 pub(crate) struct Cast;
 
 impl<St: CastStore + ?Sized> ProtocolFamily<St> for Cast {
@@ -196,33 +132,22 @@ impl<St: CastStore + ?Sized> ProtocolFamily<St> for Cast {
     }
 }
 
-/// The ordinary cast route: instant, timed, next-swing, ground-area and ground-targeted casts.
 fn ordinary_cast<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
     c: &CMSG_CAST_SPELL,
 ) -> Result<ProtocolReply> {
     let spell = c.spell;
-    // Thread the client's unit target so target-keyed effects — combo finishers, enemy spells —
-    // see the real target. No unit target stays 0 so the module applies its own self-cast rule.
     let target = unit_target(c);
     let mut outbound = Vec::new();
 
-    // An INSTANT cast clears the client's cast slot HERE, before the durable request. The
-    // cast-event relay would deliver START/GO after the aura callback (the SDK fires table
-    // callbacks in a fixed alphabetical order), so the applied buff would reach the client first
-    // and wedge its cast slot in "Another action is in progress". Unknown cast time counts as
-    // instant: a stray START/GO is harmless, a missing one wedges.
+    // Clear instant casts before the Durable Request; SDK aura callbacks otherwise precede GO.
     let instant = store.spell_cast_time(spell).is_none_or(|t| t == 0);
-    // A next-swing spell (Heroic Strike/Cleave) sends nothing. The client lights the button on the
-    // press and holds the pending cast until the durable swing-fire emits its completion; the
-    // sequence below would un-light the button and resolve the cast at queue time.
+    // Next-swing spells must stay pending until the swing fires; do not clear them here.
     let queues_swing = instant && store.spell_queues_next_swing(spell);
     if instant && !queues_swing {
         if let Some(caster) = session.actor().map(Actor::guid) {
-            // vmangos order: START(0) then the raw CAST_RESULT(OK) then GO. The 5875 client needs
-            // that 5-byte ack before GO to make m_currentSpells clearable.
-            // A cast at a clicked ground point echoes the point in both target blocks.
+            // Build 5875 clears its cast slot with START, five-byte CAST_RESULT OK, then GO.
             let dest = dest_target(c);
             let start = match dest {
                 Some(dest) => codec::build_spell_start_dest(caster, spell, dest),
@@ -235,9 +160,7 @@ fn ordinary_cast<St: CastStore + ?Sized>(
                 opcode: OP_CAST_RESULT,
                 body: codec::build_cast_result_ok(spell),
             });
-            // Any cast at a clicked ground point and a caster-anchored ground area (Consecration)
-            // impact the ground: an EMPTY hit list, or the self-cast fallback puts the caster in
-            // `hits[]` and the client plays the impact animation on the caster.
+            // Ground casts need empty hits; the caster would become a self target.
             let go = if let Some(dest) = dest {
                 codec::build_spell_go_dest(caster, spell, dest)
             } else if store.spell_is_ground_area(spell) {
@@ -251,8 +174,6 @@ fn ordinary_cast<St: CastStore + ?Sized>(
         }
     }
 
-    // A DEST_LOCATION block is a ground click (Flamestrike/Blizzard/Rain of Fire) — the durable
-    // ground cast anchors the area there. The clearing sequence above is unchanged either way.
     let item_guid = match c.targets.target_flags.get_item() {
         Some(wow_world_messages::vanilla::SpellCastTargets_SpellCastTargetFlags_Item::Item {
             item,
@@ -282,9 +203,6 @@ fn ordinary_cast<St: CastStore + ?Sized>(
         }
     };
     if let Some(reason) = refusal {
-        // Carry the mapped REASON so the client prints the red error line ("Not enough rage",
-        // "You must be behind your target"). A bare failure only resets the button and leaves
-        // server-only gates — behind, stealth, stance, react window — invisible.
         log::debug!(
             "world: cast {spell} rejected (account {}): {reason}",
             session.account_id
@@ -297,8 +215,6 @@ fn ordinary_cast<St: CastStore + ?Sized>(
     Ok(outbound.into())
 }
 
-/// The focused in-memory cast adapter and the shared seam-test helpers. Every route module's tests
-/// use this one fake, so `pub(super)` reaches the sibling route modules.
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -312,22 +228,13 @@ pub(super) mod tests {
         Vector3d,
     };
 
-    /// One recorded durable cast: caster, spell and unit target.
     pub(crate) type RecordedCast = (u64, u32, u64);
-    /// One recorded durable ground cast: a [`RecordedCast`] plus the click point.
     pub(crate) type GroundCast = (u64, u32, u64, f32, f32, f32);
-    /// One recorded ranged activation: caster, unit target and spell.
     pub(crate) type RangedAttack = (u64, u64, u32);
-    /// One recorded `enchant_item_on_slot` call: slot and enchant id.
     pub(crate) type EnchantCall = (u8, u32);
-    /// One recorded `pick_lock` call: caster and GameObject guid.
     pub(crate) type PickLockCall = (u64, u64);
-    /// One recorded `cancel_aura` call: caster and wire spell id.
     pub(crate) type CancelAuraCall = (u64, u32);
 
-    /// Spell-route metadata, item state and durable results for the cast routes, plus a record of
-    /// every durable call. Nothing else: no vendors, parties, mail, transfer or unrelated world
-    /// state.
     #[derive(Default)]
     pub(crate) struct InMemoryCasts {
         pub(crate) cast_time_ms: Option<u32>,
@@ -337,20 +244,13 @@ pub(super) mod tests {
         pub(crate) enchant: Option<EnchantRoute>,
         pub(crate) fishing: Vec<u32>,
         pub(crate) open_lock: Vec<u32>,
-        /// The Module's reason when the ordinary cast operations refuse.
         pub(crate) cast_error: Option<String>,
-        /// When set, `start_ranged_attack` refuses with this reason.
         pub(crate) ranged_error: Option<String>,
-        /// Every durable operation fails with a Transport Loss.
         pub(crate) transport_lost: bool,
-        /// The caller's owned items, and the templates their entries resolve to.
         pub(crate) items: Vec<codec::ItemInstanceView>,
         pub(crate) templates: Vec<codec::ItemTemplateView>,
-        /// Item-instance guid → bag slot, for the manual-completion item target.
         pub(crate) item_slots: Vec<(u64, u8)>,
-        /// Shared refusal for every manual-completion durable operation.
         pub(crate) manual_error: Option<String>,
-        /// Shared refusal for both cancellation operations.
         pub(crate) cancel_error: Option<String>,
         pub(crate) casts: Mutex<Vec<RecordedCast>>,
         pub(crate) ground_casts: Mutex<Vec<GroundCast>>,
@@ -363,12 +263,8 @@ pub(super) mod tests {
         pub(crate) pick_lock_calls: Mutex<Vec<PickLockCall>>,
         pub(crate) cancel_cast_calls: Mutex<Vec<u64>>,
         pub(crate) cancel_aura_calls: Mutex<Vec<CancelAuraCall>>,
-        /// The attackers with a live engagement: an armed ranged loop adds its caster, a stop
-        /// removes it.
         pub(crate) engaged: Mutex<Vec<u64>>,
-        /// Spell ids of the auras on the caster; a cancellation removes the one it names.
         pub(crate) auras: Mutex<Vec<u32>>,
-        /// Casters with a pending cast; a cancellation removes the caller's.
         pub(crate) pending_casts: Mutex<Vec<u64>>,
     }
 
@@ -387,7 +283,6 @@ pub(super) mod tests {
             }
         }
 
-        /// The Module's answer to a durable request: a Refusal with `reason`, or success.
         fn answer(&self, operation: &str, reason: &Option<String>) -> Result<()> {
             if self.transport_lost {
                 return Err(ReducerCallError::transport_lost(operation).into());
@@ -531,8 +426,6 @@ pub(super) mod tests {
         }
     }
 
-    /// The ranged teardown the cast module shares with the melee seam. `start_attack` is never
-    /// reached from a cast route; it exists because the two share one durable engagement row.
     impl MeleeActionStore for InMemoryCasts {
         fn start_attack(&self, _actor: Actor, _target_guid: u64) -> Result<()> {
             unreachable!("no cast route arms a melee engagement")
@@ -590,8 +483,6 @@ pub(super) mod tests {
         }
     }
 
-    /// The GAMEOBJECT target shape, or its ObjectUnk sibling — the two the vanilla client sends for
-    /// Pick Lock.
     fn gameobject_targets(go_guid: u64, unk_shape: bool) -> SpellCastTargets {
         let target = if unk_shape {
             SpellCastTargets_SpellCastTargetFlags_Gameobject::ObjectUnk {
@@ -607,7 +498,6 @@ pub(super) mod tests {
         }
     }
 
-    /// The ranged state and client messages after one request.
     pub(crate) fn handled(result: (bool, ProtocolReply)) -> (bool, Vec<Outbound>) {
         (result.0, result.1.outbound)
     }
@@ -622,8 +512,6 @@ pub(super) mod tests {
         Ok((repeating, reply))
     }
 
-    /// One label per outbound unit, in order — the synchronous sequence is the contract, and it
-    /// spans both raw and typed sends.
     pub(crate) fn sequence(outbound: &[Outbound]) -> Vec<String> {
         outbound
             .iter()
@@ -648,7 +536,6 @@ pub(super) mod tests {
             .collect()
     }
 
-    /// The single `SMSG_SPELL_GO` in the batch.
     pub(crate) fn spell_go(outbound: &[Outbound]) -> &wow_world_messages::vanilla::SMSG_SPELL_GO {
         outbound
             .iter()
@@ -658,8 +545,6 @@ pub(super) mod tests {
             })
             .expect("the batch has no SMSG_SPELL_GO")
     }
-
-    // ── Instant casts ────────────────────────────────────────────────────────
 
     #[test]
     fn instant_unit_target_cast_clears_the_client_then_requests_the_durable_cast() {
@@ -779,8 +664,6 @@ pub(super) mod tests {
         );
     }
 
-    // ── Casts that resolve later ─────────────────────────────────────────────
-
     #[test]
     fn timed_cast_sends_no_synchronous_messages_and_still_requests_the_durable_cast() {
         let store = InMemoryCasts {
@@ -815,8 +698,6 @@ pub(super) mod tests {
         assert_eq!(store.casts.lock().unwrap().as_slice(), &[(CASTER, 78, 77)]);
     }
 
-    // ── Ground targeting ─────────────────────────────────────────────────────
-
     #[test]
     fn destination_target_cast_requests_the_durable_ground_cast_with_the_client_coordinates() {
         let store = InMemoryCasts {
@@ -839,8 +720,6 @@ pub(super) mod tests {
         );
         assert!(store.casts.lock().unwrap().is_empty());
     }
-
-    // ── Refusal ──────────────────────────────────────────────────────────────
 
     #[test]
     fn refused_instant_cast_maps_the_reason_after_the_clearing_sequence() {
@@ -888,8 +767,6 @@ pub(super) mod tests {
         assert!(matches!(classify(&error), DurableFailure::TransportLoss));
     }
 
-    // ── World Session context ───────────────────────────────────────────────────────
-
     #[test]
     fn a_player_with_no_character_in_world_makes_no_request_and_gets_a_failed_cast() {
         let store = InMemoryCasts::instant();
@@ -900,8 +777,6 @@ pub(super) mod tests {
         assert_eq!(sequence(&outbound), ["CAST_RESULT(FAILED 0x17)"]);
         assert!(store.casts.lock().unwrap().is_empty());
     }
-
-    // ── Manual completion: enchant, disenchant, fishing, lock opening ────────
 
     #[test]
     fn enchant_cast_resolves_the_item_guid_to_its_slot_and_completes_manually() {

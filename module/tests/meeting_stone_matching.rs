@@ -1,9 +1,3 @@
-//! Meeting Stone matching on a private Standalone: the bucket pass forms and fills Parties by Open
-//! Role, the group cores keep a queued Party's queue state in step with its roster, and the
-//! reminder tick nudges a waiting Party. One database plays both the Home Shard and Realm-core, as
-//! on a single-database realm. The hook tests run each case through `realm_group_op`, the
-//! Realm-core plane, and through the `gw_group_*` reducers, the single-database plane.
-
 mod support;
 
 use std::collections::BTreeMap;
@@ -12,10 +6,7 @@ use std::time::Duration;
 use serde_json::json;
 use support::Standalone;
 
-// Fixture ids sit in 509_6000-509_6099.
-/// The Deadmines (AreaTable 1581).
 const DEADMINES: u32 = 1581;
-/// The Stockade (AreaTable 717).
 const STOCKADE: u32 = 717;
 const STONE_AT: (f32, f32, f32) = (-8949.95, -132.493, 83.5312);
 
@@ -28,17 +19,14 @@ const WARRIOR: u8 = 1;
 const PRIEST: u8 = 5;
 const MAGE: u8 = 8;
 
-// realm_meeting_stone_op bytes.
 const JOIN: &str = "0";
 
-// realm_group_op bytes.
 const INVITE: &str = "0";
 const ACCEPT: &str = "1";
 const LEAVE: &str = "3";
 const UNINVITE: &str = "4";
 const RAID_CONVERT: &str = "6";
 
-// SMSG_MEETINGSTONE_SETQUEUE status bytes, cm:LFG/LFGDefines.h:50-58.
 const LEAVE_QUEUE: u8 = 0;
 const JOINED_QUEUE: u8 = 1;
 const PARTY_MEMBER_LEFT_LFG: u8 = 2;
@@ -46,7 +34,6 @@ const PARTY_MEMBER_REMOVED_PARTY_REMOVED: u8 = 3;
 const LOOKING_FOR_NEW_PARTY_IN_QUEUE: u8 = 4;
 const NONE: u8 = 5;
 
-/// `game_group_event` kinds: the roster list and the four Meeting Stone kinds.
 const LIST: u8 = 1;
 const QUEUE: u8 = 27;
 const MEMBER_ADDED: u8 = 28;
@@ -58,13 +45,10 @@ fn start(name: &str) -> Standalone {
     realm.publish_module();
     realm.assert_call("claim_operator", &[]);
     realm.assert_call("install_guid_range", &["0"]);
-    // Group events are reaped by the shared GC. Disarming it keeps every row for the whole test,
-    // so each assertion reads the rows an action added by id.
     realm.assert_sql("DELETE FROM game_event_reaper_schedule");
     realm
 }
 
-/// A Character at the Deadmines stone with a live claim of its own Account.
 fn stage(realm: &Standalone, guid: u64, race: u8, class: u8) {
     let (x, y, z) = STONE_AT;
     realm.assert_call(
@@ -90,7 +74,6 @@ fn stage_group(realm: &Standalone, leader: u64, members: &[u64]) {
     );
 }
 
-/// The World Session actor the fixture claim admits.
 fn session(guid: u64) -> String {
     json!({
         "guid": guid,
@@ -115,12 +98,10 @@ fn stone_join(realm: &Standalone, actor: u64, area: u32, facts: &[(u64, u8, u8)]
     );
 }
 
-/// A human Character queues alone.
 fn join_alone(realm: &Standalone, guid: u64, class: u8, area: u32) {
     stone_join(realm, guid, area, &[(guid, HUMAN, class)]);
 }
 
-/// A human leader queues its whole Party, `(guid, class)` per member.
 fn join_party(realm: &Standalone, leader: u64, area: u32, members: &[(u64, u8)]) {
     let facts: Vec<_> = members
         .iter()
@@ -143,12 +124,9 @@ fn group_op(realm: &Standalone, op: &str, actor: u64, target: u64, arg_a: u8, ar
     );
 }
 
-/// The two ways a Gateway drives the party authority.
 #[derive(Clone, Copy, Debug)]
 enum Plane {
-    /// `realm_group_op` on Realm-core.
     RealmCore,
-    /// The `gw_group_*` reducers on a single database.
     SingleDatabase,
 }
 
@@ -168,7 +146,6 @@ impl Plane {
         }
     }
 
-    /// The Gateway conveys class and race on Realm-core; the single database reads its own row.
     fn accept(self, realm: &Standalone, guid: u64, class: u8) {
         match self {
             Plane::RealmCore => group_op(realm, ACCEPT, guid, 0, class, HUMAN),
@@ -183,8 +160,6 @@ impl Plane {
         }
     }
 
-    /// Character deletion: a CHARACTER_DELETED leave on Realm-core, the delete sweep on a single
-    /// database.
     fn delete(self, realm: &Standalone, guid: u64) {
         match self {
             Plane::RealmCore => group_op(realm, LEAVE, guid, 0, 1, 0),
@@ -204,7 +179,6 @@ impl Plane {
     }
 }
 
-/// One `game_group_event` row the tests read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {
     List,
@@ -214,7 +188,6 @@ enum Event {
     Complete,
 }
 
-/// Every LIST and Meeting Stone event so far, as `(id, recipient, event)` in insert order.
 fn events(realm: &Standalone) -> Vec<(u64, u64, Event)> {
     let mut rows: Vec<_> = realm
         .query_rows(&format!(
@@ -247,11 +220,9 @@ fn events(realm: &Standalone) -> Vec<(u64, u64, Event)> {
     rows
 }
 
-/// The events `action` adds, per recipient in insert order.
 struct Heard(BTreeMap<u64, Vec<Event>>);
 
 impl Heard {
-    /// The Meeting Stone events `guid` heard.
     fn stone(&self, guid: u64) -> Vec<Event> {
         self.with_lists(guid)
             .into_iter()
@@ -259,7 +230,6 @@ impl Heard {
             .collect()
     }
 
-    /// Every event `guid` heard, roster lists included.
     fn with_lists(&self, guid: u64) -> Vec<Event> {
         self.0.get(&guid).cloned().unwrap_or_default()
     }
@@ -275,7 +245,6 @@ fn heard(realm: &Standalone, action: impl FnOnce()) -> Heard {
     Heard(by_recipient)
 }
 
-/// `(area_id, team, class, group_id)` of one Seeker row.
 type SeekerRow = (u32, u32, u8, u64);
 
 fn seekers(realm: &Standalone) -> BTreeMap<u64, SeekerRow> {
@@ -315,7 +284,6 @@ fn group_of(realm: &Standalone, guid: u64) -> Option<u64> {
         .map(|row| row["group_id"].parse().unwrap())
 }
 
-/// `group_id`'s members in join order.
 fn members(realm: &Standalone, group_id: u64) -> Vec<u64> {
     let mut rows: Vec<(u64, u64)> = realm
         .query_rows(&format!(
@@ -358,8 +326,6 @@ fn alone(area: u32, team: u32, class: u8) -> SeekerRow {
     (area, team, class, 0)
 }
 
-/// Criteria 1 and 4: five Seekers covering every role form one Party that completes at once.
-/// Each Stone Add is announced to the members before it, never to the added Character.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn five_seekers_with_every_role_complete_a_party_at_once() {
@@ -425,8 +391,6 @@ fn five_seekers_with_every_role_complete_a_party_at_once() {
     assert!(queued_parties(&realm).is_empty());
 }
 
-/// Criterion 2: five mages form a party of three damage dealers that waits for a tank and a
-/// healer. The other two mages keep waiting alone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn five_mages_form_a_party_that_waits_for_a_tank_and_a_healer() {
@@ -452,8 +416,6 @@ fn five_mages_form_a_party_that_waits_for_a_tank_and_a_healer() {
     );
 }
 
-/// Criterion 3: a queued party with only its healer open takes the longest-waiting priest. The
-/// second priest keeps waiting. The leader hears MEMBER_ADDED before the roster list it precedes.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_queued_party_takes_the_longest_waiting_healer() {
@@ -468,7 +430,6 @@ fn a_queued_party_takes_the_longest_waiting_healer() {
     }
     stage_group(&realm, LEADER, &DPS);
     let group = group_of(&realm, LEADER).unwrap();
-    // The higher guid waits longer, so the wait decides and not the guid.
     for priest in [FIRST_PRIEST, SECOND_PRIEST] {
         stage(&realm, priest, HUMAN, PRIEST);
         join_alone(&realm, priest, PRIEST, DEADMINES);
@@ -511,7 +472,6 @@ fn a_queued_party_takes_the_longest_waiting_healer() {
     );
 }
 
-/// Criterion 5: a team or an area apart, Seekers never meet, neither to form a party nor to fill one.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn seekers_of_another_team_or_area_never_meet() {
@@ -540,7 +500,6 @@ fn seekers_of_another_team_or_area_never_meet() {
     let group = group_of(&realm, mages[0]).expect("five Alliance Seekers form a party");
     assert_eq!(members(&realm, group), mages[..3]);
 
-    // The party has its tank and healer open; a priest a team or an area away does not take one.
     stage(&realm, HORDE_PRIEST, ORC, PRIEST);
     stone_join(
         &realm,
@@ -569,13 +528,10 @@ fn seekers_of_another_team_or_area_never_meet() {
     );
 }
 
-/// Criterion 6: a Seeker whose claim expired before the lease reaper closed it is never added, and
-/// the pass that meets it drops its row without a packet.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_seeker_without_a_live_claim_is_dropped_by_the_pass() {
     let realm = start("stone-match-claims");
-    // Without the lease reaper only the pass can notice the expired claim.
     realm.assert_sql("DELETE FROM game_gateway_lease_reaper_schedule");
     let mages: Vec<u64> = (509_6040..509_6046).collect();
     let expired = mages[1];
@@ -603,8 +559,6 @@ fn a_seeker_without_a_live_claim_is_dropped_by_the_pass() {
     assert_eq!(group_of(&realm, expired), None);
 }
 
-/// Criterion 7, leave and deletion with the leader staying: the leaver hears NONE, the rest hear
-/// PARTY_MEMBER_LEFT_LFG, and the party stays queued and fills the role the leaver freed.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_member_who_leaves_keeps_the_party_queued_and_frees_a_role() {
@@ -620,7 +574,6 @@ fn a_member_who_leaves_keeps_the_party_queued_and_frees_a_role() {
         }
         stage_group(&realm, LEADER, &[LEAVER, DPS[0], DPS[1]]);
         let group = group_of(&realm, LEADER).unwrap();
-        // A warrior and three mages leave only the healer open.
         join_party(
             &realm,
             LEADER,
@@ -672,7 +625,6 @@ fn a_member_who_leaves_keeps_the_party_queued_and_frees_a_role() {
     }
 }
 
-/// Criterion 7, leave with the leader changing: the party leaves the queue with LEAVE_QUEUE.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_leader_who_leaves_takes_the_party_out_of_the_queue() {
@@ -705,8 +657,6 @@ fn a_leader_who_leaves_takes_the_party_out_of_the_queue() {
     }
 }
 
-/// Criterion 7, kick from a party that survives: the party leaves the queue, and the kicked
-/// Character waits alone with its class and team.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_kicked_member_waits_alone_and_the_party_leaves_the_queue() {
@@ -754,8 +704,6 @@ fn a_kicked_member_waits_alone_and_the_party_leaves_the_queue() {
     }
 }
 
-/// A kicked member without a live Account Claim, a playerbot or an offline Character, only
-/// leaves. The party still leaves the queue, and nobody waits alone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_kicked_member_without_a_claim_does_not_wait_alone() {
@@ -793,8 +741,6 @@ fn a_kicked_member_without_a_claim_does_not_wait_alone() {
     assert!(seekers(&realm).is_empty());
 }
 
-/// A queued party row whose Group is gone is broken state. The next pass drops it, and the JOIN
-/// that runs the pass still succeeds and forms its own Party.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_stale_party_row_leaves_the_queue_without_blocking_a_join() {
@@ -835,8 +781,6 @@ fn a_stale_party_row_leaves_the_queue_without_blocking_a_join() {
     assert_eq!(queued_parties(&realm), [group]);
 }
 
-/// Criterion 7, disband by a leave or a kick from two members: both hear NONE once, and nobody
-/// waits on alone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_disband_answers_every_former_member_with_none() {
@@ -870,9 +814,6 @@ fn a_disband_answers_every_former_member_with_none() {
     }
 }
 
-/// Criterion 7, accept: a solo Seeker who joins any party leaves the solo queue, told LEAVE_QUEUE
-/// unless the party is queued for its area. A queued party gains it as a Seeker with its class and
-/// completes at five members.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn accepting_an_invite_moves_a_solo_seeker_into_the_party() {
@@ -881,11 +822,8 @@ fn accepting_an_invite_moves_a_solo_seeker_into_the_party() {
         const LEADER: u64 = 509_6075;
         const HEALER: u64 = 509_6076;
         const DPS: u64 = 509_6077;
-        /// Waits at the Stockade.
         const ELSEWHERE: u64 = 509_6078;
-        /// Waits at the Deadmines with a class the Gateway could not read, so no role fits it.
         const UNREAD: u64 = 509_6079;
-        /// A solo Seeker whose own invite forms a new party.
         const INVITER: u64 = 509_6080;
         const INVITED: u64 = 509_6081;
         stage(&realm, LEADER, HUMAN, WARRIOR);
@@ -941,8 +879,6 @@ fn accepting_an_invite_moves_a_solo_seeker_into_the_party() {
     }
 }
 
-/// Criterion 7, raid convert: every member hears LEAVE_QUEUE before the raid list. The convert has
-/// no single-database reducer; the Gateway sends it to the party authority on both realm shapes.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_queued_party_that_converts_to_a_raid_leaves_the_queue() {
@@ -970,8 +906,6 @@ fn a_queued_party_that_converts_to_a_raid_leaves_the_queue() {
     assert!(seekers(&realm).is_empty());
 }
 
-/// Criterion 8: a kicked Character re-queued alone fills a second queued party's open healer in the
-/// same transaction.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_kicked_member_joins_a_second_queued_party_at_once() {
@@ -1026,8 +960,6 @@ fn a_kicked_member_joins_a_second_queued_party_at_once() {
     );
 }
 
-/// Criterion 9: the pass advances the Roster Revision of each party it forms and of each party a
-/// Stone Add changes.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn every_party_the_pass_forms_or_fills_has_a_higher_roster_revision() {
@@ -1048,8 +980,6 @@ fn every_party_the_pass_forms_or_fills_has_a_higher_roster_revision() {
     assert_eq!(revision(&realm, group), Some(formed + 1));
 }
 
-/// Criterion 10: a due reminder sends IN_PROGRESS to every member once and is due again five
-/// minutes after it fired.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_due_reminder_tells_every_member_once() {
@@ -1093,7 +1023,6 @@ fn a_due_reminder_tells_every_member_once() {
         "the reminder tick never fired"
     );
     let first_due = next_due(&realm);
-    // The tick fires within its 5 s cadence of the reminder falling due.
     let fired_after = first_due - 300_000_000 - backdated_due;
     assert!(
         (0..15_000_000).contains(&fired_after),
@@ -1106,7 +1035,6 @@ fn a_due_reminder_tells_every_member_once() {
     assert_eq!(recipients, [LEADER, MEMBER], "each member hears it once");
 }
 
-/// Criterion 11: a stone-formed party starts with the same `game_group` defaults as an invited one.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_stone_formed_party_has_the_defaults_of_an_invited_one() {
@@ -1148,16 +1076,13 @@ fn a_stone_formed_party_has_the_defaults_of_an_invited_one() {
     assert_eq!(stone["group_type"], "0", "a Party");
 }
 
-/// Criterion 12: a Character counting down in an instance its new stone party owns stays.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_stone_add_into_the_party_that_owns_the_instance_cancels_the_countdown() {
     let realm = start("stone-match-instance");
-    // The Characters `debug_stage_instance_removal_fixture` stages; all three stand in its instance.
     const ALPHA: u64 = 509_295_001;
     const BRAVO: u64 = 509_295_002;
     const CHARLIE: u64 = 509_295_003;
-    // Party ops without a token run before the claims exist, as in the Instance Removal tests.
     let tokenless = |op: &str, actor: u64, target: u64| {
         realm.assert_call(
             "realm_group_op",

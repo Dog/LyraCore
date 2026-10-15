@@ -103,7 +103,6 @@ async function readPackageIds(packageDir: string, packageName: string): Promise<
   return ledger;
 }
 
-/** New IDs avoid every installed Package's saved identities, artifacts and legacy headers. */
 export async function scriptIds(packageDir: string, packageName: string): Promise<ScriptIds> {
   const ledger = await readPackageIds(packageDir, packageName);
   const packagesDir = dirname(packageDir);
@@ -111,7 +110,7 @@ export async function scriptIds(packageDir: string, packageName: string): Promis
   for (const entry of entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
     if (entry.name === packageName || entry.name.startsWith(".")) continue;
     const siblingDir = join(packagesDir, entry.name);
-    // Collection checks install Package directories as symlinks. Disabled Packages live elsewhere.
+    // Collection checks install Package directories as symlinks.
     const directory = entry.isDirectory() || (entry.isSymbolicLink() && await stat(siblingDir).then(
       (info) => info.isDirectory(),
       (error: unknown) => {

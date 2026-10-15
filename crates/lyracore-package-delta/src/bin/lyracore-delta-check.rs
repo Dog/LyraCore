@@ -1,26 +1,3 @@
-//! `lyracore-delta-check <artifact.json>...` — parse a set of generated Package artifacts, trace
-//! them together, and print the plan they form.
-//!
-//! Two artifact kinds arrive, because a Package ships every kind it has into one generated
-//! directory: Package Deltas and Script Artifacts. Each file is routed on its own `kind` member and
-//! traced with its own kind, and both traces have to come out clear.
-//!
-//! This is the check a Datascript author gets after a build, before anything reaches a shard. It
-//! needs no client data, no database and no realm: it reads the named files and nothing else, which
-//! is why it can run on any machine in under a second.
-//!
-//! Exit status is the whole answer: 0 when every artifact parses and the Packages agree, 1 when an
-//! artifact is refused, two Packages claim the same column of one row, or two Packages claim one
-//! Package twice, or two Packages claim one Runtime Script identity. The output names the file and
-//! the exact conflict in every case,
-//! because the reader is the author who has to fix one line of a Datascript or one script file.
-//!
-//! Trace ALL of a realm's enabled artifacts in one invocation. Conflicts exist BETWEEN Packages, so
-//! checking one file at a time can only ever prove that one file parses.
-//!
-//! `lyracore-delta-check --print-events` is a second, unrelated mode: it prints the Event Binding
-//! catalogue and exits, reading no file and tracing nothing. See [`print_events`].
-
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -109,7 +86,6 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// One generated artifact, already routed to the parser its own `kind` chose.
 enum Artifact {
     Delta(PackageDelta),
     Script(ScriptArtifact),
@@ -131,13 +107,6 @@ fn print_events(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Read one file and hand it to the parser its own `kind` names.
-///
-/// Routing on `kind` rather than on the file name: a Package chooses its own artifact file names,
-/// and the member inside the file is the only thing that says what it holds. A kind this build does
-/// not read reaches [`PackageDelta::parse`], which refuses it by name.
-///
-/// A refusal names the FILE, so an author with several Packages open knows which one to fix.
 fn read_artifact(path: &Path) -> Result<Artifact, String> {
     let json = std::fs::read_to_string(path)
         .map_err(|e| format!("{}: cannot read: {e}", path.display()))?;
@@ -149,9 +118,6 @@ fn read_artifact(path: &Path) -> Result<Artifact, String> {
     .map_err(refuse)
 }
 
-/// The plan: every Package with its file and row counts, then every claimed row, then every
-/// conflict. The same shape the importer's Package Delta stage prints, so an author and an operator
-/// read the same report.
 fn report(
     delta_paths: &[&String],
     deltas: &[PackageDelta],

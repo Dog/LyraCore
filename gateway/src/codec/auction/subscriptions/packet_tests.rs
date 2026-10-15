@@ -3,11 +3,6 @@ use crate::stdb::bindings::AuctionNotice;
 use crate::world::Outbound;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Auction Notice kind decoding (`cm:AuctionHouseHandler.cpp`/`AuctionHouseMgr.cpp`): Outbid
-/// and Won go out on `SMSG_AUCTION_BIDDER_NOTIFICATION`, Sold, Expired and New bid go out on
-/// `SMSG_AUCTION_OWNER_NOTIFICATION`, Removed goes out on `SMSG_AUCTION_REMOVED_NOTIFICATION`,
-/// and an unrecognized kind or an unimported house both drop the packet. The Auction Mail the
-/// same transaction wrote still reaches the inbox.
 #[test]
 fn auction_notice_kinds_decode_to_their_own_packet_and_an_unknown_one_drops() {
     use lyracore_shared::auction::auction_notice::{EXPIRED, NEW_BID, OUTBID, REMOVED, SOLD, WON};

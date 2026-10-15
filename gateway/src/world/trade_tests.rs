@@ -1,6 +1,3 @@
-//! Trade requests and durable outcomes through the Trade Store. The Relay sends trade status;
-//! these tests check the Fake's Trade Session and the absence of direct replies.
-
 use super::handlers::{Trade, TradeStore};
 use super::*;
 use crate::stdb::ReducerCallError;
@@ -39,14 +36,10 @@ enum Decline {
     IgnoresInitiator,
 }
 
-/// One Trade Session. The Module owns every gate and the accept reset; this keeps just enough to show
-/// which seat did what, with which arguments.
 #[derive(Default)]
 struct Session {
     phase: Phase,
-    /// `(seat, trade slot)` to the absolute inventory slot offered.
     items: BTreeMap<(u64, u8), u8>,
-    /// Offered copper per seat.
     gold: BTreeMap<u64, u32>,
     accepted: BTreeSet<u64>,
 }
@@ -54,7 +47,6 @@ struct Session {
 #[derive(Default)]
 struct TradeFake {
     session: Mutex<Session>,
-    /// Answered once by the next request, in place of success.
     failure: Mutex<Option<ReducerCallError>>,
 }
 
@@ -193,14 +185,12 @@ impl TradeStore for TradeFake {
     }
 }
 
-/// Handle `msg` as `seat`, a Character of Account 7.
 fn run(store: &TradeFake, seat: u64, msg: impl Into<ClientOpcodeMessage>) {
     let mut session = ProtocolSession::in_world(7, seat);
     let reply = Trade::handle(store, &mut session, ProtocolRequest::Message(msg.into())).unwrap();
     assert!(reply.outbound.is_empty());
 }
 
-/// Initiating a trade with a targeted player names the wire's target.
 #[test]
 fn initiate_trade_proposes_to_the_wire_target_guid() {
     let store = TradeFake::default();
@@ -214,7 +204,6 @@ fn initiate_trade_proposes_to_the_wire_target_guid() {
     );
 }
 
-/// The same flow works with the seats swapped: Character 2 initiates against Character 1.
 #[test]
 fn initiate_trade_proposes_from_the_other_side_too() {
     let store = TradeFake::default();
@@ -228,9 +217,6 @@ fn initiate_trade_proposes_from_the_other_side_too() {
     );
 }
 
-/// The handshake round trip on one Trade Session: A proposes, B's client answers `CMSG_BEGIN_TRADE`
-/// (the vanilla auto-reply to `BeginTrade`), then B cancels. Each step reads the phase the Fake
-/// reached, so the steps also pin their order: a begin before the proposal opens nothing.
 #[test]
 fn the_handshake_flow_proposes_then_opens_then_cancels() {
     let store = TradeFake::default();
@@ -257,8 +243,6 @@ fn the_handshake_flow_proposes_then_opens_then_cancels() {
     assert_eq!(store.phase(), Phase::Cancelled { by: 2 });
 }
 
-/// Offer mutations carry the wire's arguments: set item (main bag to absolute slot), clear item,
-/// and gold (the `Gold` wire type decoded back to copper).
 #[test]
 fn offer_mutations_carry_the_wire_arguments() {
     let store = TradeFake::default();
@@ -286,8 +270,6 @@ fn offer_mutations_carry_the_wire_arguments() {
     assert_eq!(store.gold(), [(1, 1_2345)]);
 }
 
-/// Items inside an equipped sub-bag are out of scope: logged and ignored, never forwarded with a
-/// bag-local slot number that would alias a main-bag slot.
 #[test]
 fn set_trade_item_from_a_sub_bag_is_ignored_not_misaddressed() {
     let store = TradeFake::default();
@@ -303,9 +285,6 @@ fn set_trade_item_from_a_sub_bag_is_ignored_not_misaddressed() {
     assert!(store.items().is_empty());
 }
 
-/// The wire half of the full loop: A initiates, offers an item and accepts; B answers, offers gold
-/// and accepts. Each seat's offer lands under its own seat. The swap itself (items, gold,
-/// atomicity) is the Module's Trade Commit, tested there.
 #[test]
 fn the_full_loop_records_each_seats_offer_and_both_accepts() {
     let store = TradeFake::default();
@@ -344,8 +323,6 @@ fn the_full_loop_records_each_seats_offer_and_both_accepts() {
     assert_eq!(store.accepted(), [1, 2]);
 }
 
-/// After an accept, a further offer mutation and an explicit unaccept both reach the Store for the
-/// acting seat. The reset itself (both flags cleared, `BackToTrade` to both) is the Module's rule.
 #[test]
 fn unaccept_and_post_accept_mutations_reach_the_acting_seat() {
     let store = TradeFake::default();
@@ -365,9 +342,6 @@ fn unaccept_and_post_accept_mutations_reach_the_acting_seat() {
     assert!(store.accepted().is_empty());
 }
 
-/// The proposed target's client answers a `BeginTrade` it cannot take with `CMSG_BUSY_TRADE`
-/// (already in a dialog) or `CMSG_IGNORE_TRADE` (initiator ignored). Each declines as the
-/// declining side, with its own reason.
 #[test]
 fn decline_opcodes_decline_with_their_own_reason_for_the_declining_side() {
     for (reason, decline) in [
@@ -384,8 +358,6 @@ fn decline_opcodes_decline_with_their_own_reason_for_the_declining_side() {
     }
 }
 
-/// Either side can cancel: the initiator's own `CMSG_CANCEL_TRADE` cancels as themselves, the
-/// counterpart of the handshake test's cancel by the target.
 #[test]
 fn cancel_trade_cancels_for_the_initiating_side_too() {
     let store = TradeFake::default();

@@ -1,8 +1,5 @@
 name: Module durable tests and Gateway bindings
 
-# Durable tests start private SpacetimeDB instances and publish the Module with test fixtures.
-# The Rust workflow's --lib run does not execute these ignored integration tests.
-
 on:
   pull_request:
   push:
@@ -16,7 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  # Balance measured target durations, reserving time for each job's builds and Gateway checks.
   durable:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -40,16 +36,10 @@ jobs:
         if: matrix.shard != 2
         run: ./lyracore bindings
 
-      # Build failures report before any fixture starts. Each test process asks Cargo for the
-      # current artifact, caches its bytes, and publishes private copies through --bin-path.
       - name: Build the module wasm
         run: cargo build --release --target wasm32-unknown-unknown -p lyracore-module --features=debug_reducers,package_test_fixture
 
-      # Each test owns a whole database process, so the thread cap is a memory bound, not a CPU one.
-      #
-      # Deadmines fixtures need the separately installed Package's reducers.
-      # `lethal_floor`'s ranged phase races the module's own cast-event sweep and health regen, and
-      # is flaky on `main` with or without this change.
+      # Each test owns a standalone process; the thread limit bounds memory use.
       - name: Run the durable suite, shard ${{ matrix.shard }} of 3
         run: |
           mapfile -t targets < <(python3 scripts/durable-test-targets.py "${{ matrix.shard }}")
@@ -84,7 +74,6 @@ jobs:
         if: matrix.shard == 0
         run: cargo test --locked -p lyracore-gateway --bin lyracore-gateway benilla_durable_ -- --ignored --test-threads=1
 
-      # No Package registers a client command here, so the Module's fixture command carries it.
       - name: Run the cross-Shard command transport tests
         if: matrix.shard == 1
         run: cargo test -p lyracore-gateway --bin lyracore-gateway stdb::subscriptions::party_command_durable_tests -- --ignored --test-threads=1

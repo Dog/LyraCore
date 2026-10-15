@@ -1,22 +1,10 @@
-//! The Module↔Gateway CONTACT wire contract: why the Module refused a friends- or ignore-list
-//! change. The party half of the social pane is [`crate::group`].
-
-/// Why the Module refused a contact-list Durable Request. The tag is the whole reducer error text,
-/// so neither tier matches on human prose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContactRefusal {
-    /// The acting Character is temporarily unable to change its contact lists.
     ActorUnavailable,
-    /// A Character may not befriend or ignore itself.
     AddSelf,
-    /// The target is already on that same list.
     AlreadyOnList,
-    /// That list is at its cap.
     ListFull,
-    /// The remove named a target that is not on that list.
     NotOnList,
-    /// A friend add named a Character on the other team (cm:MiscHandler.cpp:467-468). Ignore has
-    /// no such rule.
     Enemy,
 }
 

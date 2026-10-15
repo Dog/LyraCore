@@ -1,4 +1,3 @@
-/** Read legacy headers before the first line that is neither blank nor a comment. */
 export function readDirectives(file: string, source: string): Map<string, string> {
   const directives = new Map<string, string>();
   for (const line of source.split("\n")) {

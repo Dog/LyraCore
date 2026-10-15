@@ -1,7 +1,3 @@
-//! Group Broadcasts through the party reducer on a private Standalone: the Ready Check, Target
-//! Icons, the minimap ping and `/roll`. Each op writes one `game_group_event` row per recipient and
-//! leaves the Roster Revision alone.
-
 mod support;
 
 use lyracore_shared::group::{
@@ -21,7 +17,6 @@ const TARGET_ICON: u8 = 13;
 const MINIMAP_PING: u8 = 14;
 const RANDOM_ROLL: u8 = 15;
 
-/// A creature guid. Target Icons name any unit.
 const DEFIAS: u64 = 0xF130_0000_0000_0042;
 const MURLOC: u64 = 0xF130_0000_0000_0043;
 const OUTSIDER: u64 = 9;
@@ -63,7 +58,6 @@ fn refusal(
     text
 }
 
-/// One `game_group_event` row as the Gateway reads it.
 #[derive(Debug, PartialEq, Eq)]
 struct Event {
     recipient: u64,
@@ -72,9 +66,6 @@ struct Event {
     payload: String,
 }
 
-/// Every `game_group_event` row one reducer call inserts, by recipient guid, and each recipient's
-/// rows in insert order. Only rows newer than every row present before the call match, so the
-/// event GC deleting older rows cannot stand in for the call's own transaction.
 fn events_of(node: &Standalone, action: impl FnOnce()) -> Vec<Event> {
     let newest = node
         .query_rows("SELECT id FROM game_group_event")
@@ -118,7 +109,6 @@ fn event(recipient: u64, kind: u8, other: u64, payload: &str) -> Event {
     }
 }
 
-/// The same row for each recipient.
 fn to_each(recipients: &[u64], kind: u8, other: u64, payload: &str) -> Vec<Event> {
     recipients
         .iter()
@@ -147,7 +137,6 @@ fn icon(icon: u8, target_guid: u64) -> TargetIcon {
     TargetIcon { icon, target_guid }
 }
 
-/// A Party led by 1 with `members` after it, in join order.
 fn party(name: &str, members: &[u64]) -> Standalone {
     let mut node = Standalone::start(name);
     node.publish_module();
@@ -159,8 +148,6 @@ fn party(name: &str, members: &[u64]) -> Standalone {
     node
 }
 
-/// A Raid of 1, 2, 3 and 4 led by 1, with 3 as its Assistant. The promote op belongs to another
-/// change, so the fixture writes the Raid Slot byte `0x80` (Subgroup 0, Assistant) directly.
 fn raid(name: &str) -> Standalone {
     let node = party(name, &[2, 3, 4]);
     group_op(&node, RAID_CONVERT, 1, 0, 0, 0);
@@ -168,8 +155,6 @@ fn raid(name: &str) -> Standalone {
     node
 }
 
-/// **AC 1, 2 and 10.** The leader or an Assistant asks every member, the asker included
-/// (cm:GroupHandler.cpp:549-564). Each answer reaches the leader alone (cm:GroupHandler.cpp:566-581).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_ready_check_asks_every_member_and_the_answers_reach_the_leader_alone() {
@@ -205,7 +190,6 @@ fn a_ready_check_asks_every_member_and_the_answers_reach_the_leader_alone() {
     );
 }
 
-/// **AC 3, 4, 5, 7 and 10.** cm:Group.cpp:583-601 and cm:GroupHandler.cpp:444-471.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn target_icons_follow_the_vanilla_placement_and_go_when_the_raid_disbands() {
@@ -295,8 +279,6 @@ fn target_icons_follow_the_vanilla_placement_and_go_when_the_raid_disbands() {
     );
 }
 
-/// **AC 6.** A Party client clears its marks on every list, so a Party's LIST carries its icons
-/// (vm:Group.cpp:1343-1360). A Raid keeps its marks, and its LIST carries none.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_party_list_carries_its_target_icons_and_a_raid_list_carries_none() {
@@ -323,8 +305,6 @@ fn a_party_list_carries_its_target_icons_and_a_raid_list_carries_none() {
     );
 }
 
-/// A leader change pushes a list too, and a Party's list always carries its Target Icons: the
-/// marks survive a leader change the same way they survive any other list-pushing op.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_leader_change_list_still_carries_the_partys_target_icons() {
@@ -349,9 +329,6 @@ fn a_leader_change_list_still_carries_the_partys_target_icons() {
     }
 }
 
-/// **AC 8, 9 and 10.** The ping reaches everyone but the sender with the same floats
-/// (cm:GroupHandler.cpp:395-415). A grouped roll reaches every member, the roller included; an
-/// ungrouped one reaches the roller alone (cm:GroupHandler.cpp:436-441, vm:GroupHandler.cpp:419-431).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_ping_skips_the_sender_and_a_roll_reaches_the_whole_group() {
@@ -417,9 +394,6 @@ fn a_ping_skips_the_sender_and_a_roll_reaches_the_whole_group() {
     );
 }
 
-/// A deleted Character's World Shard sweep cannot reach Realm-core's icon rows, so the Gateway's
-/// deleted-Character LEAVE (`arg_a` = `leave_cause::CHARACTER_DELETED`) drops them. A plain leave
-/// keeps the icon on the unit.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_deleted_characters_leave_drops_the_target_icons_on_it() {

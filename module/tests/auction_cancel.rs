@@ -4,19 +4,14 @@ use std::collections::BTreeMap;
 
 use support::{actor, Standalone};
 
-/// The staged listings (`debug_stage_auction_cancel_fixture`): a bid of 1000 at a 15% cut, no bid,
-/// and a second bid of 1000.
 const BID_LISTING: &str = "5090086";
 const UNBID_LISTING: &str = "5090088";
 const STALE_LISTING: &str = "5090089";
 const BIDDER: &str = "5090087";
-/// A seller with no Character in the world: Realm-core decides without reading any purse.
 const REALM_SELLER: &str = "5090090";
-/// The seeded Character, who pays the cut from a live purse in the single-database path.
 const LOCAL_SELLER: &str = "1";
 const VENDOR_ENTRY: &str = "51004";
 const HOUSE: &str = "7";
-/// 15% of the bid of 1000, truncated (`cm:AuctionHouseMgr.cpp:733-736`).
 const CUT: &str = "150";
 
 fn rows(standalone: &Standalone, query: &str) -> Vec<BTreeMap<String, String>> {
@@ -101,9 +96,6 @@ fn purse(standalone: &Standalone) -> String {
         .clone()
 }
 
-/// The item back to the seller and the bid back to the bidder, as cmangos writes them
-/// (`cm:AuctionHouseHandler.cpp:167-189,450-456`): subject `entry:random_property:action`, action 5
-/// for the seller and 4 for the bidder, from house 7, COPIED (0x04), and no deposit anywhere.
 fn assert_cancellation_mail(standalone: &Standalone, seller: &str) {
     let seller_mail = auction_mail(standalone, seller);
     assert_eq!(seller_mail.len(), 2, "{seller_mail:?}");
@@ -146,8 +138,6 @@ fn assert_cancellation_mail(standalone: &Standalone, seller: &str) {
     .is_empty());
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
-/// One database plays the Home Shard and Realm-core.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once() {
@@ -155,11 +145,8 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
     standalone.publish_module();
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
-    // Auction Notices are reaped about a second after insert. Without the reaper schedule every
-    // notice this test writes stays until the test reads it.
     standalone.assert_sql("DELETE FROM game_event_reaper_schedule");
 
-    // Realm-core's decision, as the sharded driver calls it.
     standalone.assert_call("debug_stage_auction_cancel_fixture", &[REALM_SELLER, "0"]);
     decide_cancel(
         &standalone,
@@ -177,7 +164,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
         HOUSE,
         "0",
     );
-    // A bid after the read changed the cut; another player's listing; another market (house 1).
     decide_cancel(
         &standalone,
         "5090089",
@@ -233,7 +219,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
         "not found"
     );
 
-    // A replay changes nothing. A crossed payload or a bid under the same id is refused.
     decide_cancel(
         &standalone,
         "5090086",
@@ -264,7 +249,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
         5
     );
 
-    // The single-database path: the seeded Character at an auctioneer, with a live purse.
     standalone.assert_call("debug_seed_scenario_fixtures", &[]);
     standalone.assert_call("debug_spawn_player_entity", &[LOCAL_SELLER]);
     standalone.assert_call("debug_spawn_at_feet", &[LOCAL_SELLER, VENDOR_ENTRY, "1"]);
@@ -293,7 +277,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
         standalone.assert_call("gw_auction_cancel_local", &args);
     };
 
-    // A seller who cannot pay the cut gets nothing: no Hold, no change.
     standalone.assert_call("debug_set_money", &[LOCAL_SELLER, "100"]);
     let poor = cancel_local("5090092", &vendor, BID_LISTING, CUT);
     refused(
@@ -333,7 +316,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
         ["7", "1", CUT, "0"]
     );
 
-    // A stale cut refunds in the same transaction; an absent auctioneer holds nothing.
     call_local(cancel_local("5090094", &vendor, STALE_LISTING, "149"));
     assert_eq!(purse(&standalone), "850");
     assert!(listing_is_active(&standalone, STALE_LISTING));
@@ -353,8 +335,6 @@ fn a_cancellation_returns_the_item_refunds_the_bidder_and_charges_the_cut_once()
     .is_empty());
 }
 
-/// A Cancellation Hold crosses a Shard Boundary with its Character and settles on the new Home
-/// Shard, so a Gateway stop before the decision never strands the cut on the old one.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_unfinished_cancellation_hold_travels_with_its_seller_and_settles_on_the_new_home_shard() {
@@ -377,7 +357,6 @@ fn an_unfinished_cancellation_hold_travels_with_its_seller_and_settles_on_the_ne
     );
     let seller = actor(LOCAL_SELLER);
 
-    // The Gateway stopped with only the World Shard Hold committed.
     source.assert_call(
         "gw_auction_hold_cancel",
         &["5090092", &seller, &vendor, BID_LISTING, HOUSE, CUT],
@@ -421,7 +400,6 @@ fn an_unfinished_cancellation_hold_travels_with_its_seller_and_settles_on_the_ne
         ["0", "1", CUT]
     );
 
-    // The source plays Realm-core and decides; the new Home Shard spends the Hold once.
     source.assert_call(
         "realm_auction_decide_cancel",
         &["5090092", &seller, BID_LISTING, HOUSE, CUT],
@@ -453,8 +431,6 @@ fn an_unfinished_cancellation_hold_travels_with_its_seller_and_settles_on_the_ne
 
 const HOLD_QUERY: &str = "SELECT * FROM game_auction_hold WHERE operation_id = 5090094";
 
-/// A five-item Tough Jerky listing held on the World Shard before Realm-core commitment.
-/// Returns the Shard, Hold row, and purse after the deposit.
 fn a_held_listing(name: &str) -> (Standalone, BTreeMap<String, String>, String) {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -474,7 +450,6 @@ fn a_held_listing(name: &str) -> (Standalone, BTreeMap<String, String>, String) 
         &[LOCAL_SELLER, &vendor],
     );
     shard.assert_sql("DELETE FROM game_item_instance WHERE owner_guid = 1");
-    // Five Tough Jerky (sell price 2), marked as a Letter Copy's letter so the text id rides along.
     shard.assert_call("debug_grant_item", &[LOCAL_SELLER, "5090052", "5"]);
     shard.assert_sql("UPDATE game_item_instance SET item_text_id = 41 WHERE owner_guid = 1");
     let item = rows(
@@ -509,7 +484,6 @@ fn a_held_listing(name: &str) -> (Standalone, BTreeMap<String, String>, String) 
     (shard, held.remove(0), purse_after_deposit)
 }
 
-/// An empty Shard with its own guid range.
 fn another_shard(name: &str) -> Standalone {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -518,7 +492,6 @@ fn another_shard(name: &str) -> Standalone {
     shard
 }
 
-/// The seller crosses from `source` to `destination` through every Transfer step.
 fn transfer(source: &Standalone, destination: &Standalone, transfer_id: &str) {
     source.assert_call(
         "begin_transfer",
@@ -546,7 +519,6 @@ fn transfer(source: &Standalone, destination: &Standalone, transfer_id: &str) {
     destination.assert_call("release_transfer", &[transfer_id, &system]);
 }
 
-/// `realm_core` commits the held listing and `home` settles it. Returns the listed Auction.
 fn list_from(
     realm_core: &Standalone,
     home: &Standalone,
@@ -598,9 +570,6 @@ fn list_from(
     listed.remove(0)
 }
 
-/// A listing Hold crosses a Shard Boundary with its seller and lists from the new Home Shard, so a
-/// Gateway stop between the Hold and Realm-core's commit never strands the item or the deposit on
-/// the old one. The Hold carries a Letter Copy's text id with the item.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_unfinished_listing_hold_travels_with_its_seller_and_lists_from_the_new_home_shard() {
@@ -619,7 +588,6 @@ fn an_unfinished_listing_hold_travels_with_its_seller_and_lists_from_the_new_hom
         "the Hold arrives with every column"
     );
 
-    // The source plays Realm-core and commits the held listing; the new Home Shard settles it.
     let listed = list_from(&source, &destination, &held);
     assert_eq!(
         [&listed["item_entry"], &listed["item_text_id"]],
@@ -634,18 +602,13 @@ fn an_unfinished_listing_hold_travels_with_its_seller_and_lists_from_the_new_hom
     );
 }
 
-/// A Transfer from before Holds travelled left the listing Hold on the old Shard. When the seller
-/// comes back, the import keeps that Hold, and the listing finishes there once. Nothing stays
-/// frozen.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_listing_hold_left_on_a_shard_finishes_once_when_its_seller_comes_back() {
     let (home, held, purse_after_deposit) = a_held_listing("auction-stranded-home");
     let away = another_shard("auction-stranded-away");
     transfer(&home, &away, "5090095");
-    // Put the Hold back where the older build left it: on the Shard the seller left.
     away.assert_sql("DELETE FROM game_auction_hold WHERE operation_id = 5090094");
-    // In declaration order: the SQL INSERT binds its values by the table's column order.
     let columns = [
         "operation_id",
         "seller_guid",
@@ -694,7 +657,6 @@ fn a_listing_hold_left_on_a_shard_finishes_once_when_its_seller_comes_back() {
         );
     }
 
-    // The other Shard plays Realm-core; the seller's own Shard settles the Hold it kept.
     let listed = list_from(&away, &home, &held);
     assert_eq!(listed["item_text_id"], "41");
     assert!(rows(&away, HOLD_QUERY).is_empty());

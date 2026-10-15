@@ -1,7 +1,3 @@
-// Compile a Package's Runtime Scripts into one Script Artifact. Each file binds one named
-// function to a typed event. Legacy Script Directives remain readable during migration.
-// Stable numeric identities live in the Package's script-ids.json and must travel with its source.
-
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rename, writeFile } from "node:fs/promises";
@@ -11,13 +7,10 @@ import { bindInvocation, readBinding, type SourceBinding } from "./bindings.ts";
 import { readDirectives } from "./directives.ts";
 import { allocateScriptId, renderScriptIds, scriptIds, SCRIPT_IDS_FILE } from "./script-ids.ts";
 
-/// Where a Package keeps its Runtime Script sources, relative to the Package folder.
 const SCRIPTS_DIR = "scripts";
 
-/// Where a Package's generated artifacts live, relative to the Package folder.
 const GENERATED_DIR = "data/.generated";
 
-/// One script, as its directives and its Lua describe it.
 interface RuntimeScript {
   readonly script_id: number;
   readonly name: string;
@@ -27,14 +20,11 @@ interface RuntimeScript {
   readonly source: string;
 }
 
-/// A refusal an author can act on: it always names the file.
 class ScriptRefusal extends Error {}
 
 function refuse(file: string, what: string): never {
   throw new ScriptRefusal(`${file}: ${what}`);
 }
-
-// ---- directives ----
 
 function requiredDirective(file: string, directives: Map<string, string>, key: string): string {
   const value = directives.get(key);
@@ -60,14 +50,12 @@ function enabled(file: string, directives: Map<string, string>): boolean {
   return refuse(file, `\`@enabled ${raw}\` is neither \`true\` nor \`false\``);
 }
 
-/// The catalogue the Module dispatches, or `undefined` when the caller did not supply one.
 function hookEvents(): Set<string> | undefined {
   const raw = process.env.LYRACORE_HOOK_EVENTS;
   if (raw === undefined) return undefined;
   return new Set(raw.split("\n").map((name) => name.trim()).filter((name) => name.length > 0));
 }
 
-/// A core event from the catalogue, or a Package Event this Package fires itself.
 function checkEvent(file: string, event: string, packageName: string, catalogue: Set<string> | undefined): void {
   if (catalogue === undefined || catalogue.has(event)) return;
   const own = event.startsWith(`${packageName}.`) && /^[a-z][a-z0-9_]*$/.test(event.slice(packageName.length + 1));
@@ -79,9 +67,6 @@ function checkEvent(file: string, event: string, packageName: string, catalogue:
   );
 }
 
-// ---- compilation ----
-
-/// The directory this file sits in: the pinned Runtime Script toolchain.
 function toolchainDir(): string {
   return dirname(new URL(import.meta.url).pathname);
 }
@@ -94,16 +79,7 @@ function packagesRoot(): string {
   return process.env.LYRACORE_PACKAGES_ROOT ?? join(repoRoot(), "packages");
 }
 
-/// Compile ONE `.ts` under `scriptsDir` into `outDir`, with the checked-in settings.
-///
-/// One file per invocation, not one program per Package: every script declares `function script()`
-/// at top level, and a shared program would make the second one a duplicate declaration. Separate
-/// programs also match the Host, which runs each script as its own chunk with its own globals.
-///
-/// The per-run config is the checked-in `tsconfig.json` with three members added and the plugin path
-/// made absolute. It is NOT an `extends` of it: `typescript-to-lua` resolves a plugin path against
-/// the config it was invoked with, so a relative one in a base config would resolve from the wrong
-/// directory. Materialising the whole config keeps that resolution the toolchain's own business.
+// Compile separately so legacy script() declarations cannot collide.
 async function compile(scriptsDir: string, source: string, outDir: string, bound: boolean): Promise<void> {
   const toolchain = toolchainDir();
   const config = JSON.parse(await readFile(join(toolchain, "tsconfig.json"), "utf8")) as {
@@ -114,6 +90,7 @@ async function compile(scriptsDir: string, source: string, outDir: string, bound
   config.compilerOptions.rootDir = scriptsDir;
   config.compilerOptions.outDir = outDir;
   config.files = [join(toolchain, bound ? "runtime-script.d.ts" : "runtime-script.base.d.ts"), source];
+  // TSTL resolves plugin paths relative to the temporary config.
   config.tstl.luaPlugins = config.tstl.luaPlugins.map((plugin) => ({
     ...plugin,
     name: resolve(toolchain, plugin.name),
@@ -137,13 +114,7 @@ async function compile(scriptsDir: string, source: string, outDir: string, bound
   }
 }
 
-// ---- the artifact ----
-
-/// The digest covers immediate `.ts` and `.lua` sources and the recorded script identities,
-/// sorted by basename and length-prefixed to match the CLI Build Identity.
-///
-/// The toolchain is deliberately NOT in it. `source_hash` answers "which revision of this Package's
-/// sources is on the Shard"; whether the compiler moved is the Build Identity sidecar's question.
+// Match the CLI Build Identity framing; source_hash excludes the toolchain.
 async function sourceHash(scriptsDir: string, files: string[], ids: string): Promise<string> {
   const digest = createHash("sha256");
   for (const file of [...files, SCRIPT_IDS_FILE].sort()) {
@@ -157,12 +128,6 @@ async function sourceHash(scriptsDir: string, files: string[], ids: string): Pro
   return digest.digest("hex");
 }
 
-/// The artifact, as `crates/lyracore-package-delta/src/script.rs` parses it.
-///
-/// Indented rather than canonical: the Official Package Collection COMMITS Script Artifacts, and a
-/// reviewer reads this file. The Module canonicalises it again before hashing, so how it is spelled
-/// changes nothing it means. Member order and script order are still fixed, so two runs over one
-/// source tree write the same bytes.
 function renderArtifact(packageName: string, hash: string, scripts: RuntimeScript[]): string {
   const ordered = [...scripts].sort((a, b) => a.script_id - b.script_id);
   return `${JSON.stringify(
@@ -185,7 +150,6 @@ function renderArtifact(packageName: string, hash: string, scripts: RuntimeScrip
   )}\n`;
 }
 
-/// Every script source a Package ships, in file-name order.
 function scriptSources(scriptsDir: string): string[] {
   const listing = existsSync(scriptsDir) ? readdirSync(scriptsDir, { withFileTypes: true }) : [];
   return listing
@@ -194,11 +158,7 @@ function scriptSources(scriptsDir: string): string[] {
     .sort();
 }
 
-/// Flush `artifact` to a sibling temporary file, then replace `path` in one rename.
-///
-/// The old artifact stays whole if creating, writing, flushing, closing, or renaming the temporary
-/// file fails. The temporary directory is on the destination filesystem, so the final rename is
-/// atomic rather than a copy followed by deletion.
+// The temporary file must share the destination filesystem for an atomic rename.
 async function writeArtifact(path: string, artifact: string): Promise<void> {
   const parent = dirname(path);
   await mkdir(parent, { recursive: true });
@@ -218,7 +178,6 @@ async function writeArtifact(path: string, artifact: string): Promise<void> {
   }
 }
 
-/// Build one Package's Script Artifact and write it. Returns the path written.
 export async function buildPackageScripts(packageName: string): Promise<string> {
   const packageDir = join(packagesRoot(), packageName);
   const scriptsDir = join(packageDir, SCRIPTS_DIR);

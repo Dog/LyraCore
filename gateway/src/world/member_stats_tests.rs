@@ -1,10 +1,3 @@
-//! Member Stats against the realm-wide party topology: the Relay tick for one viewer, and the
-//! `CMSG_REQUEST_PARTY_MEMBER_STATS` answer. Party membership comes from the same Fake Realm-core
-//! the routing tests use, so a mate on `instances` is read from that shard's cache.
-//!
-//! Expected bodies are written out by hand from cm:GroupHandler.cpp:585-630: packed guid, `u32`
-//! mask, then the masked fields. Every guid here is one byte, so the packed guid is `01 <guid>`.
-
 use super::party_tests::{
     character, form_split_party, party_members, party_topology, BOT, GINGER, TRIN, VIM,
 };
@@ -15,7 +8,6 @@ use std::sync::atomic::Ordering;
 
 type Snapshots = HashMap<u64, MemberSnapshot>;
 
-/// A level 20 caster standing in Elwynn Forest.
 fn caster() -> codec::MemberEntity {
     codec::MemberEntity {
         health: 1234,
@@ -33,7 +25,6 @@ fn caster() -> codec::MemberEntity {
     }
 }
 
-/// The caster with two positive auras (slots 0 and 5) and one negative aura (slot 35).
 fn caster_with_auras() -> codec::MemberEntity {
     codec::MemberEntity {
         auras: vec![
@@ -54,7 +45,6 @@ fn caster_with_auras() -> codec::MemberEntity {
     }
 }
 
-/// A Hunter's live pet: Fluffy, with one positive aura.
 fn hunter_pet() -> codec::MemberPetEntity {
     codec::MemberPetEntity {
         guid: 85,
@@ -64,7 +54,7 @@ fn hunter_pet() -> codec::MemberPetEntity {
         max_health: 60,
         power: 40,
         max_power: 100,
-        unit_bytes_0: 0x0200_0000, // power type 2, focus
+        unit_bytes_0: 0x0200_0000,
         auras: vec![codec::MemberAuraSlot {
             slot: 2,
             spell_id: 400,
@@ -72,70 +62,52 @@ fn hunter_pet() -> codec::MemberPetEntity {
     }
 }
 
-/// The caster's aura block for [`caster_with_auras`]: `AURAS` (bits 0, 5) then
-/// `AURAS_NEGATIVE` (bit 3, slot 35).
 fn caster_aura_bytes() -> Vec<u8> {
     #[rustfmt::skip]
     let bytes = vec![
-        0x21, 0x00, 0x00, 0x00, // AURAS mask: slots 0 and 5
-        0x64, 0x00,             // spell 100
-        0xC8, 0x00,             // spell 200
-        0x08, 0x00,             // AURAS_NEGATIVE mask: slot 35 (bit 3)
-        0x2C, 0x01,             // spell 300
+        0x21, 0x00, 0x00, 0x00,
+        0x64, 0x00,
+        0xC8, 0x00,
+        0x08, 0x00,
+        0x2C, 0x01,
     ];
     bytes
 }
 
-/// The caster's 9 base fields, header and aura blocks excluded.
 fn caster_base_bytes() -> Vec<u8> {
     vec![
-        0x01, // status ONLINE
-        0xD2, 0x04, // current health 1234
-        0xDC, 0x05, // max health 1500
-        0x00, // power type mana
-        0x20, 0x03, // current power 800
-        0xE8, 0x03, // max power 1000
-        0x14, 0x00, // level 20
-        0x0C, 0x00, // zone 12
-        0x0B, 0xDD, // x -8949
-        0x7C, 0xFF, // y -132
+        0x01, 0xD2, 0x04, 0xDC, 0x05, 0x00, 0x20, 0x03, 0xE8, 0x03, 0x14, 0x00, 0x0C, 0x00, 0x0B,
+        0xDD, 0x7C, 0xFF,
     ]
 }
 
-/// [`hunter_pet`]'s scalar pet fields: guid, name, display, health and power. Its aura blocks are
-/// a separate concern; a caller appends them (occupied or empty) after this.
 fn hunter_pet_bytes() -> Vec<u8> {
     #[rustfmt::skip]
     let bytes = vec![
-        0x55, 0, 0, 0, 0, 0, 0, 0,       // PET_GUID 85
-        b'F', b'l', b'u', b'f', b'f', b'y', 0x00, // PET_NAME "Fluffy"
-        0x6A, 0x02,             // PET_MODEL_ID 618
-        0x32, 0x00,             // PET_CUR_HP 50
-        0x3C, 0x00,             // PET_MAX_HP 60
-        0x02,                   // PET_POWER_TYPE 2 (focus)
-        0x28, 0x00,             // PET_CUR_POWER 40
-        0x64, 0x00,             // PET_MAX_POWER 100
+        0x55, 0, 0, 0, 0, 0, 0, 0,
+        b'F', b'l', b'u', b'f', b'f', b'y', 0x00,
+        0x6A, 0x02,
+        0x32, 0x00,
+        0x3C, 0x00,
+        0x02,
+        0x28, 0x00,
+        0x64, 0x00,
     ];
     bytes
 }
 
-/// The wire bytes for an empty `AURAS`/`PET_AURAS` block where every slot rides the packet (a
-/// `None` previous, cm:Group.cpp:306-307, 746-747): mask `0xFFFFFFFF`, then 32 zero values.
 fn empty_positive_aura_bytes() -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFF, 0xFF, 0xFF];
     bytes.extend(std::iter::repeat_n(0u8, 32 * 2));
     bytes
 }
 
-/// [`empty_positive_aura_bytes`] for the negative block: mask `0xFFFF`, then 16 zero values.
 fn empty_negative_aura_bytes() -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFF];
     bytes.extend(std::iter::repeat_n(0u8, 16 * 2));
     bytes
 }
 
-/// [`empty_positive_aura_bytes`] with `slot` overlaid to `spell_id`, for a first send where one
-/// slot is occupied: mask `0xFFFFFFFF`, then a spell id per slot, `slot`'s the only nonzero one.
 fn full_positive_aura_bytes(slot: usize, spell_id: u16) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFF, 0xFF, 0xFF];
     for i in 0..32u16 {
@@ -145,41 +117,30 @@ fn full_positive_aura_bytes(slot: usize, spell_id: u16) -> Vec<u8> {
     bytes
 }
 
-/// A zeroed pet block, PET_GUID through PET_AURAS_NEGATIVE: what a first send writes for a
-/// pet-less member, and what a delta writes once for a member whose pet just vanished
-/// (cm:GroupHandler.cpp:660-755's own "write zero when there is no charm" branches).
 fn zeroed_pet_bytes() -> Vec<u8> {
-    let mut bytes = vec![0u8; 8]; // PET_GUID
-    bytes.push(0); // PET_NAME: an empty CString
-    bytes.extend([0u8; 2]); // PET_MODEL_ID
-    bytes.extend([0u8; 2]); // PET_CUR_HP
-    bytes.extend([0u8; 2]); // PET_MAX_HP
-    bytes.push(0); // PET_POWER_TYPE
-    bytes.extend([0u8; 2]); // PET_CUR_POWER
-    bytes.extend([0u8; 2]); // PET_MAX_POWER
-    bytes.extend(empty_positive_aura_bytes()); // PET_AURAS
-    bytes.extend(empty_negative_aura_bytes()); // PET_AURAS_NEGATIVE
+    let mut bytes = vec![0u8; 8];
+    bytes.push(0);
+    bytes.extend([0u8; 2]);
+    bytes.extend([0u8; 2]);
+    bytes.extend([0u8; 2]);
+    bytes.push(0);
+    bytes.extend([0u8; 2]);
+    bytes.extend([0u8; 2]);
+    bytes.extend(empty_positive_aura_bytes());
+    bytes.extend(empty_negative_aura_bytes());
     bytes
 }
 
-/// The pet-less caster's body for guid `g` answering `CMSG_REQUEST_PARTY_MEMBER_STATS`: every
-/// base field, plus the two empty aura blocks. Mask 0x7FF, no pet bits: only the explicit FULL
-/// answer strips `GROUP_UPDATE_PET` whole for a pet-less member (cm:GroupHandler.cpp:781-786).
 fn caster_full_body(guid: u8) -> Vec<u8> {
-    let mut body = vec![0x01, guid, 0xFF, 0x07, 0x00, 0x00]; // mask 0x7FF
+    let mut body = vec![0x01, guid, 0xFF, 0x07, 0x00, 0x00];
     body.extend(caster_base_bytes());
     body.extend(empty_positive_aura_bytes());
     body.extend(empty_negative_aura_bytes());
     body
 }
 
-/// The pet-less caster's body for guid `g` on a Relay first send (opcode `0x007E`): every base
-/// field, both aura blocks written in full, and every pet field zeroed. `None` marks
-/// `GROUP_UPDATE_FULL` dirty unconditionally, pet fields included even with no pet
-/// (cm:Group.cpp:306-307, 746-747), so a relogged member without their old pet still clears the
-/// viewer's stale pet frame.
 fn caster_first_send_body(guid: u8) -> Vec<u8> {
-    let mut body = vec![0x01, guid, 0xFF, 0xFF, 0x1F, 0x00]; // mask 0x1FFFFF (GROUP_UPDATE_FULL)
+    let mut body = vec![0x01, guid, 0xFF, 0xFF, 0x1F, 0x00];
     body.extend(caster_base_bytes());
     body.extend(empty_positive_aura_bytes());
     body.extend(empty_negative_aura_bytes());
@@ -187,7 +148,6 @@ fn caster_first_send_body(guid: u8) -> Vec<u8> {
     body
 }
 
-/// The caster's wire values.
 fn stats() -> codec::MemberStats {
     codec::MemberStats::from_entity(&caster())
 }
@@ -207,7 +167,6 @@ fn despawn(shard: &WorldFake, guid: u64) {
         .retain(|(g, _)| *g != guid);
 }
 
-/// Ginger and Trin, both on `world`.
 fn ginger_and_trin() -> (
     std::sync::Arc<WorldFake>,
     std::sync::Arc<WorldFake>,
@@ -226,7 +185,6 @@ fn ginger_and_trin() -> (
     (realm, world, instances)
 }
 
-/// One tick for Ginger, whose client has created only the guids in `created`.
 fn tick(store: &WorldFake, created: &[u64], snapshots: &mut Snapshots) -> Vec<(u16, Vec<u8>)> {
     member_stats_tick(store, GINGER, |guid| created.contains(&guid), snapshots)
         .expect("the tick reads")
@@ -260,14 +218,14 @@ fn a_live_mate_on_another_shard_is_read_from_that_shards_cache() {
 
     let packets = tick(&world, &[GINGER], &mut Snapshots::new());
 
-    let mut expected = vec![0x01, 0x02, 0xFF, 0xFF, 0x1F, 0x00]; // mask 0x1FFFFF (GROUP_UPDATE_FULL)
+    let mut expected = vec![0x01, 0x02, 0xFF, 0xFF, 0x1F, 0x00];
     #[rustfmt::skip]
     expected.extend([
-        0x05,                   // status ONLINE | DEAD
+        0x05,
         0xD2, 0x04, 0xDC, 0x05, 0x00, 0x20, 0x03, 0xE8, 0x03, 0x14, 0x00,
-        0x2D, 0x06,             // zone 1581
-        0xF0, 0xFF,             // x -16
-        0x81, 0xFE,             // y -383
+        0x2D, 0x06,
+        0xF0, 0xFF,
+        0x81, 0xFE,
     ]);
     expected.extend(empty_positive_aura_bytes());
     expected.extend(empty_negative_aura_bytes());
@@ -309,7 +267,6 @@ fn a_power_type_change_sends_the_type_and_both_power_values() {
     let (_realm, world, _instances) = ginger_and_trin();
     let mut snapshots = Snapshots::new();
     tick(&world, &[GINGER], &mut snapshots);
-    // Bear Form: the same numbers, now rage.
     place(
         &world,
         TRIN,
@@ -322,11 +279,7 @@ fn a_power_type_change_sends_the_type_and_both_power_values() {
     let packets = tick(&world, &[GINGER], &mut snapshots);
 
     let body = vec![
-        0x01, 0x03, // packed guid 3
-        0x38, 0x00, 0x00, 0x00, // POWER_TYPE | CUR_POWER | MAX_POWER
-        0x01, // rage
-        0x20, 0x03, // current power 800
-        0xE8, 0x03, // max power 1000
+        0x01, 0x03, 0x38, 0x00, 0x00, 0x00, 0x01, 0x20, 0x03, 0xE8, 0x03,
     ];
     assert_eq!(packets, vec![(0x007E, body)]);
 }
@@ -371,7 +324,6 @@ fn a_mate_in_transfer_gets_nothing_and_is_never_reported_offline() {
     realm.party.members_in_transit.lock().unwrap().push(VIM);
     assert!(tick(&world, &[GINGER], &mut snapshots).is_empty());
 
-    // Arrival with nothing changed: the record survived the Transfer, so nothing is resent.
     realm.party.members_in_transit.lock().unwrap().clear();
     place(&world, VIM, caster());
     assert!(tick(&world, &[GINGER], &mut snapshots).is_empty());
@@ -433,7 +385,6 @@ fn request(store: &WorldFake, self_guid: Option<u64>, guid: u64) -> ProtocolRepl
     request_with(store, &mut session, guid)
 }
 
-/// Run the answer the way the session writer does: every job, in order.
 fn answer(outcome: ProtocolReply) -> Vec<(u16, Vec<u8>)> {
     let outbound = outcome.outbound;
     outbound
@@ -468,23 +419,18 @@ fn a_request_for_a_group_mate_returns_one_full_packet() {
 fn a_request_for_anyone_else_returns_the_offline_full_packet() {
     let (_realm, world, instances, _) = party_topology();
     form_split_party(&world, &instances);
-    // The bot is live on `world` but in nobody's group: its position must not leak.
     place(&world, BOT, caster());
 
     assert_eq!(
         answer(request(&world, Some(GINGER), BOT)),
         full_offline(BOT as u8)
     );
-    // A mate with no entity anywhere.
     assert_eq!(
         answer(request(&world, Some(GINGER), VIM)),
         full_offline(VIM as u8)
     );
 }
 
-/// cmangos answers a teleporting mate from the player object, flagged ZONE_OUT
-/// (cm:GroupHandler.cpp:764, cm:Group.cpp:54-55). The entity is gone here, so the status goes
-/// alone: online, zone out.
 #[test]
 fn a_request_for_a_mate_between_two_places_answers_online_and_zone_out() {
     let (realm, world, instances, _) = party_topology();
@@ -504,9 +450,6 @@ fn a_request_for_a_mate_between_two_places_answers_online_and_zone_out() {
     assert_eq!(answer(request(&world, Some(GINGER), VIM)), online_zone_out);
 }
 
-/// A FULL answer rewrites the frame behind the Relay's back. The mate crossed while the record
-/// said ONLINE, got the in-transit answer, then arrived with nothing else changed: the next tick
-/// must still send every field, the online status among them.
 #[test]
 fn after_a_full_answer_the_next_tick_sends_every_field() {
     let (realm, world, instances, _) = party_topology();
@@ -537,7 +480,6 @@ fn after_a_full_answer_the_next_tick_sends_every_field() {
 fn a_failed_read_answers_nothing_and_is_never_offline() {
     let (realm, world, instances, _) = party_topology();
     form_split_party(&world, &instances);
-    // Vim has no entity, and one World Shard cannot prove the absence.
     let unhealthy = WorldFake {
         topology: TopologyState {
             shard: "world".into(),
@@ -570,7 +512,6 @@ fn a_bot_crossing_between_shards_is_never_reported_offline() {
     let mut snapshots = Snapshots::new();
     tick(&world, &[GINGER], &mut snapshots);
 
-    // The Package placed the bot and wrote its Transfer Intent; the Gateway has not claimed it.
     despawn(&world, BOT);
     world
         .social
@@ -592,8 +533,6 @@ fn a_stats_request_outside_the_world_sends_nothing() {
     assert!(request(&world, None, TRIN).outbound.is_empty());
 }
 
-/// The raw FULL body survives the session writer and the header cipher, on a single database
-/// where the party lives in the shard's own tables.
 #[test]
 fn a_stats_request_is_answered_through_the_encrypted_session() {
     let store = {
@@ -664,8 +603,6 @@ fn a_stats_request_that_cannot_be_read_does_not_end_the_session() {
     let _ = server.join();
 }
 
-/// A Relay tick can reach the writer between viewer registration and the world-entry party frame.
-/// The client does not know the party yet, so world entry forgets that tick behind the frame.
 #[test]
 fn world_entry_forgets_member_stats_sent_before_the_party_frame() {
     let view = std::sync::Arc::new(crate::stdb::world_view::WorldView::new(true));
@@ -712,7 +649,6 @@ fn world_entry_forgets_member_stats_sent_before_the_party_frame() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // The answer for a stranger is the barrier: the writer runs its queue in order.
     wow_world_messages::vanilla::CMSG_REQUEST_PARTY_MEMBER_STATS {
         guid: Guid::new(99),
     }
@@ -721,7 +657,7 @@ fn world_entry_forgets_member_stats_sent_before_the_party_frame() {
     let mut saw_party_frame = false;
     loop {
         let (opcode, _) = read_raw_frame(&mut client, &mut c_dec);
-        saw_party_frame |= opcode == 0x007D; // SMSG_GROUP_LIST
+        saw_party_frame |= opcode == 0x007D;
         if opcode == 0x02F2 {
             break;
         }
@@ -739,30 +675,26 @@ fn world_entry_forgets_member_stats_sent_before_the_party_frame() {
     let _ = server.join();
 }
 
-/// AC1: a member with two buffs and one debuff sends `AURAS` with two ids and `AURAS_NEGATIVE`
-/// with one id, at the right bits. Driven as a delta so the body carries only the aura fields.
 #[test]
 fn a_member_with_two_buffs_and_one_debuff_sends_both_aura_blocks() {
     let (_realm, world, _instances) = ginger_and_trin();
     let mut snapshots = Snapshots::new();
-    tick(&world, &[GINGER], &mut snapshots); // seed: the plain, aura-less caster
+    tick(&world, &[GINGER], &mut snapshots);
 
     place(&world, TRIN, caster_with_auras());
     let packets = tick(&world, &[GINGER], &mut snapshots);
 
-    let mut expected = vec![0x01, TRIN as u8, 0x00, 0x06, 0x00, 0x00]; // mask 0x600
+    let mut expected = vec![0x01, TRIN as u8, 0x00, 0x06, 0x00, 0x00];
     expected.extend(caster_aura_bytes());
     assert_eq!(packets, vec![(0x007E, expected)]);
 }
 
-/// AC2: removing one buff, and only that one, sends only its bit, with id 0. The other buff and
-/// the debuff stay in place and stay silent.
 #[test]
 fn removing_one_buff_sends_only_its_bit_with_id_zero() {
     let (_realm, world, _instances) = ginger_and_trin();
     place(&world, TRIN, caster_with_auras());
     let mut snapshots = Snapshots::new();
-    tick(&world, &[GINGER], &mut snapshots); // seed with both buffs and the debuff
+    tick(&world, &[GINGER], &mut snapshots);
 
     let mut one_buff_left = caster_with_auras();
     one_buff_left.auras.retain(|aura| aura.slot != 0);
@@ -770,16 +702,11 @@ fn removing_one_buff_sends_only_its_bit_with_id_zero() {
 
     let packets = tick(&world, &[GINGER], &mut snapshots);
     let expected = vec![
-        0x01, TRIN as u8, // packed guid
-        0x00, 0x02, 0x00, 0x00, // mask 0x200 (AURAS only)
-        0x01, 0x00, 0x00, 0x00, // AURAS mask: bit 0, the removed buff, alone
-        0x00, 0x00, // spell id 0
+        0x01, TRIN as u8, 0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     assert_eq!(packets, vec![(0x007E, expected)]);
 }
 
-/// AC3: a hunter with a live pet sends the pet block with guid, name, display, health, power and
-/// auras. Dismissing the pet sends the pet bits zeroed once, then nothing more.
 #[test]
 fn a_live_pet_sends_its_block_then_dismissing_it_zeroes_the_bits_once() {
     let (_realm, world, _instances) = ginger_and_trin();
@@ -793,32 +720,22 @@ fn a_live_pet_sends_its_block_then_dismissing_it_zeroes_the_bits_once() {
         },
     );
 
-    let mut first_send = vec![0x01, TRIN as u8, 0xFF, 0xFF, 0x1F, 0x00]; // mask FULL, live pet
+    let mut first_send = vec![0x01, TRIN as u8, 0xFF, 0xFF, 0x1F, 0x00];
     first_send.extend(caster_base_bytes());
-    first_send.extend(empty_positive_aura_bytes()); // AURAS: the member has none
-    first_send.extend(empty_negative_aura_bytes()); // AURAS_NEGATIVE: the member has none
+    first_send.extend(empty_positive_aura_bytes());
+    first_send.extend(empty_negative_aura_bytes());
     first_send.extend(hunter_pet_bytes());
-    first_send.extend(full_positive_aura_bytes(2, 400)); // PET_AURAS: slot 2
-    first_send.extend(empty_negative_aura_bytes()); // PET_AURAS_NEGATIVE: the pet has none
+    first_send.extend(full_positive_aura_bytes(2, 400));
+    first_send.extend(empty_negative_aura_bytes());
     assert_eq!(
         tick(&world, &[GINGER], &mut snapshots),
         vec![(0x007E, first_send)]
     );
 
-    place(&world, TRIN, caster()); // the pet is dismissed
+    place(&world, TRIN, caster());
     let dismissed = vec![
-        0x01, TRIN as u8, // packed guid
-        0x00, 0xF8, 0x0F, 0x00, // mask 0xFF800: every pet bit but PET_AURAS_NEGATIVE
-        0, 0, 0, 0, 0, 0, 0, 0,    // PET_GUID zeroed
-        0x00, // PET_NAME: an empty CString
-        0x00, 0x00, // PET_MODEL_ID zeroed
-        0x00, 0x00, // PET_CUR_HP zeroed
-        0x00, 0x00, // PET_MAX_HP zeroed
-        0x00, // PET_POWER_TYPE zeroed
-        0x00, 0x00, // PET_CUR_POWER zeroed
-        0x00, 0x00, // PET_MAX_POWER zeroed
-        0x04, 0x00, 0x00, 0x00, // PET_AURAS: slot 2 cleared, the one differing bit
-        0x00, 0x00, // spell id 0
+        0x01, TRIN as u8, 0x00, 0xF8, 0x0F, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     assert_eq!(
         tick(&world, &[GINGER], &mut snapshots),
@@ -831,8 +748,6 @@ fn a_live_pet_sends_its_block_then_dismissing_it_zeroes_the_bits_once() {
     );
 }
 
-/// AC4: a member without a pet gets a FULL packet with no pet bits (already the shape
-/// `caster_full_body` carries; this test names the mask directly, for AC traceability).
 #[test]
 fn a_member_without_a_pet_gets_a_full_answer_with_no_pet_bits() {
     let (_realm, world, instances, _) = party_topology();
@@ -850,8 +765,6 @@ fn a_member_without_a_pet_gets_a_full_answer_with_no_pet_bits() {
     );
 }
 
-/// AC5: a member inside the viewer's AOI is already created on the client and gets nothing, auras
-/// and a pet included.
 #[test]
 fn a_created_mate_with_auras_and_a_pet_still_gets_nothing() {
     let (_realm, world, _instances) = ginger_and_trin();

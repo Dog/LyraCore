@@ -1,6 +1,3 @@
-//! `package_account::create_package_character` against a real Shard, through
-//! `debug_create_package_character`.
-
 mod support;
 
 use support::Standalone;
@@ -103,7 +100,6 @@ fn a_package_character_meets_the_client_name_race_and_class_refusals() {
         "create_character",
         &["1", &arg("Taken"), "1", "1", "0", "0", "0", "0", "0", "0"],
     );
-    // Human Warrior is the one legal pair, so Human Shaman is illegal.
     shard
         .assert_sql("INSERT INTO game_char_base_info (race_class, race, class) VALUES (257, 1, 1)");
 
@@ -127,7 +123,6 @@ fn a_new_package_account_skips_a_name_an_unowned_account_holds() {
     let shard = stage("package-account-taken-name");
     let first = create(&shard, "Bota", "1", "1");
     assert!(first.status.success(), "{first:?}");
-    // The Account `test_fixture#0` stays, but no longer counts as owned.
     shard.assert_sql("DELETE FROM game_package_account");
 
     let second = create(&shard, "Botb", "1", "1");

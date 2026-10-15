@@ -1,7 +1,3 @@
-//! The globals family's identifier policy. Three of its seven tables follow the loot shape (one
-//! band, checked against the row's own surrogate key). The other four permit no insert at all:
-//! their key names a race, a class, a level or an `AreaTrigger.dbc` trigger id.
-
 mod common;
 
 use common::{
@@ -63,8 +59,6 @@ fn an_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// The three insertable globals tables share one band, so one out-of-range identifier is refused
-/// the same way whichever of them names it.
 #[test]
 fn one_band_covers_every_insertable_globals_table() {
     let out_of_band = PACKAGE_GLOBALS_ID_FLOOR - 1;
@@ -95,8 +89,6 @@ fn an_update_may_name_a_real_imported_graveyard_zone_row() {
     assert_eq!(delta.claims()[0].key().row_id(), REAL_GRAVEYARD_ZONE);
 }
 
-/// The four update-only tables: each key names something the client fixes, so no identifier makes
-/// an insert legal.
 #[test]
 fn the_update_only_globals_tables_refuse_every_insert() {
     let cases = [
@@ -142,8 +134,6 @@ fn a_stat_curve_row_the_client_already_has_may_be_tuned() {
     );
 }
 
-/// The packed key the Module reads is derived here, never authored, so a claim that names the same
-/// class and level names the same durable row.
 #[test]
 fn a_stat_curve_key_packs_the_class_and_level_the_module_packs() {
     let key = PrimaryKey::class_level_stats(2, 60).expect("a real class and level are claimable");

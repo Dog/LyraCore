@@ -1,27 +1,11 @@
-//! Realm-wide party state — the routing tests.
-//!
-//! What EXECUTES here is production `world::party`, against the same in-memory multi-database
-//! topology the cross-database transfer tests use. What the fakes stand in for is named at each
-//! seam: `FakeParty` models realm-core's authority (module reducer bodies cannot run in a gateway
-//! test — there is no `ReducerContext`), and each shard's `mirror` is exactly what
-//! `sync_group_mirror` wrote there.
-//!
-//! A child module of `world::tests` so it can reach `WorldFake` without widening anything.
-
 use super::*;
 use lyracore_shared::group::{realm_op, GroupRefusal, RosterMember, RosterPayload};
 
-pub(super) const GINGER: u64 = 1; // in the open world, on `world`
-pub(super) const VIM: u64 = 2; // inside the dungeon, on `instances`
-pub(super) const TRIN: u64 = 3; // in the open world — the third member
-pub(super) const DORMANT: u64 = 4; // has a character row on `world`, but is offline
-/// A PLAYERBOT: a live `game_world_entity` on `world` whose character row never ran `player_login`,
-/// so `game_character.online` stays false for its whole life. The module's own invite gate reads the
-/// ENTITY ("a session-less playerbot's live entity counts"); the session flag would refuse it.
+pub(super) const GINGER: u64 = 1;
+pub(super) const VIM: u64 = 2;
+pub(super) const TRIN: u64 = 3;
+pub(super) const DORMANT: u64 = 4;
 pub(super) const BOT: u64 = 5;
-/// A second PLAYERBOT, resident on the OTHER shard (`instances`) — the same session-less shape as
-/// [`BOT`], on the far side of the boundary. The invite is authoritative on realm-core, so a bot
-/// standing on a different database than the inviting player is reachable in principle; this pins it.
 const FAR_BOT: u64 = 6;
 
 fn topology_after_vim_is_deleted() -> (
@@ -86,7 +70,6 @@ fn two_member_topology_after_vim_is_deleted() -> (
     (realm, world, deleted_from_instances)
 }
 
-/// Party members in join order, every one in Subgroup 0.
 pub(super) fn party_members(guids: &[u64]) -> Vec<party::GroupRosterMember> {
     guids
         .iter()
@@ -108,15 +91,13 @@ pub(super) fn character(guid: u64, name: &str) -> codec::CharacterView {
     }
 }
 
-/// Realm-core owns the party. Ginger and Vim live on separate World Shards,
-/// each connected to the authority and both World Stores.
 pub(super) fn party_topology_with(
     mirror_error: Option<&str>,
     accept_error: Option<&str>,
 ) -> (
-    std::sync::Arc<WorldFake>, // realm-core
-    std::sync::Arc<WorldFake>, // the open-world shard
-    std::sync::Arc<WorldFake>, // the instances shard
+    std::sync::Arc<WorldFake>,
+    std::sync::Arc<WorldFake>,
+    std::sync::Arc<WorldFake>,
     ShardCallLog,
 ) {
     let calls: ShardCallLog = Default::default();
@@ -147,9 +128,6 @@ pub(super) fn party_topology_with(
             character(BOT, "Botty"),
         ],
         session: SessionState {
-            // `live_guids` = `game_world_entity`; `offline_guids` = `game_character.online == false`.
-            // The bot is in BOTH, which is the production shape a playerbot has (spawned straight into
-            // the entity table, never logged in) and the case the two gates disagree about.
             live_guids: vec![GINGER, TRIN, BOT],
             ..Default::default()
         },
@@ -205,9 +183,6 @@ pub(super) fn party_topology() -> (
     party_topology_with(None, None)
 }
 
-/// Form the split party the live run could not: Ginger (open world) invites Vim (inside Deadmines),
-/// Vim accepts. `pub(super)` (`loot_tests` reuses it — a disband-capable op needs a real
-/// party to disband).
 pub(super) fn form_split_party(world: &WorldFake, instances: &WorldFake) {
     party::run(world, Actor::new(GINGER).unwrap(), party::Op::Invite(VIM))
         .expect("the invite crosses");
@@ -399,7 +374,6 @@ fn a_stale_target_mirror_cannot_grant_command_authority() {
         .is_empty());
 }
 
-/// A local roster of `extra + 2` members: Ginger leads, and the bot takes Companion Orders.
 fn store_with_roster_of(extra: usize) -> WorldFake {
     let mut members = vec![GINGER, BOT];
     members.extend((0..extra).map(|offset| 80_000 + offset as u64));
@@ -424,10 +398,6 @@ fn store_with_roster_of(extra: usize) -> WorldFake {
     }
 }
 
-/// A Companion Order covers the whole Raid, but only the Group leader issues it. The leader may
-/// order a bot in another Subgroup and name a member in a third, so the order reaches target
-/// application with every member certified. A member of the Raid who is not the leader gets
-/// `NotLeader`.
 #[test]
 fn a_companion_order_in_a_ten_member_raid_reaches_target_application() {
     let store = store_with_roster_of(8);
@@ -477,8 +447,6 @@ fn a_companion_order_in_a_ten_member_raid_reaches_target_application() {
     assert_eq!(certified, expected);
 }
 
-/// A roster longer than any Raid is a damaged cache, not a gameplay answer: the intent stays
-/// pending.
 #[test]
 fn a_roster_longer_than_a_raid_is_not_sent_for_command_authority() {
     let store = store_with_roster_of(lyracore_shared::group::RAID_MAX_MEMBERS);
@@ -819,26 +787,18 @@ fn equal_numeric_intents_from_distinct_modules_have_distinct_receipts() {
     );
 }
 
-/// **AC: an invite works across a shard boundary.**
-///
-/// The live failure was not the party logic — it was the target RESOLUTION: `/invite` looks a typed
-/// name up in `game_character` on ONE database, so a player inside Deadmines had no row on the open
-/// world's database and the invite died as `BadPlayerName` before any rule ran.
 #[test]
 fn an_invite_resolves_a_target_standing_on_another_shard() {
     let (_realm, world, instances, _calls) = party_topology();
-    // The pre-realm-core read, run against the shard the inviter is on: Vim is simply not there.
     assert_eq!(
         world.character_guid_by_name("Vim").unwrap(),
         None,
         "the fixture must reproduce the live shape — Vim's row lives on the instances shard"
     );
-    // The realm-core read, from the same handle: the union finds them.
     assert_eq!(
         presence::resolve_by_name(world.as_ref(), "Vim").unwrap(),
         Some(VIM)
     );
-    // …and it still resolves a name on the asking shard itself, from either side.
     assert_eq!(
         presence::resolve_by_name(instances.as_ref(), "Ginger").unwrap(),
         Some(GINGER)
@@ -849,7 +809,6 @@ fn an_invite_resolves_a_target_standing_on_another_shard() {
     );
 }
 
-/// **AC: an invite works across a shard boundary** — the op itself, end to end.
 #[test]
 fn a_cross_shard_invite_and_accept_form_one_party_on_realm_core() {
     let (realm, world, instances, calls) = party_topology();
@@ -868,7 +827,6 @@ fn a_cross_shard_invite_and_accept_form_one_party_on_realm_core() {
         "the inviter leads and joins first, the acceptor second (join order)"
     );
     drop(party_state);
-    // The op ran on REALM-CORE, not on either world shard — the whole point of the slice.
     let ops = calls.lock().unwrap().clone();
     assert!(
         ops.iter()
@@ -883,11 +841,6 @@ fn a_cross_shard_invite_and_accept_form_one_party_on_realm_core() {
     );
 }
 
-/// **AC: a SPLIT party sees each other's frames**, without the `begin_transfer` snapshot.
-///
-/// Both members render an `SMSG_GROUP_LIST` naming the other with its ONLINE flag set — and the name
-/// and the liveness each come from the shard that actually holds them, which no single database
-/// could answer and which realm-core (no character rows) cannot answer either.
 #[test]
 fn a_split_party_renders_both_members_from_either_side_of_the_boundary() {
     let (realm, world, instances, _calls) = party_topology();
@@ -928,8 +881,6 @@ fn a_split_party_renders_both_members_from_either_side_of_the_boundary() {
     assert!(list.members[0].is_online);
 }
 
-/// **AC: world shards read membership through the gateway rather than owning copies** — the
-/// write-through mirror, and the fan-out that keeps every shard's copy honest.
 #[test]
 fn every_world_shard_mirrors_the_authoritative_roster_after_a_party_op() {
     let (realm, world, instances, _calls) = party_topology();
@@ -957,7 +908,6 @@ fn a_disbanded_party_is_tombstoned_on_every_world_shard() {
         "precondition: the party is mirrored"
     );
 
-    // Two members: one leaving disbands the party (vanilla — a party of one is no party).
     party::run(
         instances.as_ref(),
         Actor::new(VIM).unwrap(),
@@ -978,14 +928,9 @@ fn a_disbanded_party_is_tombstoned_on_every_world_shard() {
     }
 }
 
-/// The leaver's own shard is not the only one that has to hear about it: the mirror push has to
-/// cover the group the actor was in BEFORE the op, or the members still in it keep a roster listing
-/// someone who left. The actor's membership row is gone from the authority by then, which is why the
-/// group id is captured up front.
 #[test]
 fn leaving_a_party_re_pushes_the_roster_of_the_group_the_leaver_left() {
     let (realm, world, instances, _calls) = party_topology();
-    // Three members, so the party SURVIVES the leave and there is a remaining roster to compare.
     form_split_party(&world, &instances);
     party::run(
         world.as_ref(),
@@ -1167,8 +1112,6 @@ fn repeated_deleted_character_cleanup_is_harmless() {
     );
 }
 
-/// The deleted Character's LEAVE names its cause, so the party authority also drops the Target
-/// Icons on it: the World Shard's delete sweep cannot reach Realm-core's icon rows.
 #[test]
 fn a_deleted_characters_leave_tells_the_authority_it_was_deleted() {
     let (realm, world, _instances, _calls) = topology_after_vim_is_deleted();
@@ -1431,11 +1374,6 @@ fn deleted_character_cleanup_flushes_pending_loot_before_leaving_realm_core() {
     );
 }
 
-/// **The invariant this batch has broken five times: unset config changes NOTHING.**
-///
-/// A single-database gateway has no realm-core to route to, so every op takes the pre-realm-core
-/// path — the player's own connection, the player-facing reducer, that database's own tables — and neither
-/// the realm plane nor the mirror is touched at all.
 #[test]
 fn an_unsharded_gateway_runs_every_party_op_on_the_players_own_shard() {
     let calls: ShardCallLog = Default::default();
@@ -1450,7 +1388,7 @@ fn an_unsharded_gateway_runs_every_party_op_on_the_players_own_shard() {
             live_guids: vec![VIM],
             ..Default::default()
         },
-        ..Default::default() // no `realm`, no `peers` — the unconfigured gateway
+        ..Default::default()
     });
     assert!(
         store.realm_store().unwrap().is_none(),
@@ -1509,15 +1447,10 @@ fn an_unsharded_gateway_runs_every_party_op_on_the_players_own_shard() {
     );
 }
 
-/// World ENTRY is what carries a party across the boundary now that the character-transfer blob's
-/// party mirror is gone: the arriving shard gets realm-core's roster pushed onto it, and the player
-/// gets their frame back.
 #[test]
 fn world_entry_pushes_the_authoritative_roster_onto_the_shard_the_player_arrives_on() {
     let (realm, world, instances, _calls) = party_topology();
     form_split_party(&world, &instances);
-    // A fresh instances shard: the character arrived through a transfer, so it has NO party rows —
-    // exactly the state `import_character_blob` leaves now that membership does not ride the blob.
     instances.party.mirror.lock().unwrap().clear();
 
     let (tx, rx) = crate::world::SessionTx::with_depth(0);
@@ -1536,8 +1469,6 @@ fn world_entry_pushes_the_authoritative_roster_onto_the_shard_the_player_arrives
     assert_eq!(list.members[0].name, "Ginger");
 }
 
-/// A character in no party must not have a roster pushed for them — and an unsharded gateway must
-/// not read anything at world entry at all.
 #[test]
 fn world_entry_is_a_no_op_for_an_ungrouped_character_and_on_a_single_database() {
     let (_realm, world, _instances, calls) = party_topology();
@@ -1570,16 +1501,6 @@ fn world_entry_is_a_no_op_for_an_ungrouped_character_and_on_a_single_database() 
     );
 }
 
-/// **The mirror's self-healing claim, in the direction it does not hold by construction.**
-///
-/// This module promises that a shard which misses a push
-/// "re-syncs on the next op or world entry". For a member who is still IN the party that is true —
-/// the arriving roster is pushed. For a member the authority DROPPED while that shard was
-/// unreachable it was not: with no roster to push, world entry returned before touching anything and
-/// the stale membership row survived every arrival. The shard then ran that character's gameplay —
-/// kill-XP split, quest credit, loot method and round-robin, `/p` chat, the dungeon binding — against
-/// a party they are not in, and no future op could ever repair it (the ops of a party they left never
-/// name them again).
 #[test]
 fn world_entry_clears_a_mirror_that_still_lists_a_character_the_authority_dropped() {
     let (realm, world, instances, _calls) = party_topology();
@@ -1594,8 +1515,6 @@ fn world_entry_clears_a_mirror_that_still_lists_a_character_the_authority_droppe
         .expect("the third accepts");
     let group_id = realm.group_roster(VIM).unwrap().unwrap().group_id;
 
-    // Vim leaves while the instances shard is unreachable: the authority commits, that shard's push
-    // is dropped on the floor (the documented best-effort ceiling), so its mirror still lists Vim.
     {
         let mut p = realm.party.party.lock().unwrap();
         p.members.retain(|(_, g)| *g != VIM);
@@ -1605,7 +1524,6 @@ fn world_entry_clears_a_mirror_that_still_lists_a_character_the_authority_droppe
         "precondition: the instances mirror still has Vim in the party they already left"
     );
 
-    // Vim comes back to that shard. This is the "or world entry" half of the self-healing promise.
     let (tx, _rx) = crate::world::SessionTx::with_depth(0);
     party::on_world_entry(&tx, instances.as_ref(), Actor::new(VIM).unwrap())
         .expect("world entry is fine for a loner");
@@ -1628,9 +1546,6 @@ fn world_entry_clears_a_mirror_that_still_lists_a_character_the_authority_droppe
     );
 }
 
-/// The two gates realm-core cannot run for itself. Both are refused BEFORE the authority is touched,
-/// and both answer the module's own Refusals so `social::party_result_for` classifies them
-/// identically on either plane.
 #[test]
 fn an_invite_to_a_missing_or_offline_target_never_reaches_realm_core() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -1661,9 +1576,7 @@ fn an_invite_to_a_missing_or_offline_target_never_reaches_realm_core() {
     );
 }
 
-/// An Orc, for the faction Gate. Race 2 is Horde; every other fixture Character is a Human.
 const GRUNT: u64 = 8;
-/// An Orc with a character row but no live entity.
 const SLEEPING_GRUNT: u64 = 9;
 
 fn orc(guid: u64, name: &str) -> codec::CharacterView {
@@ -1673,10 +1586,6 @@ fn orc(guid: u64, name: &str) -> codec::CharacterView {
     }
 }
 
-/// Vanilla's default refuses a party across factions (cm:GroupHandler.cpp:80,
-/// `AllowTwoSide.Interaction.Group = 0`), after the target lookup and before anything else. The
-/// Gateway reads both races realm-wide, so an Orc standing on another Shard is refused before the
-/// authority is touched.
 #[test]
 fn a_cross_faction_invite_is_refused_before_realm_core() {
     let calls: ShardCallLog = Default::default();
@@ -1749,7 +1658,6 @@ fn a_cross_faction_invite_is_refused_before_realm_core() {
     );
 }
 
-/// The unsharded plane refuses the same invite before the player-facing reducer runs.
 #[test]
 fn an_unsharded_gateway_refuses_a_cross_faction_invite_too() {
     let calls: ShardCallLog = Default::default();
@@ -1781,18 +1689,6 @@ fn an_unsharded_gateway_refuses_a_cross_faction_invite_too() {
     );
 }
 
-/// The moved ONLINE gate has to be the module's gate, not a lookalike.
-///
-/// The module refuses an invite when the target has no `game_world_entity` row, and says so in its
-/// own comment: *"a session-less playerbot's live entity counts"*. `game_character.online` is a
-/// different fact — it is set by `player_login` and cleared by logout, and a playerbot runs neither
-/// (its spawn reducer inserts the entity directly), so every bot in the tree has a live entity and
-/// `online == false` for its whole life.
-///
-/// Gating on the session flag therefore refuses `/invite <bot>` on a MULTI-DATABASE gateway while
-/// the single-database plane still accepts it — the moved gate answering differently than the module
-/// did, which is a behaviour change wearing a refactor's clothes. The playerbot real-player-simulation
-/// runs are driven by exactly this opcode.
 #[test]
 fn a_playerbot_is_invitable_because_the_online_gate_reads_the_entity_not_the_session_flag() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -1825,11 +1721,6 @@ fn a_playerbot_is_invitable_because_the_online_gate_reads_the_entity_not_the_ses
     );
 }
 
-// ===========================================================================================
-//  Somebody has to ANSWER a bot's invite
-// ===========================================================================================
-
-/// A bot on a World Shard accepts a Realm-core invite with its own Character guid.
 #[test]
 fn a_players_invite_to_a_session_less_bot_is_answered_by_the_bot_itself() {
     use lyracore_shared::group::realm_op;
@@ -1855,8 +1746,6 @@ fn a_players_invite_to_a_session_less_bot_is_answered_by_the_bot_itself() {
         party_state.invites.is_empty(),
         "the pending invite must be CONSUMED; a leftover row is the hung dialog this fixes"
     );
-    // IMPERSONATION (the hazard this batch already hit once): `realm_group_op` takes the actor as an
-    // ARGUMENT, so the gateway could trivially accept as somebody else. The bot acts as ITSELF.
     assert_eq!(
         party_state.ops.clone(),
         vec![
@@ -1869,10 +1758,8 @@ fn a_players_invite_to_a_session_less_bot_is_answered_by_the_bot_itself() {
 
 #[test]
 fn a_stale_character_row_on_another_shard_cannot_make_a_logged_in_player_look_session_less() {
-    /// The seeded `init` character: a row on EVERY database, `online = false` in the seed.
     const SEEDED: u64 = 1;
     let (realm, world, instances, _calls) = party_topology();
-    // `instances` carries the stale seed copy (offline)…
     let mut i_chars = instances.characters.clone();
     i_chars.push(character(SEEDED, "Tester"));
     let far = std::sync::Arc::new(WorldFake {
@@ -1892,7 +1779,6 @@ fn a_stale_character_row_on_another_shard_cannot_make_a_logged_in_player_look_se
         },
         ..Default::default()
     });
-    // …while `world` holds the real, LOGGED-IN character and its live entity.
     let mut w_chars = world.characters.clone();
     w_chars.push(character(SEEDED, "Tester"));
     let home = std::sync::Arc::new(WorldFake {
@@ -1915,7 +1801,6 @@ fn a_stale_character_row_on_another_shard_cannot_make_a_logged_in_player_look_se
     for shard in [&home, &far] {
         *shard.topology.peers.lock().unwrap() = vec![home.clone(), far.clone()];
     }
-    // …and end to end: an inviter on the far shard must leave that player's dialog alone.
     party::run(
         far.as_ref(),
         Actor::new(VIM).unwrap(),
@@ -1942,12 +1827,6 @@ fn a_stale_character_row_on_another_shard_cannot_make_a_logged_in_player_look_se
     );
 }
 
-/// **AC: the bot's membership reaches the shard it stands on.**
-///
-/// The bot's own in-world behaviour — follow-the-leader (the playerbot simulation), the
-/// kill-XP split, `/p` — all read the SHARD's mirror, not realm-core. The answer therefore has to
-/// happen before the mirror push of the op that caused it, or the bot is a member the shard does not
-/// know about until the party's next op (and a bot party has no next op — the human does everything).
 #[test]
 fn the_bots_new_membership_is_mirrored_onto_its_own_shard_by_the_same_op() {
     let (realm, world, instances, _calls) = party_topology();
@@ -1992,11 +1871,6 @@ fn the_bots_new_membership_is_mirrored_onto_its_own_shard_by_the_same_op() {
     );
 }
 
-/// **AC: a bot on ANOTHER shard than the inviting player is reachable.**
-///
-/// Free, now that the invite is authoritative on realm-core: the answer is a realm-core op too, so the
-/// boundary never enters into it. Asserted once so a future change that resolves the bot against the
-/// inviter's own database is caught.
 #[test]
 fn a_bot_standing_on_another_shard_answers_the_invite_too() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -2014,10 +1888,6 @@ fn a_bot_standing_on_another_shard_answers_the_invite_too() {
     );
 }
 
-/// **AC: a real player's invite is NOT answered for them.**
-///
-/// The counter-case, and the one that must never regress: Trin has a client, so Trin's dialog is
-/// Trin's to answer. Auto-accepting for a human would be a party the player never agreed to join.
 #[test]
 fn a_real_players_invite_dialog_is_left_for_their_own_client_to_answer() {
     use lyracore_shared::group::realm_op;
@@ -2047,12 +1917,6 @@ fn a_real_players_invite_dialog_is_left_for_their_own_client_to_answer() {
     );
 }
 
-/// **AC: a refusal DECLINES explicitly rather than being ignored.**
-///
-/// An ignored refusal leaves the invite row standing (every accept gate in the module returns `Err`,
-/// which rolls its transaction back) — and a hanging dialog is indistinguishable, from the player's
-/// side, from the bug this whole issue is about. So the bot says no out loud: the invite is consumed
-/// and the inviter gets `SMSG_GROUP_DECLINE` off the DECLINE event.
 #[test]
 fn a_bot_that_cannot_join_declines_out_loud_instead_of_leaving_the_dialog_hanging() {
     use lyracore_shared::group::{event_kind, realm_op};
@@ -2072,7 +1936,6 @@ fn a_bot_that_cannot_join_declines_out_loud_instead_of_leaving_the_dialog_hangin
         vec![
             (realm_op::INVITE, GINGER, BOT, 0, 0, 0),
             (realm_op::ACCEPT, BOT, 0, 1, 0, 0),
-            // …and the decline is the bot's own too, not the inviter's.
             (realm_op::DECLINE, BOT, 0, 0, 0, 0),
         ],
         "a refused accept must be followed by an explicit decline"
@@ -2088,11 +1951,6 @@ fn a_bot_that_cannot_join_declines_out_loud_instead_of_leaving_the_dialog_hangin
     );
 }
 
-/// The answer is not a new tick and not a poll: it runs INSIDE the invite op, so a bot is in the party
-/// by the time `/invite` returns. Pinned because the alternative shape the issue suggested — a poll on
-/// the playerbots goal tick — would have read the SHARD's `game_group_invite`, which a sharded
-/// deployment never writes (the invite lives on realm-core), and would have been a no-op that a source
-/// scan could not tell from a fix.
 #[test]
 fn the_bot_answers_within_the_invite_op_itself_with_no_second_call() {
     let (realm, world, _instances, calls) = party_topology();
@@ -2119,9 +1977,6 @@ fn the_bot_answers_within_the_invite_op_itself_with_no_second_call() {
     );
 }
 
-/// `realm_group_op` packs seven ops into six argument slots, and the packing is a WIRE contract with
-/// the module (`lyracore_shared::group::realm_op`). A slot swap is silent — a loot-method change would
-/// arrive as a kick of the master looter — so every op's packing is pinned as it is SENT.
 #[test]
 fn every_party_op_reaches_realm_core_in_its_declared_argument_slots() {
     use lyracore_shared::group::realm_op;
@@ -2153,28 +2008,18 @@ fn every_party_op_reaches_realm_core_in_its_declared_argument_slots() {
     assert_eq!(
         realm.party.party.lock().unwrap().ops.clone(),
         vec![
-            // INVITE: the target rides `target_guid`, nothing else is used.
             (realm_op::INVITE, GINGER, VIM, 0, 0, 0),
-            // ACCEPT: the acceptor's class in arg_a, the fixture's Warrior.
             (realm_op::ACCEPT, VIM, 0, 1, 0, 0),
-            // LOOT_METHOD: setting in arg_a, MASTER in target_guid, threshold in arg_b —
-            // CMSG_LOOT_METHOD's own field order.
             (realm_op::LOOT_METHOD, GINGER, VIM, 2, 4, 0),
-            // RAID_CONVERT: the actor alone.
             (realm_op::RAID_CONVERT, GINGER, 0, 0, 0, 0),
-            // UNINVITE: the kicked member rides `target_guid`.
             (realm_op::UNINVITE, GINGER, VIM, 0, 0, 0),
         ]
     );
 }
 
-///
-/// World entry delivers the Realm roster, and in-world party operations use Realm-core.
 #[test]
 fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() {
     let (realm, _world, _instances, calls) = party_topology();
-    // The session's own shard, wired into the same realm + peer set as the topology's `world`,
-    // plus what `run_world_session` needs to handshake and enter the world as Ginger.
     let session_shard = std::sync::Arc::new(WorldFake {
         topology: TopologyState {
             shard: "world".into(),
@@ -2196,9 +2041,6 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
         ..Default::default()
     });
     *session_shard.topology.peers.lock().unwrap() = vec![session_shard.clone()];
-    // Ginger is ALREADY in a party on realm-core when they log in — a party formed while they were
-    // on the loading screen, which is exactly what the deleted character-transfer blob mirror could
-    // never carry.
     {
         let mut p = realm.party.party.lock().unwrap();
         p.next_group_id = 5;
@@ -2213,15 +2055,12 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
         run_world_session(server_end, server_store.clone()).unwrap();
     });
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
-    // Missing roster delivery must fail at the read deadline.
     CMSG_PLAYER_LOGIN {
         guid: Guid::new(GINGER),
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
 
-    // The realm-wide party slice appends the party frame right after world entry. A frame that
-    // times out or does not decode is missing; the assertions below say what.
     let mut frames = drain_world_entry(&mut client, &mut c_dec);
     frames.extend(ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).ok());
     let mut roster_named: Option<String> = None;
@@ -2242,10 +2081,6 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
         "world entry must push the authoritative roster onto the shard the player entered"
     );
 
-    // …and EVERY party op typed in-world goes to realm-core, not to this shard's own tables — each
-    // one attributed to the character this socket authenticated as.
-    //
-    // Each operation must carry the Character guid authenticated by this socket.
     use wow_world_messages::vanilla::{
         CMSG_GROUP_ACCEPT, CMSG_GROUP_DECLINE, CMSG_GROUP_DISBAND, CMSG_GROUP_INVITE,
         CMSG_GROUP_RAID_CONVERT, CMSG_GROUP_UNINVITE, CMSG_LOOT_METHOD,
@@ -2275,11 +2110,6 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
     CMSG_GROUP_UNINVITE { name: "vim".into() }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    // The BARRIER: an invite for a name no shard can resolve never reaches `party::run`, so it adds
-    // no op — but it always answers `SMSG_PARTY_COMMAND_RESULT`, and the dispatch is sequential on
-    // one thread, so seeing ITS reply proves all seven above have been dispatched. (No `join`: the
-    // session thread outlives the socket by design, and waiting on it would reintroduce the hang the
-    // deadline above removes.)
     CMSG_GROUP_INVITE {
         name: "Nobodyatall".into(),
     }
@@ -2291,7 +2121,7 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
                 break;
             }
             Ok(_) => {}
-            Err(_) => break, // the deadline fired — the assertions below say what was missing
+            Err(_) => break,
         }
     }
     drop(client);
@@ -2308,19 +2138,14 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
         "the invite ran against the session shard's own party tables — the shard-local behaviour \
          realm-wide party routing removes. Calls were {log:?}"
     );
-    // Realm-core derives authorization from the actor argument. Verify each operation
-    // carries the authenticated Character and the correct argument slots, including Refusals.
     use lyracore_shared::group::realm_op;
     assert_eq!(
         realm.party.party.lock().unwrap().ops.clone(),
         vec![
-            // World entry asks for the Party's Target Icons after the list.
             (realm_op::TARGET_ICON, GINGER, 0, 0xFF, 0, 0),
             (realm_op::INVITE, GINGER, VIM, 0, 0, 0),
             (realm_op::ACCEPT, GINGER, 0, 1, 0, 0),
             (realm_op::DECLINE, GINGER, 0, 0, 0, 0),
-            // CMSG_LOOT_METHOD's own field order: setting in arg_a, MASTER in target_guid,
-            // threshold in arg_b.
             (realm_op::LOOT_METHOD, GINGER, VIM, 2, 4, 0),
             (realm_op::RAID_CONVERT, GINGER, 0, 0, 0, 0),
             (realm_op::LEAVE, GINGER, 0, 0, 0, 0),
@@ -2331,12 +2156,8 @@ fn a_real_session_syncs_its_party_at_login_and_routes_an_invite_to_realm_core() 
     );
 }
 
-/// A failed mirror push must not turn a party op that DID commit into a failure the client renders
-/// as one: realm-core has already accepted the change, and the party frame is relayed from there,
-/// not from the mirror.
 #[test]
 fn a_shard_that_refuses_the_mirror_does_not_fail_the_party_op() {
-    // The instances shard rejects `sync_group_mirror` (a database that went away mid-op).
     let (realm, world, instances, _calls) =
         party_topology_with(Some("instances is unreachable"), None);
 
@@ -2368,25 +2189,11 @@ fn a_shard_that_refuses_the_mirror_does_not_fail_the_party_op() {
     );
 }
 
-// ===========================================================================================
-//  Bot-initiated (serendipity) invites go through the SAME authority a player's own
-//  CMSG_GROUP_INVITE does, so a `sync_group_mirror` push never contradicts a bot-formed party.
-// ===========================================================================================
-
-/// **AC: bot-formed parties are created through the same authority as player parties.**
-///
-/// `run_bot_invite` — not `invite_core` — is what a playerbot's serendipity pick now runs through.
-/// The bot has no client and no account connection, so this must reach realm-core the same guid-based
-/// way [`answer_for_session_less`] already does, and must NOT touch either shard's own `game_group`/
-/// `game_group_member` tables directly (the exact shard-local write realm-wide party routing already
-/// removed once).
 #[test]
 fn a_bot_invite_forms_a_party_on_realm_core_across_a_shard_boundary() {
     use lyracore_shared::group::realm_op;
     let (realm, world, instances, calls) = party_topology();
 
-    // BOT (on `world`) invites FAR_BOT (on `instances`) — the far side of the boundary, same shape
-    // `a_bot_standing_on_another_shard_answers_the_invite_too` pins for the player-initiated case.
     party::run_bot_invite(world.as_ref(), BOT, FAR_BOT).expect("a bot-initiated invite must land");
 
     let party_state = realm.party.party.lock().unwrap();
@@ -2432,8 +2239,6 @@ fn a_bot_invite_forms_a_party_on_realm_core_across_a_shard_boundary() {
     }
 }
 
-/// Two Gateways observe the same subscribed row. The World Shard claim is the only arbitration
-/// point, so exactly one consumer may reach Realm-core even when both callbacks run concurrently.
 #[test]
 fn two_relay_consumers_execute_one_bot_invite() {
     use lyracore_shared::group::{bot_op, realm_op};
@@ -2490,9 +2295,6 @@ fn two_relay_consumers_execute_one_bot_invite() {
     assert!(world.party.bot_invite_intents.lock().unwrap().is_empty());
 }
 
-/// **AC: one intent table, two party ops.** The row's `op` byte is the whole dispatch, so an INVITE
-/// and a LEAVE written to the same table must reach two different ops on the party authority. A
-/// dispatch that ignored the byte would silently re-invite a bot that asked to leave.
 #[test]
 fn the_intent_op_byte_picks_the_party_op_that_runs() {
     use lyracore_shared::group::{bot_op, realm_op};
@@ -2545,9 +2347,6 @@ fn the_intent_op_byte_picks_the_party_op_that_runs() {
     );
 }
 
-/// A module newer than this gateway can write an op byte this build has never heard of. Running it
-/// as an invite would form a party nobody asked for, so it is refused by name — and the claim has
-/// already consumed the row, so it is refused once rather than every second.
 #[test]
 fn an_unknown_intent_op_is_refused_rather_than_run_as_an_invite() {
     const INTENT_ID: u64 = 73;
@@ -2572,17 +2371,9 @@ fn an_unknown_intent_op_is_refused_rather_than_run_as_an_invite() {
     );
 }
 
-/// **The regression test the issue asks for.** A bot party must survive the next
-/// `sync_group_mirror` push that touches its group id — the failure mode was that realm-core had
-/// never heard of the group, so the mirror read that as "this party does not exist" and tombstoned
-/// it. Simulated here as a SECOND, independent push (a later world entry or another member's op would
-/// trigger exactly this) rather than the op's own immediate push, so it is not just re-testing the
-/// invite path above.
 #[test]
 fn a_bots_party_survives_the_next_sync_group_mirror_push_that_touches_it() {
     let (realm, world, _instances, _calls) = party_topology();
-    // A second BOT as the target (not TRIN, a real player) so the invite auto-accepts and actually
-    // forms a party in one call — a pending invite has no mirror to survive anything.
     party::run_bot_invite(world.as_ref(), BOT, FAR_BOT).expect("forms the party");
     let group_id = realm
         .party
@@ -2598,8 +2389,6 @@ fn a_bots_party_survives_the_next_sync_group_mirror_push_that_touches_it() {
         "precondition: the party is already mirrored by the invite's own push"
     );
 
-    // The next push that touches this exact group id — nobody's `self_guid`, `before` names the group
-    // directly, matching how `on_world_entry`/`sync_mirrors` reach a group that isn't the actor's own.
     party::sync_mirrors(
         world.as_ref(),
         realm.as_ref(),
@@ -2616,14 +2405,6 @@ fn a_bots_party_survives_the_next_sync_group_mirror_push_that_touches_it() {
     );
 }
 
-/// **The counterfactual, proving the mechanism above is real.** A group that realm-core has never
-/// heard of — modelling the bug's PRE-fix shape, where a bot wrote this shard's
-/// `game_group`/`game_group_member` rows directly and realm-core's authority never gained a matching
-/// row — IS wiped by the next push
-/// that touches its id. This is not a hypothetical: the world shard's own `game_group.group_id` and
-/// realm-core's run independent `#[auto_inc]` counters, so a shard-local-only id colliding with some
-/// unrelated REAL realm-core party's id was exactly how the live bug manifested — any op on that real
-/// party pushed realm-core's (different) roster for the same number over the bot's local rows.
 #[test]
 fn a_shard_local_only_group_realm_core_never_heard_of_is_wiped_by_the_next_push() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -2661,8 +2442,6 @@ fn a_shard_local_only_group_realm_core_never_heard_of_is_wiped_by_the_next_push(
     );
 }
 
-/// Same existence/online gate a player's own invite uses (`presence`/`live_anywhere`) — a bot invite
-/// must not skip it just because there is no client waiting on the `SMSG_PARTY_COMMAND_RESULT`.
 #[test]
 fn a_bot_invite_to_a_missing_or_offline_target_never_reaches_realm_core() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -2682,10 +2461,6 @@ fn a_bot_invite_to_a_missing_or_offline_target_never_reaches_realm_core() {
     );
 }
 
-/// **AC, unsharded half.** A bot has no per-account connection, on EITHER topology — so unlike
-/// [`run`], `run_bot_invite` must not fall back to the account-based player reducers when there is no
-/// realm-core to route to. Unsharded, this database is its own authority: the guid-based
-/// `realm_group_op` still runs, against the ONE database there is.
 #[test]
 fn an_unsharded_deployment_still_routes_a_bot_invite_through_realm_group_op() {
     use lyracore_shared::group::realm_op;
@@ -2697,7 +2472,7 @@ fn an_unsharded_deployment_still_routes_a_bot_invite_through_realm_group_op() {
             ..Default::default()
         },
         party: PartyState {
-            is_realm: true, // this database IS its own authority — nothing else to route to
+            is_realm: true,
             ..Default::default()
         },
         characters: vec![character(BOT, "Botty"), character(TRIN, "Trin")],
@@ -2709,7 +2484,7 @@ fn an_unsharded_deployment_still_routes_a_bot_invite_through_realm_group_op() {
             offline_guids: vec![BOT],
             ..Default::default()
         },
-        ..Default::default() // no `realm`, no `peers` — the unconfigured gateway
+        ..Default::default()
     });
     assert!(
         store.realm_store().unwrap().is_none(),
@@ -2920,10 +2695,6 @@ fn unsharded_bot_invitations_leave_a_suppressed_target_unanswered() {
     assert_eq!(state.ops, vec![(realm_op::INVITE, BOT, FAR_BOT, 0, 0, 0)]);
 }
 
-// ---- Raids ----
-
-/// Decode one sent `SMSG_GROUP_LIST`. With a loot block it must end with the extra byte 0 the 1.12
-/// servers send after the loot threshold.
 fn group_list(packet: Outbound) -> wow_world_messages::vanilla::SMSG_GROUP_LIST {
     let Outbound::Raw { opcode, body } = packet else {
         panic!("expected a raw SMSG_GROUP_LIST")
@@ -2956,7 +2727,6 @@ fn mirror_calls(calls: &ShardCallLog) -> usize {
         .count()
 }
 
-/// **AC: the leader converts; every member gets a raid list and every shard mirrors the Raid.**
 #[test]
 fn a_leader_converts_the_party_on_realm_core_and_every_shard_mirrors_the_raid() {
     let (realm, world, instances, _calls) = party_topology();
@@ -3022,8 +2792,6 @@ fn a_leader_converts_the_party_on_realm_core_and_every_shard_mirrors_the_raid() 
     assert!(list.members.iter().all(|member| member.flags == 0));
 }
 
-/// Converting a Raid again changes nothing on Realm-core, so it must not cost a mirror push to
-/// every World Shard each time a client repeats the opcode.
 #[test]
 fn converting_a_raid_again_pushes_no_mirror() {
     let (_realm, world, instances, calls) = party_topology();
@@ -3047,7 +2815,6 @@ fn converting_a_raid_again_pushes_no_mirror() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC: a non-leader's convert changes nothing and sends nothing.**
 #[test]
 fn a_member_who_does_not_lead_cannot_convert_and_no_mirror_is_pushed() {
     let (realm, world, instances, calls) = party_topology();
@@ -3074,8 +2841,6 @@ fn a_member_who_does_not_lead_cannot_convert_and_no_mirror_is_pushed() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC: a single-database Gateway converts through `realm_group_op` on its only shard.** A raid op
-/// has no player-facing reducer, so the home shard is the party authority there.
 #[test]
 fn an_unsharded_gateway_converts_through_realm_group_op_on_its_own_shard() {
     let calls: ShardCallLog = Default::default();
@@ -3115,9 +2880,6 @@ fn an_unsharded_gateway_converts_through_realm_group_op_on_its_own_shard() {
     assert_eq!(state.kind_of(5), GroupKind::Raid);
 }
 
-/// **AC: with Subgroup 0 full, the next joiner lands in Subgroup 1, and every member's list shows
-/// its flags byte as 1.** The placement is the Module's rule; the Gateway must carry it to every
-/// mirror and every list.
 #[test]
 fn a_raid_joiner_past_a_full_first_subgroup_shows_subgroup_one_in_every_list() {
     let (realm, world, instances, _calls) = party_topology();
@@ -3174,14 +2936,11 @@ fn a_raid_joiner_past_a_full_first_subgroup_shows_subgroup_one_in_every_list() {
     }
 }
 
-/// **AC: a member on another shard renders online in a LIST pushed from Realm-core.**
 #[test]
 fn the_realm_core_list_relay_renders_a_member_on_another_shard_online() {
     let (realm, world, instances, _calls) = party_topology();
     form_split_party(&world, &instances);
-    // The production Realm-core Coordinator reads every World Shard.
     *realm.topology.peers.lock().unwrap() = vec![world.clone(), instances.clone()];
-    // What the Module writes on Realm-core: no names, no presence.
     let payload = RosterPayload {
         leader: GINGER,
         loot_method: 3,
@@ -3227,8 +2986,6 @@ fn the_realm_core_list_relay_renders_a_member_on_another_shard_online() {
     );
 }
 
-/// A name the payload carries is kept; a blank one is read from the shards; a member no shard can
-/// name stays in the list, blank and offline, because a missing row reads as "they left".
 #[test]
 fn a_list_keeps_payload_names_and_lists_a_member_no_shard_can_name() {
     let (_realm, world, _instances, _calls) = party_topology();
@@ -3269,8 +3026,6 @@ fn a_list_keeps_payload_names_and_lists_a_member_no_shard_can_name() {
     );
 }
 
-/// **AC: `CMSG_GROUP_RAID_CONVERT` in, `SMSG_PARTY_COMMAND_RESULT(Invite, "", Success)` out**
-/// (cm:GroupHandler.cpp:488), and a refused convert sends nothing (cm:GroupHandler.cpp:483-484).
 #[test]
 fn raid_convert_answers_the_leader_with_success_and_a_refusal_with_silence() {
     use wow_world_messages::vanilla::{
@@ -3302,8 +3057,6 @@ fn raid_convert_answers_the_leader_with_success_and_a_refusal_with_silence() {
         GroupKind::Raid
     );
 
-    // Another member now leads, so the session's convert is refused. The barrier invite's reply
-    // must be the next packet: the refusal sent nothing.
     store.party.party.lock().unwrap().groups[0].1 = 2;
     CMSG_GROUP_RAID_CONVERT {}
         .write_encrypted_client(&mut client, &mut c_enc)
@@ -3326,9 +3079,6 @@ fn raid_convert_answers_the_leader_with_success_and_a_refusal_with_silence() {
     let _ = server.join();
 }
 
-// ---- Leadership and Assistants ----
-
-/// Ginger leads a Party of Ginger (world), Vim (instances) and Trin (world).
 fn party_of_three() -> (
     std::sync::Arc<WorldFake>,
     std::sync::Arc<WorldFake>,
@@ -3347,7 +3097,6 @@ fn party_of_three() -> (
     (realm, world, instances, calls)
 }
 
-/// The kinds `guid` received since event `from`.
 fn events_for(realm: &WorldFake, from: usize, guid: u64) -> Vec<u8> {
     realm.party.party.lock().unwrap().events[from..]
         .iter()
@@ -3356,9 +3105,6 @@ fn events_for(realm: &WorldFake, from: usize, guid: u64) -> Vec<u8> {
         .collect()
 }
 
-/// **AC: the leader passes the lead to an online member. Every member hears the new leader, then
-/// gets a list naming it, and every shard mirrors the new leader.** The target is live on the far
-/// shard, which only the Gateway can see from here.
 #[test]
 fn the_leader_passes_the_lead_to_a_member_live_on_the_far_shard() {
     use lyracore_shared::group::event_kind::{LIST, SET_LEADER};
@@ -3390,8 +3136,6 @@ fn the_leader_passes_the_lead_to_a_member_live_on_the_far_shard() {
     }
 }
 
-/// **AC: passing the lead to an offline member changes nothing.** Realm-core cannot see presence,
-/// so the Gateway refuses before it calls the authority, and a live target on either shard passes.
 #[test]
 fn the_lead_passes_only_to_a_member_live_on_some_shard() {
     let (realm, world, _instances, calls) = party_of_three();
@@ -3433,8 +3177,6 @@ fn the_lead_passes_only_to_a_member_live_on_some_shard() {
     );
 }
 
-/// The two leadership ops pack their arguments into `realm_group_op`'s slots as the shared contract
-/// names them: the member in `target_guid`, and promote or demote in `arg_a`.
 #[test]
 fn leadership_ops_reach_realm_core_in_their_declared_argument_slots() {
     let (realm, world, _instances, _calls) = party_of_three();
@@ -3470,8 +3212,6 @@ fn leadership_ops_reach_realm_core_in_their_declared_argument_slots() {
     );
 }
 
-/// **AC: the raid leader promotes a member, and every list shows its flags byte with `0x80`;
-/// demoting clears it.** Each change resyncs every mirror.
 #[test]
 fn a_promoted_assistant_shows_0x80_in_every_list_and_every_mirror() {
     let (realm, world, instances, _calls) = party_of_three();
@@ -3512,7 +3252,6 @@ fn a_promoted_assistant_shows_0x80_in_every_list_and_every_mirror() {
     }
 }
 
-/// Repeating a promotion changes nothing on Realm-core, so it costs no mirror push.
 #[test]
 fn repeating_a_promotion_pushes_no_mirror() {
     let (_realm, world, _instances, calls) = party_of_three();
@@ -3535,8 +3274,6 @@ fn repeating_a_promotion_pushes_no_mirror() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC: a single-database Gateway runs both leadership ops through `realm_group_op` on its own
-/// shard**, after the same presence Gate.
 #[test]
 fn an_unsharded_gateway_runs_leadership_ops_on_its_own_shard() {
     let calls: ShardCallLog = Default::default();
@@ -3584,7 +3321,6 @@ fn an_unsharded_gateway_runs_leadership_ops_on_its_own_shard() {
     assert!(state.slots[&VIM].is_assistant());
 }
 
-/// A `SET_LEADER` row as the relay decodes it.
 fn set_leader_row(leader: u64) -> crate::stdb::bindings::GroupEvent {
     crate::stdb::bindings::GroupEvent {
         id: 1,
@@ -3598,7 +3334,6 @@ fn set_leader_row(leader: u64) -> crate::stdb::bindings::GroupEvent {
     }
 }
 
-/// The one `SMSG_GROUP_SET_LEADER` name the relay sends for `row`, or `None` for no packet.
 fn relayed_leader_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
@@ -3616,9 +3351,6 @@ fn relayed_leader_name(
     }
 }
 
-/// **AC: every member gets `SMSG_GROUP_SET_LEADER` with the new leader's name.** The relay reads
-/// the name from whichever shard holds the leader. A leader no shard can name sends nothing rather
-/// than a blank "is now the group leader" line.
 #[test]
 fn the_set_leader_relay_names_the_leader_from_the_far_shard() {
     let (realm, world, instances, _calls) = party_topology();
@@ -3631,8 +3363,6 @@ fn the_set_leader_relay_names_the_leader_from_the_far_shard() {
     assert_eq!(relayed_leader_name(&realm, &set_leader_row(404)), None);
 }
 
-/// An `INVITE` row as the relay decodes it: `other_guid` is the INVITER (`invite_core_on`'s
-/// `push_event` call in `module/src/group.rs`).
 fn invite_row(inviter: u64) -> crate::stdb::bindings::GroupEvent {
     crate::stdb::bindings::GroupEvent {
         id: 1,
@@ -3646,7 +3376,6 @@ fn invite_row(inviter: u64) -> crate::stdb::bindings::GroupEvent {
     }
 }
 
-/// The one `SMSG_GROUP_INVITE` name the relay sends for `row`, or `None` for no packet.
 fn relayed_invite_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
@@ -3664,12 +3393,6 @@ fn relayed_invite_name(
     }
 }
 
-/// **AC: the invite dialog names the inviter, even across a shard boundary, and still reaches the
-/// target when no shard can name them.** `push_event` writes `other_name` on whichever database
-/// the invite op runs on. On a sharded Realm that is Realm-core, which holds no `game_character`
-/// rows, so the relay reads the inviter's name from the World Shard caches instead. The pending
-/// `game_group_invite` row already committed, and the popup is the target's only way to learn of
-/// it, so an unresolvable name sends the popup blank rather than dropping the packet.
 #[test]
 fn the_invite_relay_names_the_inviter_from_the_far_shard() {
     let (realm, world, instances, _calls) = party_topology();
@@ -3686,8 +3409,6 @@ fn the_invite_relay_names_the_inviter_from_the_far_shard() {
     );
 }
 
-/// A `DECLINE` row as the relay decodes it: `other_guid` is the DECLINER (`decline_invite_on`'s
-/// `push_event` call in `module/src/group.rs`).
 fn decline_row(decliner: u64) -> crate::stdb::bindings::GroupEvent {
     crate::stdb::bindings::GroupEvent {
         id: 1,
@@ -3701,7 +3422,6 @@ fn decline_row(decliner: u64) -> crate::stdb::bindings::GroupEvent {
     }
 }
 
-/// The one `SMSG_GROUP_DECLINE` name the relay sends for `row`, or `None` for no packet.
 fn relayed_decline_name(
     realm: &WorldFake,
     row: &crate::stdb::bindings::GroupEvent,
@@ -3719,10 +3439,6 @@ fn relayed_decline_name(
     }
 }
 
-/// **AC: the inviter's "declined" line names the decliner, even across a shard boundary.** Same
-/// defect as INVITE, same fix: the relay resolves the name from the World Shard caches rather than
-/// trusting `other_name`. Same fallback as INVITE too: a decliner no shard can name still gets a
-/// line sent, blank rather than dropped, for the same consistency reason.
 #[test]
 fn the_decline_relay_names_the_decliner_from_the_far_shard() {
     let (realm, world, instances, _calls) = party_topology();
@@ -3738,7 +3454,6 @@ fn the_decline_relay_names_the_decliner_from_the_far_shard() {
     );
 }
 
-/// Decode one hand-written client frame: size (u16 BE, opcode plus body), opcode (u32 LE), body.
 fn client_frame(opcode: u32, body: &[u8]) -> ClientOpcodeMessage {
     let mut framed = u16::try_from(body.len() + 4)
         .unwrap()
@@ -3749,8 +3464,6 @@ fn client_frame(opcode: u32, body: &[u8]) -> ClientOpcodeMessage {
     ClientOpcodeMessage::read_unencrypted(&mut framed.as_slice()).expect("a client frame")
 }
 
-/// The three bodies as cmangos reads them: a u64 member guid, and for the Assistant opcode one
-/// flag byte after it (cm:GroupHandler.cpp:252-253, 346-347, 529-532).
 #[test]
 fn leadership_opcodes_decode_from_the_vanilla_layout() {
     let guid = 0x0102_0304_0506_0708u64;
@@ -3778,7 +3491,6 @@ fn leadership_opcodes_decode_from_the_vanilla_layout() {
     }
 }
 
-/// A session on a shard that reaches `realm`, entered as Ginger.
 fn realm_session(
     realm: &std::sync::Arc<WorldFake>,
 ) -> (
@@ -3800,7 +3512,6 @@ fn realm_session(
     enter_world(store, GINGER)
 }
 
-/// Send `CMSG_GROUP_UNINVITE_GUID`, then the barrier.
 fn kick_by_guid(
     client: &mut UnixStream,
     c_enc: &mut EncrypterHalf,
@@ -3815,9 +3526,6 @@ fn kick_by_guid(
     barrier(client, c_enc, c_dec)
 }
 
-/// Send an invite for a name no shard knows, which is always answered. Returns the first
-/// `SMSG_PARTY_COMMAND_RESULT` the session sends back, past the party frame world entry sent. The
-/// dispatch is sequential, so a result naming the barrier proves that no op before it answered.
 fn barrier(
     client: &mut UnixStream,
     c_enc: &mut EncrypterHalf,
@@ -3837,9 +3545,6 @@ fn barrier(
     }
 }
 
-/// **AC: an Assistant who names the leader in the raid frame's "Remove from group" gets
-/// `SMSG_PARTY_COMMAND_RESULT(Leave, "", NotLeader)`, and nothing changes**
-/// (cm:GroupHandler.cpp:274-276).
 #[test]
 fn a_guid_kick_of_the_leader_answers_not_leader() {
     use wow_world_messages::vanilla::{PartyOperation, PartyResult};
@@ -3873,10 +3578,6 @@ fn a_guid_kick_of_the_leader_answers_not_leader() {
     let _ = server.join();
 }
 
-/// **AC: set leader and set Assistant reach the party authority as the session's own character,
-/// and neither answers the client, whatever the outcome** (cm:GroupHandler.cpp:344-362, 527-545).
-/// The last set leader is refused, because Ginger no longer leads; the barrier's answer is still
-/// the first packet.
 #[test]
 fn set_leader_and_set_assistant_run_as_the_session_and_answer_nothing() {
     use wow_world_messages::vanilla::{CMSG_GROUP_ASSISTANT_LEADER, CMSG_GROUP_SET_LEADER};
@@ -3931,8 +3632,6 @@ fn set_leader_and_set_assistant_run_as_the_session_and_answer_nothing() {
     let _ = server.join();
 }
 
-/// A guid kick naming the sender is dropped without an answer, as cmangos drops it
-/// (cm:GroupHandler.cpp:255-260). It never reaches the party authority.
 #[test]
 fn a_guid_kick_of_yourself_answers_nothing() {
     let realm = std::sync::Arc::new(WorldFake {
@@ -3961,8 +3660,6 @@ fn a_guid_kick_of_yourself_answers_nothing() {
     let _ = server.join();
 }
 
-/// **AC: the leader removes a member by guid.** No name is looked up, so a member no shard can name
-/// is still removed, and a kick that ran answers nothing: the next packet is the barrier's.
 #[test]
 fn a_guid_kick_removes_a_member_no_shard_can_name() {
     let realm = std::sync::Arc::new(WorldFake {
@@ -3997,9 +3694,6 @@ fn a_guid_kick_removes_a_member_no_shard_can_name() {
     drop(client);
     let _ = server.join();
 }
-/// The `realm_group_op` argument slots [`party::Op::ChangeSubgroup`] and [`party::Op::SwapSubgroup`]
-/// declare: the mover in `target_guid` and the destination Subgroup in `arg_a` for a move, one
-/// member in `target_guid` and the other in `arg_c` for a swap.
 #[test]
 fn subgroup_ops_reach_realm_core_in_their_declared_argument_slots() {
     use lyracore_shared::group::realm_op;
@@ -4041,8 +3735,6 @@ fn subgroup_ops_reach_realm_core_in_their_declared_argument_slots() {
     );
 }
 
-/// **AC 1, 9: the leader moves a member to another Subgroup; every shard mirrors the new slot with
-/// its Assistant bit kept, and the Roster Revision advances.**
 #[test]
 fn a_leader_moves_a_member_to_another_subgroup_and_every_shard_mirrors_the_slot() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4093,7 +3785,6 @@ fn a_leader_moves_a_member_to_another_subgroup_and_every_shard_mirrors_the_slot(
     }
 }
 
-/// Moving into the Subgroup a member already holds pushes no mirror to either shard.
 #[test]
 fn changing_into_the_same_subgroup_pushes_no_mirror() {
     let (_realm, world, instances, calls) = party_topology();
@@ -4120,7 +3811,6 @@ fn changing_into_the_same_subgroup_pushes_no_mirror() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC 2: an Assistant may move a member; a plain member may not, and nothing changes.**
 #[test]
 fn an_assistant_can_move_a_member_a_plain_member_cannot() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4187,9 +3877,6 @@ fn an_assistant_can_move_a_member_a_plain_member_cannot() {
     );
 }
 
-/// An Assistant's rights reach both a roster change and a Group Broadcast from the same session:
-/// the Subgroup move lands on the authoritative roster, and the Target Icon mark reaches the party
-/// authority as the Assistant's own action.
 #[test]
 fn an_assistant_moves_a_member_and_marks_a_target_icon() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4252,7 +3939,6 @@ fn an_assistant_moves_a_member_and_marks_a_target_icon() {
     );
 }
 
-/// **AC 4: a Raid has only 8 Subgroups, 0 to 7.**
 #[test]
 fn a_move_to_subgroup_eight_is_refused() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4282,7 +3968,6 @@ fn a_move_to_subgroup_eight_is_refused() {
     assert_eq!(realm.group_roster(GINGER).unwrap().unwrap(), before);
 }
 
-/// **AC 5: in a Party, both ops are refused and change nothing.**
 #[test]
 fn subgroup_ops_in_a_party_are_refused_and_change_nothing() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4313,9 +3998,6 @@ fn subgroup_ops_in_a_party_are_refused_and_change_nothing() {
     assert_eq!(realm.group_roster(GINGER).unwrap().unwrap(), before);
 }
 
-/// A Raid whose Subgroup 0 and Subgroup 1 each hold 5 members: `GINGER` leads Subgroup 0,
-/// `VIM` leads Subgroup 1. AC 3 and AC 6 need Subgroups already full, which is a different
-/// scenario from a member joining one with room.
 fn seed_raid_with_two_full_subgroups(realm: &WorldFake) {
     let mut p = realm.party.party.lock().unwrap();
     let group_id = 20;
@@ -4331,7 +4013,6 @@ fn seed_raid_with_two_full_subgroups(realm: &WorldFake) {
     p.raids.push(group_id);
 }
 
-/// **AC 3: a move into a full Subgroup is refused, changes nothing, and pushes no mirror.**
 #[test]
 fn a_move_into_a_full_subgroup_is_refused() {
     let (realm, world, _instances, calls) = party_topology();
@@ -4354,8 +4035,6 @@ fn a_move_into_a_full_subgroup_is_refused() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC 6: swapping two members of two full Subgroups needs no capacity Gate, and sends exactly
-/// one list per member.**
 #[test]
 fn swapping_members_of_two_full_subgroups_succeeds_and_sends_one_list_per_member() {
     let (realm, world, instances, _calls) = party_topology();
@@ -4399,7 +4078,6 @@ fn swapping_members_of_two_full_subgroups_succeeds_and_sends_one_list_per_member
     }
 }
 
-/// **AC 7: swapping two members of one Subgroup succeeds and pushes no mirror.**
 #[test]
 fn swapping_members_of_one_subgroup_pushes_no_mirror() {
     let (_realm, world, instances, calls) = party_topology();
@@ -4430,9 +4108,6 @@ fn swapping_members_of_one_subgroup_pushes_no_mirror() {
     assert_eq!(mirror_calls(&calls), mirrors_before);
 }
 
-/// **AC 8: a name outside the actor's OWN roster resolves to nothing, even when a Character with
-/// that name exists elsewhere on the realm.** cmangos matches Change/Swap Subgroup names against
-/// the member list alone (cm:GroupHandler.cpp:919-936), never realm-wide.
 #[test]
 fn resolve_roster_member_by_name_ignores_a_namesake_outside_the_roster() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -4452,17 +4127,10 @@ fn resolve_roster_member_by_name_ignores_a_namesake_outside_the_roster() {
     );
 }
 
-// ---- Group Broadcasts ----
-
-/// `realm_group_op`'s slots after the actor: `(op, target_guid, arg_a, arg_b, arg_c)`.
 type RealmArgs = (u8, u64, u8, u8, u64);
 
-/// One packet as the client receives it: `(opcode, body)`.
 type Wire = (u16, Vec<u8>);
 
-/// Every Group Broadcast op and the `realm_group_op` slots it must fill: the op byte, the target
-/// slot, `arg_a`, `arg_b` and `arg_c`. Pinned by hand against `realm_op`'s slot table. The ping's
-/// floats go as bit patterns: 0.5 is `0x3F00_0000` and -0.25 is `0xBE80_0000`.
 fn broadcast_ops() -> [(party::Op, RealmArgs); 6] {
     [
         (party::Op::ReadyCheckStart, (11, 0, 0, 0, 0)),
@@ -4492,9 +4160,6 @@ fn broadcast_ops() -> [(party::Op, RealmArgs); 6] {
     ]
 }
 
-/// **AC: none of the broadcast ops advances the Roster Revision or pushes a mirror.** On a sharded
-/// Realm each one is one `realm_group_op` call on Realm-core and nothing else: no roster read, no
-/// loot-roll flush, no World Shard write.
 #[test]
 fn a_group_broadcast_runs_once_on_realm_core_and_pushes_no_mirror() {
     let (realm, world, instances, calls) = party_topology();
@@ -4530,8 +4195,6 @@ fn a_group_broadcast_runs_once_on_realm_core_and_pushes_no_mirror() {
     }
 }
 
-/// **AC: a single-database Gateway runs all five on its only shard.** No player-facing reducer
-/// exists for them, so the home shard's `realm_group_op` runs each one.
 #[test]
 fn an_unsharded_gateway_runs_every_group_broadcast_on_its_own_shard() {
     let calls: ShardCallLog = Default::default();
@@ -4568,7 +4231,6 @@ fn an_unsharded_gateway_runs_every_group_broadcast_on_its_own_shard() {
     }
 }
 
-/// Send one hand-written client frame over the encrypted session.
 fn send_client_frame(
     client: &mut UnixStream,
     encrypter: &mut EncrypterHalf,
@@ -4583,8 +4245,6 @@ fn send_client_frame(
     client.write_all(body).unwrap();
 }
 
-/// A barrier: the reply to an invite of an unknown name must be the next packet, so nothing the
-/// frames before it sent reached the client.
 fn assert_nothing_sent_before_the_barrier(
     client: &mut UnixStream,
     encrypter: &mut EncrypterHalf,
@@ -4601,9 +4261,6 @@ fn assert_nothing_sent_before_the_barrier(
     }
 }
 
-/// Client bytes in, `realm_group_op` slots out, for every opcode (cmangos: GroupHandler.cpp
-/// 395-415 ping, 417-442 roll, 444-471 icons, 547-583 ready check). The actor's own packets ride
-/// the group event relay, so the session answers none of them directly.
 #[test]
 fn every_group_broadcast_opcode_reaches_the_party_authority_with_its_client_values() {
     let s = quest_store();
@@ -4617,17 +4274,11 @@ fn every_group_broadcast_opcode_reaches_the_party_authority_with_its_client_valu
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     let skull_on: Vec<u8> = [&[0x07][..], &0xF130_0000_0000_0042u64.to_le_bytes()].concat();
     let frames: [(u32, Vec<u8>); 6] = [
-        // MSG_RAID_READY_CHECK, start.
         (0x0322, vec![]),
-        // MSG_RAID_READY_CHECK, answer "ready".
         (0x0322, vec![0x01]),
-        // MSG_RAID_TARGET_UPDATE, skull on a creature.
         (0x0321, skull_on),
-        // MSG_RAID_TARGET_UPDATE, the list request.
         (0x0321, vec![0xFF]),
-        // MSG_MINIMAP_PING at (0.5, -0.25).
         (0x01D5, vec![0, 0, 0, 0x3F, 0, 0, 0x80, 0xBE]),
-        // MSG_RANDOM_ROLL with inverted bounds, min 100 and max 1.
         (0x01FB, vec![100, 0, 0, 0, 1, 0, 0, 0]),
     ];
     for (opcode, body) in &frames {
@@ -4644,7 +4295,6 @@ fn every_group_broadcast_opcode_reaches_the_party_authority_with_its_client_valu
             (13, 1, 0xF130_0000_0000_0042, 7, 0, 0),
             (13, 1, 0, 0xFF, 0, 0),
             (14, 1, 0x3F00_0000, 0, 0, 0xBE80_0000),
-            // The Module normalizes the bounds; the Gateway passes what the client sent.
             (15, 1, 100, 0, 0, 1),
         ]
     );
@@ -4652,8 +4302,6 @@ fn every_group_broadcast_opcode_reaches_the_party_authority_with_its_client_valu
     let _ = server.join();
 }
 
-/// cmangos answers a refused Ready Check, mark or ping with silence. A ninth icon index reaches
-/// the Module, which refuses it.
 #[test]
 fn a_refused_group_broadcast_sends_nothing() {
     let store = std::sync::Arc::new(quest_store());
@@ -4675,9 +4323,6 @@ fn a_refused_group_broadcast_sends_nothing() {
     let _ = server.join();
 }
 
-/// A second Ready Check start, minimap ping or `/roll` inside its one-second cooldown never
-/// reaches the party authority, and one kind does not hold back another. A Ready Check answer and
-/// a Target Icon have no cooldown.
 #[test]
 fn a_repeated_fan_out_broadcast_inside_its_cooldown_is_dropped() {
     let s = quest_store();
@@ -4691,19 +4336,14 @@ fn a_repeated_fan_out_broadcast_inside_its_cooldown_is_dropped() {
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     let skull_on: Vec<u8> = [&[0x07][..], &900u64.to_le_bytes()].concat();
     let frames: [(u32, &[u8]); 10] = [
-        // MSG_MINIMAP_PING, twice.
         (0x01D5, &[0; 8]),
         (0x01D5, &[0; 8]),
-        // MSG_RANDOM_ROLL 1-100, twice.
         (0x01FB, &[1, 0, 0, 0, 100, 0, 0, 0]),
         (0x01FB, &[1, 0, 0, 0, 100, 0, 0, 0]),
-        // MSG_RAID_READY_CHECK start, twice.
         (0x0322, &[]),
         (0x0322, &[]),
-        // MSG_RAID_READY_CHECK answer "ready", twice.
         (0x0322, &[0x01]),
         (0x0322, &[0x01]),
-        // MSG_RAID_TARGET_UPDATE skull, twice.
         (0x0321, &skull_on),
         (0x0321, &skull_on),
     ];
@@ -4727,8 +4367,6 @@ fn a_repeated_fan_out_broadcast_inside_its_cooldown_is_dropped() {
     let _ = server.join();
 }
 
-/// The cooldown admits an op at its start, drops the same kind 999 ms later, and admits it again
-/// one full second after the start.
 #[test]
 fn a_group_broadcast_cooldown_lasts_exactly_one_second() {
     let mut cooldowns = party::GroupBroadcastCooldowns::default();
@@ -4739,7 +4377,6 @@ fn a_group_broadcast_cooldown_lasts_exactly_one_second() {
     assert!(cooldowns.admit_at(roll, t0 + std::time::Duration::from_secs(1)));
 }
 
-/// One sent packet as `(opcode, body)`, the way the client receives it.
 fn wire(packet: &Outbound) -> Wire {
     match packet {
         Outbound::One(message) => {
@@ -4766,10 +4403,6 @@ fn group_event(kind: u8, other_guid: u64, payload: &str) -> crate::stdb::binding
     }
 }
 
-/// **Each Group Broadcast kind renders its vanilla packet**, pinned byte for byte against the
-/// cmangos writers: ready check (GroupHandler.cpp:562-563, 576-579), the partial icon update
-/// (Group.cpp:595-600), the full icon list (Group.cpp:648-666), the ping (GroupHandler.cpp:410-413)
-/// and the roll (GroupHandler.cpp:434-438).
 #[test]
 fn the_relay_renders_each_group_broadcast_kind() {
     use lyracore_shared::group::event_kind;
@@ -4778,15 +4411,7 @@ fn the_relay_renders_each_group_broadcast_kind() {
     let star = 901u64.to_le_bytes();
     let none = 0u64.to_le_bytes();
     let vim = VIM.to_le_bytes();
-    // cm:Group.cpp:648-666: the update type, then only the held icons, in icon order.
-    let full_list: Vec<u8> = [
-        &[0x01][..], // update type: full
-        &[0x00],     // star
-        &star,
-        &[0x07], // skull
-        &skull,
-    ]
-    .concat();
+    let full_list: Vec<u8> = [&[0x01][..], &[0x00], &star, &[0x07], &skull].concat();
     let cases: [(u8, &str, Wire); 7] = [
         (event_kind::READY_CHECK, "", (0x0322, vec![])),
         (
@@ -4837,9 +4462,6 @@ fn the_relay_renders_each_group_broadcast_kind() {
     }
 }
 
-/// **Each Meeting Stone kind renders its vanilla packet**: SETQUEUE is `u32 area, u8 status`
-/// (cm:LFG/LFGHandler.cpp:146-152), MEMBER_ADDED the added guid, and COMPLETE and IN_PROGRESS are
-/// empty (cm:LFG/LFGMgr.cpp:288-309).
 #[test]
 fn the_relay_renders_each_meeting_stone_kind() {
     use lyracore_shared::meeting_stone::event_kind;
@@ -4871,7 +4493,6 @@ fn the_relay_renders_each_meeting_stone_kind() {
     }
 }
 
-/// A QUEUE payload the client could not read, or an area it has no id for, reaches no client.
 #[test]
 fn the_relay_drops_a_meeting_stone_queue_it_cannot_encode() {
     use lyracore_shared::meeting_stone::event_kind;
@@ -4886,8 +4507,6 @@ fn the_relay_drops_a_meeting_stone_queue_it_cannot_encode() {
     }
 }
 
-/// A Dwarf Priest stands on `instances`, so the acceptor's facts differ from the party fixture's
-/// Human Warrior and cross a shard when the asking session is on `world`.
 fn dwarf_priest_topology() -> (
     std::sync::Arc<WorldFake>,
     std::sync::Arc<WorldFake>,
@@ -4966,8 +4585,6 @@ fn accepts(realm: &WorldFake) -> Vec<(u8, u64, u64, u8, u8, u64)> {
         .collect()
 }
 
-/// A client's Realm-core ACCEPT conveys the acceptor's class in `arg_a`, so a queued party can give
-/// the joiner a Seeker row.
 #[test]
 fn a_client_accept_carries_the_acceptors_class() {
     let (realm, world, instances) = dwarf_priest_topology();
@@ -4988,8 +4605,6 @@ fn a_client_accept_carries_the_acceptors_class() {
     assert_eq!(accepts(&realm), [(realm_op::ACCEPT, VIM, 0, 5, 0, 0)]);
 }
 
-/// A playerbot's automatic accept reads its facts from the Shard that holds it, here not the
-/// inviter's.
 #[test]
 fn a_playerbot_accept_carries_its_class_from_its_own_shard() {
     let (realm, world, _instances) = dwarf_priest_topology();
@@ -5004,7 +4619,6 @@ fn a_playerbot_accept_carries_its_class_from_its_own_shard() {
     assert_eq!(accepts(&realm), [(realm_op::ACCEPT, FAR_BOT, 0, 5, 0, 0)]);
 }
 
-/// An acceptor no World Shard names conveys class 0, and the accept still runs.
 #[test]
 fn an_accept_nobody_can_name_conveys_zero_class() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -5015,7 +4629,6 @@ fn an_accept_nobody_can_name_conveys_zero_class() {
     assert_eq!(accepts(&realm), [(realm_op::ACCEPT, 99, 0, 0, 0, 0)]);
 }
 
-/// A payload that does not decode reaches no client.
 #[test]
 fn the_relay_drops_a_group_broadcast_it_cannot_decode() {
     use lyracore_shared::group::event_kind;
@@ -5036,9 +4649,6 @@ fn the_relay_drops_a_group_broadcast_it_cannot_decode() {
     }
 }
 
-/// **AC: in a Party the icons survive a list.** The Party client clears its marks on every
-/// `SMSG_GROUP_LIST`, so the LIST job sends the list and then the icons, in that order
-/// (vm:Group.cpp:1343-1360, 1403-1408). A list without icons sends the list alone.
 #[test]
 fn a_party_list_with_target_icons_sends_the_list_then_the_icons() {
     use lyracore_shared::group::{event_kind, TargetIcon};
@@ -5077,9 +4687,6 @@ fn a_party_list_with_target_icons_sends_the_list_then_the_icons() {
     );
 }
 
-/// **A Party member who zones in gets its Target Icons again.** World entry sends a list, and the
-/// Party client clears its marks on every list, so the Gateway asks the party authority for the full
-/// icon list after the list. A Raid keeps its marks and asks for nothing.
 #[test]
 fn world_entry_asks_for_a_partys_target_icons_after_the_list() {
     let (realm, world, instances, _calls) = party_topology();
@@ -5111,7 +4718,6 @@ fn world_entry_asks_for_a_partys_target_icons_after_the_list() {
     );
 }
 
-/// A lost broadcast must not end the session: nothing waits on a ping, and the roster is unchanged.
 #[test]
 fn a_group_broadcast_lost_in_transport_keeps_the_session() {
     let s = {
@@ -5141,7 +4747,6 @@ fn a_group_broadcast_lost_in_transport_keeps_the_session() {
     let _ = server.join();
 }
 
-/// Whether `shard`'s mirror of Group `group_id` lists `member`.
 fn mirror_lists(shard: &WorldFake, group_id: u64, member: u64) -> bool {
     shard
         .party
@@ -5153,8 +4758,6 @@ fn mirror_lists(shard: &WorldFake, group_id: u64, member: u64) -> bool {
         .is_some_and(|roster| roster.has_member(member))
 }
 
-/// A three-member party with Vim inside the dungeon on `instances`. From here on Realm-core's
-/// Coordinator cache lags every call-pipe commit.
 fn lagging_three_member_party() -> (std::sync::Arc<WorldFake>, std::sync::Arc<WorldFake>, u64) {
     let (realm, world, instances, _) = party_topology();
     form_split_party(&world, &instances);
@@ -5173,10 +4776,6 @@ fn lagging_three_member_party() -> (std::sync::Arc<WorldFake>, std::sync::Arc<Wo
     (world, instances, group_id)
 }
 
-/// The Instance Pool starts and cancels an Instance Removal from its mirror. A World Session's
-/// party op returns only after the Coordinator cache holds the commit, so a cache that lags the
-/// commit still pushes the leave and the rejoin, and the Pool never sends home a Character whom
-/// Realm-core shows back in its Group.
 #[test]
 fn a_leave_and_a_rejoin_reach_the_instance_pool_while_the_realm_cache_lags() {
     let (world, instances, group_id) = lagging_three_member_party();
@@ -5210,9 +4809,6 @@ fn a_leave_and_a_rejoin_reach_the_instance_pool_while_the_realm_cache_lags() {
     );
 }
 
-/// A bot leader that leaves a two-member party disbands it. The player in the Group's dungeon must
-/// lose the Group on the Instance Pool, or its Instance Removal never starts. The bot intent runs
-/// on its own thread, so it takes the same visibility receipt a World Session does.
 #[test]
 fn a_bot_leave_that_disbands_reaches_the_instance_pool_while_the_realm_cache_lags() {
     let (realm, world, instances, _) = party_topology();
@@ -5246,7 +4842,6 @@ fn a_bot_leave_that_disbands_reaches_the_instance_pool_while_the_realm_cache_lag
     );
 }
 
-/// A membership op retries a failed mirror push, so one dropped push cannot strand a rejoin.
 #[test]
 fn a_rejoin_retries_a_failed_mirror_push() {
     let (world, instances, group_id) = lagging_three_member_party();
@@ -5278,8 +4873,6 @@ fn a_rejoin_retries_a_failed_mirror_push() {
 
 #[test]
 fn group_invite_by_name_replies_party_command_result_success() {
-    // CMSG_GROUP_INVITE "Buddy" resolves the name, calls the store, and echoes
-    // SMSG_PARTY_COMMAND_RESULT(Invite, "Buddy", Success); the store recorded the resolved guid.
     let mut s = quest_store();
     s.characters = vec![codec::CharacterView {
         guid: 2,
@@ -5313,8 +4906,6 @@ fn group_invite_by_name_replies_party_command_result_success() {
     let _ = server.join();
 }
 
-/// Every party Refusal the Module can send reaches the client as exactly one `PartyResult`, through
-/// the real store seam rather than the mapping function alone.
 #[test]
 fn every_group_refusal_reaches_the_client_as_one_party_result() {
     use wow_world_messages::vanilla::PartyResult;
@@ -5353,8 +4944,6 @@ fn every_group_refusal_reaches_the_client_as_one_party_result() {
     }
 }
 
-/// A Transport Loss left the party in an unknown state, so it must end the session rather than pose
-/// as a gameplay answer the client renders.
 #[test]
 fn a_group_invite_transport_loss_is_not_answered_as_a_refusal() {
     let mut s = quest_store();
@@ -5396,7 +4985,6 @@ fn a_group_invite_transport_loss_is_not_answered_as_a_refusal() {
 
 #[test]
 fn group_invite_unknown_name_replies_bad_player_name() {
-    // An unresolvable name never reaches the store — the reply is BadPlayerName ("player not found").
     let store = std::sync::Arc::new(quest_store());
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
 
@@ -5421,9 +5009,6 @@ fn group_invite_unknown_name_replies_bad_player_name() {
 
 #[test]
 fn loot_method_dispatches_the_decoded_setting_threshold_and_master() {
-    // CMSG_LOOT_METHOD (leader sets MASTER LOOT, Epic threshold, master guid 7) must reach the
-    // store with the gateway-decoded wire bytes — a direct pass-through (module adopted the wire
-    // ordering verbatim), no separate ack packet (vanilla sends none for this opcode either).
     let store = std::sync::Arc::new(quest_store());
     let (mut client, mut c_enc, _c_dec, server) = enter_world(store.clone(), 1);
     CMSG_LOOT_METHOD {
@@ -5433,9 +5018,6 @@ fn loot_method_dispatches_the_decoded_setting_threshold_and_master() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // No reply packet for this opcode — send a harmless follow-up (CMSG_LOOT_MONEY, a no-op here
-    // with no tracked target) and confirm it's the NEXT thing the server processes, proving the
-    // method call didn't hang the dispatch loop waiting to send something.
     CMSG_LOOT_MONEY {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();

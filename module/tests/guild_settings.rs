@@ -7,7 +7,6 @@ const GM: u64 = 5_091_001;
 const LOW_RANK: u64 = 5_091_002;
 const STRANGER: u64 = 5_091_003;
 
-/// A tokenless actor: Realm-core holds no Account Claim for the reserved guids.
 fn actor(guid: u64) -> String {
     format!(r#"{{"guid":{guid},"ownership":null}}"#)
 }
@@ -57,7 +56,6 @@ fn refused(realm: &Standalone, args: &[&str], tag: &str) {
     );
 }
 
-/// Found `name` led by `GM` and answer its `guild_id`.
 fn found(realm: &Standalone, name: &str) -> String {
     realm.assert_call(
         "realm_guild_op",
@@ -67,8 +65,6 @@ fn found(realm: &Standalone, name: &str) -> String {
         .clone()
 }
 
-/// Seed a member row directly: these tests need a second member's data, not a full invite and
-/// accept.
 fn insert_member(realm: &Standalone, guild_id: &str, guid: u64, rank_id: u32, name: &str) {
     realm.assert_sql(&format!(
         "INSERT INTO game_guild_member (character_guid,guild_id,rank_id,name,public_note,officer_note,realm_account_id,joined_micros) VALUES ({guid},{guild_id},{rank_id},'{name}','','',{guid},0)"
@@ -104,7 +100,6 @@ fn event_count(realm: &Standalone, guild_id: &str) -> usize {
         .len()
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn motd_and_info_text_gate_on_rank_rights_and_length_caps() {
@@ -137,7 +132,6 @@ fn motd_and_info_text_gate_on_rank_rights_and_length_caps() {
     );
     assert_eq!(guild_row(&realm, &guild_id)["motd"], "Assemble!");
 
-    // An empty MOTD is allowed (`cm:GuildHandler.cpp:494-497`).
     realm.assert_call("realm_guild_op", &[&actor(GM), &set_motd("")]);
     assert_eq!(guild_row(&realm, &guild_id)["motd"], "");
 

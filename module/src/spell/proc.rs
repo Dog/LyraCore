@@ -1,116 +1,57 @@
-//! The **Proc** engine: one decision, one pass, one chokepoint.
-//!
-//! A Proc is an aura whose row carries its own proc profile — the combat-event mask, the chance or
-//! procs-per-minute rate, the charges left, the internal cooldown and its ready time, and the filter
-//! on which spells may trigger it. The unit wearing the aura is the **Carrier**; the unit on the other
-//! side of the hit is the **Counterparty**.
-//!
-//! [`run_proc_pass`] is the pass, and `combat::apply_hit` — the one chokepoint every damaging hit
-//! routes through — is its only caller, so a new damage path cannot forget procs. Everything the pass
-//! decides ([`hit_bits`], [`proc_chance_bp`], [`decide`]) is pure and unit-tested below: the pass reads
-//! rows, asks the decision, and writes the outcome. The one other `ReducerContext`-bound function here
-//! is [`freeze_profile`], which reads the `spell_proc_event` overlay at apply so the pass never has to.
-//!
-//! Firing means one of two things, by aura kind. A trigger Proc starts a **Triggered Cast**
-//! ([`crate::spell::cast_triggered`]) of its frozen trigger spell from the Carrier at the Counterparty;
-//! a damage Proc deals its frozen amount to the Counterparty instead. A Triggered Cast pays nothing,
-//! passes no Gates, starts no cooldown, and every hit either kind produces is marked Triggered — which
-//! fires no proc pass, so two shields can never ping-pong.
-
 use spacetimedb::{log, ReducerContext, Table};
 
-// The `game_world_entity` accessor trait must be in scope to read the Carrier's base attack time.
 use crate::game_world_entity;
 
 use crate::combat::{Hit, HitSource};
-// The taxonomy consts, the `Aura`/`Spell` rows, the `game_aura` accessor trait and `auras_on` are all
-// re-exported by `spell::mod`.
+
 use super::*;
 
-// ===========================================================================================
-//  Vanilla `procFlags` / `procEx` bits (cmangos `SpellMgr.h`), stored VERBATIM on the row.
-//  The engine names only the bits it fires; the rest import and stay inert.
-// ===========================================================================================
+// Bit values match procFlags and procEx in cmangos SpellMgr.h.
 
-/// Dealer, main-hand auto-hit. An off-hand swing sets this bit too (vanilla sets both).
+// Vanilla off-hand hits set this shared melee bit as well as the off-hand bit.
 pub(crate) const PROC_FLAG_SUCCESSFUL_MELEE_HIT: u32 = 0x0000_0004;
-/// Victim, any melee auto-hit.
 pub(crate) const PROC_FLAG_TAKEN_MELEE_HIT: u32 = 0x0000_0008;
-/// Dealer, melee ability (weapon strike / finisher).
 pub(crate) const PROC_FLAG_SUCCESSFUL_MELEE_SPELL_HIT: u32 = 0x0000_0010;
-/// Victim, melee ability.
 pub(crate) const PROC_FLAG_TAKEN_MELEE_SPELL_HIT: u32 = 0x0000_0020;
-/// Dealer, ranged auto-shot.
 pub(crate) const PROC_FLAG_SUCCESSFUL_RANGED_HIT: u32 = 0x0000_0040;
-/// Victim, ranged auto-shot.
 pub(crate) const PROC_FLAG_TAKEN_RANGED_HIT: u32 = 0x0000_0080;
-/// Dealer, direct damaging spell.
 pub(crate) const PROC_FLAG_SUCCESSFUL_NEGATIVE_SPELL_HIT: u32 = 0x0001_0000;
-/// Victim, direct damaging spell.
 pub(crate) const PROC_FLAG_TAKEN_NEGATIVE_SPELL_HIT: u32 = 0x0002_0000;
-/// Dealer, off-hand auto-hit — its own bit, so an off-hand-only proc fires off off-hand swings alone.
 pub(crate) const PROC_FLAG_SUCCESSFUL_OFFHAND_HIT: u32 = 0x0080_0000;
 
-/// `procEx`: the hit was an ordinary (non-critical) landed hit.
 pub(crate) const PROC_EX_NORMAL_HIT: u32 = 0x0000_0001;
-/// `procEx`: the hit was a critical hit.
 pub(crate) const PROC_EX_CRITICAL_HIT: u32 = 0x0000_0002;
 
-/// The school a hit that carries no spell belongs to. An auto-attack swing is physical, so a school
-/// filter judges it against this bit rather than skipping the swing entirely (cmangos
-/// `SPELL_SCHOOL_MASK_NORMAL`).
 const SCHOOL_MASK_PHYSICAL: u8 = 0x01;
 
-/// Basis points in a whole — the roll space every chance in this module is expressed in.
 const BASIS_POINTS: u32 = 10_000;
 
-/// The vanilla procs-per-minute divisor: `chance_pct = ppm * attack_time_ms / 600`, i.e. the rate per
-/// minute scaled by how much of a minute one swing takes.
+// Vanilla chance_pct = ppm * attack_time_ms / 600.
 const PPM_DIVISOR_PCT: f32 = 600.0;
 
-// ===========================================================================================
-//  The frozen profile + the hit facts the decision reads
-// ===========================================================================================
-
-/// Which side of the hit a Carrier is on. Decides which half of [`ProcHit`]'s event bits the profile
-/// is matched against, and whether procs-per-minute applies (it is a rate per swing, so only the unit
-/// that swung has an attack time to scale by).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ProcSide {
-    /// The Carrier dealt the hit.
     Dealer,
-    /// The Carrier took the hit.
     Victim,
 }
 
-/// One Carrier's frozen proc profile, read off its aura row. Everything the decision needs and nothing
-/// else, so [`decide`] is a pure function of data rather than of a live table.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProcProfile {
-    /// The combat-event mask (vanilla `procFlags`).
     pub flags: u32,
-    /// Flat chance, percent.
+    // Percent.
     pub chance: u8,
-    /// Procs-per-minute rate; replaces `chance` when the Carrier is the dealer.
     pub ppm: f32,
-    /// Vanilla `procEx`: the normal-hit / critical-hit rule.
     pub proc_ex: u32,
-    /// School filter on the triggering spell; 0 = any school.
     pub school_mask: u8,
-    /// Spell-family filter (name half); 0 = any family.
     pub family_name: u8,
-    /// Spell-family filter (flags half); 0 = any flag of the named family.
     pub family_flags: u64,
-    /// Charges left; 0 = unlimited.
+    // Zero means unlimited charges.
     pub charges: u8,
-    /// Internal-cooldown length; 0 = none.
     pub icd_ms: u32,
-    /// Micros-since-epoch the internal cooldown is up.
     pub ready_micros: i64,
 }
 
 impl ProcProfile {
-    /// Read a Carrier's profile off its aura row.
     pub(crate) fn of(a: &Aura) -> Self {
         Self {
             flags: a.proc_flags,
@@ -127,8 +68,6 @@ impl ProcProfile {
     }
 }
 
-/// The spell that carried a hit, for the school/family filter. `None` for an auto-attack swing, which
-/// [`filter_matches`] then judges as physical-school and family-less.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TriggeringSpell {
     pub school_mask: u8,
@@ -136,8 +75,6 @@ pub(crate) struct TriggeringSpell {
     pub family_flags: u64,
 }
 
-/// The facts of one hit the decision reads: which event bits it set on each side, what spell carried
-/// it, whether it crit, and the dealer's attack time (the procs-per-minute scale).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcHit {
     pub dealer_bits: u32,
@@ -148,7 +85,6 @@ pub(crate) struct ProcHit {
 }
 
 impl ProcHit {
-    /// The event bits this hit set for a Carrier on `side`.
     fn bits(&self, side: ProcSide) -> u32 {
         match side {
             ProcSide::Dealer => self.dealer_bits,
@@ -157,30 +93,17 @@ impl ProcHit {
     }
 }
 
-/// What a fired Proc leaves behind on its aura row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ProcFire {
-    /// Charges after this fire; 0 stays 0 for an unlimited Proc.
     pub charges_left: u8,
-    /// The new internal-cooldown deadline (unchanged when the Proc has no cooldown).
     pub ready_micros: i64,
-    /// The last charge was spent — every aura row of this spell comes off the Carrier.
     pub remove_buff: bool,
 }
 
-// ===========================================================================================
-//  The pure decision
-// ===========================================================================================
-
-/// Is `kind` one of the two Proc aura kinds?
 pub(crate) fn is_proc_kind(kind: u8) -> bool {
     kind == A_PROC_TRIGGER || kind == A_PROC_DAMAGE
 }
 
-/// The event bits one hit sets: `(dealer, victim)`. An off-hand swing sets the shared melee bit AND
-/// its own off-hand bit on the dealer, so both a dual-wield proc and an off-hand-only proc see it; the
-/// victim reads one melee-taken bit either way. A Triggered hit sets nothing at all, which is what
-/// keeps a proc from chaining off its own trigger.
 pub(crate) fn hit_bits(hit: &Hit) -> (u32, u32) {
     match hit.source {
         HitSource::MainHand => (PROC_FLAG_SUCCESSFUL_MELEE_HIT, PROC_FLAG_TAKEN_MELEE_HIT),
@@ -220,8 +143,6 @@ fn filter_matches(profile: &ProcProfile, spell: Option<&TriggeringSpell>) -> boo
         if profile.family_name != spell.family_name {
             return false;
         }
-        // The same family match the spell-modifier fold applies: the name must agree, and a non-zero
-        // flag mask must overlap. A named family with no flags accepts every spell of that family.
         if profile.family_flags != 0 && profile.family_flags & spell.family_flags == 0 {
             return false;
         }
@@ -229,8 +150,6 @@ fn filter_matches(profile: &ProcProfile, spell: Option<&TriggeringSpell>) -> boo
     true
 }
 
-/// The `procEx` hit-quality rule: the critical-hit bit alone means crit only, the normal-hit bit alone
-/// means non-crit only, and neither (or both) accepts any landed hit.
 fn proc_ex_allows(proc_ex: u32, crit: bool) -> bool {
     match (
         proc_ex & PROC_EX_NORMAL_HIT != 0,
@@ -242,14 +161,6 @@ fn proc_ex_allows(proc_ex: u32, crit: bool) -> bool {
     }
 }
 
-/// **The proc decision.** `None` means the Proc did not fire and nothing about it changes — its charge
-/// and its cooldown are untouched, so a 50 percent Proc with 3 charges lands 3 times, not one and a
-/// half.
-///
-/// In order: the event bit must be set for this side; the hit must pass the school and family filter;
-/// `procEx` must accept the hit quality; the internal cooldown must be up; and only then does the roll
-/// happen — so a Proc still on cooldown never consumes its roll. `roll_bp` is a basis-point roll in
-/// `0..10_000`.
 pub(crate) fn decide(
     profile: &ProcProfile,
     side: ProcSide,
@@ -285,21 +196,6 @@ pub(crate) fn decide(
     })
 }
 
-/// The profile a fresh aura row freezes at apply, from its spell header and the classic-db
-/// `spell_proc_event` overlay.
-///
-/// Spell.dbc carries only the event mask, the flat chance and the charge count; the rate, the internal
-/// cooldown, the hit-quality rule and the school/family filter have no column there and come from the
-/// overlay alone. An ABSENT overlay row is the ordinary case: the header's values, and neutral zeros
-/// for the rest, which the decision reads as "no rate, any hit, any spell, no cooldown".
-///
-/// Where both carry a value the overlay wins, the way cmangos applies it: a non-zero `procFlags`
-/// override REPLACES the header's mask (0 means "the header already says it"), and a non-zero
-/// `CustomChance` replaces the header's `procChance`. The rate is not a chance and cannot be folded
-/// into one here — it needs the Carrier's attack time at proc time — so it freezes alongside, and
-/// [`proc_chance_bp`] lets it win on the dealer side.
-///
-/// Charges always come from the header: the overlay has no charge column.
 pub(crate) fn frozen_profile(
     kind: u8,
     hdr: &Spell,
@@ -338,35 +234,14 @@ pub(crate) fn frozen_profile(
     }
 }
 
-/// [`frozen_profile`] with the overlay looked up for you — what `aura_apply` and the post-publish
-/// repair both call. The overlay is read HERE, once, at apply: the proc pass reads one aura row and
-/// never re-joins either the header or this table.
 pub(crate) fn freeze_profile(ctx: &ReducerContext, kind: u8, hdr: &Spell) -> ProcProfile {
     if !is_proc_kind(kind) {
-        return ProcProfile::default(); // the common path: no lookup for an ordinary aura
+        return ProcProfile::default();
     }
     let overlay = ctx.db.game_spell_proc_event().spell_id().find(hdr.spell_id);
     frozen_profile(kind, hdr, overlay.as_ref())
 }
 
-// ===========================================================================================
-//  The one pass [entity]
-// ===========================================================================================
-
-/// Run **the** proc pass for one landed hit. Called once per outcome branch of `combat::apply_hit`
-/// (killed, duel-completed, survived) and from nowhere else.
-///
-/// The attacker's "dealt" Procs run first and run even on a killing blow; the target's "taken" Procs
-/// run only when it survived. A Carrier whose Counterparty has left the world fires nothing at all:
-/// with no Counterparty to aim at, a Triggered Cast would resolve its enemy effects back onto the
-/// Carrier. Rows are snapshotted before any of them fires (collect-then-mutate), and
-/// a row applied in this same reducer invocation is skipped — the same guard `break_auras_on_damage`
-/// uses — so a Proc that grants another Proc cannot double up in one instant.
-///
-/// A fired Proc of the trigger kind starts a Triggered Cast of its frozen trigger spell from the
-/// Carrier at the Counterparty; one of the damage kind deals its frozen amount there instead. A Proc
-/// whose data is missing — no trigger spell, no amount — does nothing, logs, and keeps its charge.
-/// Only a Proc that actually fired spends a charge or stamps its cooldown.
 pub(crate) fn run_proc_pass(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -376,16 +251,11 @@ pub(crate) fn run_proc_pass(
 ) {
     let (dealer_bits, victim_bits) = hit_bits(hit);
     if dealer_bits == 0 && victim_bits == 0 {
-        return; // a Triggered hit sets no event bits — it can never start a proc pass
+        return;
     }
-    // Snapshot every candidate row BEFORE firing any of them: a Triggered Cast writes to `game_aura`
-    // (it can place, refresh or displace an aura), and a pass that read the table lazily would decide
-    // later rows against a table its own earlier fire had already moved.
+    // Triggered Casts can change aura rows, so snapshot all candidates before firing any.
     let mut candidates: Vec<(Aura, ProcSide, u64)> = Vec::new();
-    // A Counterparty that is not in the world at all (an environmental hit with no attacker, a caster
-    // that logged out mid-flight) fires nothing: the Triggered Cast's own target resolution treats a
-    // guid of 0 as "no explicit target" and would land the trigger back on the Carrier. A DEAD
-    // Counterparty is still a real unit and still fires — the cast then lands only its self effects.
+    // Guid zero targets the Carrier, so a missing Counterparty must not trigger a cast.
     if in_world(ctx, target_guid) {
         for row in proc_rows(ctx, attacker_guid, dealer_bits) {
             candidates.push((row, ProcSide::Dealer, target_guid));
@@ -397,16 +267,14 @@ pub(crate) fn run_proc_pass(
         }
     }
     if candidates.is_empty() {
-        return; // the common path: neither side carries a Proc that this event could fire
+        return;
     }
     let proc_hit = ProcHit {
         dealer_bits,
         victim_bits,
         spell: triggering_spell(ctx, hit.spell_id),
         crit: hit.crit,
-        // Procs-per-minute is a per-swing rate, and only the dealer has a swing: the Carrier's own
-        // base attack time. One attack time per unit here, so an off-hand swing and a spell hit scale
-        // by the same value — a documented approximation.
+        // One base attack time per unit approximates spell hits and off-hand swing rates.
         attack_time_ms: ctx
             .db
             .game_world_entity()
@@ -420,18 +288,15 @@ pub(crate) fn run_proc_pass(
         let profile = ProcProfile::of(&row);
         let roll_bp = ctx.random::<u32>() % BASIS_POINTS;
         let Some(fire) = decide(&profile, side, &proc_hit, now_micros, roll_bp) else {
-            continue; // no fire: charge, cooldown and buff are all untouched
+            continue;
         };
         if !fire_proc(ctx, &row, counterparty_guid) {
-            continue; // a data gap fired nothing, so it spends nothing
+            continue;
         }
         if fire.remove_buff {
             remove_carrier_buff(ctx, row.target_guid, row.spell_id);
         } else if let Some(mut fresh) = ctx.db.game_aura().id().find(row.id) {
-            // Re-read, because the Triggered Cast above can have written this very row. A REFRESH in
-            // this same instant refilled the charges to full, and that refill wins over the count this
-            // fire computed from the pre-fire snapshot; the cooldown stamp is written either way, since
-            // a refresh deliberately leaves a running cooldown alone.
+            // A refresh in this invocation refills charges and wins over the pre-refresh count.
             if fresh.applied_at != ctx.timestamp {
                 fresh.proc_charges = fire.charges_left;
             }
@@ -441,14 +306,11 @@ pub(crate) fn run_proc_pass(
     }
 }
 
-/// Is `guid` a unit in the world? A guid of 0 (the "no attacker" sentinel every environmental and
-/// non-melee damage path passes) is never one.
 fn in_world(ctx: &ReducerContext, guid: u64) -> bool {
     guid != 0 && ctx.db.game_world_entity().guid().find(guid).is_some()
 }
 
-/// The Carrier's Proc rows this event could fire: a Proc kind, not applied in this same instant, whose
-/// frozen mask names one of `bits`.
+// Skip new auras so a proc cannot fire another proc in the same invocation.
 fn proc_rows(ctx: &ReducerContext, carrier_guid: u64, bits: u32) -> Vec<Aura> {
     if bits == 0 {
         return Vec::new();
@@ -460,12 +322,6 @@ fn proc_rows(ctx: &ReducerContext, carrier_guid: u64, bits: u32) -> Vec<Aura> {
         .collect()
 }
 
-/// The school and family of the spell that carried the hit — `None` for an auto-attack swing, which
-/// the filter then judges as physical and family-less.
-///
-/// A non-zero `spell_id` always has a header in this same transaction (the hit was produced by
-/// resolving that spell's own effects, which read the header first), so the missing-header arm is the
-/// unreachable one; it falls back to the swing reading rather than inventing facts.
 fn triggering_spell(ctx: &ReducerContext, spell_id: u32) -> Option<TriggeringSpell> {
     if spell_id == 0 {
         return None;
@@ -481,8 +337,6 @@ fn triggering_spell(ctx: &ReducerContext, spell_id: u32) -> Option<TriggeringSpe
         })
 }
 
-/// Fire one Proc row. Returns whether it actually did something — a Proc that fired nothing spends no
-/// charge and stamps no cooldown.
 fn fire_proc(ctx: &ReducerContext, row: &Aura, counterparty_guid: u64) -> bool {
     match row.eff_kind {
         A_PROC_TRIGGER => {
@@ -517,19 +371,6 @@ fn fire_proc(ctx: &ReducerContext, row: &Aura, counterparty_guid: u64) -> bool {
     }
 }
 
-/// Deal a damage-kind Proc's frozen amount to the Counterparty, in the school frozen alongside it
-/// (`eff_p0`, the proc spell's own school — aura 43 carries no per-effect school of its own).
-///
-/// Resistance first, then the SHARED damage pipeline as a **Triggered** hit: the damage is the
-/// Carrier's, so it accrues the Carrier's threat and credits the Carrier's kill, and being Triggered
-/// it raises no proc event of its own. There is no Triggered Cast here — a damage Proc has no spell to
-/// cast — so the client's only sign of it is a log-only cast-event row named after the proc spell, the
-/// same shape the seal's holy line and a ground area's tick already use: the gateway relays
-/// `SMSG_SPELLNONMELEEDAMAGELOG` alone, never a cast START/GO.
-///
-/// Returns whether the Proc fired. A row with no amount is a data gap: it logs, fires nothing, and
-/// keeps its charge. A hit a shield ate, or one the Counterparty did not live to take, still counts as
-/// fired — the Proc did its work and the target's defenses answered it.
 fn fire_proc_damage(ctx: &ReducerContext, row: &Aura, counterparty_guid: u64) -> bool {
     if row.amount <= 0 {
         log::info!(
@@ -573,10 +414,7 @@ fn fire_proc_damage(ctx: &ReducerContext, row: &Aura, counterparty_guid: u64) ->
     true
 }
 
-/// The last charge is spent: EVERY aura row of `spell_id` comes off the Carrier, not just the Proc
-/// effect — a proc buff is one buff in the client and its other effects must not linger as an orphan.
-/// Routed through the shared [`crate::spell::shed_auras`] tail, so the projections an aura removal can
-/// move are re-derived exactly as they are on any other involuntary removal.
+// The client represents every effect row of a spell as one buff.
 fn remove_carrier_buff(ctx: &ReducerContext, carrier_guid: u64, spell_id: u32) {
     let spent: Vec<Aura> = auras_on(ctx, carrier_guid)
         .filter(|a| a.spell_id == spell_id)
@@ -592,8 +430,6 @@ mod tests {
         Hit::weapon(source, false)
     }
 
-    /// A profile that matches everything the tests do not specifically exercise: fires off a melee hit
-    /// taken, always, unlimited charges, no cooldown, no filter.
     fn always() -> ProcProfile {
         ProcProfile {
             flags: PROC_FLAG_TAKEN_MELEE_HIT,
@@ -612,18 +448,11 @@ mod tests {
         }
     }
 
-    // ---- hit_bits ---------------------------------------------------------------------------
-
-    /// The event a main-hand swing raises on each side: the melee-hit bit for the swinger, the
-    /// melee-hit-taken bit for whoever was hit. Values are vanilla's, read off cmangos `SpellMgr.h`.
     #[test]
     fn a_main_hand_swing_raises_the_melee_hit_event_on_both_sides() {
         assert_eq!(hit_bits(&swing(HitSource::MainHand)), (0x4, 0x8));
     }
 
-    /// Vanilla sets BOTH dealer bits on an off-hand swing, so a dual-wield proc keyed on the shared
-    /// melee bit and an off-hand-only proc keyed on its own bit both see it. The victim side is the
-    /// same melee-hit-taken event either way — being hit is being hit.
     #[test]
     fn an_off_hand_swing_raises_both_dealer_bits_and_the_ordinary_taken_bit() {
         let (dealer, victim) = hit_bits(&swing(HitSource::OffHand));
@@ -631,8 +460,6 @@ mod tests {
         assert_eq!(victim, 0x8);
     }
 
-    /// Ranged, melee-ability and spell hits each raise their own pair — a Frost Armor keyed on the
-    /// melee pair must not see a Hunter's auto-shot or a Warlock's Shadow Bolt.
     #[test]
     fn each_remaining_source_raises_its_own_event_pair() {
         assert_eq!(hit_bits(&swing(HitSource::Ranged)), (0x40, 0x80));
@@ -646,8 +473,6 @@ mod tests {
         );
     }
 
-    /// A hit produced inside a Triggered Cast raises no event at all — this is what makes "a proc can
-    /// never start a proc" structural rather than a per-family exception list.
     #[test]
     fn a_triggered_hit_raises_no_event() {
         assert_eq!(
@@ -656,10 +481,6 @@ mod tests {
         );
     }
 
-    // ---- proc_chance_bp ---------------------------------------------------------------------
-
-    /// The worked vanilla example: 1 proc per minute off a 2.0 s weapon is one proc per 30 swings,
-    /// i.e. 3.33 percent — 333 basis points.
     #[test]
     fn one_proc_per_minute_off_a_two_second_weapon_is_three_and_a_third_percent() {
         let profile = ProcProfile {
@@ -669,8 +490,6 @@ mod tests {
         assert_eq!(proc_chance_bp(&profile, ProcSide::Dealer, 2000), 333);
     }
 
-    /// A slow weapon procs more per swing and a fast one less, so the rate PER MINUTE holds: a 4.0 s
-    /// weapon is twice a 2.0 s one, a 1.0 s weapon half of it.
     #[test]
     fn a_slower_weapon_procs_more_per_swing_at_the_same_rate_per_minute() {
         let profile = ProcProfile {
@@ -681,8 +500,6 @@ mod tests {
         assert_eq!(proc_chance_bp(&profile, ProcSide::Dealer, 1000), 166);
     }
 
-    /// A rate that would exceed certainty is capped there — 30 procs a minute off a 2.0 s weapon is
-    /// 100 percent, and anything beyond it stays 100 percent.
     #[test]
     fn a_rate_above_certainty_is_capped_at_certainty() {
         let profile = ProcProfile {
@@ -703,8 +520,6 @@ mod tests {
         );
     }
 
-    /// A Carrier on the receiving end uses its flat chance: a taken-side proc must not depend on the
-    /// weapon its attacker happens to be swinging.
     #[test]
     fn the_victim_side_ignores_the_rate_and_uses_the_flat_chance() {
         let profile = ProcProfile {
@@ -716,8 +531,6 @@ mod tests {
         assert_eq!(proc_chance_bp(&profile, ProcSide::Dealer, 2000), 333);
     }
 
-    /// A flat chance at or above 100 percent fills the roll space, so every roll in `0..10_000` is
-    /// under it — Frost Armor's 100 always chills.
     #[test]
     fn a_flat_chance_at_or_above_certainty_always_passes() {
         for chance in [100u8, 101, 255] {
@@ -733,10 +546,6 @@ mod tests {
         }
     }
 
-    // ---- decide -----------------------------------------------------------------------------
-
-    /// The event mask decides first: a Proc keyed on "melee hit taken" fires for the Carrier that took
-    /// the swing, and not for the Carrier that dealt it.
     #[test]
     fn a_proc_fires_only_on_the_side_its_mask_names() {
         let profile = always();
@@ -744,8 +553,6 @@ mod tests {
         assert!(decide(&profile, ProcSide::Dealer, &melee_hit(), 0, 0).is_none());
     }
 
-    /// The internal cooldown is checked BEFORE the roll, so a Proc inside its window cannot fire even
-    /// on a roll that would otherwise have passed.
     #[test]
     fn the_internal_cooldown_blocks_a_fire_before_the_roll() {
         let profile = ProcProfile {
@@ -754,20 +561,17 @@ mod tests {
             ..always()
         };
         assert!(decide(&profile, ProcSide::Victim, &melee_hit(), 9_999_999, 0).is_none());
-        // At the deadline it is ready again, and the fire stamps the next window.
         let fire = decide(&profile, ProcSide::Victim, &melee_hit(), 10_000_000, 0)
             .expect("the cooldown is up at its deadline");
         assert_eq!(fire.ready_micros, 10_000_000 + 5_000 * 1000);
     }
 
-    /// A Proc with no cooldown leaves its ready time where it was — nothing to stamp.
     #[test]
     fn a_proc_without_a_cooldown_stamps_no_deadline() {
         let fire = decide(&always(), ProcSide::Victim, &melee_hit(), 42, 0).expect("fires");
         assert_eq!(fire.ready_micros, 0);
     }
 
-    /// A roll at or above the chance fails: a 50 percent Proc passes on 4_999 and fails on 5_000.
     #[test]
     fn the_roll_passes_strictly_below_the_chance() {
         let profile = ProcProfile {
@@ -778,8 +582,6 @@ mod tests {
         assert!(decide(&profile, ProcSide::Victim, &melee_hit(), 0, 5_000).is_none());
     }
 
-    /// A charged Proc spends a charge per FIRE, never per hit: three fires take it 3 → 2 → 1 → 0, and
-    /// only the last one signals that the buff comes off.
     #[test]
     fn three_charges_are_spent_one_fire_at_a_time_and_the_last_removes_the_buff() {
         let mut charges = 3u8;
@@ -795,8 +597,6 @@ mod tests {
         }
     }
 
-    /// A roll that failed changes nothing — the charge is still there for the next hit, which is why a
-    /// 50 percent Proc with 3 charges lands 3 times rather than one and a half.
     #[test]
     fn a_failed_roll_leaves_the_charge_alone() {
         let profile = ProcProfile {
@@ -807,7 +607,6 @@ mod tests {
         assert!(decide(&profile, ProcSide::Victim, &melee_hit(), 0, 9_999).is_none());
     }
 
-    /// An unlimited Proc (0 charges) never reports the buff should come off, however often it fires.
     #[test]
     fn an_unlimited_proc_never_removes_its_buff() {
         let fire = decide(&always(), ProcSide::Victim, &melee_hit(), 0, 0).expect("fires");
@@ -815,8 +614,6 @@ mod tests {
         assert!(!fire.remove_buff);
     }
 
-    /// `procEx`: the crit bit alone fires only on a crit, the normal bit alone only on a non-crit, and
-    /// neither or both accepts any landed hit.
     #[test]
     fn proc_ex_selects_the_hit_quality() {
         let crit_hit = ProcHit {
@@ -847,13 +644,11 @@ mod tests {
         }
     }
 
-    /// The school filter on a hit that carried a spell: Impact's fire-only rule lets a Fireball
-    /// through and stops a Frostbolt.
     #[test]
     fn the_school_filter_admits_only_a_spell_of_the_named_school() {
         let fire_only = ProcProfile {
             flags: PROC_FLAG_TAKEN_MELEE_SPELL_HIT,
-            school_mask: 0x4, // fire
+            school_mask: 0x4,
             ..always()
         };
         let spell_hit = |school_mask| ProcHit {
@@ -869,10 +664,6 @@ mod tests {
         assert!(decide(&fire_only, ProcSide::Victim, &spell_hit(0x10), 0, 0).is_none());
     }
 
-    /// A swing carries no spell, so it belongs to the physical school and to no family. A school
-    /// filter still judges it — against physical — which is how Impact's fire-only rule excludes a
-    /// swing while a physical-school weapon Proc keeps firing off one. A family filter names spells
-    /// and never applies to a swing.
     #[test]
     fn a_swing_is_judged_as_physical_by_a_school_filter_and_not_at_all_by_a_family_one() {
         let swing = melee_hit();
@@ -898,8 +689,6 @@ mod tests {
         assert!(decide(&mage_frost, ProcSide::Victim, &swing, 0, 0).is_some());
     }
 
-    /// The family filter: the name must agree, and a non-zero flag mask must overlap. A named family
-    /// with no flags accepts every spell of that family.
     #[test]
     fn the_family_filter_matches_the_name_then_the_flags() {
         let mage_frost = ProcProfile {
@@ -927,9 +716,6 @@ mod tests {
         assert!(decide(&any_mage, ProcSide::Victim, &spell(3, 0x40), 0, 0).is_some());
     }
 
-    // ---- frozen_profile: the header, and the overlay over it -------------------------------
-
-    /// Frost Armor's real Spell.dbc proc data.
     fn proc_header() -> Spell {
         let mut hdr = crate::seed::base_spell(168, "Frost Armor");
         hdr.proc_flags = 0x28;
@@ -938,7 +724,6 @@ mod tests {
         hdr
     }
 
-    /// An overlay row that overrides nothing, for a test to change one field of.
     fn overlay() -> SpellProcEvent {
         SpellProcEvent {
             spell_id: 168,
@@ -953,9 +738,6 @@ mod tests {
         }
     }
 
-    /// No overlay row is the ordinary case: the header's mask, chance and charges, and neutral zeros
-    /// for the four fields Spell.dbc has no column for. And every non-proc row freezes zeros, so an
-    /// ordinary buff can never be mistaken for a Proc.
     #[test]
     fn a_proc_row_freezes_its_header_and_every_other_row_freezes_zeros() {
         let hdr = proc_header();
@@ -973,8 +755,6 @@ mod tests {
         assert_eq!(frozen_profile(A_MOD_RESISTANCE, &hdr, None).charges, 0);
     }
 
-    /// The overlay's own fields — the four Spell.dbc cannot express — freeze straight through, and
-    /// the header's charge count is untouched by it (the overlay has no charge column).
     #[test]
     fn the_overlay_supplies_the_rate_cooldown_hit_rule_and_filter() {
         let frozen = frozen_profile(
@@ -999,7 +779,6 @@ mod tests {
         assert_eq!(frozen.charges, 3, "charges only ever come from the header");
     }
 
-    /// A `procFlags` override REPLACES the header's mask; 0 means the header already says it.
     #[test]
     fn a_non_zero_flag_override_replaces_the_header_mask_and_zero_keeps_it() {
         let overridden = frozen_profile(
@@ -1016,7 +795,6 @@ mod tests {
         assert_eq!(kept.flags, 0x28);
     }
 
-    /// A custom chance REPLACES the header's `procChance`; 0 means the header keeps it.
     #[test]
     fn a_custom_chance_replaces_the_header_chance_and_zero_keeps_it() {
         let custom = frozen_profile(
@@ -1033,8 +811,6 @@ mod tests {
         assert_eq!(kept.chance, 100);
     }
 
-    /// And a rate beats BOTH on the dealer side: the custom chance is what a taken-side Carrier
-    /// (and a Carrier with no rate) uses, while a dealer scales the rate by its own weapon.
     #[test]
     fn the_rate_beats_the_custom_chance_on_the_dealer_side_only() {
         let frozen = frozen_profile(

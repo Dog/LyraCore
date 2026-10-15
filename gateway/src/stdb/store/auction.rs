@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`AuctionActionStore`] adapter.
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -65,8 +63,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
         }))
     }
 
-    /// Create one auction listing. Single-database deployments use one atomic reducer; sharded
-    /// deployments drive the durable Hold -> Auction -> receipt -> settle protocol.
     fn create_auction(&self, request: CreateAuctionRequest) -> Result<CreateAuctionOutcome> {
         let item_is_present = self
             .0
@@ -77,9 +73,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
             .guid()
             .find(&request.item_guid)
             .is_some();
-        // A successful listing removes the source item in the same transaction that records its
-        // Hold or receipt. Presence therefore proves this is a new request even when a returned
-        // item later reuses the same guid and terms.
         if !item_is_present {
             if let Some(receipt) = self.matching_active_auction_receipt(request)? {
                 if self
@@ -126,8 +119,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
         }
     }
 
-    /// Place one full-offer bid. The sharded path fences the bidder purse before realm-core makes
-    /// its serialized Auction decision; both paths finish with the same normalized terminal Hold.
     fn place_bid(&self, request: PlaceBidRequest) -> Result<PlaceBidOutcome> {
         let operation_id = self
             .matching_unfinished_bid_hold(request)
@@ -147,9 +138,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
         }
     }
 
-    /// Cancel one listing. The Gateway reads the listing from the Realm-core cache and fences the
-    /// Auction Cut it computes; Realm-core refuses the Cancellation if a later bid changed that cut.
-    /// A pending Cancellation of the same listing is driven again instead of fencing a second cut.
     fn cancel_auction(&self, request: CancelAuctionRequest) -> Result<CancelAuctionOutcome> {
         let pending = self
             .unfinished_auction_holds(request.actor.guid())
@@ -183,8 +171,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
         }
     }
 
-    /// Finish every unfinished Hold of `actor` on this Home Shard, listing Holds first. A Refusal
-    /// leaves that Hold for a later attempt; a Transport Loss ends the request.
     fn resume_auction_holds(&self, actor: Actor) -> Result<()> {
         let actor_guid = actor.guid();
         for hold in self.listing_holds(actor_guid) {
@@ -228,9 +214,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
                 .guid()
                 .find(&player_guid)
                 .ok_or_else(|| anyhow!("auction query actor {player_guid} is not in world"))?;
-            // The "usable" checkbox asks what THIS Character can wear, so the armor half reads its
-            // trained passives, not the class ceiling — a level-1 Warrior must not see plate as
-            // usable. One spellbook scan per query, not per row.
             let learned: Vec<u32> = db
                 .game_player_spell()
                 .iter()
@@ -295,7 +278,6 @@ impl AuctionActionStore for crate::stdb::Coordinator {
 }
 
 impl Coordinator {
-    /// The keys `pick` names for `character_guid` in THIS handle's auction index.
     pub(super) fn auction_keys(
         &self,
         pick: impl Fn(
@@ -311,9 +293,6 @@ impl Coordinator {
         pick(&index).keys_of(character_guid)
     }
 
-    /// The rows `pick` names for `character_guid` in THIS handle's auction index, read back by
-    /// primary key through `find`. A row whose `owner` is no longer `character_guid` is dropped,
-    /// because the index can trail the cache.
     pub(super) fn indexed_rows<T>(
         &self,
         pick: impl Fn(
@@ -331,7 +310,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// `actor_guid`'s unfinished Holds on THIS handle.
     pub(super) fn unfinished_auction_holds(
         &self,
         actor_guid: u64,
@@ -346,7 +324,6 @@ impl Coordinator {
         .filter(crate::stdb::auction_holds::hold_is_unfinished)
     }
 
-    /// `seller_guid`'s listing Holds on THIS handle.
     pub(super) fn listing_holds(&self, seller_guid: u64) -> Vec<AuctionHold> {
         self.indexed_rows(
             |index| &index.listing_holds,
@@ -365,22 +342,15 @@ impl Coordinator {
         self.complete_listing_hold(&hold)
     }
 
-    /// Realm-core's Auction, this Home Shard's receipt and the settle of one listing Hold, or its
-    /// refund when Realm-core refuses the listing, from the phase a stopped Gateway left it in.
-    /// Every phase is idempotent, so a replay changes nothing.
     fn complete_listing_hold(&self, hold: &AuctionHold) -> Result<u32> {
         let operation_id = hold.operation_id;
         let realm = self.realm_core()?;
         if let Err(error) = realm.auction_commit_listing(hold) {
-            // Only a Refusal proves realm-core took nothing. A timeout or transport failure
-            // leaves the Hold for the next replay, which commits idempotently.
+            // Only a Refusal proves nothing was taken; retain the Hold after Transport Loss.
             if matches!(classify(&error), DurableFailure::Refusal { .. })
                 && !realm.auction_receipt_is_visible(operation_id)
             {
-                // Mail is authoritative on Realm-core. Commit its idempotent refund receipt and
-                // the exact returned value there before deleting the source Hold. If either call
-                // is interrupted, the Hold remains recovery evidence and the next replay resumes
-                // from the same operation id.
+                // Commit the refund receipt and returned value before deleting the source Hold.
                 realm.auction_refund_listing(hold)?;
                 self.auction_release_listing_hold(hold)?;
             }
@@ -518,7 +488,6 @@ impl Coordinator {
         )
     }
 
-    /// The Character a Hold acts for. A Hold without one is corrupt.
     fn hold_actor(&self, character_guid: u64) -> Result<SessionActor> {
         let actor =
             Actor::new(character_guid).ok_or_else(|| anyhow!("auction Hold names no Character"))?;
@@ -558,9 +527,6 @@ impl Coordinator {
             return Ok(None);
         }
 
-        // Receipts outlive Auctions so an operation replay stays auditable. Only reuse a receipt
-        // while its Auction is still active: returned items can later be granted the same item guid
-        // and legitimately listed again with the same terms.
         let realm = self.realm_core()?;
         let guard = realm.0.coord();
         let receipt = candidates.into_iter().find(|receipt| {
@@ -610,8 +576,6 @@ impl Coordinator {
         self.complete_auction_hold(hold)
     }
 
-    /// Realm-core's decision, the Home Shard's finish, and any refund phases of one Hold, from the
-    /// phase a stopped Gateway left it in. Every phase is idempotent, so a replay changes nothing.
     fn complete_auction_hold(&self, mut hold: AuctionBidHold) -> Result<AuctionBidHold> {
         let operation_id = hold.operation_id;
         let realm = self.realm_core()?;
@@ -708,7 +672,6 @@ impl Coordinator {
         )
     }
 
-    /// Realm-core's decision for a Hold, by the operation the Hold pays for.
     fn auction_decide(&self, hold: &AuctionBidHold) -> Result<()> {
         let actor = self.hold_actor(hold.bidder_guid)?;
         use lyracore_shared::auction::hold_operation;
@@ -742,8 +705,6 @@ impl Coordinator {
         }
     }
 
-    /// The Auction Cut the seller pays to cancel the listing, read from THIS handle's cache.
-    /// `None` when the listing is gone, is not the seller's, or lists in another market.
     fn cancellation_cut(&self, request: crate::world::CancelAuctionRequest) -> Option<u32> {
         let guard = self.0.coord();
         let auction = guard
@@ -755,7 +716,6 @@ impl Coordinator {
         listing_cut(&auction, request)
     }
 
-    /// `seller_guid`'s listing receipts on THIS handle.
     fn listing_receipts(&self, seller_guid: u64) -> Vec<AuctionOperationReceipt> {
         self.indexed_rows(
             |index| &index.listing_receipts,
@@ -976,8 +936,6 @@ fn select_active_page(
 }
 
 fn bidder_matches(row: &Auction, player_guid: u64, _outbid_auction_ids: &[u32]) -> bool {
-    // Vanilla sends recently outbid ids as cache-invalidation hints. They never authorize a
-    // displaced row back into the bidder tab; the authoritative winner is the realm Auction.
     row.highest_bidder_guid == player_guid
 }
 
@@ -1068,8 +1026,6 @@ fn same_auction_request(
         && row.house_id() == request.house_id
 }
 
-/// The Module's typed auction Refusal. Only a reducer the Module rejected carries a tag; a Transport
-/// Loss stays an error with an unknown outcome.
 fn auction_refusal(error: &anyhow::Error) -> Option<AuctionRefusal> {
     match classify(error) {
         DurableFailure::Refusal { reason } => AuctionRefusal::parse_tag(reason),
@@ -1092,8 +1048,6 @@ fn bid_refund_is_recorded(hold: &AuctionBidHold, decision: &AuctionBidDecision) 
         && hold.deferred_refund == decision.deferred_refund
 }
 
-/// The seller's Auction Cut for `request`'s listing, when the listing is the seller's and lists in
-/// the auctioneer's market.
 fn listing_cut(auction: &Auction, request: crate::world::CancelAuctionRequest) -> Option<u32> {
     use lyracore_shared::auction::{auction_cut, market_of};
     if auction.owner_guid != request.actor.guid()
@@ -1186,7 +1140,6 @@ mod tests {
         }
     }
 
-    /// A Character of `player_class` that has trained neither level-40 armor upgrade.
     fn untrained(player_class: u8) -> Proficiency {
         Proficiency::derive(player_class, false, false)
     }
@@ -1277,7 +1230,6 @@ mod tests {
             Proficiency::derive(1, true, false),
             plate
         ));
-        // A Mage trains neither upgrade, so plate stays unusable however the flags fall.
         assert!(!browse_matches(
             &usable,
             60,
@@ -1340,9 +1292,9 @@ mod tests {
         let mut at_deadline = auction(2);
         at_deadline.expires_at = spacetimedb_sdk::Timestamp::from_micros_since_unix_epoch(20);
         let mut other_market = auction(3);
-        other_market.house = 7; // Blackwater is neutral, outside the queried Horde market.
+        other_market.house = 7;
         let mut same_market_other_house = auction(4);
-        same_market_other_house.house = 5; // Thunder Bluff pools into the same Horde market.
+        same_market_other_house.house = 5;
         let mut other_owner = auction(5);
         other_owner.house = 4;
         other_owner.owner_guid = 2;
@@ -1567,7 +1519,6 @@ mod auction_reducer_tests {
         }
     }
 
-    /// 5% of a bid of 201 is 10.05, truncated to 10 (`cm:AuctionHouseMgr.cpp:733-736`).
     #[test]
     fn the_gateway_fences_the_cut_of_the_sellers_own_listing_in_its_market() {
         assert_eq!(listing_cut(&listing(7, 1, 201), cancel_request()), Some(10));

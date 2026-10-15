@@ -1,5 +1,3 @@
-//! Source population choices survive import; each Instance keeps its first selection.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use spacetimedb::{log, table, ReducerContext, SpacetimeType, Table};
@@ -14,7 +12,6 @@ pub struct CreaturePopulation {
     pub world_state_condition: u32,
     pub world_state_expression: u32,
     pub flags: u32,
-    /// Rows of entry,min_count,max_count,chance. Zero chance shares the remaining probability.
     pub entries: String,
     #[default(false)]
     pub is_pool: bool,
@@ -29,7 +26,6 @@ pub struct CreaturePopulationMember {
     pub entry: u32,
     pub choices: String,
     pub chance_bp: u32,
-    /// Positive ids require an active game event; negative ids remove a spawn during that event.
     pub event_ids: String,
 }
 
@@ -113,7 +109,6 @@ fn decode_member(member: &CreaturePopulationMember) -> Result<Member, String> {
     })
 }
 
-/// Check source references before the first spawn batch changes the live population.
 pub(crate) fn check_definitions(ctx: &ReducerContext) -> Result<(), String> {
     let templates = ctx.db.game_creature_template();
     let populations = ctx.db.game_creature_population();
@@ -174,7 +169,6 @@ pub(crate) fn check_definitions(ctx: &ReducerContext) -> Result<(), String> {
 }
 
 fn choose_index(len: usize, draw: &mut impl FnMut() -> u64) -> usize {
-    // Every caller checks for an empty candidate list first.
     (draw() % len as u64) as usize
 }
 
@@ -192,8 +186,7 @@ fn select_pool(
         eligible.swap(index, other);
     }
     if limit == 1 {
-        // The source compares every explicit chance with the same roll, then falls back to
-        // an equal-chance member or the first explicit member. It is not a cumulative roll.
+        // Source chances share one roll; they are not cumulative probability ranges.
         let roll = draw() % 10_000;
         let chosen = eligible
             .iter()
@@ -244,7 +237,6 @@ fn select(
     if population.max_count > 0 {
         eligible.truncate(population.max_count as usize);
     }
-    // Fixed and independent random entries consume group quotas before group-selected entries.
     eligible.sort_by_key(|member| member.entry == 0 && member.choices.is_empty());
     let mut counts = BTreeMap::<u32, u32>::new();
     let mut selected = Vec::new();

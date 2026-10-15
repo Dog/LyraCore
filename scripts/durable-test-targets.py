@@ -9,8 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # Seconds from Actions run 38090384855, including builds and Gateway checks.
-# .github/durable-test-seconds.json records its Module targets; session_expiry allows 10s
-# after shortening its schedule interval. New targets use a 20s estimate until measured.
 JOB_SECONDS = (615, 240, 135)
 DEFAULT_TARGET_SECONDS = 20
 

@@ -1,45 +1,12 @@
-//! **Weapon & defense skill** — a per-player skill store (`game_player_skill`) tracking each weapon-type
-//! line + Defense, feeding the melee attack table's skill-vs-defense rolls (miss / dodge / parry / block)
-//! and rising on use.
-//!
-//! BASELINE SAFETY: an untracked skill (no row) falls back to `level * SKILL_PER_LEVEL`, so with an empty
-//! table the computed `skill_diff = defense_skill - weapon_skill` equals exactly the level-derived
-//! `(target.level - attacker.level) * 5` — every attack-table band is byte-identical until a skill
-//! actually diverges from cap. The skill-up hook caps at `level*5`, so a maxed skill is a no-op.
-//!
-//! SCOPE: server-authoritative skills + the combat consumption + skill-up-on-use, verified
-//! server-side via `debug_compute_swing`. DEFERRED: the client skill-pane DISPLAY (the `PLAYER_SKILL_INFO`
-//! descriptor array — blocked by the update-mask descriptor wall), class-specific weapon learnability, and
-//! basing glancing/crushing on skill (they stay level-based). [entity]
-
 use spacetimedb::{table, Identity, ReducerContext, Table};
 
 use lyracore_shared::constants::starter_item;
 
-// `game_player_skill` is defined in THIS module (the `#[table]` accessor is generated here, like
-// `threat::game_threat`), so it's in scope without a `use`. `game_item_template` (items/) is read to
-// resolve the equipped weapon's subclass; `game_world_entity` (world.rs) only by the debug reducer.
 use crate::skilldata::{game_skill_ability, game_skill_availability};
-use crate::{game_item_template, game_world_entity, WorldEntity}; // accessor trait for the autolearn read
+use crate::{game_item_template, game_world_entity, WorldEntity};
 
-// ===========================================================================================
-//  Pure skill math + taxonomy (ctx-free, unit-tested) [server]
-// ===========================================================================================
-
-/// Skill points gained per character level — the cap on every skill line is `level * SKILL_PER_LEVEL`
-/// (vanilla: weapon/defense skill maxes at level×5). Also the level→skill conversion the baseline
-/// fallback uses, so an untracked skill reads as if perfectly trained for its level.
 pub const SKILL_PER_LEVEL: u32 = 5;
 
-/// Real vanilla `SkillLine.dbc` IDs (kept verbatim so the DEFERRED client skill-pane relay is a straight
-/// read with no remap — a local enum would force a translation layer at the descriptor boundary). Only
-/// the lines combat/professions can actually produce are defined; ranged lines come with their features.
-///
-/// DEPRECATION POINTER: `game_skill_line` (`skilldata.rs`), loaded from the operator's
-/// real `SkillLine.dbc` by the importer, is now the AUTHORITATIVE source for "what skill lines exist" —
-/// it carries every vanilla line (~135), not just the ~17 hand-picked here. These consts stay because
-/// the wire protocol is still keyed on the same verbatim ids (no remap needed either way), but treat
-/// `game_skill_line` as the source of truth for anything beyond this hardcoded combat/profession subset.
 pub mod skill_line {
     pub const AXE_1H: u32 = 44;
     pub const AXE_2H: u32 = 172;
@@ -53,33 +20,20 @@ pub mod skill_line {
     pub const DAGGER: u32 = 173;
     pub const UNARMED: u32 = 162;
     pub const DEFENSE: u32 = 95;
-    // --- Profession lines (verbatim vanilla SkillLine.dbc IDs, same convention as the combat lines so the
-    // client skill-pane relay is a straight read). Unlike combat skills these are NOT level-capped (cooking
-    // can reach 75 at level 1) — the profession learn path uses `max_rank=75` directly, never `level*5`.
     pub const COOKING: u32 = 185;
-    pub const SKINNING: u32 = 393; // skin→leather producer
-    pub const LEATHERWORKING: u32 = 165; // skin→leather→CRAFT consumer
-    pub const HERBALISM: u32 = 182; // gather: herb nodes -> herbs
-    pub const MINING: u32 = 186; // gather: mining veins -> ore
-                                 // --- Profession-breadth batch (verbatim vanilla SkillLine.dbc IDs). Four new LEARNABLE craft lines;
-                                 // SMELTING is NOT a separate skill — it rides MINING (186), so a recipe under MINING with no learn marker.
+    pub const SKINNING: u32 = 393;
+    pub const LEATHERWORKING: u32 = 165;
+    pub const HERBALISM: u32 = 182;
+    pub const MINING: u32 = 186;
     pub const ALCHEMY: u32 = 171;
     pub const FIRST_AID: u32 = 129;
     pub const TAILORING: u32 = 197;
     pub const BLACKSMITHING: u32 = 164;
-    // --- The final three professions (completing the 13). Verbatim vanilla SkillLine.dbc IDs, same
-    // convention. ENGINEERING is a craft line (recipes → products incl. on-use BOMBS); ENCHANTING is a
-    // craft line driven by disenchant/enchant reducers (a server-side per-instance enchant overlay);
-    // FISHING is a secondary gather line driven by the `fish` reducer (immediate-catch, no bobber).
     pub const ENGINEERING: u32 = 202;
     pub const ENCHANTING: u32 = 333;
     pub const FISHING: u32 = 356;
 
     pub const LOCKPICKING: u32 = 633;
-    /// Riding — the mount line. Neither a profession nor a combat line: its rank is a TRAINED TIER
-    /// (Apprentice 75, Journeyman 150) granted whole by a `trainer_type::MOUNTS` trainer, never climbed
-    /// by use and never derived from level. Aliased from the shared crate because the gateway reads the
-    /// same id to tell a riding offering from a spell offering.
     pub const RIDING: u32 = lyracore_shared::trainer::RIDING_SKILL_LINE;
 }
 
@@ -102,13 +56,8 @@ pub(crate) fn is_profession_line(line: u32) -> bool {
     )
 }
 
-/// Apprentice rank cap for a freshly-learned primary/secondary profession (vanilla: the first training tier
-/// caps at 75). A profession row is born `current: 1, max_rank: APPRENTICE_CAP` and climbs toward it on use —
-/// NOT bounded by `level*5` (the combat invariant), so a level-1 character can train cooking to 75.
 pub const APPRENTICE_CAP: u16 = 75;
 
-/// Map a vanilla weapon `ItemTemplate.subclass` to its `skill_line`. Anything unrecognized (or no weapon)
-/// resolves to `UNARMED` — the line an empty-handed swing trains, so a fist/unmapped weapon never errors.
 pub(crate) fn weapon_subclass_to_skill_line(subclass: u8) -> u32 {
     use skill_line::*;
     match subclass {
@@ -122,75 +71,31 @@ pub(crate) fn weapon_subclass_to_skill_line(subclass: u8) -> u32 {
         10 => STAFF,
         13 => FIST,
         15 => DAGGER,
-        _ => UNARMED, // unarmed, thrown, wands, and any unmapped subclass train Unarmed
+        _ => UNARMED,
     }
 }
 
-/// The skill cap for a unit of `level` — `level * SKILL_PER_LEVEL`. Both the max a tracked skill can reach
-/// and the baseline value an UNtracked skill reads as (so combat against an equal-level foe nets 0).
 pub(crate) fn skill_cap_for_level(level: u32) -> u32 {
     level * SKILL_PER_LEVEL
 }
 
-/// The attack-table skill difference (in skill points) driving miss/dodge/parry/block: how far the
-/// defender's defense skill exceeds the attacker's weapon skill, clamped at 0 (a higher-skilled attacker
-/// adds nothing — the band floors). The single definition both live combat and the readback use.
 pub(crate) fn skill_diff(defense_skill: u32, weapon_skill: u32) -> u32 {
     defense_skill.saturating_sub(weapon_skill)
 }
 
-/// One skill-up step: `current + 1`, clamped to `cap`. A skill already at cap is unchanged.
 pub(crate) fn next_skill(current: u32, cap: u32) -> u32 {
     (current + 1).min(cap)
 }
 
-// -------------------------------------------------------------------------------------------
-//  COMBAT skill-up curve — the behavioural spec this section implements
-// -------------------------------------------------------------------------------------------
-//
-// Vanilla weapon/Defense skill-up mechanics are publicly documented community knowledge. The
-// observable contract, restated here as the thing the code below has to satisfy — it is written
-// FROM this spec, not transcribed from any particular implementation of it:
-//
-//   * A qualifying event (a landed melee swing for a weapon line, a landed hit taken for Defense)
-//     rolls once for a single +1. Nothing else moves a combat line.
-//   * The only thing that drives the roll is HEADROOM — how far the line sits below ITS OWN cap.
-//     There is no mob-level / grey-target gate on this path (that band belongs to the profession
-//     curve, `skillup_chance_bp`, which is unrelated and stays separate). A maxed line never rolls.
-//   * Wide headroom is a CATCH-UP regime: the chance grows with headroom, only logarithmically
-//     (skilling up an untrained line is fast at first and flattens), and it grows faster for low
-//     levels so a low-level character is not stuck grinding a line their cap already moved past.
-//   * Narrow headroom is a TAPER regime: the chance falls off quadratically to exactly zero as the
-//     line touches cap, so the last few points are the slow ones.
-//   * The two regimes MEET, they do not step: at the seam the catch-up term contributes nothing and
-//     both branches evaluate to the same floor. See `SEAM_HEADROOM`.
-//   * Weapon lines get a small additive assist from intellect (a smart character picks a weapon up
-//     faster), capped at +10 percentage points. Defense gets no such assist.
-//   * Degenerate input (no cap, no level, at/over cap) is a hard 0 — never roll.
-//
-// Everything below is expressed in that vocabulary: headroom, seam, catch-up, taper, assist.
-
-/// Probability scale: every skill chance in this module is basis points, 0..=10000.
 const BP_SCALE: f64 = 10_000.0;
 
-/// The headroom at which the combat curve changes regime (catch-up above, taper below), in skill
-/// points. Chosen so the two branches AGREE there rather than stepping: the catch-up logarithm is
-/// written to be zero at the seam, leaving the shared floor `SEAM_HEADROOM / cap`, and the taper
-/// is written as `headroom² / (SEAM_HEADROOM * cap)`, which at `headroom == SEAM_HEADROOM` is the
-/// same `SEAM_HEADROOM / cap`. Continuity is therefore a property of the algebra, not a tuned
-/// coincidence — the `..._seam_is_continuous` test guards it.
 const SEAM_HEADROOM: u32 = 7;
 
-/// Additive offset inside the catch-up logarithm, in skill points: it is what makes the log
-/// argument reach 1 (and so the whole term vanish) exactly at the seam.
 const CATCH_UP_LOG_OFFSET: f64 = 5.0;
 
-/// How steeply the catch-up regime rewards headroom, and how much steeper it gets at low level
-/// (`slope = BASE * (1 + LOW_LEVEL_LIFT / level)` — at level 12 the slope has doubled).
 const CATCH_UP_BASE_SLOPE: f64 = 0.22;
 const CATCH_UP_LOW_LEVEL_LIFT: f64 = 12.0;
 
-/// The most intellect can add to a WEAPON line's per-hit chance (as a fraction, so +10 points).
 const INTELLECT_ASSIST_MAX: f64 = 0.10;
 
 const INTELLECT_ASSIST_BANDS: [(u32, f64, f64); 4] = [
@@ -200,8 +105,6 @@ const INTELLECT_ASSIST_BANDS: [(u32, f64, f64); 4] = [
     (u32::MAX, 255.0, 6000.0),
 ];
 
-/// How far `current` sits below `cap`, or `None` when no roll may happen at all (no cap, no level,
-/// or the line is already at/over its cap). The single gate the whole curve is guarded by.
 fn combat_headroom(current: u32, cap: u32, level: u32) -> Option<u32> {
     if cap == 0 || level == 0 {
         return None;
@@ -209,27 +112,20 @@ fn combat_headroom(current: u32, cap: u32, level: u32) -> Option<u32> {
     cap.checked_sub(current).filter(|&headroom| headroom > 0)
 }
 
-/// The headroom-driven part of the chance, as a fraction: catch-up above the seam, taper below it.
-/// Both regimes are anchored on the shared floor `SEAM_HEADROOM / cap` (see `SEAM_HEADROOM`).
 fn combat_practice_fraction(headroom: u32, cap: u32, level: u32) -> f64 {
     let seam = SEAM_HEADROOM as f64;
     let headroom_f = headroom as f64;
     let cap_f = cap as f64;
     let seam_floor = seam / cap_f;
     if headroom >= SEAM_HEADROOM {
-        // CATCH-UP. The log argument is normalised on the seam, so it is 1 (and the term 0) there
-        // and grows from there with headroom; the slope steepens as level drops.
         let slope = CATCH_UP_BASE_SLOPE * (1.0 + CATCH_UP_LOW_LEVEL_LIFT / level as f64);
         seam_floor
             + slope * ((headroom_f + CATCH_UP_LOG_OFFSET) / (seam + CATCH_UP_LOG_OFFSET)).ln()
     } else {
-        // TAPER. Quadratic in headroom, normalised so it hits `seam_floor` at the seam and 0 at cap.
         (headroom_f * headroom_f) / (seam * cap_f)
     }
 }
 
-/// The intellect assist for a WEAPON line, as a fraction (Defense never calls this). Bounded by
-/// `INTELLECT_ASSIST_MAX` at both ends, so a wildly-statted character cannot run away with it.
 fn intellect_assist(intellect: u32, level: u32) -> f64 {
     let (_, reference_level, full_assist_intellect) = INTELLECT_ASSIST_BANDS
         .iter()
@@ -242,16 +138,6 @@ fn intellect_assist(intellect: u32, level: u32) -> f64 {
         .clamp(0.0, INTELLECT_ASSIST_MAX)
 }
 
-/// Chance (basis points, 0..=10000) that ONE qualifying hit trains a COMBAT (weapon or Defense) line
-/// currently at `current`/`cap` for a unit of `level`, plus — for weapon lines only — the small
-/// intellect assist. Implements the spec block above: headroom is the only driver, the catch-up and
-/// taper regimes meet continuously at `SEAM_HEADROOM`, and a maxed/untracked/level-0 line is a hard 0.
-///
-/// BEHAVIOURAL REFERENCE (citation, not derivation): the mangos-family cores drive their weapon and
-/// defence skill-ups off the line's own headroom on this path with no mob-level check, which is why
-/// grinding a grey mob still trains a lagging weapon skill here. That is a statement about observable
-/// behaviour we match — no implementation of it was copied. Pure → unit-tested at the seam, the
-/// monotonicity contract, and the clamp edges.
 pub(crate) fn combat_skillup_chance_bp(
     current: u32,
     cap: u32,
@@ -271,46 +157,24 @@ pub(crate) fn combat_skillup_chance_bp(
     ((practice + assist).clamp(0.0, 1.0) * BP_SCALE) as u32
 }
 
-/// Probability (in basis points, 0..=10000) that ONE use of a profession at `current` skill yields a +1
-/// skill-up, given the recipe/node's `orange` (the required floor — always skills below it) and `gray`
-/// (the ceiling — never skills at/above it) difficulty thresholds. A single linear band orange→gray
-/// (vanilla's yellow/green nuance is collapsed into the one line — DEFERRED). Pure → unit-tested.
-///
-/// SENTINEL: `gray <= orange` (notably the default-band `orange=1, gray=0`) means "no difficulty / always
-/// skill up" → returns 10000. The seeded recipes/nodes carry the default band, so every craft/gather
-/// deterministically +1s.
 pub(crate) fn skillup_chance_bp(current: u32, orange: u32, gray: u32) -> u32 {
     if gray <= orange {
-        return 10_000; // degenerate/disabled band (incl. the default sentinel) => always skill up
+        return 10_000;
     }
     if current < orange {
-        return 10_000; // below the required floor => always (vanilla: grey-name recipes you can't pick)
+        return 10_000;
     }
     if current >= gray {
-        return 0; // at/above gray => never
+        return 0;
     }
-    // Linear interpolation across [orange, gray): (gray - current) / (gray - orange), in basis points.
     let span = gray - orange;
     (gray - current) * 10_000 / span
 }
 
-/// Pure rank/cap-raise decision (ctx-free, unit-tested): the `max_rank` an EXISTING profession row should
-/// carry after a rank-up offering of ceiling `offered_cap` — `max(current_cap, offered_cap)`. A higher
-/// tier (Journeyman 150 over Apprentice 75) lifts the ceiling; re-buying the same/lower tier is a no-op
-/// (the idempotency the trainer's already-known gate also enforces). `learn_profession` uses exactly this
-/// for the present-row case (a NEW row instead just inserts `1/offered_cap`).
 pub(crate) fn raised_cap(current_cap: u16, offered_cap: u16) -> u16 {
     current_cap.max(offered_cap)
 }
 
-// ===========================================================================================
-//  Table [entity] — per-player, owner-scoped
-// ===========================================================================================
-
-/// One trained skill line for one character: `(character_guid, skill_line)` logical key (an `#[auto_inc]`
-/// PK + a `by_character` btree, mirroring `game_threat`'s `(creature, source)` idiom — no lossy guid pack).
-/// `owner_identity` scopes the RLS like `game_item_instance`/`game_character`. `current`/`max_rank` are the
-/// trained value and the level cap (both ≤ level×5 ≤ 300, so `u16`). No Timestamp → SQL-inspectable. [entity]
 #[table(accessor = game_player_skill, public, index(accessor = by_character, btree(columns = [character_guid])))]
 pub struct PlayerSkill {
     #[primary_key]
@@ -323,16 +187,12 @@ pub struct PlayerSkill {
     pub max_rank: u16,
 }
 
-// Skills are deleted on character delete, re-owned (identity re-stamp) on a relog under a changed
-// gateway identity.
 crate::character_owned!(delete, fn sweep_delete_game_player_skill(ctx, character_guid) {
     let skills = ctx.db.game_player_skill();
     for r in skills.by_character().filter(&character_guid).collect::<Vec<_>>() {
         skills.id().delete(r.id);
     }
 });
-// CROSS-DATABASE transport, HOT: weapon/defense/profession skill values gate every
-// swing the character makes on arrival. `id` is a surrogate PK, re-minted.
 crate::character_owned!(transfer, fn sweep_transfer_game_player_skill(ctx, character_guid, io) {
     table = game_player_skill,
     by = by_character,
@@ -348,13 +208,6 @@ crate::character_owned!(restamp, fn sweep_restamp_game_player_skill(ctx, charact
     }
 });
 
-// ===========================================================================================
-//  ctx readers — effective skills with the level*5 fallback [entity]
-// ===========================================================================================
-
-/// The `skill_line` a unit's currently-equipped main-hand weapon trains: the weapon's subclass → line, or
-/// `UNARMED` when there's no main-hand item, a non-weapon/broken item in it, or a missing template — the
-/// same gate `combat::equipped_weapon_damage` uses, so weapon damage and weapon skill agree on "unarmed".
 fn equipped_weapon_skill_line(ctx: &ReducerContext, guid: u64) -> u32 {
     let Some(inst) = crate::items::item_in_slot(ctx, guid, starter_item::MAINHAND_SLOT) else {
         return skill_line::UNARMED;
@@ -368,8 +221,6 @@ fn equipped_weapon_skill_line(ctx: &ReducerContext, guid: u64) -> u32 {
     weapon_subclass_to_skill_line(tmpl.subclass)
 }
 
-/// The trained value of `guid`'s `line`, or the `level*5` baseline when untracked. The fallback is what
-/// makes combat byte-identical before any skill diverges from cap.
 fn skill_value_or_cap(ctx: &ReducerContext, guid: u64, line: u32, level: u32) -> u32 {
     ctx.db
         .game_player_skill()
@@ -380,17 +231,11 @@ fn skill_value_or_cap(ctx: &ReducerContext, guid: u64, line: u32, level: u32) ->
         .unwrap_or_else(|| skill_cap_for_level(level))
 }
 
-/// A unit's EFFECTIVE weapon skill: the trained value of its equipped weapon's line, else the `level*5`
-/// baseline. A creature (no items) always reads the baseline → its swings are unchanged.
 pub(crate) fn effective_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) -> u32 {
     let line = equipped_weapon_skill_line(ctx, attacker.guid);
     skill_value_or_cap(ctx, attacker.guid, line, attacker.level)
 }
 
-/// A unit's EFFECTIVE defense skill: the trained Defense value (else the `level*5` baseline) PLUS any
-/// `A_MOD_COMBAT(COMBAT_DEFENSE)` aura and Defense from working equipped items. More defense raises
-/// `skill_diff` against an attacker, so it tightens the attacker's miss/dodge/parry/block bands — a
-/// defender's avoidance. With neither source, this is exactly the trained or baseline value. [entity]
 pub(crate) fn effective_defense_skill(ctx: &ReducerContext, target: &WorldEntity) -> u32 {
     let base = skill_value_or_cap(ctx, target.guid, skill_line::DEFENSE, target.level);
     let aura = crate::spell::combat_field_bonus(ctx, target.guid, crate::spell::COMBAT_DEFENSE);
@@ -399,9 +244,6 @@ pub(crate) fn effective_defense_skill(ctx: &ReducerContext, target: &WorldEntity
     (i64::from(base) + i64::from(aura) + i64::from(gear)).clamp(0, i64::from(u32::MAX)) as u32
 }
 
-/// The attack-table skill difference for a swing of `attacker` at `target`: the defender's defense skill
-/// minus the attacker's weapon skill (clamped ≥0). With no tracked rows this is exactly
-/// `(target.level - attacker.level) * 5` — the pure level-derived `skill_diff` (baseline-safe). [entity]
 pub(crate) fn skill_diff_ctx(
     ctx: &ReducerContext,
     attacker: &WorldEntity,
@@ -413,22 +255,6 @@ pub(crate) fn skill_diff_ctx(
     )
 }
 
-// ===========================================================================================
-//  ctx mutators — lazy init + skill-up on use [entity]
-// ===========================================================================================
-
-/// Raise an EXISTING `(character_guid, line)` row one step toward ITS OWN `max_rank`. A no-op once at
-/// `max_rank` and a no-op when the row is ABSENT: an untracked line already reads as the `level*5`
-/// baseline, so there's nothing to climb (rows are born at login / `debug_set_skill`, never lazily here —
-/// which also keeps creatures, never seeded, free of skill rows). Capping on the row's stored `max_rank`
-/// (not the live `level*5`) preserves the `current ≤ max_rank` invariant and naturally admits a future
-/// >`level*5` cap from a +weapon-skill racial/item. The visible climb window is `raise_combat_caps` lifting
-/// > `max_rank` above `current` on a ding — without that, every combat line would be born and stay at cap,
-/// > making this a permanent no-op.
-///
-/// Returns the row's `current` AFTER the call (whether or not it actually climbed), or `None` if
-/// the row is ABSENT — callers that need the post-raise value (`gain_profession_skill`'s autolearn
-/// check) use this instead of re-reading the row they just wrote.
 fn raise_skill(ctx: &ReducerContext, guid: u64, line: u32) -> Option<u32> {
     let skills = ctx.db.game_player_skill();
     let mut row = skills
@@ -443,10 +269,6 @@ fn raise_skill(ctx: &ReducerContext, guid: u64, line: u32) -> Option<u32> {
     Some(next as u32)
 }
 
-/// Roll `combat_skillup_chance_bp` for `guid`'s EXISTING `(line)` row and, on success, step it via
-/// `raise_skill`. A no-op when the row is ABSENT (untracked lines read the `level*5` baseline — nothing
-/// to climb) — the same guard `raise_skill` itself uses. `gain_weapon_skill` / `gain_defense_skill` both
-/// route through this shared entry point.
 fn roll_and_raise_skill(
     ctx: &ReducerContext,
     guid: u64,
@@ -476,9 +298,6 @@ fn roll_and_raise_skill(
     }
 }
 
-/// Skill-up the attacker's equipped weapon line on a landed player→creature hit. Gated by the caller on
-/// `attacker.is_player()` + a real hit; trains the line the swing actually used, at the
-/// headroom/level/intellect chance (`combat_skillup_chance_bp`, `weapon = true`).
 pub(crate) fn gain_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) {
     let line = equipped_weapon_skill_line(ctx, attacker.guid);
     roll_and_raise_skill(
@@ -491,9 +310,6 @@ pub(crate) fn gain_weapon_skill(ctx: &ReducerContext, attacker: &WorldEntity) {
     );
 }
 
-/// Skill-up the defender's Defense line on a landed hit it survived. Gated by the caller on the defender
-/// being a player, at the headroom/level chance (`combat_skillup_chance_bp`, `weapon = false` — vanilla
-/// gives the intellect assist to weapon lines only, so Defense never gets it).
 pub(crate) fn gain_defense_skill(ctx: &ReducerContext, target: &WorldEntity) {
     roll_and_raise_skill(
         ctx,
@@ -505,29 +321,14 @@ pub(crate) fn gain_defense_skill(ctx: &ReducerContext, target: &WorldEntity) {
     );
 }
 
-/// The COMBAT (weapon + Defense) skill lines — the set whose `max_rank` tracks `level*5`, as opposed to
-/// profession lines (Cooking, Mining, …) whose cap is an independent apprentice/journeyman/…/artisan tier
-/// set by `learn_profession`. Used by `raise_combat_caps` to know which rows to lift on a ding/login and
-/// never touch a profession row's cap. `pub(crate)` (weapon masters): `trainer::apply_trainer_buy`
-/// forks its profession-learn branch on this same taxonomy — a weapon-master offering (`learn_skill_line` set
-/// to a weapon line) needs a LEVEL-derived cap, not the offering's static tier column.
 pub(crate) fn is_combat_skill_line(line: u32) -> bool {
     lyracore_shared::trainer::is_combat_skill_line(line)
 }
 
-/// Is `line` the Riding line? Its own third taxonomy alongside `is_combat_skill_line` and
-/// `is_profession_line`, because riding is granted WHOLE at a purchased tier: not level-derived like a
-/// weapon line, and not born at 1 and climbed like a profession. `trainer::apply_trainer_buy` forks on
-/// this to pick `learn_riding` over `learn_profession`.
 pub(crate) fn is_riding_skill_line(line: u32) -> bool {
     line == skill_line::RIDING
 }
 
-/// Grant Riding at `rank` (75 Apprentice, 150 Journeyman) — the trainer-buy grant for a MOUNTS offering.
-/// Both `current` and `max_rank` become the purchased tier, because the mount gate compares the CURRENT
-/// rank against the mount's `min_skill`; a profession's born-at-1 shape would leave a paying rider unable
-/// to mount. Idempotent, and never lowers a higher tier, so a re-buy or an out-of-order buy cannot demote
-/// a Journeyman rider. [entity]
 pub(crate) fn learn_riding(ctx: &ReducerContext, guid: u64, owner: Identity, rank: u16) {
     let skills = ctx.db.game_player_skill();
     if let Some(mut row) = skills
@@ -543,7 +344,7 @@ pub(crate) fn learn_riding(ctx: &ReducerContext, guid: u64, owner: Identity, ran
         }
     } else {
         skills.insert(PlayerSkill {
-            id: 0, // auto_inc
+            id: 0,
             character_guid: guid,
             owner_identity: owner,
             skill_line: skill_line::RIDING,
@@ -553,18 +354,6 @@ pub(crate) fn learn_riding(ctx: &ReducerContext, guid: u64, owner: Identity, ran
     }
 }
 
-/// Raise every COMBAT-line row's `max_rank` to `level*5` for `guid` — never LOWERS it (a future
-/// +weapon-skill racial/item bonus could already exceed it) and never touches `current` (that lag IS the
-/// visible skill-up window) or a profession row (guarded by `is_combat_skill_line`). Called from BOTH the
-/// mid-session ding path (`xp::grant_xp`) and login (`ensure_player_skills`, reconciling an ALREADY-dinged
-/// character whose caps were frozen at first-login level — so a relog alone un-sticks a stale character,
-/// not just future dings). [entity]
-///
-/// Lockpicking (633) also tracks `level*5` in vanilla but isn't part of
-/// `is_combat_skill_line` — that predicate is shared with `trainer::apply_trainer_buy`'s weapon-master
-/// fork, and Lockpicking is never a trainer offering (it's granted by learning Pick Lock, see
-/// `grant_lockpicking_on_learn`), so it's checked here as a second, dedicated clause instead of joining
-/// the shared taxonomy.
 pub(crate) fn raise_combat_caps(ctx: &ReducerContext, guid: u64, new_level: u32) {
     let cap = skill_cap_for_level(new_level) as u16;
     let skills = ctx.db.game_player_skill();
@@ -586,11 +375,6 @@ fn profile_mask_admits(mask: u32, id: u8) -> bool {
 #[cfg_attr(not(has_packages), allow(dead_code))]
 const PROFILE_SKILL_AVAILABILITY_LIMIT: usize = 16;
 
-/// Reconcile one combat skill selected by a free provisioning profile. Imported availability owns
-/// the race, class, and level Gates. A seed-only Shard falls back to the established class weapon
-/// table so the no-import demo remains usable. The indexed admission reads at most 16 matching
-/// availability rows plus one overflow row. An eligible row ends the read early; an inconclusive
-/// bounded prefix returns `ProfileLimit`.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn reconcile_profile_skill(
     ctx: &ReducerContext,
@@ -694,18 +478,6 @@ pub(crate) fn reconcile_profile_skill(
     Ok(true)
 }
 
-/// Skill-up a PROFESSION line (e.g. Cooking) after a successful craft/gather: ROLL the orange/gray
-/// difficulty band (`skillup_chance_bp`) and, on success, climb one step toward the row's own `max_rank`
-/// via `raise_skill` (caps on the row's stored cap — 75/150/…, NOT `level*5`, so a profession climbs
-/// independent of level). A no-op when the profession isn't learned (no row) — the same ABSENT-row guard
-/// `raise_skill` already uses for combat lines.
-///
-/// DEFAULT BAND: callers seeded with the sentinel band (`orange=1, gray=0`, or any `gray<=orange`)
-/// get a 10000bp chance → a deterministic +1 every use. Real difficulty tables (`gray>0`) are a
-/// DEFERRED data concern.
-///
-/// Combat skill-ups (`gain_weapon_skill`/`gain_defense_skill`) DO NOT route through here — they roll
-/// their own headroom curve (`combat_skillup_chance_bp`), not the orange/gray band.
 pub(crate) fn gain_profession_skill(
     ctx: &ReducerContext,
     guid: u64,
@@ -725,11 +497,6 @@ pub(crate) fn gain_profession_skill(
         let Some(new_current) = raise_skill(ctx, guid, line) else {
             return;
         };
-        // AUTOLEARN at threshold: climbing may have unlocked acquire_method=2 abilities whose
-        // min_skill the new rank now meets. Idempotent; owner from the live caster entity (a skill-up
-        // only ever fires for an in-world crafter). Requires a REAL live entity — the "always
-        // in-world" invariant broke once already, and minting a `game_player_spell` row under
-        // `Identity::ZERO` would be invisible to its owner under RLS forever, not just skipped.
         let Some(owner) = ctx
             .db
             .game_world_entity()
@@ -743,12 +510,6 @@ pub(crate) fn gain_profession_skill(
     }
 }
 
-/// Insert the `(guid, skill_line)` profession row at apprentice rank (`current: 1, max_rank: 75`) if it's
-/// absent — the core learn-profession write, mirroring `ensure_player_skills`'s presence check + insert but
-/// NOT level-capped (a profession's max is the apprentice cap, not `level*5`). Idempotent: a re-learn of an
-/// already-known profession is a no-op (never resets a climbed skill). Called by the trainer-buy path
-/// (`trainer::apply_trainer_buy`) when an offering carries `learn_skill_line > 0`, and by the
-/// `debug_learn_profession` direct-grant lever below — so it's live in ALL builds. [entity]
 pub(crate) fn learn_profession(
     ctx: &ReducerContext,
     guid: u64,
@@ -762,10 +523,6 @@ pub(crate) fn learn_profession(
         .filter(&guid)
         .find(|s| s.skill_line == skill_line)
     {
-        // RANK-UP: an EXISTING profession row whose ceiling the next rank LIFTS
-        // (Apprentice 75 → Journeyman 150 → …). Only raises `max_rank` (never resets `current`), and only
-        // when the offered `cap` exceeds the stored ceiling — re-learning the SAME (or a lower) rank is a
-        // no-op, so a default `cap == APPRENTICE_CAP` re-learn stays idempotent.
         let new_cap = raised_cap(row.max_rank, cap);
         if new_cap != row.max_rank {
             row.max_rank = new_cap;
@@ -773,7 +530,7 @@ pub(crate) fn learn_profession(
         }
     } else {
         skills.insert(PlayerSkill {
-            id: 0, // auto_inc
+            id: 0,
             character_guid: guid,
             owner_identity: owner,
             skill_line,
@@ -781,10 +538,6 @@ pub(crate) fn learn_profession(
             max_rank: cap,
         });
     }
-    // AUTOLEARN: learning a profession instantly grants its base abilities — this is how
-    // Charred Wolf Meat (2538) / Disenchant (13262) arrive in vanilla (NOT from a trainer). Grant
-    // at the row's current skill; higher-threshold autolearn abilities land as it climbs (via
-    // gain_profession_skill below).
     let current = skills
         .by_character()
         .filter(&guid)
@@ -794,11 +547,6 @@ pub(crate) fn learn_profession(
     grant_autolearn_abilities(ctx, guid, owner, skill_line, current);
 }
 
-/// AUTOLEARN grant: for `skill_line`, learn every `game_skill_ability` spell whose real
-/// `acquire_method` is autolearn (1 = on skill learn, 2 = on reaching the skill rank) and whose
-/// `min_skill <= current`. Idempotent (`learn_spell` dedups), so it's safe to call on every learn +
-/// skill-up. Race/class masks on profession recipes are universal in vanilla, so they're not
-/// filtered here — a class-gated autolearn line would need that check (none in the 13 professions).
 pub(crate) fn grant_autolearn_abilities(
     ctx: &ReducerContext,
     guid: u64,
@@ -819,19 +567,8 @@ pub(crate) fn grant_autolearn_abilities(
     }
 }
 
-/// Pick Lock (Rogue), the spell whose learn grants the Lockpicking (633) skill line.
-/// Kept as ONE named constant (the isolated place a spell id is named, like the importer's name rescues)
-/// because the skill GRANT keys on the id: the gateway routes the CAST by the E_OPEN_LOCK effect kind,
-/// but a fresh Rogue must already own the 633 row when their first pick_lock lands — `apply_pick_lock`
-/// reads `game_player_skill(633)`, and an absent row reads skill 0 and refuses every lock.
 pub(crate) const PICK_LOCK_SPELL_ID: u32 = 1804;
 
-/// Grant the Lockpicking (633) skill line when a character learns Pick Lock, insert
-/// `1 / level*5` if absent (mirrors `learn_profession`'s NEW-row insert, but LEVEL-capped like a weapon
-/// line: vanilla Lockpicking maxes at level×5, not the 75 apprentice tier). Idempotent — a re-learn
-/// never resets a climbed skill. A no-op for every other spell. Called from the single `learn_spell`
-/// grant seam (`spell::spellbook`), so a trainer buy / quest reward / any grant path seeds it once. Owner
-/// is passed through from the learn (the RLS stamp). [entity]
 pub(crate) fn grant_lockpicking_on_learn(
     ctx: &ReducerContext,
     guid: u64,
@@ -847,10 +584,8 @@ pub(crate) fn grant_lockpicking_on_learn(
         .filter(&guid)
         .any(|s| s.skill_line == skill_line::LOCKPICKING)
     {
-        return; // already have the line — never reset a climbed skill
+        return;
     }
-    // Level from the live entity (a trainer-taught spell → the learner is in world); default 1 so the
-    // cap is >= 5 and the born-at-1 `current` never exceeds `max_rank`.
     let level = ctx
         .db
         .game_world_entity()
@@ -869,11 +604,6 @@ pub(crate) fn grant_lockpicking_on_learn(
     });
 }
 
-/// Learn a profession (e.g. Cooking = 185) on `character_guid` at rank-cap `cap`: insert its skill row at
-/// `1/cap` if absent, else LIFT the existing ceiling to `cap` (the rank-up path — Apprentice 75 →
-/// Journeyman 150 → …). Reads owner from the live entity (mirrors `debug_set_skill`). The headless learn
-/// lever — lets a verify learn a profession AND rank it up without the trainer UI. `cap` is the new
-/// max_rank (75 = Apprentice, 150 = Journeyman, 225 = Expert, 300 = Artisan). [entity]
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_learn_profession(
@@ -896,39 +626,26 @@ pub fn debug_learn_profession(
     Ok(())
 }
 
-/// The synthetic "profession-learn spell" marker ids the seeded trainer offers. They
-/// are NEVER resolved as spells (no `game_spell` header / effects) — they exist ONLY as a
-/// `game_trainer_spell.spell_id` whose `learn_skill_line` is set, and the trainer-buy branch grants the skill
-/// directly. Picked in the seed's 500xx range to avoid colliding with any real imported spell id.
+// Synthetic profession markers name trainer offerings, never game_spell rows.
 #[cfg(feature = "debug_reducers")]
-const LEARN_COOKING_SPELL_ID: u32 = 50080; // -> game_trainer_spell row with learn_skill_line = COOKING (185)
+const LEARN_COOKING_SPELL_ID: u32 = 50080;
 #[cfg(feature = "debug_reducers")]
-const LEARN_SKINNING_SPELL_ID: u32 = 50081; // -> learn_skill_line = SKINNING (393)
+const LEARN_SKINNING_SPELL_ID: u32 = 50081;
 #[cfg(feature = "debug_reducers")]
-const LEARN_LEATHERWORKING_SPELL_ID: u32 = 50082; // -> learn_skill_line = LEATHERWORKING (165)
+const LEARN_LEATHERWORKING_SPELL_ID: u32 = 50082;
 #[cfg(feature = "debug_reducers")]
-const LEARN_MINING_SPELL_ID: u32 = 50083; // -> learn_skill_line = MINING (186)
+const LEARN_MINING_SPELL_ID: u32 = 50083;
 #[cfg(feature = "debug_reducers")]
-const LEARN_HERBALISM_SPELL_ID: u32 = 50084; // -> learn_skill_line = HERBALISM (182)
-                                             // --- Profession-breadth batch markers (same convention: a `game_trainer_spell.spell_id` whose
-                                             // `learn_skill_line` is set; never resolved as a spell). SMELTING needs NO marker (it rides MINING).
+const LEARN_HERBALISM_SPELL_ID: u32 = 50084;
 #[cfg(feature = "debug_reducers")]
-const LEARN_ALCHEMY_SPELL_ID: u32 = 50085; // -> learn_skill_line = ALCHEMY (171)
+const LEARN_ALCHEMY_SPELL_ID: u32 = 50085;
 #[cfg(feature = "debug_reducers")]
-const LEARN_FIRST_AID_SPELL_ID: u32 = 50086; // -> learn_skill_line = FIRST_AID (129)
+const LEARN_FIRST_AID_SPELL_ID: u32 = 50086;
 #[cfg(feature = "debug_reducers")]
-const LEARN_TAILORING_SPELL_ID: u32 = 50087; // -> learn_skill_line = TAILORING (197)
+const LEARN_TAILORING_SPELL_ID: u32 = 50087;
 #[cfg(feature = "debug_reducers")]
-const LEARN_BLACKSMITHING_SPELL_ID: u32 = 50088; // -> learn_skill_line = BLACKSMITHING (164)
+const LEARN_BLACKSMITHING_SPELL_ID: u32 = 50088;
 
-/// DRIVE the real trainer-buy branch for a profession without the trainer-window UI —
-/// the small-arg test lever (`character_guid` is small; the trainer's own guid is a u64 > 2^53 the CLI
-/// `spacetime call` mangles, so the trainer is resolved SERVER-SIDE here, mirroring `debug_skin_nearest`'s
-/// nearest-search). It finds the closest live TRAINER creature on the player's map, maps the requested
-/// `profession` skill_line → its marker spell id (Cooking 185 → 50080, Skinning 393 → 50081), then funnels
-/// through the shared `trainer::apply_trainer_buy` — exercising the SAME range/flag gate, `trainer_buy_check`
-/// (charge/idempotency), and `learn_profession` grant the CMSG-routed buy would. The trainer must offer that
-/// marker (parent SQL-seeds the two `game_trainer_spell` rows) or the buy returns "[0] does not teach".
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_learn_profession_from_trainer(
@@ -954,8 +671,6 @@ pub fn debug_learn_profession_from_trainer(
     };
     let player = crate::helpers::live_entity(ctx, character_guid)
         .map_err(|_| format!("learner {character_guid} not in world"))?;
-    // Nearest live TRAINER creature in the learner's OWN (map, instance) partition — same-partition
-    // scan via `crate::helpers::nearest_entity` (the big trainer guid resolved here, not by the CLI).
     let trainer = crate::helpers::nearest_entity(ctx, &player, |e| {
         !e.is_player()
             && !e.dead
@@ -966,19 +681,10 @@ pub fn debug_learn_profession_from_trainer(
 }
 
 #[cfg(feature = "debug_reducers")]
-const LEARN_AXE_1H_SPELL_ID: u32 = 50130; // -> learn_skill_line = AXE_1H (44), required_level 1 (the buy-succeeds fixture)
+const LEARN_AXE_1H_SPELL_ID: u32 = 50130;
 #[cfg(feature = "debug_reducers")]
-const LEARN_POLEARM_SPELL_ID: u32 = 50131; // -> learn_skill_line = POLEARM (229), required_level 60 (the level-refusal fixture)
+const LEARN_POLEARM_SPELL_ID: u32 = 50131;
 
-/// DRIVE the real trainer-buy branch for a WEAPON PROFICIENCY without the trainer-window
-/// UI — the weapon-master twin of `debug_learn_profession_from_trainer` above, same shape: the requested
-/// `skill_line` (Daggers/1H Axe/Polearm/…) maps to its marker spell id, the nearest live TRAINER creature on
-/// the learner's map is resolved SERVER-SIDE (mirroring `debug_skin_nearest`'s nearest-search — the
-/// trainer's own guid is a u64 > 2^53 the CLI `spacetime call` mangles), then funnels through the SAME
-/// `trainer::apply_trainer_buy` — exercising the identical range/flag gate, `trainer_buy_check`, and (via
-/// `is_combat_skill_line`) the WEAPON fork's level-derived cap + row-presence known-check the CMSG-routed
-/// buy would. The trainer must offer that marker (the seeded fixture SQL) or the buy is refused as
-/// `trainer:not_offered`.
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_learn_weapon_from_trainer(
@@ -997,8 +703,6 @@ pub fn debug_learn_weapon_from_trainer(
     };
     let player = crate::helpers::live_entity(ctx, character_guid)
         .map_err(|_| format!("learner {character_guid} not in world"))?;
-    // Nearest live TRAINER creature in the learner's OWN (map, instance) partition — same-partition
-    // scan via `crate::helpers::nearest_entity` (the big trainer guid resolved here, not by the CLI).
     let trainer = crate::helpers::nearest_entity(ctx, &player, |e| {
         !e.is_player()
             && !e.dead
@@ -1008,17 +712,9 @@ pub fn debug_learn_weapon_from_trainer(
     crate::trainer::apply_trainer_buy(ctx, character_guid, trainer.guid, spell_id)
 }
 
-/// The synthetic riding-offering marker ids the seeded MOUNTS trainer offers — one per vanilla tier. Same
-/// convention as the profession/weapon markers above (a `game_trainer_spell.spell_id` whose
-/// `learn_skill_line` is set, NEVER resolved as a real spell), but NOT `debug_reducers`-gated: the fixture
-/// seeder reads them in every build, so there is one definition instead of a hand-copied twin in
-/// `seed/fixtures.rs` that could drift. Picked just past the weapon-master markers (50130/50131).
 pub(crate) const LEARN_APPRENTICE_RIDING_SPELL_ID: u32 = 50132;
 pub(crate) const LEARN_JOURNEYMAN_RIDING_SPELL_ID: u32 = 50133;
 
-/// The tier a riding marker teaches, or `None` for anything else — the ONE mapping shared by the fixture
-/// seeder (which writes each offering's `learn_skill_cap`) and the debug trainer lever (which resolves a
-/// requested rank back to its marker). Pure, so the two can never disagree about what 50132 costs you.
 pub(crate) fn riding_marker_rank(spell_id: u32) -> Option<u16> {
     match spell_id {
         LEARN_APPRENTICE_RIDING_SPELL_ID => Some(75),
@@ -1027,9 +723,6 @@ pub(crate) fn riding_marker_rank(spell_id: u32) -> Option<u16> {
     }
 }
 
-/// Grant Riding at `rank` directly — the headless lever for scenarios that need a trained rider without
-/// walking to a trainer (`debug_set_skill` cannot serve: it clamps to `level*5`, so a level-1 character
-/// could never hold riding 75). The trainer path has its own coverage; this one seeds the skill row. [entity]
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_learn_riding(
@@ -1044,14 +737,6 @@ pub fn debug_learn_riding(
     Ok(())
 }
 
-/// DRIVE the real trainer-buy branch for RIDING without the trainer-window UI — the riding twin of
-/// `debug_learn_profession_from_trainer` / `debug_learn_weapon_from_trainer` above, same shape: the
-/// requested `rank` (75 Apprentice / 150 Journeyman) maps to its marker spell id, the nearest live TRAINER
-/// creature on the learner's map is resolved SERVER-SIDE (the trainer's own guid is a u64 > 2^53 the CLI
-/// `spacetime call` mangles), then funnels through the SAME `trainer::apply_trainer_buy` — exercising the
-/// identical range/flag gate, the MOUNTS-trainer check, `trainer_buy_check`, and the `learn_riding` grant
-/// the CMSG-routed buy would. The trainer must offer that marker (the seeded riding-trainer fixture) or
-/// the buy is refused as `trainer:not_offered`.
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_learn_riding_from_trainer(
@@ -1075,43 +760,17 @@ pub fn debug_learn_riding_from_trainer(
     crate::trainer::apply_trainer_buy(ctx, character_guid, trainer.guid, spell_id)
 }
 
-/// The weapon skill lines a player of `class` is proficient with at character creation (vanilla
-/// `playercreateinfo_spell` / SkillLine.dbc). Only returns melee/ranged lines that have a tracked
-/// `skill_line::*` constant (UNARMED and DEFENSE are seeded unconditionally; wands/thrown/bow/gun/
-/// crossbow fall to UNARMED in `weapon_subclass_to_skill_line` and are therefore NOT listed here).
-/// Returns an empty slice for unknown classes (e.g. creatures).
-///
-/// DEPRECATION POINTER: this hand-authored per-class table could in principle be
-/// derived from `game_skill_availability` (`SkillRaceClassInfo.dbc`'s `class_mask`, imported by
-/// `skilldata.rs`) joined against `skill_line::*`'s known combat lines — that data-driven replacement
-/// is a follow-up, not done here (this function's behavior is UNCHANGED by this item).
-/// Vanilla STARTING weapon proficiencies — what a FRESH character knows before visiting a
-/// weapon master, matching vanilla's per-race/class proficiency spells (race-merged;
-/// wand/thrown/bow/gun lines are unmodeled — ranged rides the UNARMED fallback). The FULL per-class
-/// list below stays as the "ever learnable by this class" reference; seeding from THAT list gave every
-/// fresh paladin swords/axes/polearms and made the weapon masters pointless (live find, faladin).
-/// Existing characters are GRANDFATHERED: `ensure_player_skills` only inserts missing lines, never
-/// deletes, so an existing character keeps its wide set.
 pub(crate) fn class_starting_weapon_skill_lines(class: u8) -> &'static [u32] {
     use skill_line::*;
     match class {
-        // Warrior: 1H axes, 1H maces, 1H swords (createinfo grants exactly these three).
         1 => &[AXE_1H, MACE_1H, SWORD_1H],
-        // Paladin: 1H + 2H maces.
         2 => &[MACE_1H, MACE_2H],
-        // Hunter: 1H axes + daggers (bow/gun unmodeled).
         3 => &[AXE_1H, DAGGER],
-        // Rogue: daggers (thrown unmodeled).
         4 => &[DAGGER],
-        // Priest: 1H maces (wand unmodeled).
         5 => &[MACE_1H],
-        // Shaman: 1H maces + staves.
         7 => &[MACE_1H, STAFF],
-        // Mage: staves (wand unmodeled).
         8 => &[STAFF],
-        // Warlock: daggers (wand unmodeled).
         9 => &[DAGGER],
-        // Druid: daggers, 1H maces, staves.
         11 => &[DAGGER, MACE_1H, STAFF],
         _ => &[],
     }
@@ -1120,39 +779,25 @@ pub(crate) fn class_starting_weapon_skill_lines(class: u8) -> &'static [u32] {
 pub(crate) fn class_weapon_skill_lines(class: u8) -> &'static [u32] {
     use skill_line::*;
     match class {
-        // Warrior: axes, maces, polearms, swords, fist, daggers (no staves; ranged → UNARMED fallback, not listed).
         1 => &[
             AXE_1H, AXE_2H, MACE_1H, MACE_2H, POLEARM, SWORD_1H, SWORD_2H, FIST, DAGGER,
         ],
-        // Paladin: 1H/2H axes, maces, polearms, 1H/2H swords.
         2 => &[
             AXE_1H, AXE_2H, MACE_1H, MACE_2H, POLEARM, SWORD_1H, SWORD_2H,
         ],
-        // Hunter: axes (1H/2H), daggers, fist, polearms, staves, swords (1H/2H).
         3 => &[
             AXE_1H, AXE_2H, DAGGER, FIST, POLEARM, STAFF, SWORD_1H, SWORD_2H,
         ],
-        // Rogue: daggers, fist, 1H maces, 1H swords.
         4 => &[DAGGER, FIST, MACE_1H, SWORD_1H],
-        // Priest: daggers, 1H maces, staves (wand → UNARMED, not listed).
         5 => &[DAGGER, MACE_1H, STAFF],
-        // Shaman: 1H/2H axes, daggers, fist, 1H/2H maces, staves.
         7 => &[AXE_1H, AXE_2H, DAGGER, FIST, MACE_1H, MACE_2H, STAFF],
-        // Mage: daggers, staves, 1H swords (wand → UNARMED, not listed).
         8 => &[DAGGER, STAFF, SWORD_1H],
-        // Warlock: daggers, staves, 1H swords (wand → UNARMED, not listed).
         9 => &[DAGGER, STAFF, SWORD_1H],
-        // Druid: daggers, fist, 1H/2H maces, staves.
         11 => &[DAGGER, FIST, MACE_1H, MACE_2H, STAFF],
         _ => &[],
     }
 }
 
-/// Lazily seed a logging-in player's skill rows (Defense + Unarmed + all class weapon proficiency
-/// lines) at the level cap, owner-scoped for the RLS. Idempotent — only inserts lines the
-/// character lacks, so a relog never duplicates (mirrors `grant_starter_item`). Seeding at cap
-/// keeps a fresh login baseline (defense = weapon = level*5 → 0 skill_diff vs an equal-level foe).
-/// `class` is the vanilla class id (1=Warrior … 11=Druid) from `Character.class`. [entity]
 pub(crate) fn ensure_player_skills(
     ctx: &ReducerContext,
     guid: u64,
@@ -1164,16 +809,10 @@ pub(crate) fn ensure_player_skills(
     let equipped_weapon = equipped_weapon_skill_line(ctx, guid);
     let skills = ctx.db.game_player_skill();
 
-    // Build the full set of lines to seed: always Defense + Unarmed, plus every class proficiency
-    // line, plus the currently-equipped weapon (covers classes with no matching proficiency row,
-    // and ensures the equipped slot is seeded even for odd starting gear).
     let mut lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
     lines.insert(skill_line::DEFENSE);
     lines.insert(skill_line::UNARMED);
     lines.insert(equipped_weapon);
-    // 256: seed only the vanilla STARTING subset — the wide class_weapon_skill_lines list made
-    // every weapon-master purchase moot. The equipped-weapon insert above still covers odd
-    // starting gear, and the equip gate (row presence) now genuinely refuses unlearned types.
     for &l in class_starting_weapon_skill_lines(class) {
         lines.insert(l);
     }
@@ -1185,7 +824,7 @@ pub(crate) fn ensure_player_skills(
             .any(|s| s.skill_line == line);
         if !present {
             skills.insert(PlayerSkill {
-                id: 0, // auto_inc
+                id: 0,
                 character_guid: guid,
                 owner_identity: owner,
                 skill_line: line,
@@ -1195,15 +834,9 @@ pub(crate) fn ensure_player_skills(
         }
     }
 
-    // Reconcile PRE-EXISTING rows too: a character's combat lines can lag the current level's cap
-    // (frozen at an earlier login's cap) — lift them here so a relog alone un-sticks a stale
-    // character, not just future dings.
     raise_combat_caps(ctx, guid, level);
 }
 
-/// Set (find-or-insert) `character_guid`'s `skill_line` to `value`, clamped to the level cap — the
-/// server-side verification lever (drop a weapon skill below cap, then `debug_compute_swing` /
-/// fight to see the bands shift + the skill climb). Reads level + owner from the live entity.
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_set_skill(
@@ -1241,15 +874,10 @@ pub fn debug_set_skill(
     Ok(())
 }
 
-/// Force-run `ensure_player_skills` for an (offline) character from the CLI — the headless
-/// verification path for the login skill seed. Reads level + class from `game_character`; owner is
-/// set to `ctx.sender()` (operator identity, fine for a verify-only run). All missing weapon
-/// proficiency rows for the character's class are inserted idempotently.
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
 pub fn debug_reseed_skills(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
-    // REFUSE verdict: `game_player_skill` is a HOT manifest table, so a post-begin
-    // reseed is a lost write cross-database.
+    // Refuse after Transfer begins because a reseed would miss the exported skill snapshot.
     let ch = crate::helpers::require_character(ctx, character_guid)
         .map_err(|_| format!("no game_character row for guid {character_guid}"))?;
     ensure_player_skills(ctx, ch.guid, ctx.sender(), ch.level as u32, ch.class);
@@ -1261,17 +889,10 @@ pub fn debug_reseed_skills(ctx: &ReducerContext, character_guid: u64) -> Result<
     Ok(())
 }
 
-// ===========================================================================================
-//  Tests [server]
-// ===========================================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Riding is its OWN taxonomy: not a combat line (so a ding never lifts it to level*5) and not a
-    /// profession (so it is never born at 1 and climbed by use). If it leaked into either, a rider would
-    /// silently lose or gain rank without visiting a trainer.
     #[test]
     fn riding_is_neither_a_combat_line_nor_a_profession() {
         assert_eq!(skill_line::RIDING, 762, "verbatim SkillLine.dbc id");
@@ -1288,9 +909,6 @@ mod tests {
         }
     }
 
-    /// The riding markers and the tiers they teach. One mapping feeds both the fixture seeder (which
-    /// writes each offering's `learn_skill_cap`) and the debug trainer lever, so the two cannot disagree
-    /// about what a purchase grants. The two tiers are vanilla's 75 (Apprentice) and 150 (Journeyman).
     #[test]
     fn riding_markers_map_to_the_two_vanilla_tiers() {
         assert_eq!(
@@ -1314,8 +932,6 @@ mod tests {
 
     #[test]
     fn skill_line_ids_are_the_verbatim_vanilla_dbc_values() {
-        // These are wire-facing (the deferred client skill-pane reads them verbatim) — guard the literals
-        // against a silent edit so the mapping test below can't pass with a wrong-but-consistent ID.
         assert_eq!(skill_line::SWORD_1H, 43);
         assert_eq!(skill_line::AXE_1H, 44);
         assert_eq!(skill_line::MACE_1H, 54);
@@ -1337,7 +953,6 @@ mod tests {
         assert_eq!(weapon_subclass_to_skill_line(0), skill_line::AXE_1H);
         assert_eq!(weapon_subclass_to_skill_line(15), skill_line::DAGGER);
         assert_eq!(weapon_subclass_to_skill_line(10), skill_line::STAFF);
-        // Thrown/wand/unknown all train Unarmed (the fallback line).
         assert_eq!(weapon_subclass_to_skill_line(16), skill_line::UNARMED);
         assert_eq!(weapon_subclass_to_skill_line(19), skill_line::UNARMED);
         assert_eq!(weapon_subclass_to_skill_line(255), skill_line::UNARMED);
@@ -1354,14 +969,10 @@ mod tests {
     fn next_skill_steps_one_and_caps() {
         assert_eq!(next_skill(0, 300), 1);
         assert_eq!(next_skill(299, 300), 300);
-        assert_eq!(next_skill(300, 300), 300); // already capped → unchanged
-        assert_eq!(next_skill(305, 300), 300); // never exceeds cap even if over
+        assert_eq!(next_skill(300, 300), 300);
+        assert_eq!(next_skill(305, 300), 300);
     }
 
-    /// COMBAT skill-up chance — the headroom curve specified above `combat_skillup_chance_bp`.
-    /// Guards, one per spec bullet: degenerate inputs → 0 (never rolls); the seam is continuous
-    /// (catch-up side meets taper side); chance is non-increasing as `current` climbs toward `cap`;
-    /// Defense (weapon=false) gets no intellect assist while an otherwise-identical weapon line does.
     #[test]
     fn combat_skillup_chance_zero_on_degenerate_inputs() {
         assert_eq!(
@@ -1388,8 +999,6 @@ mod tests {
 
     #[test]
     fn combat_skillup_chance_seam_is_continuous() {
-        // Across the seam (headroom 6 = taper side, headroom 7 = catch-up side): no discontinuous
-        // jump — the chance rises with headroom and only slightly at the crossing.
         let level = 60;
         let cap = 300u32;
         let at_headroom_6 = combat_skillup_chance_bp(cap - 6, cap, level, 0, false);
@@ -1405,10 +1014,6 @@ mod tests {
         );
     }
 
-    /// The seam is continuous BY CONSTRUCTION, not by tuning (see `SEAM_HEADROOM`): evaluated at
-    /// exactly `SEAM_HEADROOM`, the catch-up branch's logarithm is zero, so it returns the shared
-    /// floor `SEAM_HEADROOM / cap` — which is precisely what the taper branch's
-    /// `headroom² / (SEAM_HEADROOM * cap)` evaluates to there, at every cap and every level.
     #[test]
     fn combat_practice_fraction_branches_agree_exactly_at_the_seam() {
         let seam = SEAM_HEADROOM as f64;
@@ -1420,19 +1025,15 @@ mod tests {
                     catch_up_at_seam, taper_at_seam,
                     "branches must meet at the seam (cap={cap} level={level})"
                 );
-                // …and the shared value IS the floor the spec names.
                 assert_eq!(catch_up_at_seam, seam / cap as f64);
             }
         }
     }
 
-    /// The catch-up regime's low-level lift: at equal headroom, a lower-level character trains a
-    /// lagging line strictly faster (that is the whole point of the `CATCH_UP_LOW_LEVEL_LIFT` term),
-    /// and the effect vanishes as level grows. Headroom must be above the seam for the term to exist.
     #[test]
     fn combat_skillup_catch_up_is_faster_at_low_level() {
         let cap = 300u32;
-        let headroom = 60u32; // well above the seam → catch-up regime
+        let headroom = 60u32;
         let current = cap - headroom;
         let low = combat_skillup_chance_bp(current, cap, 10, 0, false);
         let mid = combat_skillup_chance_bp(current, cap, 30, 0, false);
@@ -1447,8 +1048,6 @@ mod tests {
         );
     }
 
-    /// The intellect assist is bounded at `INTELLECT_ASSIST_MAX` (+10 points = 1000bp) no matter how
-    /// absurd the intellect, and is exactly zero at zero intellect.
     #[test]
     fn intellect_assist_is_clamped_and_zero_without_intellect() {
         for level in [1u32, 30, 60] {
@@ -1458,7 +1057,6 @@ mod tests {
                 "assist must clamp at {INTELLECT_ASSIST_MAX}"
             );
         }
-        // The clamp is reachable, not vacuous: enough intellect saturates it.
         assert_eq!(intellect_assist(100_000, 60), INTELLECT_ASSIST_MAX);
     }
 
@@ -1479,8 +1077,6 @@ mod tests {
 
     #[test]
     fn combat_skillup_chance_weapon_intellect_bonus_only_applies_to_weapon_lines() {
-        // Same room/level/cap, only `weapon` flips: the weapon line's chance must be >= the defense
-        // line's (the intellect bonus only ever ADDS), and strictly greater with nonzero intellect.
         let (current, cap, level, intellect) = (100u32, 300u32, 60u32, 500u32);
         let defense = combat_skillup_chance_bp(current, cap, level, intellect, false);
         let weapon = combat_skillup_chance_bp(current, cap, level, intellect, true);
@@ -1488,7 +1084,6 @@ mod tests {
             weapon > defense,
             "weapon line should get a strictly higher chance from intellect > 0"
         );
-        // Zero intellect: the bonus term is 0, so weapon and defense agree exactly.
         let weapon_no_int = combat_skillup_chance_bp(current, cap, level, 0, true);
         assert_eq!(
             weapon_no_int, defense,
@@ -1513,13 +1108,11 @@ mod tests {
 
     #[test]
     fn skill_diff_is_defense_minus_weapon_clamped() {
-        assert_eq!(skill_diff(300, 300), 0); // equal skill
-        assert_eq!(skill_diff(315, 300), 15); // +3 levels of defense over weapon
-        assert_eq!(skill_diff(300, 315), 0); // higher weapon skill floors at 0
+        assert_eq!(skill_diff(300, 300), 0);
+        assert_eq!(skill_diff(315, 300), 15);
+        assert_eq!(skill_diff(300, 315), 0);
     }
 
-    /// The combat/profession taxonomy `apply_trainer_buy` forks the weapon-master branch on:
-    /// a weapon line (DAGGER) is combat (level-capped); a profession line (COOKING) is not (static-tier capped).
     #[test]
     fn is_combat_skill_line_true_for_dagger_false_for_cooking() {
         assert!(
@@ -1534,64 +1127,45 @@ mod tests {
 
     #[test]
     fn profession_skill_lines_are_verbatim_vanilla_dbc_values() {
-        // Wire-facing (the client skill-pane reads these verbatim) — guard the literals against a silent edit.
         assert_eq!(skill_line::COOKING, 185);
         assert_eq!(skill_line::SKINNING, 393);
         assert_eq!(skill_line::LEATHERWORKING, 165);
         assert_eq!(skill_line::HERBALISM, 182);
         assert_eq!(skill_line::MINING, 186);
-        // Profession-breadth batch (vanilla SkillLine.dbc ids — DO NOT change).
         assert_eq!(skill_line::ALCHEMY, 171);
         assert_eq!(skill_line::FIRST_AID, 129);
         assert_eq!(skill_line::TAILORING, 197);
         assert_eq!(skill_line::BLACKSMITHING, 164);
-        // The final three (completing the 13) — verbatim vanilla SkillLine.dbc ids, DO NOT change.
         assert_eq!(skill_line::ENGINEERING, 202);
         assert_eq!(skill_line::ENCHANTING, 333);
         assert_eq!(skill_line::FISHING, 356);
     }
 
-    /// A learned profession is born at apprentice rank (1/75) and climbs ONE step per craft toward 75,
-    /// INDEPENDENT of character level (the `next_skill` cap is the row's own `max_rank`, never `level*5`).
-    /// This is the skill-add piece the cooking loop's skill-up reuses (`raise_skill` → `next_skill`).
     #[test]
     fn profession_skill_adds_one_per_craft_capped_at_apprentice_75() {
-        let cap = APPRENTICE_CAP as u32; // 75 — NOT level*5
+        let cap = APPRENTICE_CAP as u32;
         assert_eq!(cap, 75);
-        // Born at 1; the first craft climbs to 2 (the loop's observable skill-up).
         assert_eq!(next_skill(1, cap), 2);
-        // Climbs one at a time toward the apprentice cap, independent of level (level 1 can reach 75).
         assert_eq!(next_skill(74, cap), 75);
-        assert_eq!(next_skill(75, cap), 75); // at apprentice cap → unchanged (further ranks need a new tier)
-                                             // A profession is NOT level-capped: skill 1 at level 1 (cap level*5 == 5) still climbs past 5 toward 75.
+        assert_eq!(next_skill(75, cap), 75);
         assert!(
             skill_cap_for_level(1) < cap,
             "profession cap 75 must exceed the level-1 combat cap (5)"
         );
-        assert_eq!(next_skill(5, cap), 6); // would be frozen at 5 under the combat cap; the profession path isn't
+        assert_eq!(next_skill(5, cap), 6);
     }
 
-    /// The skill-up DIFFICULTY curve (orange/yellow/green/gray, collapsed to one linear band): a use at/below
-    /// the orange floor ALWAYS skills (10000bp); at/above gray NEVER (0bp); between, linearly interpolated
-    /// `(gray - current)/(gray - orange)`; and the `gray<=orange` SENTINEL (incl. the default `1,0` band)
-    /// is always-skill. This is the regression guard for the seeded recipes/nodes (their default band must
-    /// stay at 100%) AND the curve shape for future difficulty tables.
     #[test]
     fn skillup_chance_curve_orange_full_gray_zero_and_monotone() {
-        // GRAY: at/above the ceiling → 0% (orange<gray real band).
-        assert_eq!(skillup_chance_bp(80, 60, 80), 0); // exactly at gray
-        assert_eq!(skillup_chance_bp(90, 60, 80), 0); // above gray
-                                                      // ORANGE floor: at or below → always 100% (the required-level "always skills" floor).
-        assert_eq!(skillup_chance_bp(60, 60, 120), 10_000); // exactly at orange
-        assert_eq!(skillup_chance_bp(40, 60, 120), 10_000); // below orange
-                                                            // SENTINEL (gray <= orange), incl. the default-band 1,0 → always 100% (the legacy byte-identical path).
+        assert_eq!(skillup_chance_bp(80, 60, 80), 0);
+        assert_eq!(skillup_chance_bp(90, 60, 80), 0);
+        assert_eq!(skillup_chance_bp(60, 60, 120), 10_000);
+        assert_eq!(skillup_chance_bp(40, 60, 120), 10_000);
         assert_eq!(skillup_chance_bp(50, 1, 0), 10_000);
-        assert_eq!(skillup_chance_bp(50, 60, 60), 10_000); // gray == orange degenerate
-        assert_eq!(skillup_chance_bp(50, 60, 30), 10_000); // gray < orange degenerate
-                                                           // INTERPOLATION across [orange, gray): the midpoint is ~50%.
-        assert_eq!(skillup_chance_bp(70, 60, 80), 5_000); // (80-70)/(80-60) = 1/2
-        assert_eq!(skillup_chance_bp(65, 60, 80), 7_500); // (80-65)/20 = 3/4
-                                                          // MONOTONE non-increasing across the band — never goes UP as skill rises.
+        assert_eq!(skillup_chance_bp(50, 60, 60), 10_000);
+        assert_eq!(skillup_chance_bp(50, 60, 30), 10_000);
+        assert_eq!(skillup_chance_bp(70, 60, 80), 5_000);
+        assert_eq!(skillup_chance_bp(65, 60, 80), 7_500);
         let mut prev = 10_001u32;
         for current in 0u32..=130 {
             let c = skillup_chance_bp(current, 60, 120);
@@ -1603,27 +1177,15 @@ mod tests {
         }
     }
 
-    /// RANK/CAP RAISE for an EXISTING profession row: the ceiling only LIFTS when the offered cap
-    /// is higher (Journeyman 150 over Apprentice 75); re-buying the same/lower tier is a no-op
-    /// (`raised_cap` == the stored cap → no update). This is the pure decision `learn_profession`
-    /// branches on for the present-row case. (The NEW-row insert path takes the offered cap
-    /// verbatim — no raise math — so it isn't asserted here.)
     #[test]
     fn raised_cap_lifts_only_a_higher_tier() {
-        // EXISTING row: Apprentice 75 → Journeyman 150 lifts the ceiling.
         assert_eq!(raised_cap(75, 150), 150);
-        assert_eq!(raised_cap(150, 225), 225); // Journeyman → Expert
-        assert_eq!(raised_cap(225, 300), 300); // Expert → Artisan
-                                               // Re-buying the SAME tier is a no-op (75 stays 75) — the idempotent already-known path.
+        assert_eq!(raised_cap(150, 225), 225);
+        assert_eq!(raised_cap(225, 300), 300);
         assert_eq!(raised_cap(75, 75), 75);
-        // A LOWER-tier "re-buy" never lowers the ceiling (max keeps the higher stored cap).
         assert_eq!(raised_cap(150, 75), 150);
     }
 
-    /// The load-bearing baseline-safety equivalence: the NEW skill-derived diff
-    /// (`skill_diff(cap(tl), cap(al))`) must equal the OLD level-derived diff
-    /// (`(tl - al).saturating_sub * 5`) for EVERY level pair, since the refactor moved the
-    /// saturating-subtract from before the ×5 to after it. Brute-forced over 0..=100².
     #[test]
     fn skill_diff_from_caps_equals_old_level_derived_form() {
         for al in 0u32..=100 {
@@ -1638,12 +1200,9 @@ mod tests {
         }
     }
 
-    /// Mage createinfo weapon proficiency lines: Daggers (173), Staves (136),
-    /// 1H Swords (43). These are the three lines the vanilla `playercreateinfo_spell` table seeds
-    /// for class 8. Verified against cmangos `playercreateinfo_spell race=1 class=8`.
     #[test]
     fn mage_weapon_proficiency_lines_are_dagger_staff_sword_1h() {
-        let lines = class_weapon_skill_lines(8 /* Mage */);
+        let lines = class_weapon_skill_lines(8);
         let mut set: std::collections::HashSet<u32> = lines.iter().copied().collect();
         assert!(
             set.remove(&skill_line::DAGGER),
@@ -1661,12 +1220,8 @@ mod tests {
         );
     }
 
-    /// The `class_weapon_skill_lines` contract `ensure_player_skills` seeds from: every playable
-    /// class returns at least one weapon proficiency line, and unknown/creature classes return an
-    /// empty slice. (ensure_player_skills itself needs a ReducerContext and is NOT exercised here.)
     #[test]
     fn class_weapon_skill_lines_nonempty_for_playable_classes_empty_otherwise() {
-        // Every playable human class must return at least one weapon proficiency line.
         for &class in &[1u8, 2, 3, 4, 5, 7, 8, 9, 11] {
             let lines = class_weapon_skill_lines(class);
             assert!(
@@ -1674,29 +1229,18 @@ mod tests {
                 "class {class} returned zero weapon proficiency lines"
             );
         }
-        // Unknown / creature class returns empty (guards the caller's loop from stale entries).
         assert!(class_weapon_skill_lines(0).is_empty());
-        assert!(class_weapon_skill_lines(6).is_empty()); // no class 6 in vanilla
+        assert!(class_weapon_skill_lines(6).is_empty());
     }
 
-    /// PINNED OUTPUTS — the observable contract this module's consumers see, as concrete basis
-    /// points. These are the numbers the live realm rolls against; a change here is a rebalance,
-    /// not a refactor, and must be argued as such. (Level 60 / cap 300 is the max-level line;
-    /// level 12 / cap 60 is a mid-levelling one; cap 5 is the level-1 edge.)
     #[test]
     fn combat_skillup_chance_pinned_outputs() {
-        // Max-level weapon line, far below cap → catch-up regime.
         assert_eq!(combat_skillup_chance_bp(100, 300, 60, 0, false), 7_725);
-        // Same, with the intellect assist (weapon line, 750 int saturates the level-60 band at +1000bp).
         assert_eq!(combat_skillup_chance_bp(100, 300, 60, 750, true), 8_725);
-        // Taper regime: the last few points before cap.
         assert_eq!(combat_skillup_chance_bp(299, 300, 60, 0, false), 4);
         assert_eq!(combat_skillup_chance_bp(294, 300, 60, 0, false), 171);
-        // Exactly at the seam (headroom 7) → the shared floor 7/300.
         assert_eq!(combat_skillup_chance_bp(293, 300, 60, 0, false), 233);
-        // Mid-level line: the low-level lift makes the same headroom train faster.
         assert_eq!(combat_skillup_chance_bp(20, 60, 12, 0, false), 6_982);
-        // Level-1 edge (cap 5): every point is inside the taper.
         assert_eq!(combat_skillup_chance_bp(4, 5, 1, 0, false), 285);
     }
 }

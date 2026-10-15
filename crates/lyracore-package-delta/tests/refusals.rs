@@ -1,5 +1,3 @@
-//! Everything a Package Delta refuses, and refuses before an applier could act on any of it.
-
 mod common;
 
 use common::{
@@ -113,8 +111,6 @@ fn a_value_that_does_not_fit_its_declared_type_is_refused() {
 
 #[test]
 fn an_unsigned_64_bit_value_written_as_a_json_number_is_refused() {
-    // A JSON number cannot carry a u64 without losing precision above 2^53, so the artifact does not
-    // accept one even when the value would have fitted.
     let json = one_spell_update(
         "example.pkg",
         REAL_SPELL,
@@ -209,10 +205,6 @@ fn row_deletion_is_refused() {
     assert_eq!(refuse(&json), DeltaError::DeleteNotSupported);
 }
 
-/// `game_creature_cast`'s key names a creature template, which no Package may invent — the worked
-/// example of an update-only table. Five more follow it (`game_gossip_menu`, the two stat curves,
-/// `game_start_position`, `game_areatrigger_teleport`); see `gossip_identifiers.rs` and
-/// `globals_identifiers.rs` for their own coverage.
 #[test]
 fn an_insert_on_an_update_only_table_is_refused_by_name() {
     let json = artifact(
@@ -257,7 +249,6 @@ fn an_insert_that_does_not_carry_the_whole_row_is_refused() {
     match refuse(&json) {
         DeltaError::IncompleteInsert { table, missing } => {
             assert_eq!(table, Table::Spell);
-            // Every claimable column except the one the claim carried.
             assert_eq!(missing.len(), 23);
             assert!(missing.contains(&"name".to_owned()));
             assert!(!missing.contains(&"cooldown_ms".to_owned()));

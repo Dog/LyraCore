@@ -3,16 +3,10 @@ use crate::stdb::ReducerCallError;
 
 #[derive(Default)]
 pub(crate) struct LootRollState {
-    /// Recorded `loot_roll` calls: (corpse_guid, loot_slot, vote).
     pub(crate) loot_rolls: std::sync::Mutex<Vec<(u64, u32, u8)>>,
-    /// Recorded `loot_master_give` calls: (corpse_guid, loot_slot, target_guid).
     pub(crate) loot_master_gives: std::sync::Mutex<Vec<(u64, u8, u64)>>,
-    /// Typed gameplay Refusal returned by loot-roll and master-loot action tests.
     pub(crate) loot_action_refusal: Option<LootRefusal>,
-    /// When set, loot-roll and master-loot requests fail as a Transport Loss.
     pub(crate) loot_action_transport_lost: bool,
-    /// Records every `realm_loot_op` reducer argument in wire order. The Realm-core handle owns the
-    /// recorder so a test can distinguish authority routing from a Shard-local request.
     #[allow(clippy::type_complexity)]
     pub(crate) realm_loot_ops: std::sync::Mutex<
         Vec<(
@@ -29,25 +23,11 @@ pub(crate) struct LootRollState {
             u64,
         )>,
     >,
-    /// When set, `realm_loot_start` is refused with this reason.
     pub(crate) realm_loot_op_refusal: Option<String>,
-    /// This WORLD SHARD's staging rolls `pending_local_rolls` answers — the relay's promotion
-    /// INPUT. `Mutex`-wrapped (like `mirror`) so a test can set it AFTER the fixture
-    /// is wrapped in an `Arc` — every existing party/whisper topology builder hands back `Arc`s.
-    /// Empty (derive-Default) = nothing to promote, byte-identical to before this field existed.
     pub(crate) pending_rolls: std::sync::Mutex<Vec<crate::world::loot::PendingLootRoll>>,
-    /// Recorded `settle_loot_roll` calls on THIS shard — `(corpse_guid, slot, winner_guid)`.
     pub(crate) settled_rolls: std::sync::Mutex<Vec<(u64, u8, u64)>>,
-    /// When set, `settle_loot_roll` fails as a Transport Loss.
     pub(crate) settle_loot_roll_transport_lost: bool,
-    /// Recorded `clear_promoted_loot_roll` calls on THIS shard — the roll ids the relay told
-    /// this shard's staging copy to forget after a successful promotion.
     pub(crate) cleared_rolls: std::sync::Mutex<Vec<u64>>,
-    /// This REALM-CORE handle's fixture `ROLL_WON` queue — `(corpse_guid, slot, winner_guid)`
-    /// triples, in the order they "arrived". `loot_won_since(after_id)` answers every entry whose
-    /// 1-based INDEX exceeds `after_id`, and the new watermark is the queue's length — the same
-    /// shape the real `game_group_event.id` high-water mark has, without needing a fake event table.
-    /// `Mutex`-wrapped for the same after-`Arc`-construction reason as `pending_rolls`.
     pub(crate) won_events: std::sync::Mutex<Vec<(u64, u8, u64)>>,
 }
 

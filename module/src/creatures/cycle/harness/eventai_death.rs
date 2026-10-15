@@ -1,5 +1,3 @@
-//! EventAI death-authority scenarios.
-
 use super::*;
 use crate::creatures::eventai::*;
 

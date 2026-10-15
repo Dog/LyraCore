@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`VendorActionStore`] adapter.
-
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -10,16 +8,9 @@ use crate::stdb::reads::property_enchant_ids;
 use crate::world::{Actor, VendorActionStore};
 
 impl VendorActionStore for crate::stdb::Coordinator {
-    /// Read a vendor's stock for `SMSG_LIST_INVENTORY`. Resolve the vendor's creature entry from
-    /// its `game_world_entity` row, filter `game_npc_vendor` to that entry, and join each
-    /// `game_item_template` for the display id / buy price / max durability (carrying the
-    /// npc_vendor row's `max_count`). Read from the privileged cache; the SDK exposes only the PK
-    /// index, so iterate and filter. A stock line whose template isn't loaded is skipped: it can't
-    /// be priced or displayed. Ordered by the vendor `slot`.
     fn vendor_stock(&self, vendor_guid: u64) -> Result<Vec<codec::VendorItemView>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
-        // The vendor's creature entry drives the stock lookup; a missing entity → no stock.
         let Some(creature_entry) = db
             .game_world_entity()
             .guid()
@@ -33,7 +24,7 @@ impl VendorActionStore for crate::stdb::Coordinator {
             .iter()
             .filter(|v| v.creature_entry == creature_entry)
             .collect();
-        rows.sort_by_key(|v| v.slot); // stable vendor-slot order (SQL has no ORDER BY in 2.5)
+        rows.sort_by_key(|v| v.slot);
         let items = rows
             .into_iter()
             .filter_map(|v| {
@@ -57,8 +48,6 @@ impl VendorActionStore for crate::stdb::Coordinator {
         self.npc_refuses_interaction(vendor_guid, actor.guid())
     }
 
-    /// The module gates the purchase on the vendor (stock + NPC flags + range) and debits the
-    /// buyer's copper.
     fn vendor_buy(
         &self,
         actor: Actor,
@@ -73,8 +62,6 @@ impl VendorActionStore for crate::stdb::Coordinator {
         )
     }
 
-    /// The player's buyback ring, newest-first: `(item_entry, stack_count, price,
-    /// random_property_id)`, at most 12.
     fn buyback_slots(&self, player_guid: u64) -> Vec<(u32, u32, u32, u32)> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -98,8 +85,6 @@ impl VendorActionStore for crate::stdb::Coordinator {
         crate::stdb::Coordinator::item_slot_by_guid(self, item_guid)
     }
 
-    /// The module gates the REPAIR NPC and charges copper; the player's item and purse replicate
-    /// back via subscription.
     fn vendor_repair(&self, actor: Actor, npc_guid: u64, slot: u8) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -108,8 +93,6 @@ impl VendorActionStore for crate::stdb::Coordinator {
         )
     }
 
-    /// The gateway resolves the client's item-INSTANCE guid to the owning slot before calling
-    /// (the reducer takes the slot); the module credits the seller's copper.
     fn vendor_sell(&self, actor: Actor, vendor_guid: u64, slot: u8) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,

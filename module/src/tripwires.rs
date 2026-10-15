@@ -1,26 +1,8 @@
-//! Architecture Tests: source scans for structural invariants that behaviour tests cannot observe.
-//! Each failure message opens with the invariant it protects, and each scanner has a negative test
-//! that feeds it a small violating source.
-//!
-//! - [`character_owned_tripwire`]: every table with a Character-capable guid has a
-//!   `character_owned` sweep marker or a reasoned exclusion.
-//! - [`build_scan_strip_tripwire`]: a commented-out marker invocation never registers.
-//! - [`partition_discipline_tripwire`]: no whole-table scan of a spatial table outside the budget,
-//!   and no Module game logic reads a shard id.
-//! - [`character_fence_tripwire`]: no raw `game_character` lookup outside the transfer fence.
-//! - [`gc_reap_tripwire`]: every TTL-shaped event table is reaped in `gc.rs`.
-//! - [`grid_cell_tripwire`]: a grid-coordinate write also writes the packed cell.
-//! - [`package_name_tripwire`]: Core source names no official Package.
-//!
-//! The spatial and fence scanners share one engine, [`crate::test_scan::raw_table_reads`].
-
 #[cfg(test)]
 pub(crate) mod character_owned_tripwire {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// Guid fields whose name fixes a non-Character object kind. Every other `*_guid: u64` field is
-    /// treated as Character-capable. A new object-specific name fails closed until it is classified.
     const NON_UNIT_GUID_FIELDS: &[&str] = &[
         "corpse_guid",
         "creature_guid",
@@ -32,8 +14,6 @@ pub(crate) mod character_owned_tripwire {
         "pet_guid",
     ];
 
-    /// Tables with a Character-capable guid that deliberately do not belong to one Character.
-    /// Each reason states the row's actual owner or lifetime.
     const NOT_CHARACTER_OWNED: &[(&[&str], &str)] = &[
         (
             &[
@@ -203,9 +183,6 @@ pub(crate) mod character_owned_tripwire {
         ),
     ];
 
-    /// Every `.rs` file that compiles into this crate: core `src/` plus each drop-in
-    /// `packages/*/src/` (build.rs compiles those in, so every source-scanning Architecture Test
-    /// must see them too). Shared with the other Architecture Tests in this file.
     pub(crate) fn scanned_files() -> Vec<PathBuf> {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let mut files = Vec::new();
@@ -239,9 +216,6 @@ pub(crate) mod character_owned_tripwire {
         }
     }
 
-    /// Replace comments, literals, and `#[cfg(test)]` items with spaces while preserving byte offsets
-    /// and newlines. The scanner can then use simple balanced-delimiter walks without accepting a
-    /// declaration that production never compiles.
     pub(super) fn production_code(content: &str) -> String {
         fn blank(bytes: &mut [u8], start: usize, end: usize) {
             for byte in &mut bytes[start..end] {
@@ -323,8 +297,6 @@ pub(crate) mod character_owned_tripwire {
                 continue;
             }
             if source[i] == b'\'' {
-                // A lifetime starts with the same quote. Only mask the narrow Rust char-literal
-                // shapes: one byte or an escape followed by a closing quote.
                 let escaped = source.get(i + 1) == Some(&b'\\');
                 let close = if escaped { i + 3 } else { i + 2 };
                 if source.get(close) == Some(&b'\'') {
@@ -430,11 +402,6 @@ pub(crate) mod character_owned_tripwire {
         String::from_utf8(code).expect("masking Rust source preserves UTF-8")
     }
 
-    /// Extract every production `#[table(accessor = NAME` struct's field block as
-    /// `(accessor, fields_text)`.
-    ///
-    /// `pub(super)`: [`gc_reap_tripwire`] (a sibling in this same file) reuses this rather than
-    /// re-walking every `#[table]` struct a third time.
     pub(super) fn extract_tables(content: &str) -> Vec<(String, String)> {
         let code = production_code(content);
         let mut out = Vec::new();
@@ -592,10 +559,6 @@ pub(crate) mod character_owned_tripwire {
 
         let mut missing = Vec::new();
         for file in &files {
-            // `tripwires.rs` (this file) defines no `#[table]` struct of its own — it only ever
-            // MENTIONS the attribute in prose/string literals (including this very scanner's own
-            // source, e.g. `extract_tables`'s `.find("#[table(")`), which would otherwise misparse
-            // as malformed attributes. Every real table lives in a submodule.
             if file.file_name().and_then(|n| n.to_str()) == Some("tripwires.rs") {
                 continue;
             }
@@ -793,12 +756,6 @@ pub(crate) mod character_owned_tripwire {
     }
 }
 
-/// ENFORCEMENT tripwire for the marker scan itself: a commented-out marker invocation must
-/// neither register nor break the build. The comment right inside this mod IS the fixture — it is
-/// real, well-formed marker syntax that would have panicked a naive substring scan (no `fn`
-/// body brace games, the genuine article). If comment-stripping ever regresses, one of two things
-/// happens loudly: build.rs panics on the "malformed" comment text, or the ghost pass registers
-/// and this test fails.
 #[cfg(test)]
 mod build_scan_strip_tripwire {
     // game_tick_pass!(fn ghost_commented_out_pass(ctx) { unreachable!() })
@@ -806,10 +763,7 @@ mod build_scan_strip_tripwire {
 
     #[test]
     fn commented_out_markers_do_not_register() {
-        // Assert on the GENERATED TEXT, not the registry consts: the ghost fn never compiles
-        // into anything, so there is no fn-pointer value to look for — and referencing the const
-        // arrays would materialize every REAL registered fn's pointer, dragging SpacetimeDB host
-        // imports into this native test binary (which cannot link them).
+        // Read generated text; registry pointers would require wasm-only imports in native tests.
         let registries = include_str!(concat!(env!("OUT_DIR"), "/package_registries.rs"));
         assert!(
             !registries.contains("ghost_commented_out_pass"),
@@ -823,41 +777,10 @@ mod build_scan_strip_tripwire {
     }
 }
 
-/// ENFORCEMENT tripwire (part of the elastic-world-sharding spec): a full
-/// `.iter()` over a SPATIAL table reads the whole world, so it silently breaks shardability —
-/// once the world is cut into region/continent/instance shards, a whole-table scan can only ever
-/// see the rows on the caller's own shard, and the code that relied on seeing everything goes
-/// quietly wrong. Every spatial read must instead go through the partition-scoped helper family
-/// (`helpers::entities_near` + `helpers::in_same_partition`), which is `(map_id, instance_id)`-
-/// scoped and grid-indexed and therefore keeps meaning the same thing after a shard split.
-///
-/// This test source-scans `src/**/*.rs` + `packages/*/src/**/*.rs` (same file set as
-/// `character_owned_tripwire`) for raw scans and fails on any file over its whitelisted budget.
-/// The whitelist FREEZES today's legitimate scans; it is a ratchet, so it should only ever shrink
-/// as perf-catalog Tier 1 work replaces scans with indexed helpers.
-///
-// Deliberate simplification: whitelist granularity is (file, count), not (file, line) — line
-// numbers churn on every unrelated edit above them and would make this test a merge-conflict
-// generator. The ceiling: swapping one whitelisted scan for a different one inside an
-// already-whitelisted file slips through. Upgrade path if that ever bites: key on the enclosing
-// `fn` name instead.
-//
-// Deliberate simplification: "raw" is a whole-table read (`.iter()` or `.count()`) reached either
-// straight off the accessor OR off a local handle bound from it one line earlier — `let entities =
-// ctx.db.game_world_entity();` is this codebase's DOMINANT idiom (~120 bindings vs ~18 inline
-// calls), so a scanner that only matched the inline form would wave through most of the real
-// scans and would fail exactly nobody who copied the style of the code next to them. Index reads
-// (`.by_grid().filter(..)`, `.guid().find(..)`) are already partition-safe or point reads.
-// Ceiling: still a text scan — a handle passed to another fn, or an accessor name pasted together
-// by a macro, defeats it. Upgrade path: none planned — the tripwire's job is to make the lazy
-// paths fail, not to be a sound analysis.
 #[cfg(test)]
 mod partition_discipline_tripwire {
     use crate::test_scan::{line_of, on_comment_line, repo_root};
 
-    /// Tables whose rows have a world position, i.e. the ones a shard split partitions.
-    /// Non-spatial tables (accounts, items, quests, templates) are realm-wide by construction and
-    /// are none of this test's business.
     const SPATIAL_ACCESSORS: &[&str] = &[
         "game_world_entity",
         "game_creature_spawn",
@@ -865,34 +788,23 @@ mod partition_discipline_tripwire {
         "game_dynamic_object",
     ];
 
-    /// `(repo-relative path, allowed raw-scan count, why)`. One line of justification each.
     const WHITELIST: &[(&str, usize, &str)] = &[
-        // Diagnostics and harness code, never on a gameplay path.
         ("module/src/debug/mod.rs", 9, "Debug fixture and operator migration reducers inspect the whole Shard, including the packed-cell backfill."),
         ("module/src/debug/instance.rs", 3, "Debug fixture setup and floor validation inspect template populations and guid allocation."),
-        // Importers — realm-wide by definition: they wipe and rebuild every partition at once.
         ("module/src/creatures/spawn.rs", 4, "World imports replace all authored spawns. Timer normalization and region retirement inspect the complete spawn catalogue."),
         ("module/src/go_collider.rs", 1, "Operator reconciliation rebuilds derived colliders for every hosted partition"),
         ("module/src/gameobject.rs", 2, "`import_gameobjects` drops every gameobject row before reloading the world; plus one by-`template_entry` lookup (an entry-keyed find, not a spatial query — no index on that column)"),
         ("module/src/package_import/creatures.rs", 1, "a Package Delta apply clears the whole Package creature range before it writes, so a Package that left the enabled set takes its spawns with it — realm-wide reconciliation, and the band has no index"),
         ("module/src/package_import/gameobjects.rs", 1, "the same whole-band clear for the Package gameobject range"),
-        // Deliberately cross-partition: these ARE the code that manages partitions.
         ("module/src/instance.rs", 7, "instance population spawn/teardown + the reaper's occupied-instance census — classifying every partition at once is the job"),
         ("module/src/encounter.rs", 2, "guid high-water marks over spawn/gameobject TEMPLATE rows when allocating a wave guid, not live-world reads"),
-        // Unindexed lookups whose target is co-located with the caller anyway.
         ("module/src/creatures/pet.rs", 1, "`nearest_hostile_near` — KNOWN DEBT, a textbook `entities_near` radius search kept only because pets are rare (one per online warlock)"),
         ("packages/deadmines/src/choreography.rs", 1, "single instance-scoped boss-liveness check inside one encounter"),
-        // Creature tick scans: `tick/mod.rs` and `cycle/ctx.rs`.
         ("module/src/creatures/tick/mod.rs", 3, "Active-cell classification snapshots all players. Diagnostic counters measure total rows and narrowed pass candidates."),
         ("module/src/creatures/cycle/ctx.rs", 2, "Aggro snapshots all players and regeneration selects entities with health or power. Neither predicate has its own index."),
         ("module/src/spell/cast/targeting.rs", 1, "AoE/chain target resolution by full-iter + squared distance; a textbook `helpers::entities_near` call (perf-catalog Tier 1)"),
-        // Nearest-trainer scans go through `helpers::nearest_entity` (an indexed `by_map` scan,
-        // partition-scoped), so the trainer files have no raw scans and no entry.
     ];
 
-    /// The text at `byte_idx` opens a whole-table read: `.iter()`, or `.count()` (the same read
-    /// with the rows thrown away — `Table::count` is no more partition-scoped than `iter`).
-    /// Whitespace is collapsed so a rustfmt-wrapped method chain still matches.
     fn opens_whole_table_read(content: &str, byte_idx: usize) -> bool {
         let tail: String = content[byte_idx..]
             .chars()
@@ -923,8 +835,6 @@ mod partition_discipline_tripwire {
         let root = repo_root();
         let mut violations = Vec::new();
         for file in super::character_owned_tripwire::scanned_files() {
-            // tripwires.rs (this file) holds the whitelist and this scanner's own prose; it defines
-            // no reducers, so skipping it costs nothing — same carve-out the sibling tripwire makes.
             if file.file_name().and_then(|n| n.to_str()) == Some("tripwires.rs") {
                 continue;
             }
@@ -965,12 +875,6 @@ mod partition_discipline_tripwire {
         );
     }
 
-    /// The whitelist is a ratchet: an entry whose file no longer needs its full budget (or no
-    /// longer exists) must be trimmed, or the budget quietly re-opens the door it was closed for.
-    ///
-    /// An entry naming an OPTIONAL drop-in package that isn't installed is skipped, not counted as
-    /// zero — `crate::test_scan::is_installed` draws that line at the package DIRECTORY, so a file
-    /// missing from an INSTALLED package still reports `actual 0` and fails here.
     #[test]
     fn whitelist_has_no_stale_entries() {
         let root = repo_root();
@@ -993,27 +897,8 @@ mod partition_discipline_tripwire {
         );
     }
 
-    // ==========================================================================================
-    //  EXTENSION: no module game logic may read a SHARD ID.
-    // ==========================================================================================
-
-    /// The only files allowed to touch a shard column: `region.rs` defines the assignment table and
-    /// the operator reducer that writes it, and `load.rs` defines the per-shard load-sample table
-    /// and its operator reducer. `game_shard_load.shard` is a database-name LABEL an ops sample is
-    /// filed under, ring-evicted and compared for equality, exactly like `RegionAssignment.shard`.
-    /// Both write or compare. Neither branches on the value to decide anything gameplay-visible.
     const SHARD_ID_OWNERS: &[&str] = &["module/src/region.rs", "module/src/load.rs"];
 
-    /// The ways module code could reach a shard id: the assignment table's accessor, the `.shard`
-    /// column itself (`row.shard`), and the ROW TYPE, because `let RegionAssignment { shard, .. }
-    /// = row;` and `match row { RegionAssignment { shard: db, .. } => … }` bind the column without
-    /// ever writing a dot (both forms were confirmed to slip past the first two). You cannot
-    /// destructure a type you may not name. `game_character_shard` / `CharacterShard` deliberately
-    /// do NOT count — that table stores a `(map_id, instance_id)` LOCATION precisely so nothing has
-    /// to name a database. `game_shard_load` / `ShardLoad` get the same destructuring
-    /// protection as `RegionAssignment` — they carry a shard-name LABEL an ops sample is filed
-    /// under, not a location, but the same "cannot destructure a type you may not name" argument
-    /// applies to it too.
     const SHARD_ID_FORMS: &[&str] = &[
         "game_region_assignment",
         ".shard",
@@ -1022,9 +907,6 @@ mod partition_discipline_tripwire {
         "ShardLoad",
     ];
 
-    /// Every `(line, form)` where a file names a shard id. `.shard` must be a whole field access,
-    /// so `.shard_name`/`.shard_index` (gateway vocabulary, if it ever appears in prose) and
-    /// `game_character_shard` (no dot before `shard`) are not hits.
     fn shard_id_reads(content: &str) -> Vec<(usize, &'static str)> {
         let mut out = Vec::new();
         for form in SHARD_ID_FORMS {
@@ -1050,7 +932,6 @@ mod partition_discipline_tripwire {
         if !matches!(path, "module/src/lib.rs" | "module/src/tables.rs") {
             return shard_id_reads(content);
         }
-        // Named table reexports declare the schema; they do not read its rows.
         let code = super::character_owned_tripwire::production_code(content);
         let mut masked = code.as_bytes().to_vec();
         let mut depth = 0usize;
@@ -1125,18 +1006,6 @@ mod partition_discipline_tripwire {
         assert_eq!(shard_id_reads(src), vec![(2, ".shard")]);
     }
 
-    /// Region definitions are data. Shard ids are the Gateway's business. The Module stores
-    /// `region_assignment { map_id, region_id, shard, epoch }` (it has to, because realm-core is
-    /// this same wasm under another database name). The instant a reducer *branches* on `shard`,
-    /// the Module stops being relocatable: the same code on two databases would take two different
-    /// paths, and a region migration would change gameplay instead of changing routing. Regions and
-    /// cells are fair game anywhere. The database name is not.
-    ///
-    /// The scan covers the Module's own `src` + `packages/*` plus `crates/lyracore-shared/src`,
-    /// which compiles INTO this Module and can name a database just as well. `DUNGEON_MAPS` lives
-    /// there, so Module logic that moves into the shared crate stays under this scan. The spatial
-    /// and character-owned scans need no extension, because a shared crate has no `#[table]`
-    /// definitions or spatial iteration.
     fn shard_id_scanned_files() -> Vec<std::path::PathBuf> {
         let mut files = super::character_owned_tripwire::scanned_files();
         let shared = repo_root().join("crates/lyracore-shared/src");
@@ -1152,7 +1021,7 @@ mod partition_discipline_tripwire {
         let mut violations = Vec::new();
         for file in shard_id_scanned_files() {
             if file.file_name().and_then(|n| n.to_str()) == Some("tripwires.rs") {
-                continue; // this file holds the scanner's own vocabulary (see the sibling tests)
+                continue;
             }
             let rel = file
                 .strip_prefix(&root)
@@ -1182,8 +1051,6 @@ mod partition_discipline_tripwire {
         );
     }
 
-    /// The owner list is a ratchet too: a file that no longer touches a shard id must come off it,
-    /// or it keeps a hole open for the next person who copies the code next to them.
     #[test]
     fn shard_id_owner_list_has_no_stale_entries() {
         let root = repo_root();
@@ -1201,42 +1068,17 @@ mod partition_discipline_tripwire {
     }
 }
 
-/// ENFORCEMENT tripwire (part of the elastic-world-sharding spec): a reducer that
-/// reaches a character by GUID or by NAME straight into `game_character` touches none of the
-/// escrowed-transfer chokepoints — not `helpers::entity_by_owner` (the actor side), not
-/// `world::player_login` (re-materialisation), not `begin_transfer`'s delete of the live entity
-/// (the target side). Same-database that is harmless: the write lands on the SAME row the
-/// destination reads. Cross-database each one is a LOST WRITE, because the export blob was
-/// serialized at `begin_transfer` and the mutation dies with the source copy.
-///
-/// The fence is `helpers::character_by_guid` / `character_by_name`, which read an in-transit
-/// character as ABSENT so each caller's existing "no such character" arm fires. This test
-/// source-scans the same file set as its two sibling tripwires for RAW character lookups and fails
-/// on any file over its whitelisted budget. `WHITELIST` FREEZES today's audited exceptions in
-/// Core's own source, each with a verdict (see the verdict table in `transfer/mod.rs`'s module doc);
-/// it is a ratchet, so it should only ever shrink. `PACKAGE_FILE_BUDGET` carries the same budget
-/// for an installed Package's file, keyed by file shape instead of by Package, so Core names no
-/// Package.
 #[cfg(test)]
 mod character_fence_tripwire {
     use crate::test_scan::repo_root;
 
-    /// `(repo-relative path, allowed raw-lookup count, verdict + why)`. One line each; every entry
-    /// is an audited exception from the by-guid verdict table in `module/src/transfer/mod.rs`.
-    /// Core's own files only — an installed Package's file is never named here; see
-    /// `PACKAGE_FILE_BUDGET` below.
     const WHITELIST: &[(&str, usize, &str)] = &[
         ("module/src/account_ownership.rs", 2, "Account fencing reads ownership even during Transfer. These two reads only check the Account name before fencing or removing a live entity; Character rows and Transfer records remain intact."),
-        // THE GATE ITSELF.
         ("module/src/helpers.rs", 2, "`character_by_guid` + `character_by_name` — the fence; these two ARE the raw lookups everything else routes through"),
-        // TRANSFER MACHINERY — must read the row the fence hides, or it could not move it.
         ("module/src/transfer/mod.rs", 4, "Transfer reads the fenced Character for export, destination materialization, durability checks, and the in-transit Instance census."),
         ("module/src/world.rs", 8, "player_login carries its own `is_in_transit` fence (the re-materialisation chokepoint, 2 reads); teleport_player, set_home, persist_entity and is_gm_character take a guid already resolved through a fenced entity (persist_entity is called BY begin_transfer); debug_delete_character keeps a raw existence probe so a missing character stays a no-op while an in-transit one is REFUSED, with the fence on the same expression; cascade_delete_character's raw row DELETE is the sweep that probe guards. `recall_to_home` is now FENCED (character_by_guid) — it was the one teleport_player caller needing no live entity"),
-        // OPEN, not decided — spec puts group MEMBERSHIP state on realm-core, settled.
         ("module/src/group.rs", 3, "Group accept, uninvite, and leave read member identity while changing membership, which is authoritative on Realm-core."),
-        // REGENERATE at the destination — connection-derived state, never carried in the blob.
         ("module/src/auth.rs", 4, "Character creation checks name uniqueness and initializes the guid allocator. Character deletion distinguishes absence, ownership, and the Transfer fence."),
-        // READS, not writes: name/class/race/identity lookups that mutate nothing on the character.
         ("module/src/items/ops.rs", 2, "race/class reads for the starter loadout and the mana-class gate — no write to the character"),
         ("module/src/spell/cast/targeting.rs", 1, "caster NAME for the resurrect prompt — no write"),
         ("module/src/reputation.rs", 1, "owner_identity fallback for RLS visibility of a new rep row — no write to the character"),
@@ -1249,26 +1091,18 @@ mod character_fence_tripwire {
         ("module/src/operations.rs", 1, "`debug_repair_after_publish`'s gm-tester backfill (guid 1); every debug WRITER that touches character state is fenced"),
     ];
 
-    /// `(path relative to a Package's own root, allowed raw-lookup count, verdict + why)` — keyed
-    /// this way so Core names no Package. No staleness ratchet: it names a file shape, not one
-    /// installed Package, so there is no single file to measure it against.
     const PACKAGE_FILE_BUDGET: &[(&str, usize, &str)] = &[(
         "src/mod.rs",
         2,
         "roster bookkeeping over rows this same reducer just created: the free-name probe and the post-create fetch",
     )];
 
-    /// If `rel` sits under `packages/<pkg>/`, its path relative to that Package's own root —
-    /// `packages/example/src/mod.rs` → `Some("src/mod.rs")`. `None` for a Core file.
     fn package_relative_path(rel: &str) -> Option<&str> {
         let after = rel.strip_prefix("packages/")?;
         let (_pkg, tail) = after.split_once('/')?;
         Some(tail)
     }
 
-    /// The raw-lookup budget for `rel`: a Package file is checked against `PACKAGE_FILE_BUDGET` by
-    /// its path relative to the Package root; a Core file is checked against `WHITELIST` by its
-    /// full repo-relative path. Either way, an unlisted file gets zero.
     fn budget_for(rel: &str) -> usize {
         if let Some(pkg_rel) = package_relative_path(rel) {
             return PACKAGE_FILE_BUDGET
@@ -1284,10 +1118,6 @@ mod character_fence_tripwire {
             .unwrap_or(0)
     }
 
-    /// The lookup forms that reach a character row raw. `.guid().find(` and `.name().find(` are the
-    /// indexed point reads; `.iter()` is the case-folding name scan (`character_by_name`'s
-    /// convention) and the account-scoped counts. `.guid().update(` is deliberately NOT here: the
-    /// row it writes was already resolved by one of these, so the READ is the chokepoint.
     const LOOKUP_FORMS: &[&str] = &[
         ".guid().find(",
         ".name().find(",
@@ -1295,7 +1125,6 @@ mod character_fence_tripwire {
         ".iter()",
     ];
 
-    /// The one accessor this tripwire watches.
     const ACCESSOR: &[&str] = &["game_character"];
 
     fn opens_raw_lookup(content: &str, byte_idx: usize) -> bool {
@@ -1332,8 +1161,6 @@ mod character_fence_tripwire {
         let root = repo_root();
         let mut violations = Vec::new();
         for file in super::character_owned_tripwire::scanned_files() {
-            // tripwires.rs holds this scanner's own prose and defines no reducers — same carve-out
-            // both sibling tripwires make.
             if file.file_name().and_then(|n| n.to_str()) == Some("tripwires.rs") {
                 continue;
             }
@@ -1379,10 +1206,6 @@ mod character_fence_tripwire {
         );
     }
 
-    /// Ratchet: a `WHITELIST` entry whose file no longer needs its full budget must be trimmed, or
-    /// the budget quietly re-opens the door it was closed for. `WHITELIST` holds Core files only
-    /// (never optional), so every entry is checked unconditionally; `PACKAGE_FILE_BUDGET` carries no
-    /// matching ratchet — see its own doc comment for why.
     #[test]
     fn character_whitelist_has_no_stale_entries() {
         let root = repo_root();
@@ -1403,59 +1226,27 @@ mod character_fence_tripwire {
     }
 }
 
-/// ENFORCEMENT tripwire: `gc.rs` has a hand-maintained `reap!` list. It covers the
-/// fifteen event tables reaped on their 1s `EVENT_TTL_MICROS` and the handful of tables with their
-/// own ad-hoc TTL block below it. A NEW short-lived event table
-/// that forgets to add its line leaks forever, silently: nothing else ever deletes its rows.
-///
-/// This scans every `#[table]` struct across the compiled tree (same file set and same
-/// `extract_tables` as `character_owned_tripwire`) for the `id: u64` PK + `created_at: Timestamp`
-/// shape every existing TTL-reaped table uses, and fails if `gc.rs`'s own source never actually
-/// reaps that accessor — either via `reap!(<accessor>)` or a direct `ctx.db.<accessor>()` call (the
-/// shape the ad-hoc blocks and the sweep fns `gc.rs` calls out to use). A bare substring match on
-/// the accessor NAME would be satisfied by a comment mentioning it (this file's own `gc.rs` carries
-/// exactly that kind of comment about `game_creature_move_event`, explaining why it is not
-/// reaped), so the check is deliberately narrower than "the name appears somewhere".
-///
-/// `game_rest_state_event` (`rest.rs`) carries this exact shape. Its doc comment calls it "a
-/// one-shot relay row with a GC TTL" (`transfer/transport.rs`'s `NOT_TRANSPORTED` table), so `gc.rs`
-/// must reap it with `reap!`. Otherwise every rest-area threshold crossing leaves one more row behind.
 #[cfg(test)]
 mod gc_reap_tripwire {
-    /// Accessors carrying the `id: u64` + `created_at: Timestamp` TTL shape that are deliberately
-    /// NOT reaped by `gc.rs`:
-    /// - `game_creature_move_event`: dead — nothing writes it any more (perf catalog 2.1 moved
-    ///   creature legs onto the in-place `game_creature_spline` row, updated rather than
-    ///   inserted/reaped); the table stays in the schema, empty, rather than as a separate
-    ///   destructive migration to drop it. See the comment atop `reap_movement_events` in `gc.rs`.
-    /// - `game_mail`: DURABLE state whose `created_at` starts its life. Each Mail's own Mail Timer
-    ///   ends that life (`mail_timer.rs`). A TTL reap would delete Mail that Mail Expiry returns.
     const EXEMPT_ACCESSORS: &[&str] = &[
         "game_creature_move_event",
-        // Retired with the shard-local channel path: nothing writes it.
         "game_channel_event",
         "game_mail",
-        // Durable source-side work. The exact Gateway completion deletes it; a transfer source
-        // deletion retains it so process restart can finish the destination release.
+        // Keep source Intents until exact Gateway completion can finish the destination release.
         "game_bot_transfer_intent",
     ];
 
-    /// `gc.rs` reaps `accessor` through `reap!(accessor)` or a direct `ctx.db.accessor()` call.
-    /// Comments and string literals do not count.
     fn gc_reaps(gc_code: &str, accessor: &str) -> bool {
         gc_code.contains(&format!("reap!({accessor})"))
             || gc_code.contains(&format!("ctx.db.{accessor}()"))
     }
 
-    /// The `id: u64` primary key plus `created_at: Timestamp` shape every TTL-reaped table uses.
-    /// Full field names, because `id: u64` alone is a substring of every `*_guid: u64` field.
     fn is_ttl_shaped(fields: &str) -> bool {
         fields.contains("pub id: u64,")
             && (fields.contains("pub created_at: Timestamp,")
                 || fields.contains("pub created_at: spacetimedb::Timestamp,"))
     }
 
-    /// Every TTL-shaped, non-exempt table declared in `content` that `gc_src` never reaps.
     fn unreaped_tables(content: &str, gc_src: &str) -> Vec<String> {
         let gc_code = super::character_owned_tripwire::production_code(gc_src);
         super::character_owned_tripwire::extract_tables(content)
@@ -1476,7 +1267,6 @@ mod gc_reap_tripwire {
 
         let mut missing = Vec::new();
         for file in super::character_owned_tripwire::scanned_files() {
-            // gc.rs defines no table of its own; nothing to check it against itself.
             if file.file_name().and_then(|n| n.to_str()) == Some("gc.rs") {
                 continue;
             }
@@ -1518,50 +1308,18 @@ mod gc_reap_tripwire {
     }
 }
 
-// =================================================================================================
-//  Every `grid_x` write is accompanied by the packed `cell` write
-// =================================================================================================
-
-/// The four AOI-scoped tables carry a `cell` column that packs `(grid_x, grid_y)` into one indexed
-/// value, because that is the only shape SpacetimeDB 2.7.1's subscription planner can serve from an
-/// index. It is therefore a DENORMALIZATION, and the usual denormalization hazard applies with an
-/// unusually nasty failure mode: a row whose `cell` disagrees with its `grid_x`/`grid_y` is not
-/// slow, it is in the WRONG PLACE. The AOI subscription probes `cell`, so such a row is invisible to
-/// every player standing on it and visible to whoever happens to occupy the cell it wrongly claims.
-///
-/// Nothing in the type system couples them: `grid_x`, `grid_y` and `cell` are three independent
-/// columns, and the census behind this tripwire found **24 independent write sites** across 8 files, with no
-/// shared constructor for `game_world_entity` re-stamps (7 hand-rolled `e.grid_x = ..` runs) or for
-/// `game_gameobject` (9 independent struct literals). Adding a 25th and forgetting the third line
-/// compiles clean, passes every existing test, and shows up live as entities that vanish.
-///
-/// So: this scan requires every `grid_x` WRITE, a `grid_x: ..` struct-literal field or a
-/// `<recv>.grid_x = ..` assignment, to have a `cell` write within the same short window of source
-/// text. It is deliberately textual and deliberately local: the point is to fail the build next to
-/// the line someone just wrote, not to prove a semantic property.
 #[cfg(test)]
 pub(crate) mod grid_cell_tripwire {
     use crate::test_scan::{line_of, on_comment_line};
 
-    /// How far after a `grid_x` write the matching `cell` write may sit. Every real site writes the
-    /// three within a few adjacent lines; 400 characters is roomy enough for a doc comment between
-    /// them and far too tight to reach an unrelated statement.
     const WINDOW: usize = 400;
 
-    /// Files whose `grid_x` mentions are reads, table DEFINITIONS, or fixtures for a table with no
-    /// `cell` column at all — assembled at run time so this list cannot match itself.
     fn is_exempt(path: &str) -> bool {
-        // `helpers.rs` reads the grid off rows (`grid_of`, `entity_addr`) and its ONE fixture writer
-        // is covered; the exemptions below are files where `grid_x` appears only in a signature,
-        // a tuple destructure or a comment.
         ["module/src/tripwires.rs", "module/src/region.rs"]
             .iter()
             .any(|p| path.ends_with(p) || path.replace('\\', "/").ends_with(p))
     }
 
-    /// The AOI-scoped tables' own `#[table]` definitions declare `pub grid_x: i32` next to a `cell`
-    /// column further down the struct — further than WINDOW, and not a "write" in any case. Skip a
-    /// match that is a struct FIELD DECLARATION rather than an initializer or assignment.
     fn is_field_declaration(code: &str, idx: usize) -> bool {
         let line_start = code[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line_end = code[idx..]
@@ -1572,13 +1330,6 @@ pub(crate) mod grid_cell_tripwire {
         line.starts_with("pub grid_x") || line.starts_with("grid_x: i32")
     }
 
-    /// `true` if the nearest non-whitespace character before `idx` is `{` or `,` — i.e. `grid_x,` at
-    /// `idx` sits in a struct-literal FIELD position (first field right after the opening brace, or
-    /// any field after a preceding one), not buried inside some other expression. This is what
-    /// actually distinguishes the struct-literal shorthand from an ordinary function-call argument
-    /// (`grid_cell_id(grid_x, grid_y)`: the character before that `grid_x` is `(`, not `{`/`,`) —
-    /// deliberately independent of whether the field shares its line with other fields, so both
-    /// this repo's one-field-per-line style AND a compact `E { grid_x, grid_y }` one-liner match.
     fn is_field_position(code: &str, idx: usize) -> bool {
         let bytes = code.as_bytes();
         let mut i = idx;
@@ -1593,11 +1344,6 @@ pub(crate) mod grid_cell_tripwire {
         false
     }
 
-    /// `impl` block a `Self { .. }` struct literal at `idx` resolves to. Walks backward for the
-    /// nearest `impl` keyword, then takes `impl<..> TypeName` or, for a trait impl, the identifier
-    /// after ` for ` (`impl Trait for TypeName`) — the same rule `Self` follows in the language.
-    /// A near-clone of the `impl<..>` generics-skip is unavoidable here (no shared engine, unlike
-    /// `raw_table_reads`) because this walks forward from a keyword instead of backward from a brace.
     fn resolve_self_type(code: &str, idx: usize) -> Option<&str> {
         let impl_pos = code[..idx].rfind("impl")?;
         let after = code[impl_pos + "impl".len()..].trim_start();
@@ -1638,15 +1384,6 @@ pub(crate) mod grid_cell_tripwire {
         ident_at(rest)
     }
 
-    /// Walks backward from `idx` tracking `{`/`}` depth to find the nearest enclosing brace, then
-    /// takes the identifier immediately before it (skipping whitespace). Returns that identifier
-    /// only if it looks like a type name (starts uppercase, matching this codebase's convention) —
-    /// `TypeName { .. }` or `TypeName { ..prev }`, so `None` correctly falls out for a shorthand
-    /// `grid_x,` that is really an ordinary function-CALL argument (`queue_motion(.., grid_x,
-    /// grid_y, ..)`: its nearest enclosing `{` is a `fn`/`if`/`match` body brace, not preceded by a
-    /// type name) or any other bare code block. A literal `Self { .. }` constructor resolves through
-    /// [`resolve_self_type`] to the `impl` block's real type name instead of returning `"Self"`
-    /// verbatim — `struct_has_cell_field` searches for `struct Self`, which never exists.
     fn enclosing_struct_literal_type(code: &str, idx: usize) -> Option<&str> {
         let bytes = code.as_bytes();
         let mut depth = 0i32;
@@ -1674,7 +1411,7 @@ pub(crate) mod grid_cell_tripwire {
                         }
                     }
                     if start == end {
-                        return None; // no identifier right before `{` — a bare code block
+                        return None;
                     }
                     let ident = &code[start..end];
                     if ident == "Self" {
@@ -1692,13 +1429,6 @@ pub(crate) mod grid_cell_tripwire {
         None
     }
 
-    /// `true` if `code` (a single file's text) declares `struct TYPE_NAME { .. pub cell: i64 .. }`
-    /// somewhere — i.e. `TYPE_NAME` is one of the cell-bearing rows this tripwire polices. Every
-    /// cell-bearing type's struct literals in this codebase live in the same file as its own `#[table]`
-    /// definition, so a same-file search is enough; a type this can't find (or that genuinely has no
-    /// `cell` column — several event-log tables carry `grid_x`/`grid_y` as a plain `by_grid` btree
-    /// index with no packed `cell` at all, by design) is treated as "not this tripwire's business",
-    /// not as a violation.
     fn struct_has_cell_field(code: &str, type_name: &str) -> bool {
         let needle = format!("struct {type_name}");
         let mut search_from = 0usize;
@@ -1740,25 +1470,7 @@ pub(crate) mod grid_cell_tripwire {
         false
     }
 
-    /// Every line where `code` writes `grid_x` — via `grid_x: value` (an explicit initializer or
-    /// assignment target), `.grid_x = value` (a field assignment), or bare field-init SHORTHAND
-    /// `grid_x,` — with no `cell` write within `WINDOW` characters after it. Shared by the
-    /// real-file scan below and its own fixture test, so both exercise the identical matching logic.
-    ///
-    /// The shorthand form gets two extra gates the explicit forms don't need, because unlike
-    /// `grid_x: ` / `.grid_x = ` its literal text also shows up somewhere that ISN'T a struct-literal
-    /// write: `grid_x,` must sit in a struct-literal FIELD position (`is_field_position` — the
-    /// nearest non-whitespace character before it is `{` or `,`; excludes a read like
-    /// `grid_cell_id(grid_x, grid_y)`, whose preceding character is `(`, regardless of whether the
-    /// field shares a line with others), AND its enclosing struct-literal type must actually declare
-    /// a `cell` column (`enclosing_struct_literal_type` + `struct_has_cell_field` — excludes both
-    /// ordinary function-call arguments, whose enclosing brace is a fn/if/match body not a type name,
-    /// and the several event-log tables that carry `grid_x`/`grid_y` with no `cell` column at all,
-    /// by design). `enclosing_struct_literal_type` resolves a literal `Self { .. }` constructor
-    /// through `resolve_self_type` to the `impl` block's real type name, so a constructor written as
-    /// `Self { .. }` inside `impl E { .. }` is policed exactly like `E { .. }` would be.
     fn grid_x_writes_missing_cell(code: &str) -> Vec<usize> {
-        // Assembled at run time — a contiguous literal would match this file's own text.
         let field_init = format!("{}{}", "grid_x", ": ");
         let assign = format!("{}{}", ".grid_x", " = ");
         let shorthand = format!("{}{}", "grid_x", ",");
@@ -1782,7 +1494,6 @@ pub(crate) mod grid_cell_tripwire {
                     }
                 }
                 let mut end = (idx + WINDOW).min(code.len());
-                // The window is a byte count; step past a multi-byte char it would otherwise split.
                 while !code.is_char_boundary(end) {
                     end += 1;
                 }
@@ -1825,7 +1536,6 @@ pub(crate) mod grid_cell_tripwire {
         );
     }
 
-    /// The tripwire is only worth anything if it would actually fire. Feed it the shape it hunts.
     #[test]
     fn the_scan_rejects_a_grid_write_with_no_cell_beside_it() {
         let bad = "fn f(e: &mut E) {\n    e.grid_x = gx;\n    e.grid_y = gy;\n}\n";
@@ -1846,17 +1556,8 @@ pub(crate) mod grid_cell_tripwire {
         );
     }
 
-    /// The tripwire's original `grid_x: ` needle never saw field-init SHORTHAND
-    /// (`grid_x,`, no `: value`) — what an initializer built from same-named locals uses, the
-    /// idiom `motion.rs` uses throughout. This feeds `grid_x_writes_missing_cell` a struct literal
-    /// written that way and asserts a broken one (no `cell` field) is CAUGHT, a correct one PASSES,
-    /// and a `grid_x,` that is merely a function-call ARGUMENT (a read, not a struct-literal field)
-    /// is not mistaken for a write.
     #[test]
     fn the_scan_catches_a_broken_shorthand_initializer() {
-        // `struct E` declares a `cell` column, so this tripwire is E's business — mirrors a real
-        // cell-bearing table's own file, where the `#[table]` struct and every construction site
-        // live together.
         let cell_bearing_struct =
             "struct E {\n    pub grid_x: i32,\n    pub grid_y: i32,\n    pub cell: i64,\n}\n";
 
@@ -1883,8 +1584,6 @@ pub(crate) mod grid_cell_tripwire {
             "`grid_x,` as a function-call ARGUMENT (a read) must not be mistaken for a write"
         );
 
-        // A struct with grid_x/grid_y but genuinely NO `cell` column (the event-log-table shape) —
-        // shorthand there is legitimately not this tripwire's business.
         let no_cell_struct = "struct NoCell {\n    pub grid_x: i32,\n    pub grid_y: i32,\n}\n";
         let no_cell_use = format!(
             "{no_cell_struct}fn f() -> NoCell {{\n    NoCell {{\n        grid_x,\n        grid_y,\n    }}\n}}\n"
@@ -1933,18 +1632,14 @@ pub(crate) mod grid_cell_tripwire {
     }
 }
 
-/// ENFORCEMENT tripwire: Core source names no official Package, in code, comments or the
-/// generated Gateway bindings. Core must build and read the same with no Package installed.
 #[cfg(test)]
 pub(crate) mod package_name_tripwire {
     use std::path::{Path, PathBuf};
 
-    /// The official Packages (LyraCoreProject/packages) that Core must not name.
     const OFFICIAL_PACKAGES: &[&str] = &["playerbots"];
 
     const CORE_TREES: &[&str] = &["module", "gateway", "crates", "importer"];
 
-    /// Test-only files may name a Package, and this file holds the list.
     fn is_exempt(rel: &str) -> bool {
         rel == "module/src/tripwires.rs"
             || rel.ends_with("_tests.rs")

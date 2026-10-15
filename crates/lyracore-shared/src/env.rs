@@ -1,18 +1,11 @@
-//! Environmental damage: fall damage from the client-reported airborne time. Shared by the
-//! module (applies the damage in `movement_update`) and the gateway (sends the matching
-//! `SMSG_ENVIRONMENTAL_DAMAGE_LOG` flavor line) so the two can never drift.
-
-/// Vanilla's `MOVEMENTFLAG_SWIMMING` bit. It is also set while floating at the surface, so it
-/// must be combined with the water-surface test in [`is_submerged`].
+// SWIMMING also applies at the surface; combine it with the liquid height.
 pub const MOVEMENT_FLAG_SWIMMING: u32 = 0x0020_0000;
 
-/// Build-5875 transport movement carries a full guid and relative pose.
 pub const MOVEMENT_FLAG_ON_TRANSPORT: u32 = 0x0200_0000;
 
-/// Default player collision height.
+// Collision height in yards.
 pub const UNDERWATER_HEAD_HEIGHT: f32 = 2.0;
 
-/// Whether the player's head is below a liquid surface.
 pub fn is_submerged(
     player_z: f32,
     liquid_level: f32,
@@ -24,21 +17,17 @@ pub fn is_submerged(
         && player_z + UNDERWATER_HEAD_HEIGHT < liquid_level
 }
 
-/// The breath bar's full duration and its surface refill time, pinned to vanilla's roughly
-/// one-minute `Player::HandleDrowning` window and deliberately slower recovery.
 pub const FULL_AIR_MICROS: i64 = 60_000_000;
 pub const REFILL_MICROS: i64 = 10_000_000;
 pub const DROWNING_INTERVAL_MICROS: i64 = 1_000_000;
 pub const MAX_DROWNING_CATCHUP_TICKS: u32 = 5;
 
-/// Pure state-machine result for a draining or refilling breath bar.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BreathAdvance {
     pub remaining_air_micros: i64,
     pub drowning_ticks: u32,
 }
 
-/// Advance a breath bar by elapsed time.
 pub fn advance_breath(
     remaining_air_micros: i64,
     draining: bool,
@@ -71,16 +60,11 @@ pub fn advance_breath(
     }
 }
 
-/// One fifth of maximum health per drowning tick.
 pub fn drowning_damage(max_health: u32) -> u32 {
     max_health.saturating_mul(20).saturating_add(99) / 100
 }
 
-/// Fall damage from airborne time: WoW gravity ~19.29 yd/s^2 gives free-fall height h = 0.5*g*t^2,
-/// folded into the mangos height curve `damage% = 1.8%*yd - 24.26%` (safe under ~13.5 yd, which is
-/// ~1.18 s airborne). `fall_time_ms` is the client's MovementInfo fall time on MSG_MOVE_FALL_LAND —
-/// it INCLUDES the jump ascent, so a flat-ground hop (~750 ms) lands at 0. Client-authoritative like
-/// all movement (a hacked client can lie; the movement anti-cheat owns that). Capped at max_health.
+// Client fall_time_ms includes jump ascent; gravity is about 19.29 yd/s^2.
 pub fn fall_damage(fall_time_ms: u32, max_health: u32) -> u32 {
     let t = fall_time_ms as f32 / 1000.0;
     let height_yd = 0.5 * 19.29 * t * t;
@@ -91,20 +75,15 @@ pub fn fall_damage(fall_time_ms: u32, max_health: u32) -> u32 {
     (max_health as f32 * perc.min(1.0)) as u32
 }
 
-/// `fall_time` (u32 ms) out of a raw vanilla MovementInfo body: flags u32 LE, time u32, x/y/z/o
-/// 16 B, then [transport guid u64 + pos 16 B if flag 0x02000000], [pitch f32 if SWIMMING 0x0020_0000],
-/// then fall_time. `None` on a short body or an on-transport mover (no fall damage on transports).
-/// NOTE the wire TYPE: cmangos reads fall time as u32 MILLISECONDS; gtker's MovementInfo types the
-/// same 4 bytes f32 (a field-type lie, like its field-name ones) — this parser and any gtker-side
-/// consumer must agree on the raw-u32 reading (`f32::to_bits` at the gtker boundary).
+// Fall time is raw u32 milliseconds; gtker types those same bytes as f32.
 pub fn fall_time_from_movement_info(body: &[u8]) -> Option<u32> {
     let flags = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
     if flags & MOVEMENT_FLAG_ON_TRANSPORT != 0 {
         return None;
     }
-    let mut off = 4 + 4 + 16; // flags + time + x/y/z/o
+    let mut off = 4 + 4 + 16;
     if flags & MOVEMENT_FLAG_SWIMMING != 0 {
-        off += 4; // pitch
+        off += 4;
     }
     Some(u32::from_le_bytes(body.get(off..off + 4)?.try_into().ok()?))
 }
@@ -116,11 +95,11 @@ mod tests {
     #[test]
     fn fall_damage_curve() {
         assert_eq!(fall_damage(0, 100), 0);
-        assert_eq!(fall_damage(800, 100), 0); // a flat-ground jump is safe
-        assert_eq!(fall_damage(1_180, 100), 0); // ~13.4 yd — the safe threshold
-        let d15 = fall_damage(1_500, 100); // ~21.7 yd → ~15%
+        assert_eq!(fall_damage(800, 100), 0);
+        assert_eq!(fall_damage(1_180, 100), 0);
+        let d15 = fall_damage(1_500, 100);
         assert!((10..25).contains(&d15), "{d15}");
-        assert_eq!(fall_damage(10_000, 100), 100); // terminal: capped at max_health
+        assert_eq!(fall_damage(10_000, 100), 100);
     }
 
     #[test]
@@ -128,17 +107,14 @@ mod tests {
         let mut body = vec![0u8; 24];
         body.extend_from_slice(&1500u32.to_le_bytes());
         assert_eq!(fall_time_from_movement_info(&body), Some(1500));
-        // swimming: pitch shifts fall_time by 4
         let mut swim = MOVEMENT_FLAG_SWIMMING.to_le_bytes().to_vec();
-        swim.extend_from_slice(&[0u8; 20]); // time + pos
-        swim.extend_from_slice(&0f32.to_le_bytes()); // pitch
+        swim.extend_from_slice(&[0u8; 20]);
+        swim.extend_from_slice(&0f32.to_le_bytes());
         swim.extend_from_slice(&2000u32.to_le_bytes());
         assert_eq!(fall_time_from_movement_info(&swim), Some(2000));
-        // transport: no fall damage
         let mut tr = 0x0200_0000u32.to_le_bytes().to_vec();
         tr.extend_from_slice(&[0u8; 60]);
         assert_eq!(fall_time_from_movement_info(&tr), None);
-        // short body: None, never a panic
         assert_eq!(fall_time_from_movement_info(&[0u8; 10]), None);
     }
 
@@ -147,10 +123,10 @@ mod tests {
         let surface = 10.0;
         let swimming = MOVEMENT_FLAG_SWIMMING;
 
-        assert!(!is_submerged(8.0, surface, true, swimming)); // head exactly at surface
+        assert!(!is_submerged(8.0, surface, true, swimming));
         assert!(is_submerged(7.99, surface, true, swimming));
         assert!(!is_submerged(8.01, surface, true, swimming));
-        assert!(!is_submerged(0.0, surface, false, swimming)); // dry/off-slice cell
+        assert!(!is_submerged(0.0, surface, false, swimming));
         assert!(!is_submerged(0.0, surface, true, 0));
     }
 

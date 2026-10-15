@@ -1,5 +1,3 @@
-//! Lock-free observations at the movement batch submission boundary.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,8 +45,6 @@ impl MovementBatchMetrics {
         }
     }
 
-    /// Record one attempted reducer call. Entries in a failed call are reported as dropped,
-    /// separately from successful submissions.
     pub fn observe(&self, entries: usize, succeeded: bool) {
         let entries = entries as u64;
         self.entries.fetch_add(entries, Ordering::Relaxed);

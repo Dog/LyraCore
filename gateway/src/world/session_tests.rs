@@ -1,7 +1,3 @@
-//! Session-level socket tests: the handshake and its deadlines, the admission queue, world entry
-//! and world-port re-entry, movement and its coalescing, logout, and the order a World Session
-//! closes in.
-
 use super::*;
 
 #[derive(Clone)]
@@ -84,17 +80,14 @@ fn handshake_succeeds_and_traffic_is_encrypted_both_ways() {
             .expect("handshake should succeed");
         assert_eq!(conn.account_id, 42);
         assert_eq!(conn.account_name, "TESTER");
-        // Prove the inbound cipher works: read one encrypted client message.
         match ClientOpcodeMessage::read_encrypted(&mut s, &mut conn.decrypt).unwrap() {
             ClientOpcodeMessage::CMSG_CHAR_ENUM => {}
             other => panic!("expected encrypted CMSG_CHAR_ENUM, got {other}"),
         }
     });
 
-    // --- client: drive the shared challenge→proof→AUTH_SESSION prefix (`drive_auth`) ---
     let (mut c_enc, mut c_dec) = drive_auth(&mut client, "TESTER", K);
 
-    // --- client: the AUTH_OK response is the first ENCRYPTED packet ---
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_AUTH_RESPONSE(r) => {
             assert!(matches!(*r, SMSG_AUTH_RESPONSE::AuthOk { .. }));
@@ -102,7 +95,6 @@ fn handshake_succeeds_and_traffic_is_encrypted_both_ways() {
         other => panic!("expected encrypted SMSG_AUTH_RESPONSE, got {other}"),
     }
 
-    // --- client: send an encrypted CMSG the server decrypts ---
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -111,9 +103,6 @@ fn handshake_succeeds_and_traffic_is_encrypted_both_ways() {
     server.join().unwrap();
 }
 
-/// The typed decoder would size a buffer from the addon field and unwrap the zlib. The gateway
-/// never reads the addon list, so a 4 GiB claim over garbage bytes changes nothing: the proof is
-/// checked and AUTH_OK goes out.
 #[test]
 fn an_auth_session_with_an_absurd_addon_size_still_completes_the_handshake() {
     let store = std::sync::Arc::new(tester_store(42));
@@ -131,7 +120,6 @@ fn an_auth_session_with_an_absurd_addon_size_still_completes_the_handshake() {
         client_seed.into_client_header_crypto(&ns("TESTER"), K, server_seed);
     let (_c_enc, mut c_dec) = crypto.split();
 
-    // Hand-built frame: the fixed fields, then a 4 GiB decompressed-size claim over garbage.
     let mut body = Vec::new();
     body.extend_from_slice(&5875u32.to_le_bytes());
     body.extend_from_slice(&1u32.to_le_bytes());
@@ -156,8 +144,6 @@ fn an_auth_session_with_an_absurd_addon_size_still_completes_the_handshake() {
     server.join().unwrap().unwrap();
 }
 
-/// A peer that reads the challenge and never answers must give its blocking thread back at the
-/// total pre-auth deadline.
 #[test]
 fn a_silent_world_connection_is_closed_at_the_pre_auth_deadline() {
     let store = tester_store(42);
@@ -272,7 +258,6 @@ fn world_challenge_write_uses_the_absolute_pre_auth_deadline() {
     );
 }
 
-/// Once client proof succeeds, authenticated World Session traffic has no pre-auth deadline.
 #[test]
 fn post_auth_world_traffic_has_no_pre_auth_deadline() {
     let store = std::sync::Arc::new(tester_store(42));
@@ -305,7 +290,6 @@ fn post_auth_world_traffic_has_no_pre_auth_deadline() {
 fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
     let store = std::sync::Arc::new(tester_store(42));
     let queue = std::sync::Arc::new(LoginQueue::new(1, 0));
-    // Occupy the only seat directly — exactly what an already-connected world session holds.
     assert_eq!(queue.request(), Admission::Admitted);
 
     let (mut client, server_end) = world_session_socket_pair();
@@ -313,7 +297,6 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
     let server_queue = queue.clone();
     let server = std::thread::spawn(move || {
         let mut s = server_end;
-        // Blocks in the queue's wait loop until `queue.depart()` (below) frees the one seat.
         let (conn, _encrypt) =
             world_handshake_with_queue(&mut s, server_store.clone(), &server_queue)
                 .unwrap()
@@ -321,11 +304,8 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
         assert_eq!(conn.account_id, 42);
     });
 
-    // --- client: drive the shared challenge→proof→AUTH_SESSION prefix (`drive_auth`) ---
     let (_c_enc, mut c_dec) = drive_auth(&mut client, "TESTER", K);
 
-    // --- client: the FIRST encrypted response must be AuthWaitQueue at position 1, not AuthOk —
-    // proving the handshake actually queued instead of bypassing the gate ---
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_AUTH_RESPONSE(r) => {
             assert!(
@@ -336,8 +316,6 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
         other => panic!("expected encrypted SMSG_AUTH_RESPONSE, got {other}"),
     }
 
-    // Free the one seat — mirrors what `run_world_session_with_queue`'s teardown does on a real
-    // disconnect. The queued handshake must notice on its next poll and proceed to admission.
     queue.depart();
 
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
@@ -358,7 +336,7 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
 fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
     let store = std::sync::Arc::new(tester_store(7));
     let queue = std::sync::Arc::new(LoginQueue::new(1, 0));
-    assert_eq!(queue.request(), Admission::Admitted); // occupy the only seat
+    assert_eq!(queue.request(), Admission::Admitted);
 
     let (mut client, server_end) = world_session_socket_pair();
     let server_store = store.clone();
@@ -375,8 +353,6 @@ fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
 
     let (_c_enc, mut c_dec) = drive_auth(&mut client, "TESTER", K);
 
-    // Read (and discard) the first AuthWaitQueue so we know the server has actually queued us
-    // before hanging up — a hangup racing the very first send would prove nothing about `cancel`.
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_AUTH_RESPONSE(r) => {
             assert!(matches!(*r, SMSG_AUTH_RESPONSE::AuthWaitQueue { .. }));
@@ -384,11 +360,9 @@ fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
         other => panic!("expected AuthWaitQueue, got {other}"),
     }
 
-    drop(client); // hang up while still queued
+    drop(client);
     server.join().unwrap();
 
-    // The seat is still held by the ORIGINAL occupant (never touched); the queued-then-cancelled
-    // connection must have left NO trace in the line.
     assert_eq!(
         queue.depth(),
         0,
@@ -403,17 +377,6 @@ fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
 
 #[test]
 fn a_restarted_gateway_completes_the_handshake_from_realm_state_alone() {
-    // The stateless-gateway invariant, now realm-scoped. The session key K lives in
-    // `game_session` — on realm-core when it is configured, on the world DB when it is not — and
-    // the gateway keeps NOTHING about it. So killing the gateway mid-session and starting a fresh
-    // one must let the same account re-handshake with no re-logon, against a brand-new process
-    // that has never seen this client.
-    //
-    // Modelled here as two handshakes against two INDEPENDENT store instances that share only the
-    // realm-held session row: `store_before` is the gateway that gets killed, `store_after` is the
-    // replacement. Each handshake mints its own server seed and its own client seed, so nothing
-    // from the first run can be smuggled into the second — if any handshake input were
-    // gateway-local rather than realm state, the second run could not succeed.
     let realm_session = || WorldSession {
         account_id: 42,
         session_key: K,
@@ -442,12 +405,10 @@ fn a_restarted_gateway_completes_the_handshake_from_realm_state_alone() {
     };
     assert_eq!(handshake_once(store_before), 42);
 
-    // ---- the gateway is killed here; every byte of its in-process state is gone ----
-
     let store_after = WorldFake {
         session: SessionState {
             username: "TESTER".into(),
-            session: Some(realm_session()), // re-READ from the realm, not carried over
+            session: Some(realm_session()),
             ..Default::default()
         },
         ..Default::default()
@@ -461,11 +422,6 @@ fn a_restarted_gateway_completes_the_handshake_from_realm_state_alone() {
 
 #[test]
 fn a_gateway_that_cannot_reach_the_session_store_rejects_rather_than_guessing() {
-    // The other half of the stateless-gateway invariant: "resume from realm state" must not
-    // degrade into "resume from anything". A store that cannot answer (realm-core unreachable →
-    // `lookup_session` yields no session) rejects the handshake plaintext instead of establishing
-    // a session on an unverified key. `CoordinatorStore` reaches this state by way of
-    // `Coordinator::realm_core()`'s Err.
     let store = WorldFake {
         session: SessionState {
             username: "TESTER".into(),
@@ -498,8 +454,6 @@ fn a_gateway_that_cannot_reach_the_session_store_rejects_rather_than_guessing() 
 
 #[test]
 fn bad_proof_is_rejected() {
-    // The store hands out a session key, but the client computes its proof against a
-    // DIFFERENT key, so the server's digest check must fail.
     let store = WorldFake {
         session: SessionState {
             username: "TESTER".into(),
@@ -534,7 +488,6 @@ fn bad_proof_is_rejected() {
         .write_unencrypted_client(&mut client)
         .unwrap();
 
-    // The failure is sent plaintext (no cipher was established).
     match ServerOpcodeMessage::read_unencrypted(&mut client).unwrap() {
         ServerOpcodeMessage::SMSG_AUTH_RESPONSE(r) => {
             assert!(matches!(*r, SMSG_AUTH_RESPONSE::AuthFailed));
@@ -551,7 +504,7 @@ fn unknown_account_is_rejected_cleanly() {
     let store = WorldFake {
         session: SessionState {
             username: "TESTER".into(),
-            session: None, // account exists nowhere / no session
+            session: None,
             ..Default::default()
         },
         ..Default::default()
@@ -580,9 +533,6 @@ fn unknown_account_is_rejected_cleanly() {
 
 #[test]
 fn login_replays_a_pending_package_system_message() {
-    // A Package `on_login` hook emits its System Message INSIDE `player_login` — before the
-    // session is in the viewer registry, so the live insert relay has nobody to address. World
-    // entry must replay the parked row right after the entry sequence.
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
@@ -621,9 +571,6 @@ fn login_replays_a_pending_package_system_message() {
 
 #[test]
 fn player_login_emits_sequence_then_self_create() {
-    // CMSG_PLAYER_LOGIN must yield the full login sequence (in order), then the self
-    // CREATE_OBJECT2 at the correct position/guid, then the current zone's weather — the clock
-    // (SMSG_LOGIN_SETTIMESPEED) before the sky, so the client has both before it renders.
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
@@ -632,7 +579,6 @@ fn player_login_emits_sequence_then_self_create() {
                 ..base.session
             },
             weather: WeatherState {
-                // Elwynn Forest (the fixture's zone) is raining hard.
                 zone_weather: vec![(
                     12,
                     codec::ZoneWeatherView {
@@ -656,7 +602,6 @@ fn player_login_emits_sequence_then_self_create() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // The 11-message login sequence, the self CREATE_OBJECT2, then the zone's weather.
     let mut tags = Vec::new();
     let mut create_guid = None;
     let mut weather = None;
@@ -715,8 +660,6 @@ fn player_login_emits_sequence_then_self_create() {
         ],
     );
     assert_eq!(create_guid, Some(1));
-    // Elwynn's stored rain, synchronized rather than faded in: an arriving client must not spend
-    // a transition rendering the sky it happened to have last.
     let weather = weather.expect("world entry sends the zone's weather");
     assert_eq!(weather.weather_type, WeatherType::Rain);
     assert_eq!(weather.grade, 0.8);
@@ -729,21 +672,14 @@ fn player_login_emits_sequence_then_self_create() {
 
 #[test]
 fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
-    // MSG_MOVE_WORLDPORT_ACK must re-run the SAME enter_world path as
-    // CMSG_PLAYER_LOGIN — rebuilding the entity (now on the NEW map the module's teleport_player
-    // durably wrote to the character row) and re-subscribing with a FRESH `created` dedup set — a
-    // reused dedup set from the old map would suppress the initial sweep of pre-existing entities
-    // through the CREATE path, leaving the new map looking empty until something moved or spawned —
-    // a stale created-set is exactly what would leave entities invisible on cross-map arrival.
     let mut ported = warrior_entity();
-    ported.map_id = 1; // Kalimdor — simulates teleport_player's durable cross-map write
+    ported.map_id = 1;
     ported.x = 100.0;
     ported.y = 200.0;
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
             session: SessionState {
-                // A real cross-map teleport has despawned the old-map entity before its ack arrives.
                 entity_in_world: false,
                 login_entity: Some(warrior_entity()),
                 worldport_entity: Some(ported),
@@ -767,7 +703,6 @@ fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
     CMSG_PLAYER_LOGIN { guid: Guid::new(1) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    // Drain world entry (map 0 — not the point of this test).
     drain_world_entry(&mut client, &mut c_dec);
 
     let _ = open_loot_window(&mut client, &mut c_enc, &mut c_dec, 60);
@@ -776,7 +711,6 @@ fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // Re-entry skips SMSG_LOGIN_VERIFY_WORLD because resending it reloads the current map.
     let mut create_guid = None;
     for message in drain_world_entry(&mut client, &mut c_dec) {
         match message {
@@ -800,8 +734,6 @@ fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
         "the self entity is re-created (despawn+rebuild), not a stale row"
     );
 
-    // subscribe_player_events must have fired TWICE: once at login (map 0), once at the world-port
-    // re-entry (map 1) — a fresh `created` set is built for the new map each time, never reused.
     let calls = store.session.subscribed.lock().unwrap().clone();
     assert_eq!(
         calls.len(),
@@ -819,7 +751,6 @@ fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
          subscription placement is the observable)"
     );
 
-    // The old map's open window cannot authorize a targetless request after re-entry.
     CMSG_LOOT_MONEY {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -830,7 +761,6 @@ fn worldport_ack_reenters_with_fresh_subscription_and_empty_loot_state() {
         store.loot_window.money_looted.lock().unwrap().is_empty(),
         "world-port re-entry must start with no open loot target"
     );
-    // The login ends the Away Status; the world-port rides the reducer that keeps it.
     assert_eq!(
         store.session.login_entries.lock().unwrap().as_slice(),
         [codec::WorldEntry::FreshLogin, codec::WorldEntry::WorldPort]
@@ -904,9 +834,6 @@ fn worldport_removes_the_source_viewer_before_routing_and_registers_a_replacemen
 
 #[test]
 fn login_initialize_factions_carries_persisted_standing_at_its_reputation_index() {
-    // A persisted `game_player_reputation` row must land in the login
-    // SMSG_INITIALIZE_FACTIONS at its STORED reputation_index slot (0..63), never faction_id — the
-    // guardrail that also gates the live SET_FACTION_STANDING relay (McBride ERROR).
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
@@ -915,8 +842,6 @@ fn login_initialize_factions_carries_persisted_standing_at_its_reputation_index(
                 ..base.session
             },
             character: CharacterState {
-                // Stormwind's rep-index is 19 (Faction.dbc ReputationListID), NOT its faction id (72) —
-                // exercising the exact index/id distinction the guardrail protects.
                 reputations: vec![(19, 3175, false)],
                 ..base.character
             },
@@ -935,7 +860,6 @@ fn login_initialize_factions_carries_persisted_standing_at_its_reputation_index(
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // Drain the whole world entry so the server side doesn't see a broken pipe.
     let mut factions = None;
     for message in drain_world_entry(&mut client, &mut c_dec) {
         if let ServerOpcodeMessage::SMSG_INITIALIZE_FACTIONS(m) = message {
@@ -948,8 +872,6 @@ fn login_initialize_factions_carries_persisted_standing_at_its_reputation_index(
         factions[19].standing, 3175,
         "slot 19 (the stored reputation_index) must carry the standing"
     );
-    // Stormwind's faction_id (72) is itself past the 64-slot array — proof that indexing by faction_id
-    // (the McBride bug) would panic/crash here rather than silently landing on the wrong slot.
     for (i, f) in factions.iter().enumerate() {
         if i != 19 {
             assert_eq!(f.standing, 0, "slot {i} should remain the Neutral/0 stub");
@@ -1004,8 +926,6 @@ fn login_with_resident_items_and_reputation_emits_no_gain_feedback() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // World entry, which carries the resident item's CREATE. The item and standing are snapshots
-    // in those frames, not live insert callbacks, so neither feedback packet is lawful.
     for message in drain_world_entry(&mut client, &mut c_dec) {
         assert!(
             !matches!(
@@ -1065,8 +985,6 @@ fn login_fills_a_resident_suffix_items_enchantment_slots_after_the_entry_batch()
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // World entry, which carries the item's CREATE, then the raw update gtker's typed reader
-    // rejects.
     drain_world_entry(&mut client, &mut c_dec);
     let (opcode, body) = read_raw_frame(&mut client, &mut c_dec);
     assert_eq!(opcode, 0x00A9);
@@ -1123,7 +1041,7 @@ fn inbound_movement_is_recorded_under_its_opcode() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    drop(client); // server reads the heartbeat, then EOF
+    drop(client);
     server.join().unwrap();
 
     let moves = store.session.moves.lock().unwrap();
@@ -1184,8 +1102,6 @@ fn a_movement_packet_for_a_despawned_entity_never_kills_the_session() {
             fall_time: 0.0,
         },
     };
-    // The first packet is a transfer tail. Once the coordinator cache sees the entity again, the
-    // next state transition must resume normal batched submission.
     beat(1)
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -1390,7 +1306,6 @@ fn a_movement_desync_that_never_heals_still_ends_the_session() {
         let base = tester_store(7);
         WorldFake {
             session: SessionState {
-                // The entity is gone and is NEVER coming back — not a teleport tail, a real desync.
                 entity_in_world: false,
                 ..base.session
             },
@@ -1412,10 +1327,6 @@ fn a_movement_desync_that_never_heals_still_ends_the_session() {
         orientation: 1.5,
         fall_time: 0.0,
     };
-    // State transitions, so every one forwards immediately (never coalesced). Far more than a
-    // cross-map port's in-flight tail, and spread over more time than any loading screen's worth of
-    // queued packets — a session still serving these has stopped detecting desyncs altogether.
-    // Writes are best-effort: the socket SHOULD close partway through, which is the whole point.
     for i in 0..200u32 {
         let ok = if i % 2 == 0 {
             MSG_MOVE_START_FORWARD_Client { info: info(i) }
@@ -1454,7 +1365,6 @@ fn a_world_port_whose_transfer_cannot_be_driven_aborts_the_clients_loading_scree
         let base = tester_store(7);
         WorldFake {
             session: SessionState {
-                // The world-port ack is only actionable after teleport_player removed the old entity.
                 entity_in_world: false,
                 login_entity: Some(warrior_entity()),
                 relay_view: Some(view.clone()),
@@ -1467,7 +1377,7 @@ fn a_world_port_whose_transfer_cannot_be_driven_aborts_the_clients_loading_scree
             },
             topology: TopologyState {
                 settle_error: Some("instances shard unreachable".into()),
-                settle_ok_calls: 1, // the LOGIN routes fine; the world-port's settle is the one that fails
+                settle_ok_calls: 1,
                 ..base.topology
             },
             ..base
@@ -1482,7 +1392,6 @@ fn a_world_port_whose_transfer_cannot_be_driven_aborts_the_clients_loading_scree
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
     drain_world_entry(&mut client, &mut c_dec);
-    // The client finished loading the dungeon map and acks — this is where the transfer runs.
     MSG_MOVE_WORLDPORT_ACK {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -1536,10 +1445,8 @@ fn a_world_port_whose_world_entry_fails_also_aborts_the_clients_loading_screen()
         let base = tester_store(7);
         WorldFake {
             session: SessionState {
-                // The world-port ack is only actionable after teleport_player removed the old entity.
                 entity_in_world: false,
                 login_entity: Some(warrior_entity()),
-                // Routing succeeds; the world entry on the far side is what fails.
                 worldport_login_error: Some("character 1 is stranded on map 36".into()),
                 ..base.session
             },
@@ -1564,8 +1471,6 @@ fn a_world_port_whose_world_entry_fails_also_aborts_the_clients_loading_screen()
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // Drain whatever the (partial) re-entry emitted and require an abort somewhere in it — the
-    // client must not be left loading. `read_encrypted` returns Err once the socket closes.
     let mut aborted = None;
     while let Ok(msg) = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec) {
         if let ServerOpcodeMessage::SMSG_TRANSFER_ABORTED(m) = msg {
@@ -1616,28 +1521,21 @@ fn movement_state_changes_forward_immediately_and_in_order_never_delayed() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // Same flags + heading as the run-start -> a pure heartbeat -> held pending (nowhere near the
-    // 150ms window in real wall-clock terms, since these all write back-to-back with no sleep).
     MSG_MOVE_HEARTBEAT_Client {
         info: mk(RUN, 0.0, 5.0, 200),
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // A second same-vector heartbeat SUPERSEDES the first (rule 3: the pending slot IS the drop
-    // mechanism) — x=5.0 must never reach the module.
     MSG_MOVE_HEARTBEAT_Client {
         info: mk(RUN, 0.0, 10.0, 300),
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // A turn: different flags -> a STATE CHANGE. Must flush the pending x=10.0 heartbeat FIRST,
-    // then forward the turn itself, both undelayed.
     MSG_MOVE_START_TURN_LEFT_Client {
         info: mk(TURN, 5.0, 10.0, 400),
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // A stop: another STATE CHANGE, no pending left to flush — forwards immediately alone.
     MSG_MOVE_STOP_Client {
         info: mk(STOPPED, 5.0, 10.0, 500),
     }
@@ -1653,14 +1551,13 @@ fn movement_state_changes_forward_immediately_and_in_order_never_delayed() {
         opcodes,
         vec![
             lyracore_shared::opcodes::movement::MSG_MOVE_START_FORWARD,
-            lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT, // the FLUSHED x=10.0 heartbeat
+            lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT,
             lyracore_shared::opcodes::movement::MSG_MOVE_START_TURN_LEFT,
             lyracore_shared::opcodes::movement::MSG_MOVE_STOP,
         ],
         "run-start, [flushed heartbeat], turn, stop — in that exact order; the turn and stop must \
          never be held, and the superseded x=5.0 intermediate must never appear at all"
     );
-    // The flushed heartbeat carries the LATEST pending position (x=10.0), not the dropped x=5.0 one.
     assert!(
         (moves[1].1 - 10.0).abs() < 0.01,
         "flushed heartbeat must carry the superseding x=10.0, not the dropped x=5.0"
@@ -1693,8 +1590,6 @@ fn non_movement_opcode_flushes_pending_heartbeat_before_being_handled() {
     MSG_MOVE_START_FORWARD_Client { info: mk(0.0, 100) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    // Three same-vector heartbeats, sent back-to-back (well inside the 150ms window): each
-    // supersedes the last in the pending slot, so only the FINAL one (x=30.0) may ever ship.
     MSG_MOVE_HEARTBEAT_Client {
         info: mk(10.0, 200),
     }
@@ -1717,11 +1612,9 @@ fn non_movement_opcode_flushes_pending_heartbeat_before_being_handled() {
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
-        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {} // the query itself was still answered normally
+        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {}
         other => panic!("expected SMSG_QUESTGIVER_STATUS, got {other}"),
     }
-    // Safe to inspect now: the reply we just read could only have been produced AFTER the query's
-    // dispatch ran (flush, then the query handler) on the single-threaded reader/dispatch loop.
     {
         let moves = store.session.moves.lock().unwrap();
         assert_eq!(
@@ -1742,15 +1635,10 @@ fn non_movement_opcode_flushes_pending_heartbeat_before_being_handled() {
 
 #[test]
 fn desync_error_classifies_entity_missing_as_fatal_but_not_transient() {
-    // The module's `entity_by_owner` failures (the player's entity is gone — a desync, e.g. a
-    // schema-change publish dropped the gateway's read subscription) must be session-FATAL so the
-    // handler forces a CLEAN disconnect instead of leaving a silent zombie (can't attack / can't logout).
     assert!(is_desync_error(&anyhow!("attacker not in world")));
     assert!(is_desync_error(&anyhow!("caster not in world")));
     assert!(is_desync_error(&anyhow!("no live entity for guid 5")));
-    assert!(is_desync_error(&anyhow!("Player NOT IN WORLD"))); // case-insensitive
-                                                               // TRANSIENT per-action failures are NOT desync — they stay swallowed (the player keeps playing,
-                                                               // never disconnected). A false positive here would drop players on every dead-target swing.
+    assert!(is_desync_error(&anyhow!("Player NOT IN WORLD")));
     assert!(!is_desync_error(&anyhow!("target is dead")));
     assert!(!is_desync_error(&anyhow!(
         "target out of range (35.0 yd > 30 yd)"
@@ -1788,8 +1676,6 @@ fn the_writer_drains_the_egress_depth_back_to_zero_b2() {
 
 #[test]
 fn logout_while_out_of_combat_succeeds_and_clears_open_loot() {
-    // combat_until_ms=0 (default, never in combat) → CMSG_LOGOUT_REQUEST must reply
-    // Success/Instant + LOGOUT_COMPLETE and the Store must release Account ownership.
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
@@ -1812,7 +1698,6 @@ fn logout_while_out_of_combat_succeeds_and_clears_open_loot() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // First message: SMSG_LOGOUT_RESPONSE(Success, Instant)
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_LOGOUT_RESPONSE(r) => {
             use wow_world_messages::vanilla::{LogoutResult, LogoutSpeed};
@@ -1826,7 +1711,6 @@ fn logout_while_out_of_combat_succeeds_and_clears_open_loot() {
         }
         other => panic!("expected SMSG_LOGOUT_RESPONSE, got {other}"),
     }
-    // Second message: SMSG_LOGOUT_COMPLETE
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_LOGOUT_COMPLETE => {}
         other => panic!("expected SMSG_LOGOUT_COMPLETE, got {other}"),
@@ -1839,7 +1723,6 @@ fn logout_while_out_of_combat_succeeds_and_clears_open_loot() {
     drop(client);
     server.join().unwrap();
 
-    // Releasing Account ownership removes the live Character.
     assert!(
         store
             .session
@@ -1855,17 +1738,12 @@ fn logout_while_out_of_combat_succeeds_and_clears_open_loot() {
 
 #[test]
 fn logout_while_in_combat_is_denied() {
-    // combat_until_ms=u64::MAX → CMSG_LOGOUT_REQUEST must reply FailureInCombat. The session
-    // stays alive (verified by sending a second request and getting a second denial), meaning the
-    // entity was NOT removed during the handler — the player cannot escape combat by logging out.
-    // Note: socket teardown (drop below) still calls leave_world/logout as cleanup; that is correct
-    // and separate from the CMSG gate.
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
             session: SessionState {
                 login_entity: Some(warrior_entity()),
-                combat_until_ms: u64::MAX, // always in combat
+                combat_until_ms: u64::MAX,
                 ..base.session
             },
             ..base
@@ -1873,7 +1751,6 @@ fn logout_while_in_combat_is_denied() {
     });
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
 
-    // First request: must be denied.
     CMSG_LOGOUT_REQUEST {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -1890,9 +1767,6 @@ fn logout_while_in_combat_is_denied() {
         other => panic!("expected SMSG_LOGOUT_RESPONSE(denial) on first request, got {other}"),
     }
 
-    // Second request: still denied (session is still alive, entity still in-world).
-    // If the first denial had accidentally removed the entity / transitioned to CharSelect,
-    // this second request would either hang or produce a different message.
     CMSG_LOGOUT_REQUEST {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -1915,10 +1789,6 @@ fn logout_while_in_combat_is_denied() {
 
 #[test]
 fn played_time_replies_with_the_durable_total_plus_the_live_session_span() {
-    // CMSG_PLAYED_TIME -> SMSG_PLAYED_TIME. The character row carries a durable
-    // 3600s total plus a session_start_micros stamped in the recent past, so the reply must be
-    // strictly greater than the durable floor (the live span gets folded in) and sane (not absurdly
-    // large — bounds the test against a unit mixup, e.g. treating micros as millis).
     let durable_secs: u32 = 3600;
     let session_started_secs_ago: u64 = 5;
     let now_micros = std::time::SystemTime::now()
@@ -1976,9 +1846,6 @@ fn played_time_replies_with_the_durable_total_plus_the_live_session_span() {
 
 #[test]
 fn force_run_speed_change_ack_is_swallowed_with_no_reply_and_no_session_teardown() {
-    // The client's ack to our `.speed`-triggered SMSG_FORCE_RUN_SPEED_CHANGE must be
-    // consumed cleanly (no reply, no desync/disconnect) — proven by a sentinel opcode right after it
-    // still getting its normal reply on the SAME session.
     use wow_world_messages::vanilla::{
         MovementInfo, MovementInfo_MovementFlags, Vector3d, CMSG_FORCE_RUN_SPEED_CHANGE_ACK,
     };
@@ -2008,11 +1875,11 @@ fn force_run_speed_change_ack_is_swallowed_with_no_reply_and_no_session_teardown
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
-        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {} // the ack produced no reply of its own
+        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {}
         other => panic!("expected the sentinel (ack swallowed), got {other}"),
     }
     drop(client);
-    server.join().unwrap(); // the session ran to a clean close, not a desync teardown
+    server.join().unwrap();
 }
 
 #[test]
@@ -2022,8 +1889,6 @@ fn reducer_transport_loss_ends_an_admitted_session_and_frees_one_queue_seat() {
         WorldFake {
             session: SessionState {
                 login_entity: Some(warrior_entity()),
-                // The same dead transport makes leave-world cleanup unreachable. Teardown is best-effort,
-                // but the client session and its admission seat must not wait for that reducer.
                 logout_transport_lost: true,
                 ..base.session
             },
@@ -2305,8 +2170,6 @@ fn closing_a_world_session_interrupts_a_full_socket_without_draining_its_queue()
     writer.join().unwrap();
 }
 
-/// A refused addon-bridge command is dropped and the World Session continues; a Transport Loss
-/// leaves its outcome unknown and ends the session.
 #[test]
 fn an_addon_command_refusal_is_dropped_and_a_transport_loss_ends_the_session() {
     let conn = in_world_conn(42, 1);

@@ -1,5 +1,3 @@
-//! `teardown_package` against a real Shard, with Core's inert fixture Package.
-
 mod support;
 
 use support::Standalone;
@@ -88,7 +86,6 @@ fn teardown_leaves_a_package_character_dormant_and_forgets_the_package_config() 
         "teardown did not record the Package"
     );
 
-    // Idempotent: a second pass over the same Shard finds nothing left to do.
     shard.assert_call("teardown_package", &[&arg(PACKAGE)]);
 }
 

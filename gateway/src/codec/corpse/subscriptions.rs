@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::views::corpse_view;
@@ -16,9 +14,6 @@ pub(crate) fn relay_corpse_create(tx: &SessionTx, self_guid: u64, row: &Corpse) 
     }
 }
 
-/// The corpse CREATE body as outbound packets — shared by the per-player relay, the login
-/// resident sweep, and the shared-dispatch twin. The owner's reclaim-delay
-/// packet rides inside, keyed on the VIEWER's guid.
 pub(crate) fn corpse_create_outbound(self_guid: u64, row: &Corpse) -> Vec<Outbound> {
     let m = codec::build_corpse_create_object(&corpse_view(row.clone()));
     let mut out = vec![Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
@@ -36,8 +31,6 @@ pub(crate) fn corpse_create_outbound(self_guid: u64, row: &Corpse) -> Vec<Outbou
     out
 }
 
-/// The shared-dispatch twin of the per-player `on_corpse_update` relay (corpses): the body→bones
-/// re-CREATE. The instance gate already ran in `world_view::corpse_changed`.
 pub(crate) fn relay_corpse_update(row: &Corpse) -> Vec<Outbound> {
     let m = codec::build_corpse_create_object(&corpse_view(row.clone()));
     vec![Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
@@ -45,8 +38,6 @@ pub(crate) fn relay_corpse_update(row: &Corpse) -> Vec<Outbound> {
     ))]
 }
 
-/// Resurrect prompt: the packet body both legs run. Audience: the
-/// offer's target, resolved by the caller.
 pub(crate) fn resurrect_request_outbound(row: &ResurrectRequest) -> Vec<Outbound> {
     let m = codec::build_resurrect_request(row.caster_guid, row.caster_name.clone());
     vec![Outbound::One(ServerOpcodeMessage::SMSG_RESURRECT_REQUEST(
@@ -54,8 +45,6 @@ pub(crate) fn resurrect_request_outbound(row: &ResurrectRequest) -> Vec<Outbound
     ))]
 }
 
-/// Self-Resurrection Option: the owner's `PLAYER_SELF_RES_SPELL` write. `spell_id` 0 clears it.
-/// Audience: the option's Character, resolved by the caller.
 pub(crate) fn self_res_option_outbound(character_guid: u64, spell_id: u32) -> Vec<Outbound> {
     let m = codec::build_self_res_spell_values(character_guid, spell_id);
     vec![Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
@@ -63,9 +52,6 @@ pub(crate) fn self_res_option_outbound(character_guid: u64, spell_id: u32) -> Ve
     ))]
 }
 
-/// A player corpse appeared → CREATE for every same-instance viewer on the row's shard, with the
-/// owner's reclaim-delay packet riding inside (`corpse_create_outbound`, the same body the
-/// per-player relay and the login resident sweep use).
 pub(crate) fn corpse_appeared(view: &WorldView, shard: ShardId, row: &Corpse) {
     let row = Arc::new(row.clone());
     for viewer in viewers_on_shard(view, shard) {
@@ -83,8 +69,6 @@ pub(crate) fn corpse_appeared(view: &WorldView, shard: ShardId, row: &Corpse) {
     }
 }
 
-/// A corpse's state changed (body → bones decay) → re-emit the CREATE so the client re-renders it,
-/// same instance gate as the insert leg (the re-emit must not leak across instances either).
 pub(crate) fn corpse_changed(view: &WorldView, shard: ShardId, row: &Corpse) {
     let row = Arc::new(row.clone());
     for viewer in viewers_on_shard(view, shard) {
@@ -101,8 +85,6 @@ pub(crate) fn corpse_changed(view: &WorldView, shard: ShardId, row: &Corpse) {
     }
 }
 
-/// A corpse was reclaimed/decayed → DESTROY to every viewer on the shard. Ungated like the
-/// per-player delete leg (a DESTROY for an unknown guid is a client no-op).
 pub(crate) fn corpse_vanished(view: &WorldView, shard: ShardId, row: &Corpse) {
     let guid = row.guid;
     for viewer in viewers_on_shard(view, shard) {
@@ -112,7 +94,6 @@ pub(crate) fn corpse_vanished(view: &WorldView, shard: ShardId, row: &Corpse) {
     }
 }
 
-/// A resurrect offer landed → SMSG_RESURRECT_REQUEST to the offer's TARGET and nobody else.
 pub(crate) fn resurrect_offered(view: &WorldView, shard: ShardId, row: &ResurrectRequest) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.target_guid)) else {
         return;
@@ -129,8 +110,6 @@ pub(crate) fn resurrect_offered(view: &WorldView, shard: ShardId, row: &Resurrec
     });
 }
 
-/// A Self-Resurrection Option changed → the owner's `PLAYER_SELF_RES_SPELL` (0 clears it), and
-/// nobody else's.
 pub(crate) fn self_res_option_changed(
     view: &WorldView,
     shard: ShardId,

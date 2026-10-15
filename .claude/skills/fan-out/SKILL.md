@@ -52,8 +52,12 @@ Match model to ticket difficulty: the strongest tier for the tracer and the inte
 Work the **frontier** — the tickets whose blockers are all done:
 
 1. Run the tracer first, alone, and integrate it.
-2. Spawn one agent per unblocked ticket, concurrently, each in its own worktree so they cannot collide. Brief each agent to read the folder's `README.md` plus its own ticket file, then `/implement` it.
-3. Integrate the parallel branches, then run the integration ticket serially on the combined result.
+2. Spawn one agent per unblocked ticket, concurrently, each in its own worktree so they cannot collide.
+   Brief each agent to read its checkout's `AGENTS.md`, the folder's `README.md` and its own ticket,
+   then `/implement` it. Require the
+   [comment-review result](../../../CODING_STANDARDS.md#comment-review) in its handoff.
+3. Integrate the parallel branches, then run the integration ticket serially on the combined result,
+   including its comment review.
 
 If the harness cannot spawn agents, work the frontier yourself in the same order.
 

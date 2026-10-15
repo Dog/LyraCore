@@ -63,7 +63,7 @@ function tsLiteral(file: string, expression: ts.Expression): unknown {
 
 function tsBinding(file: string, source: string, packageName: string): SourceBinding | undefined {
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
-  // A legacy source can own a local variable with this name.
+  // Legacy scripts can declare their own events variable.
   if (tree.statements.some((node) =>
     (ts.isVariableStatement(node) && node.declarationList.declarations.some((declaration) =>
       ts.isIdentifier(declaration.name) && declaration.name.text === "events"))
@@ -142,7 +142,7 @@ function luaLiteral(file: string, expression: lua.Expression): unknown {
 function luaBinding(file: string, source: string, packageName: string): SourceBinding | undefined {
   let tree: lua.Chunk;
   try {
-    // Lua strings contain bytes. Parse those bytes without changing the emitted UTF-8 source.
+    // Lua strings contain bytes; parse them without changing the emitted UTF-8 source.
     tree = lua.parse(Buffer.from(source, "utf8").toString("latin1"), {
       luaVersion: "5.3", encodingMode: "pseudo-latin1",
     });
@@ -208,7 +208,6 @@ export function readBinding(file: string, source: string, packageName: string): 
   return file.endsWith(".ts") ? tsBinding(file, source, packageName) : luaBinding(file, source, packageName);
 }
 
-/** Capture the one declared handler inside the Invocation, then preserve its Script Answer. */
 export function bindInvocation(source: string, binding: SourceBinding): string {
   let local = "____lyracore_handler";
   while (source.includes(local)) local += "_";

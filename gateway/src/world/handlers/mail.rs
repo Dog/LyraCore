@@ -1,10 +1,3 @@
-//! Mail family: open the mailbox window, answer the client's mail poll, serve a letter's body, mark
-//! a mail read or delete it, post a letter with copper and one item attached (at a
-//! cash-on-delivery price, or not), take either back out, and return a mail to its sender.
-//!
-//! Every Refusal is per-action: log, and either answer the packet the client is blocked on or send
-//! nothing. A Transport Loss ends the World Session.
-
 use super::super::*;
 use wow_world_messages::vanilla::SMSG_SEND_MAIL_RESULT_MailResultTwo;
 
@@ -13,7 +6,7 @@ pub(crate) struct Mail;
 impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized>
     ProtocolFamily<St> for Mail
 {
-    #[allow(clippy::too_many_lines)] // One arm per Mail opcode.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         store: &St,
         conn: &mut ProtocolSession,
@@ -22,11 +15,7 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
         let msg = request.message()?;
         let mut outbound = Vec::new();
         match msg {
-            // The 1.12 client opens the mail frame ITSELF on a type-19 gameobject (there is no
-            // SMSG_SHOW_MAILBOX in vanilla) and then asks for the list. An empty mailbox still replies:
-            // "no mail" and "the server ignored me" must not look the same. A refused gate sends
-            // nothing — the same silent drop the out-of-range gameobject and unfriendly-vendor gates
-            // take, since vanilla has no mailbox-refusal packet.
+            // Vanilla opens type-19 mailboxes itself; there is no SMSG_SHOW_MAILBOX.
             ClientOpcodeMessage::CMSG_GET_MAIL_LIST(c) => {
                 match mail::open_mailbox(store, conn.actor(), c.mailbox.guid()) {
                     Ok(mails) => {
@@ -43,10 +32,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     }
                 }
             }
-            // The periodic "do I have new mail" poll behind the minimap envelope. It names no mailbox —
-            // the client sends it from anywhere — so the only gate is being in world. A refusal is
-            // answered as "no unread mail" rather than with silence: the client repeats this poll and a
-            // dropped reply leaves a stale envelope lit.
             ClientOpcodeMessage::MSG_QUERY_NEXT_MAIL_TIME => {
                 let unread = match mail::has_unread(store, conn.actor()) {
                     Ok(unread) => unread,
@@ -65,15 +50,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     )),
                 ));
             }
-            // The letter body. It does not ride the list packet: the list advertises the mail's own id
-            // as an `item_text_id` and the client fetches the text here — resolved by `item_text_id`,
-            // never trusted on the second field alone (a bag item guid when reading an item, a mail id
-            // otherwise; cm:MailHandler.cpp:630-646). That field is only a HINT the ownership check may
-            // use for a cheap lookup. Answered only for a caller who holds an item carrying the id or
-            // owns the mail it names — ids are small and sequential, so answering a bare id would let a
-            // crafted query read anyone's copied letter. A body the caller cannot have (someone else's
-            // mail or item, a deleted mail) answers with EMPTY text rather than silence — the client has
-            // already opened the letter and is waiting on this packet.
             ClientOpcodeMessage::CMSG_ITEM_TEXT_QUERY(c) => {
                 let body = match mail::item_text(
                     store,
@@ -97,10 +73,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     )),
                 ));
             }
-            // Flip a mail's read state. Vanilla sends NO reply for this opcode — the client already
-            // flipped its own display — so success and a refusal both answer with silence; only the
-            // next CMSG_GET_MAIL_LIST shows the truth. A crafted id (someone else's mail, or a stale
-            // one) is refused the same as a genuine miss — never trust a client-supplied mail id.
             ClientOpcodeMessage::CMSG_MAIL_MARK_AS_READ(c) => {
                 let actor = conn.actor();
                 if let Err(failure) =
@@ -113,10 +85,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     );
                 }
             }
-            // Delete a mail — destroys any attachment it still holds, as vanilla does (the confirmation
-            // prompt is client-side). Unlike the read-only arms above, `CMSG_MAIL_DELETE` has a real
-            // ack (`SMSG_SEND_MAIL_RESULT`/Deleted), so both outcomes reply through it, matching the
-            // vendor/loot arms' "a failed action still answers" rule.
             ClientOpcodeMessage::CMSG_MAIL_DELETE(c) => {
                 let actor = conn.actor();
                 let ok = match mail::delete(store, actor, c.mailbox_id.guid(), u64::from(c.mail_id))
@@ -135,10 +103,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     Box::new(codec::build_mail_delete_result(c.mail_id, ok)),
                 )));
             }
-            // Return a mail to whoever sent it. The row is re-addressed in place — no escrow, since it
-            // never leaves the plane that already holds it — so this is [`mail::delete`]'s twin down to
-            // the authorization: a mail id is client-supplied, and "not yours" reads the same as "no
-            // such mail". Acks through `SMSG_SEND_MAIL_RESULT`/ReturnedToSender either way.
             ClientOpcodeMessage::CMSG_MAIL_RETURN_TO_SENDER(c) => {
                 let actor = conn.actor();
                 let ok = match mail::return_to_sender(
@@ -161,11 +125,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     Box::new(codec::build_mail_return_result(c.mail_id, ok)),
                 )));
             }
-            // Take a mail's copper into the purse. The mail id is client-supplied, so the refusal for
-            // somebody else's mail is the authorization boundary and not a sanity check — and it reads
-            // the same as "there is nothing in it", so a crafted id learns nothing either way. Both
-            // outcomes ack through `SMSG_SEND_MAIL_RESULT`/MoneyTaken, which is what closes the
-            // client's spinner.
             ClientOpcodeMessage::CMSG_MAIL_TAKE_MONEY(c) => {
                 let actor = conn.actor();
                 let ok =
@@ -184,11 +143,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     Box::new(codec::build_mail_take_money_result(c.mail_id, ok)),
                 )));
             }
-            // Take a mail's attached item into the bags, paying any cash-on-delivery price for it. A
-            // full bag answers `ErrEquipError` and an unaffordable price `ErrNotEnoughMoney` — the two
-            // refusals a player can act on, and in both the item STAYS in the letter, which is also
-            // what leaves a refused buyer free to return it. Every other refusal reads the same, so a
-            // crafted mail id learns nothing.
             ClientOpcodeMessage::CMSG_MAIL_TAKE_ITEM(c) => {
                 let actor = conn.actor();
                 let outcome =
@@ -215,14 +169,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     Box::new(codec::build_mail_take_item_result(c.mail_id, outcome)),
                 )));
             }
-            // Post a letter. `cash_on_delivery_amount` is the price the RECIPIENT will owe for the
-            // attachment — it costs the sender nothing here. Every refusal answers with its OWN
-            // `MailResultTwo`, never a generic internal error: the client renders each as distinct
-            // on-screen text, which is all the player gets to work with.
-            //
-            // The one refusal that answers with SILENCE is the mailbox gate, matching the list arm
-            // above — vanilla has no mailbox-refusal packet, and the client only offers Send at a
-            // mailbox, so reaching it means a crafted packet or a desynced session.
             ClientOpcodeMessage::CMSG_SEND_MAIL(c) => {
                 let result2 = match mail::send(
                     store,
@@ -256,10 +202,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                             mail::SendRefusal::NotEnoughMoney(_) => {
                                 Some(SMSG_SEND_MAIL_RESULT_MailResultTwo::ErrNotEnoughMoney)
                             }
-                            // A bound item and one that is not the sender's are different mistakes, so
-                            // the client is told which: vanilla has no "soulbound" mail line, and
-                            // `ErrCantSendWrappedCod` is mangoszero's nearest — it renders as a refusal
-                            // about the attachment rather than about the letter.
                             mail::SendRefusal::AttachmentSoulbound(_) => {
                                 Some(SMSG_SEND_MAIL_RESULT_MailResultTwo::ErrCantSendWrappedCod)
                             }
@@ -278,11 +220,6 @@ impl<St: CharacterStore + MailStore + SessionStore + ShardRoutingStore + SocialS
                     )));
                 }
             }
-            // Turn a delivered letter's text into a Plain Letter in the bags (the client's letter
-            // button, offered on a takeable mail that is not yet COPIED). Bags-full and every other
-            // refusal are the two outcomes the player can act on, so both ack through
-            // `SMSG_SEND_MAIL_RESULT`/MadePermanent; the mailbox gate alone stays silent, matching the
-            // other arms.
             ClientOpcodeMessage::CMSG_MAIL_CREATE_TEXT_ITEM(c) => {
                 let actor = conn.actor();
                 let made =

@@ -28,7 +28,6 @@ const BOSS_CASTS: [(u32, u32, u32, u32, u32, u32); 6] = [
     (646, 6432, 6_000, 10_000, 12_000, 17_000),
 ];
 
-/// Replace every definition owned by the small development fixture catalogue.
 pub(crate) fn seed_on_aggro_fixtures(ctx: &ReducerContext) {
     let definitions = ctx.db.game_creature_ai_definition();
     let mut cleared = HashSet::new();

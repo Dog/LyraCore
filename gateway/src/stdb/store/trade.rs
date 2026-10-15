@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`TradeStore`] adapter.
-
 use anyhow::Result;
 
 use crate::stdb::bindings::*;

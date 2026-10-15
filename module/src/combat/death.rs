@@ -1,13 +1,3 @@
-//! Death + the shared damage pipeline (split of the former monolithic `combat/mod.rs`, on top of
-//! the shared damage pipeline). `kill_creature`/`kill_player` are the two chokepoints every lethal
-//! path funnels through so a melee kill, `debug_set_health(0)`, and a lethal DoT tick all produce an
-//! IDENTICAL corpse/release. `fold_incoming_damage` (the MODIFIER stage: outgoing % → incoming % →
-//! absorb → godmode), `final_damage` (the EventAI lethal floor), and `apply_hit` (the APPLICATION
-//! stage: rage + skill-ups, the lethal fork through the two kill chokepoints, the health write,
-//! break-on-damage, threat) are the pipeline every damage resolver in `swing.rs` and
-//! `spell::apply_target_damage` routes through. See the banner below.
-//! `mod.rs` names the operations shared with other Module files.
-
 use spacetimedb::{table, ReducerContext, Table, TimeDuration};
 
 #[cfg(feature = "debug_reducers")]
@@ -20,24 +10,12 @@ use crate::{
 #[cfg(feature = "debug_reducers")]
 use crate::{game_corpse_loot, game_spell_cast_event};
 
-// The corpse-lifecycle timers below are used by `kill_creature`'s decay-arm step; `RESPAWN_MICROS` has
-// no local reader (the flat-timer fallback lives in `creatures::tick`) but stays here beside
-// `CORPSE_DECAY_MICROS` since both are read externally as `crate::combat::{RESPAWN_MICROS,
-// CORPSE_DECAY_MICROS}` and describe the same corpse/respawn timeline.
-pub(crate) const RESPAWN_MICROS: i64 = 15_000_000; // 15s after the corpse despawns
-pub(crate) const CORPSE_DECAY_MICROS: i64 = 60_000_000; // a corpse lingers 60s before it despawns
+pub(crate) const RESPAWN_MICROS: i64 = 15_000_000;
+pub(crate) const CORPSE_DECAY_MICROS: i64 = 60_000_000;
 
-// Warlock soul-shard generation: Drain Soul's real vanilla script effect (`ChannelDeathItem`) mints a
-// Soul Shard when its channel's target dies mid-cast. Our Drain Soul import carries no Rust script hook
-// for that effect, so the grant lives here instead, at the ONE place every creature death already
-// funnels through. `DRAIN_SOUL_SPELL_ID` is the real vanilla spell id (1120); `SOUL_SHARD_ENTRY` is the
-// real vanilla item id (6265, hand-seeded in `seed.rs` since the.import ETL doesn't reliably carry it).
 pub(crate) const DRAIN_SOUL_SPELL_ID: u32 = 1120;
 pub(crate) const SOUL_SHARD_ENTRY: u32 = 6265;
 
-/// A creature's EventAI-owned lethal floor. Row presence means enabled. It survives engagement and
-/// evade resets, then clears on definition replacement, death, despawn, or respawn. Enabling it
-/// again replaces the row and rearms the first-prevention notification.
 #[table(accessor = game_creature_lethal_damage_floor)]
 pub struct CreatureLethalDamageFloor {
     #[primary_key]
@@ -156,9 +134,6 @@ pub(crate) fn final_damage(
     )
 }
 
-/// True when a live Lethal Damage Floor protects this creature, reaping the row when its defining
-/// revision has moved on. Exposed on its own for the periodic-damage fold, which folds several
-/// ticks against an in-transaction health that [`final_damage`] cannot see.
 pub(crate) fn lethal_floor_protects(ctx: &ReducerContext, target_guid: u64) -> bool {
     let Some(target) = ctx.db.game_world_entity().guid().find(target_guid) else {
         return false;
@@ -498,16 +473,8 @@ pub fn debug_verify_lethal_damage_floor_fixture(
     Ok(())
 }
 
-// Shared combat operations and formulas are named in the parent module.
 use super::*;
 
-/// Kill a CREATURE — the SHARED creature-death path. The melee kill, `debug_set_health(0)`, AND lethal
-/// spell/DoT damage all funnel through here so they produce an IDENTICAL corpse (no drift between the
-/// paths). Steps, in order: resolve the Loot Tag and grant its recipients' rewards; roll tagged
-/// money and item loot; set `health = 0` + `dead` (the sole on-wire corpse signal, never
-/// `UNIT_DYNFLAG_DEAD`, which is feign-death); drop the engagement; stop corpse movement; and arm
-/// corpse decay. The killing source remains separate from reward ownership. Returns `true` if it
-/// killed a live creature and `false` for a missing guid, a player, or an already-dead unit. [entity]
 pub(crate) fn kill_creature(ctx: &ReducerContext, target_guid: u64, killer: Option<u64>) -> bool {
     kill_creature_with_attribution(ctx, target_guid, CreatureDeathAttribution::credited(killer))
 }
@@ -524,13 +491,9 @@ fn kill_creature_with_attribution(
         return false;
     };
     if target.is_player() || target.dead {
-        return false; // creatures only, and never re-kill a corpse
+        return false;
     }
     clear_lethal_damage_floor(ctx, target_guid);
-    // A PET death (owner_guid != 0) is a CLEAN DESPAWN: no XP/loot/corpse/decay. A pet has NO
-    // game_creature_spawn row, so the decay pass can never reap a dead pet — without this it would linger as
-    // a stale, lootable corpse until the owner re-summons/logs out/dies. Delete it + free its engagements;
-    // the owner can re-summon. (A pet kill credits no XP — an enemy killing your Imp gains nothing.)
     if target.owner_guid != 0 {
         crate::creatures::begin_death_dispatch(ctx, target_guid, killer);
         crate::creatures::on_pet_death(ctx, target_guid);
@@ -538,7 +501,6 @@ fn kill_creature_with_attribution(
         entities.guid().delete(target_guid);
         crate::creatures::clear_live_pet_kind(ctx, target_guid);
         crate::creatures::distraction::clear(ctx, target_guid);
-        // Notify-hook: a pet death is still a death — fired after the despawn is committed.
         crate::hooks::fire_on_death(
             ctx,
             &crate::hooks::DeathPayload {
@@ -551,25 +513,12 @@ fn kill_creature_with_attribution(
         crate::loot::tag::clear(ctx, target_guid);
         return true;
     }
-    // A creature killed mid-leg (flee, patrol, chase) still has an in-flight spline row. Left alone,
-    // the client keeps sliding the corpse toward the old destination. Stop it where the client
-    // renders it at the kill, before anything reads the corpse position, so the Loot Tag range,
-    // the rewards and loot-click range all judge the point the client shows.
-    //
-    // The stop row is not deleted here. SpacetimeDB relays a transaction's net effect per row, so
-    // an update and a delete of the same row reach subscribers as a bare delete, and the Gateway
-    // relays nothing for a deleted spline row. Spline deletion also stays in
-    // `despawn_creature_entity`, the canonical despawn checklist. The next advance firing reads the
-    // zero-duration stop as arrived and forgets it.
     crate::creatures::tick::stop_where_rendered(ctx, &mut target);
-    // Snapshot the victim's identity for the notify-hooks fired at the end of this fn — the corpse row
-    // is mutated (and `target` moved into the update) before they fire.
     let victim_entry = target.entry;
     let victim_level = target.level;
     let victim_instance = target.instance_id;
     let current_target_guid = target.target_guid;
-    // The Loot Tag, not the killing blow, owns rewards and corpse eligibility. Resolve it while the
-    // creature is still live. Death dispatch defers its combat-end clear until every hook runs.
+    // Resolve the Loot Tag while live; death hooks still need its reward ceiling.
     let entitlement = crate::loot::tag::death_entitlement(
         ctx,
         target_guid,
@@ -588,9 +537,7 @@ fn kill_creature_with_attribution(
     target.dead = true;
     entities.guid().update(target);
     crate::creatures::begin_death_dispatch(ctx, target_guid, killer);
-    // Snapshot the victim's threat table for the death payload BEFORE disengage wipes it — threat
-    // is the engine's per-player damage/heal ledger, and hooks fire only after the wipe (see
-    // CreatureDeathPayload.threat_snapshot).
+    // Snapshot threat before disengage clears the ledger used by death hooks.
     let threat_snapshot: Vec<(u64, i64)> = ctx
         .db
         .game_threat()
@@ -599,18 +546,9 @@ fn kill_creature_with_attribution(
         .map(|t| (t.source_guid, t.threat))
         .collect();
     disengage(ctx, target_guid);
-    // A dead creature's taunt lock is meaningless — drop it with the engagement. threat.rs owns the
-    // lock table's whole lifecycle; this is its teardown verb.
     crate::threat::clear_taunt_lock(ctx, target_guid);
-    // A creature that dies mid-channel (a caster mob) stops channeling immediately — tear down its channel
-    // aura + any cast bar. No-op for the common non-caster kill (no channel/cast). A channel aimed AT this
-    // dying creature is ended separately by the tick arm (`!target_alive`), so both directions are covered.
     crate::spell::break_channel(ctx, target_guid);
-    // A corpse carries no buffs, no DoTs and no crowd control — vanilla sheds them on the death
-    // transition itself, for every unit and not just players. Runs AFTER the reward/loot steps above,
-    // which still read the victim's live aura set (Drain Soul's channel).
     crate::spell::remove_auras_on_death(ctx, target_guid);
-    // Arm the corpse-decay timer on the spawn row (the tick_creatures decay pass gates on it).
     let spawns = ctx.db.game_creature_spawn();
     if let Some(mut spawn) = spawns.guid().find(target_guid) {
         spawn.despawn_at = ctx
@@ -619,13 +557,6 @@ fn kill_creature_with_attribution(
             .unwrap_or(ctx.timestamp);
         spawns.guid().update(spawn);
     }
-    // VANILLA combat-drop on kill: leave combat when the mob dies UNLESS something else is still engaged.
-    // Vanilla drops you the moment the last hostile link is gone rather than waiting the flat
-    // COMBAT_DROP_MS. `disengage` above cleared this mob's rows, so if the killer now has NO melee
-    // engagement — neither attacking (its own outgoing row) nor being attacked (any row targeting it) —
-    // pull its combat deadline to NOW so the next combat-drop tick clears IN_COMBAT (~0.5s, not 6s). A
-    // killer still meleeing another mob, or with another mob on it, keeps its combat. (Applies to any
-    // killer; the player is the case that matters.)
     if let Some(killer_guid) = killer {
         if !is_engaged(ctx, killer_guid) {
             if let Some(mut k) = entities.guid().find(killer_guid) {
@@ -634,9 +565,7 @@ fn kill_creature_with_attribution(
             }
         }
     }
-    // Notify-hooks fire last so handlers observe the fully committed death. Victim and encounter
-    // callbacks retain the real killing source. The reward-oriented kill hook runs once for each
-    // entitled recipient.
+    // Run hooks after death state is settled so handlers observe the complete transition.
     crate::hooks::fire_on_death(
         ctx,
         &crate::hooks::DeathPayload {
@@ -645,9 +574,6 @@ fn kill_creature_with_attribution(
             victim_is_player: false,
         },
     );
-    // Encounter kernel: the entry-keyed, instance-stamped creature death, the
-    // pet clean-despawn branch above deliberately does NOT fire this (encounters key on wild
-    // creatures). Snapshots were taken before the corpse row was mutated.
     crate::hooks::fire_on_creature_death(
         ctx,
         &crate::hooks::CreatureDeathPayload {
@@ -671,15 +597,11 @@ fn kill_creature_with_attribution(
         );
     }
     crate::creatures::finish_death_dispatch(ctx, target_guid, killer);
-    // EventAI OnDeath quest actions resolve the same Loot Tag as death rewards. Clear it only after
-    // every synchronous death callback has observed it; ordinary live disengage still clears now.
+    // Clear the Loot Tag only after every synchronous death callback has observed it.
     crate::loot::tag::clear(ctx, target_guid);
     true
 }
 
-/// Grant kill rewards to the entitled Loot Tag recipients. `reward_source` retains the controlled
-/// Character behind the killing source for source-specific rewards such as Drain Soul, but it can
-/// receive one only when it is also in the entitled recipient set.
 fn award_tag_rewards(
     ctx: &ReducerContext,
     target: &WorldEntity,
@@ -687,8 +609,6 @@ fn award_tag_rewards(
     recipients: &[u64],
     reward_source: Option<u64>,
 ) {
-    // Elite/rare-elite/boss creatures pay 2× kill XP (vanilla) — the rank + creature_type live on
-    // the template (one lookup, reused below for the soul-shard XP/critter gate).
     let template = ctx.db.game_creature_template().entry().find(target.entry);
     let rank = template.as_ref().map(|t| t.rank).unwrap_or(0);
     let share_count = recipients.len() as u32;
@@ -704,17 +624,6 @@ fn award_tag_rewards(
         crate::creatures::award_hunter_pet_kill_progression(ctx, *recipient, target.level, rank);
         crate::quest::on_creature_killed(ctx, *recipient, target.entry);
     }
-    // Soul shard generation: if the entitled killing source is channeling Drain Soul (1120) on this dying
-    // creature — an aura targeting it, cast BY the killer, naming that spell — the killing blow
-    // mints 1x Soul Shard into the killer's backpack. Real vanilla grants
-    // this off Drain Soul's own `ChannelDeathItem` script effect on a lethal tick; we hook it here
-    // instead since that effect imports as an inert E_SCRIPTED no-op (see combat/mod.rs module docs
-    // above). Vanilla's actual rule is "the kill yields experience or honor" — no honor system
-    // exists yet, so that reduces to: NOT a critter (creature_type 8, template-driven, never yields
-    // XP regardless of level) AND NOT grey (`xp::xp_for_kill` > 0, the SAME grey clamp award_xp
-    // used two lines up — shard eligibility can never drift from XP eligibility). Best-effort: an
-    // inventory-full killer still gets the kill (`grant_item`'s Err is swallowed, never rolls back
-    // the death).
     let is_critter = template
         .as_ref()
         .map(|t| t.creature_type == crate::spell::CRITTER_TYPE)
@@ -740,30 +649,12 @@ fn award_tag_rewards(
     }
 }
 
-/// Roll a dead creature's money + item loot onto its corpse, apply the GROUP loot method's
-/// need/greed/round-robin/master-loot stamping, and mark it LOOTABLE if anything dropped. Also purges
-/// any stale corpse-loot residue on this guid BEFORE rolling fresh drops — the fix MUST
-/// run on every kill so a leftover pickpocket row can't collide with a freshly-rolled kill-drop slot.
-/// Extracted out of `kill_creature`'s
-/// inline body so the death sequence reads as a table of contents.
 fn roll_corpse_loot(
     ctx: &ReducerContext,
     target: &mut WorldEntity,
     target_guid: u64,
     entitlement: Option<&crate::loot::tag::DeathEntitlement>,
 ) {
-    // STALE-SNAPSHOT PURGE: corpse guids can be REUSED —
-    // `debug_spawn_at_feet` allocates max+1 per entry, and a harness SQL teardown deletes the entity
-    // WITHOUT running the decay reaper — so a fresh kill on a reused guid inherited a long-dead
-    // group's `game_corpse_loot_eligible` rows and split the solo looter's purse with departed
-    // members (46c purse → 13c, caught by the quest scenario's money delta). A LIVE creature also
-    // accrues its OWN residue on this same guid: `roll_pickpocket_loot` (E_PICKPOCKET) inserts
-    // `game_corpse_loot` rows at slots 0.. before it dies, and if the rogue doesn't take them all,
-    // this fn's `roll_creature_loot` below would otherwise re-insert kill drops starting at slot 0
-    // too — duplicate `(corpse_guid, slot)` pairs break every first-match consumer's addressing.
-    // `purge_corpse_residue` closes both classes at the ONE spot every creature death routes
-    // through, BEFORE the fresh loot roll / group snapshot below. No-op for a guid with no residue
-    // (the common path).
     crate::loot::purge_corpse_residue(ctx, target_guid);
     let Some(entitlement) = entitlement else {
         target.money = 0;
@@ -771,8 +662,6 @@ fn roll_corpse_loot(
         return;
     };
     crate::loot::tag::record_corpse_eligibility(ctx, target_guid, &entitlement.recipients);
-    // Money loot from the template plus data-driven item loot. A tagged creature may roll a corpse
-    // even when every snapshot member fails the death-site eligibility checks.
     let loot = ctx
         .db
         .game_creature_template()
@@ -788,14 +677,7 @@ fn roll_corpse_loot(
     if loot > 0 {
         target.money = loot;
     }
-    // A valid Loot Tag rolls quest-only rows with ordinary corpse loot. Visibility and takability
-    // remain per-viewer decisions downstream, so `roll_creature_loot` needs no killing source.
     let dropped = crate::loot::roll_creature_loot(ctx, target.entry, target_guid);
-    // Group loot methods: a GROUPED kill's above-threshold rows may
-    // spawn a need/greed roll, below-threshold/round-robin rows get a designated looter stamped, and
-    // above-threshold-under-MASTER rows get restricted to the master — all decided HERE at kill
-    // time (see loot.rs's module doc for why not lazily "at loot-open"). A no-op for an ungrouped
-    // kill or an FFA-method group (`apply_group_loot_rules`'s own early-outs).
     if let Some(group_id) = entitlement.group_id {
         crate::loot::apply_group_loot_rules(ctx, target_guid, group_id);
     }
@@ -804,21 +686,6 @@ fn roll_corpse_loot(
     }
 }
 
-/// Kill a PLAYER — the SHARED player-death path, `kill_creature`'s twin: both swing resolvers and
-/// `debug_set_health(0)` funnel through here so every player death is IDENTICAL (channel teardown,
-/// combat-deadline zeroing, and everything below all happen exactly once, the same way). `health = 0`
-/// is the SOLE on-wire death signal — vanilla 1.12 has no death opcode; the client shows Release Spirit
-/// purely from UNIT_FIELD_HEALTH == 0 on its own unit (via the crash-safe build_health_values relay). No
-/// corpse/loot/XP (creatures don't loot players); the entity persists (the decay pass only touches
-/// creature spawns) until `CMSG_REPOP_REQUEST` → the `repop` reducer revives it. Steps, in order:
-/// zero health + set `dead` (gates regen + re-attack); pull `combat_until_ms` to NOW so the
-/// gateway's logout gate doesn't block a dead player for up to COMBAT_DROP_MS (vanilla allows dead
-/// players to log out immediately; `disengage` clears melee rows but does NOT zero the deadline);
-/// drop the engagements; tear down any channel/cast bar; shed the auras death removes (which dismounts
-/// a rider); apply the 10% equipped-durability loss;
-/// and fire the `on_death` notify-hook LAST so handlers observe the fully-committed death.
-/// `killer_guid = 0` = no killer (a debug/environmental death). Returns `false` (no-op) for a
-/// missing guid, a creature, or an already-dead player. [entity]
 pub(crate) fn kill_player(ctx: &ReducerContext, victim_guid: u64, killer_guid: u64) -> bool {
     let entities = ctx.db.game_world_entity();
     let Some(mut victim) = entities.guid().find(victim_guid) else {
@@ -836,13 +703,8 @@ pub(crate) fn kill_player(ctx: &ReducerContext, victim_guid: u64, killer_guid: u
     crate::creatures::begin_death_dispatch(ctx, victim_guid, killer);
     disengage(ctx, victim_guid);
     crate::spell::break_channel(ctx, victim_guid);
-    // Dying sheds the auras vanilla does not exempt, and converges every projection they fed. A rider
-    // who dies is dismounted HERE, by ordinary aura removal — the corpse must not keep its mount, its
-    // buffs, or the crowd control that was on it. The Self-Resurrection Option is read first: the
-    // Soulstone aura that grants it does not survive the shed.
     crate::spell::record_self_resurrect_option(ctx, victim_guid);
     crate::spell::remove_auras_on_death(ctx, victim_guid);
-    // A live Trade Session dies with the victim — both windows hear `TradeCanceled`.
     crate::trade::cancel_trade_for(ctx, victim_guid);
     crate::items::apply_death_durability_loss(ctx, victim_guid);
     crate::hooks::fire_on_death(
@@ -857,63 +719,22 @@ pub(crate) fn kill_player(ctx: &ReducerContext, victim_guid: u64, killer_guid: u
     true
 }
 
-// ===========================================================================================
-//  The SHARED damage pipeline [entity]
-//
-
-//
-//    1. `fold_incoming_damage` — the MODIFIER stage: outgoing % → incoming % → absorb → godmode.
-//       Every caller that rolls a fresh number runs it; the ranged IMPACT skips it because its
-//       damage was already folded (and frozen) at launch, and applies only the godmode re-check.
-//    2. `final_damage`: the EventAI lethal floor, after every modifier and before any damage effect.
-//    3. `apply_hit`: the APPLICATION stage: rage + skill-ups, the lethal fork through the shared
-//       `kill_player`/`kill_creature` chokepoints, the health write, break-on-damage, and threat.
-//
-//  Each caller writes its own wire event between the folds and application, so the stages remain
-//  separate operations.
-// ===========================================================================================
-
-/// Where a hit came from. [`HitSource::is_weapon`] is the ONE axis [`apply_hit`] branches on, so
-/// "what is different about a spell hit" is a single readable predicate instead of a second copy of
-/// the whole pipeline; the finer split exists because the Proc engine fires a DIFFERENT combat event
-/// per source (an off-hand swing and a ranged shot are not the same event as a main-hand swing).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HitSource {
-    /// A main-hand melee auto-attack swing.
     MainHand,
-    /// An off-hand melee auto-attack swing — its own proc event, so an off-hand-only proc fires off
-    /// these alone.
     OffHand,
-    /// A ranged auto-attack impact (Auto Shot, a wand).
     Ranged,
-    /// A melee ABILITY: a weapon strike or a finisher. Its own proc event pair, distinct from the
-    /// auto-attack swing that shares its weapon.
     MeleeSpell,
-    /// A direct damaging SPELL hit.
     Spell,
-    /// A hit produced inside a **Triggered Cast**. Grants nothing, and raises NO proc event — which is
-    /// what makes "a proc can never start a proc" structural instead of an exception list.
     Triggered,
 }
 
 impl HitSource {
-    /// A WEAPON hit — a melee main-hand swing, an off-hand swing, or a ranged projectile impact.
-    /// Grants rage BOTH ways, trains weapon/defense skill, KILLS a player at 0 hp, credits a PET's
-    /// kill to its owner, and feeds the real attacker guid to the break-on-damage scan (so
-    /// Retaliation can counter-swing).
-    ///
-    /// Everything else — a spell, a melee ability, a Triggered Cast — grants no rage and no
-    /// skill-ups; a PLAYER is FLOORED at 1 hp instead of dying (there is no spell-death of players
-    /// yet); the kill credit is player-caster-only (a pet's spell doesn't credit its owner — pets
-    /// have no spells today); the break-on-damage scan gets the `0` attacker sentinel; and a player
-    /// caster's damaging hit ARMS the creature's melee retaliation.
     pub(crate) fn is_weapon(self) -> bool {
         matches!(self, Self::MainHand | Self::OffHand | Self::Ranged)
     }
 }
 
-/// One landed hit, as the pipeline and the Proc engine both read it: where it came from, which spell
-/// carried it (0 for an auto-attack swing), and whether it crit.
 #[derive(Clone, Copy)]
 pub(crate) struct Hit {
     pub source: HitSource,
@@ -922,7 +743,6 @@ pub(crate) struct Hit {
 }
 
 impl Hit {
-    /// An auto-attack hit — no spell carried it.
     pub(crate) fn weapon(source: HitSource, crit: bool) -> Self {
         Self {
             source,
@@ -931,7 +751,6 @@ impl Hit {
         }
     }
 
-    /// A hit carried by `spell_id`, whose school and family the Proc filter may judge.
     pub(crate) fn spell(source: HitSource, spell_id: u32, crit: bool) -> Self {
         Self {
             source,
@@ -940,8 +759,6 @@ impl Hit {
         }
     }
 
-    /// A hit nobody took an action to land: a Retaliation counter-swing, a ground-area tick. Grants
-    /// nothing and raises no proc event.
     pub(crate) fn triggered() -> Self {
         Self {
             source: HitSource::Triggered,
@@ -951,15 +768,8 @@ impl Hit {
     }
 }
 
-/// What [`apply_hit`] did. `killed` is what a caller checks to decide whether its own post-hit tail (a
-/// swing-timer stamp, an IN_COMBAT stamp, a react window) still has anything to stamp — after a kill
-/// the engagement row is already gone and the defender is a corpse. A struct rather than a bare bool
-/// so the pipeline can report more (resisted portions, overkill) without touching four signatures.
 pub(crate) struct HitOutcome {
-    /// The hit went through `kill_creature` / `kill_player`. False for a spell hit that floored a
-    /// player at 1 hp, and false for any hit the target survived.
     pub killed: bool,
-    /// The hit ended an active Duel at one health. Callers must not re-arm combat afterward.
     pub duel_completed: bool,
 }
 
@@ -969,30 +779,11 @@ impl HitOutcome {
     }
 }
 
-/// Pure: does a hit of `dmg` reduce a target at `health` to 0? A 0-damage hit (a miss, a fully
-/// absorbed swing, a godmode target) is NEVER lethal, which is the whole reason this is one shared
-/// predicate — the melee swing needs the answer up front for its event's `killing_blow` flag, and
-/// [`apply_hit`] needs it again for the fork. [pure]
 pub(crate) fn is_lethal(health: u32, dmg: u32) -> bool {
     dmg > 0 && health <= dmg
 }
 
-/// Stage 1 of the shared pipeline: fold the post-roll damage MODIFIERS onto a freshly-rolled hit and
-/// return `(dealt, absorbed)`.
-///
-/// In order (the order is vanilla's and is load-bearing):
-///  1. the ATTACKER's outgoing % — Defensive Stance's −10% (`stance_damage_done_pct`) summed with any
-///     `A_MOD_COMBAT(COMBAT_DMG_DONE)` aura on it (Curse of Weakness);
-///  2. the TARGET's incoming % — `A_MOD_DAMAGE_TAKEN` (Shield Wall, a vulnerability debuff);
-///  3. absorb shields (`A_ABSORB`, e.g. Power Word: Shield) — BEFORE the lethal check, so a
-///     fully-absorbed hit can't kill and drains the shield instead of health;
-///  4. the GM playtest godmode zero (the `.god` command) — keyed on the TARGET only, so a godmode unit's
-///     OUTGOING damage is untouched. Applied AFTER absorb, so a godmode target's shield still drains
-///     exactly as it did before (and the zeroed remainder reads as "absorbed").
-///
-/// `absorbed` is the difference — what shields (plus godmode) soaked — which the spell path surfaces
-/// on its cast-GO row for the floating damage breakdown. Weapon callers ignore it. A missing attacker
-/// contributes stance 0 / bonus 0 (full damage), the codebase's "missing actor stat → 0" convention.
+// Absorb before lethal checks and godmode so even a zeroed hit drains shields.
 pub(crate) fn fold_incoming_damage(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -1022,37 +813,6 @@ pub(crate) fn fold_incoming_damage(
     (dealt, incoming - dealt)
 }
 
-/// Stage 3 of the shared pipeline. Applies the [`FinalDamage`] produced after
-/// [`fold_incoming_damage`] to `target_guid`, credited to `attacker_guid`, and returns what it did.
-///
-/// In order:
-///  1. **Attacker gains** (weapon hits only) — rage for dealing damage, and a weapon skill-up when a
-///     PLAYER lands on a CREATURE. Both run BEFORE the fork: you gain rage on the killing blow too.
-///  2. **The lethal fork** — a target reduced to 0 goes through the SHARED `kill_player` /
-///     `kill_creature` chokepoints (corpse, loot, XP, disengage, hooks) and this returns
-///     `killed: true`. The one exception is a SPELL hit on a PLAYER, which floors at 1 hp instead.
-///     Death attribution names the attacking unit. Loot Tag ownership separately resolves the
-///     entitled Character recipients, including a pet's owner.
-///  3. **The survivor path** — a defense skill-up for a player that took a weapon hit and lived, the
-///     health write (floored at 1 by `damaged_value`, which is a no-op here for a weapon hit since a
-///     survivor by definition had `health > dmg`), rage for TAKING the hit, then the single entity
-///     write. `enter_combat` for a spell hit lands here (a weapon caller stamps IN_COMBAT at its own
-///     tail instead — a swing that FIRED flags combat even when it MISSED, which is a fact only the
-///     caller can see).
-///  4. **Break-on-damage** (drops polymorph, interrupts a timed cast) and **threat** (player →
-///     creature only), plus the spell path's engage-on-damage retaliation arm.
-///  5. **The proc pass** ([`crate::spell::proc::run_proc_pass`]) — once per lethal branch, and from
-///     nowhere else in the module. The attacker's "dealt" Procs run even on a killing blow; the
-///     target's "taken" Procs run only on the survivor path.
-///
-/// A 0-damage hit (miss, fully absorbed, godmode) is a complete no-op: no health write, no kill, no
-/// break-on-damage, no threat — matching what the melee swing and `apply_target_damage` have always
-/// done, and what the ranged impact now does too (before it ran the survivor path with a 0
-/// damage value on a godmode target — the same drift class fixed twice).
-///
-/// The one 0-damage hit that is NOT inert is a hit a Lethal Damage Floor reduced to nothing: it
-/// still refreshes the pursuit leash and fires the death-prevented hook once, because the creature
-/// is pinned at one health in a live fight rather than untouched.
 pub(crate) fn apply_hit(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -1066,16 +826,13 @@ pub(crate) fn apply_hit(
     };
     let entities = ctx.db.game_world_entity();
     let Some(mut target) = entities.guid().find(target_guid) else {
-        return miss; // the target left the world between the roll and here
+        return miss;
     };
     if target.dead || (damage.amount == 0 && !damage.lethal_prevented) {
         return miss;
     }
     let dmg = damage.amount;
     let weapon = hit.source.is_weapon();
-    // Read the attacker ONCE, fresh: a caller's in-hand snapshot may predate its own writes this tick
-    // (the queued-strike rage deduction, an earlier engagement's swing), and the spell path may have
-    // no attacker row at all (an environmental / departed caster → not a player, no threat).
     let attacker = entities.guid().find(attacker_guid);
     if attacker
         .as_ref()
@@ -1087,9 +844,7 @@ pub(crate) fn apply_hit(
     let reward_source = crate::loot::tag::controlling_character(ctx, attacker_guid);
     let target_is_player = target.is_player();
     if damage.lethal_prevented && dmg == 0 {
-        // Pinned at one health and still under attack. No damage lands, so nothing damage-derived
-        // (threat, break-on-damage, procs) applies — but the fight is real, so the pursuit deadline
-        // must keep moving or the leash pass evades the creature out of the script holding it here.
+        // A lethal floor still refreshes pursuit so the scripted fight cannot evade.
         refresh_leash(ctx, attacker_guid, target_guid);
         commit_death_prevention(ctx, target_guid, attacker_guid);
         return miss;
@@ -1098,27 +853,20 @@ pub(crate) fn apply_hit(
         crate::loot::tag::record_first_threat(ctx, target_guid, attacker_guid);
     }
 
-    // 1. Attacker-side gains, before the fork (rage lands on the killing blow too).
     if weapon {
         if let Some(a) = &attacker {
             if is_rage_user(a) {
-                // Fresh mutable copy (read-your-writes): `a` is still needed read-only below.
                 if let Some(mut fresh) = entities.guid().find(attacker_guid) {
                     fresh.power = (fresh.power + rage_from_damage(dmg, true)).min(fresh.max_power);
                     entities.guid().update(fresh);
                 }
             }
-            // Weapon skill-up: a PLAYER landing a damaging hit on a CREATURE trains the equipped
-            // weapon's skill line one step toward cap. Touches only `game_player_skill` rows, so it is
-            // independent of the rage write above. A no-op at cap (the normal case).
             if attacker_is_player && !target_is_player {
                 crate::skill::gain_weapon_skill(ctx, a);
             }
         }
     }
 
-    // 2. The lethal fork. An active opponent Duel floors its loser at one health and completes
-    // before any player-death work can run, regardless of whether the damage was weapon or spell.
     if target_is_player
         && is_lethal(target.health, dmg)
         && crate::duel::active_opponents(ctx, attacker_guid, target_guid)
@@ -1134,15 +882,12 @@ pub(crate) fn apply_hit(
                 target_guid,
             );
         }
-        // The duel finisher dealt real damage to a target that survived it, so both sides' Procs fire,
-        // exactly as they would on any other surviving hit.
         crate::spell::proc::run_proc_pass(ctx, attacker_guid, target_guid, &hit, true);
         return HitOutcome {
             killed: false,
             duel_completed: true,
         };
     }
-    // A spell hit on a PLAYER is the one non-fatal ordinary 0-hp case (floored at 1 below).
     let killed = is_lethal(target.health, dmg) && (weapon || !target_is_player);
     if killed {
         if target_is_player {
@@ -1152,27 +897,19 @@ pub(crate) fn apply_hit(
                 ctx,
                 target_guid,
                 CreatureDeathAttribution {
-                    // Death callbacks keep the actual unit that landed the blow. A missing caster
-                    // remains unattributed rather than naming an entity that has left the world.
                     source_guid: attacker.as_ref().map(|_| attacker_guid),
                     reward_guid: reward_source,
                 },
             );
         }
-        // A killing blow still fires the ATTACKER's "dealt" Procs (a Lightning Shield zap that lands
-        // the kill still counts); the corpse's own "taken" Procs do not.
         crate::spell::proc::run_proc_pass(ctx, attacker_guid, target_guid, &hit, false);
         return HitOutcome {
             killed: true,
             duel_completed: false,
         };
     }
-    // 3. The survivor path.
-    // Capture the threat predicate before `target` is moved by the write below.
     let accrues_threat = !target_is_player && reward_source.is_some();
     if weapon && target_is_player {
-        // Defense skill-up: a PLAYER that takes a damaging weapon hit and SURVIVES trains Defense one
-        // step toward cap. Read-only on `target`; a no-op at cap (the normal case).
         crate::skill::gain_defense_skill(ctx, &target);
     }
     target.health = crate::spell::damaged_value(target.health, dmg as i32);
@@ -1183,28 +920,17 @@ pub(crate) fn apply_hit(
     if damage.lethal_prevented {
         commit_death_prevention(ctx, target_guid, attacker_guid);
     }
-    // Damage kept the fight alive: restart the pursuit deadline and re-remember where the creature
-    // stands. Both guids go in, so a creature hitting the player refreshes the leash just like the
-    // player hitting it. The lethal branch above already returned — a dead pair has no engagement left.
     refresh_leash(ctx, attacker_guid, target_guid);
     if !weapon {
-        // The surviving spell target is in combat too. Weapon callers stamp both sides at their own
-        // tail (a swing that fired flags combat even on a miss), so this would be redundant for them.
         enter_combat(ctx, target_guid);
     }
 
-    // 4. Break-on-damage drops the target's break-on-damage CC (polymorph etc.) and interrupts its
-    // in-progress timed cast (direct damage → `periodic = false`). The attacker guid rides along for a
-    // WEAPON hit so Retaliation can counter-swing the assailant; everything else passes the `0`
-    // sentinel (a counter-swing answers a real incoming swing only).
     crate::spell::break_auras_on_damage(
         ctx,
         target_guid,
         if weapon { attacker_guid } else { 0 },
         false,
     );
-    // Threat accrues on the creature's table so the retarget pass targets the highest-threat attacker.
-    // Player → creature only; the lethal branch already returned (a killing blow wiped the table).
     if accrues_threat {
         crate::threat::add_threat(
             ctx,
@@ -1213,14 +939,9 @@ pub(crate) fn apply_hit(
             crate::threat::threat_from_damage(dmg),
         );
         if !weapon {
-            // ENGAGE-ON-DAMAGE: a player's spell hit pulls the creature into melee (the ranged twin of
-            // `aggro_pass`; the melee paths already have their engagement row by construction).
-            // Idempotent — shared with the cast-level engage in `resolve_cast_at`.
             crate::spell::arm_spell_retaliation(ctx, attacker_guid, target_guid);
         }
     }
-    // 5. The proc pass. Both sides fire here: the attacker's "dealt" Procs and — because the target
-    // lived — its "taken" Procs too (Frost Armor chills whoever hit its wearer).
     crate::spell::proc::run_proc_pass(ctx, attacker_guid, target_guid, &hit, true);
     HitOutcome {
         killed: false,
@@ -1232,22 +953,17 @@ pub(crate) fn apply_hit(
 mod lethality_tests {
     use super::{is_lethal, lethal_floor_amount, CreatureDeathAttribution, HitOutcome};
 
-    // The one shared lethality predicate: the melee swing needs it up front for its wire event's
-    // `killing_blow` flag and `apply_hit` needs it again for the fork, so they must not be two
-    // hand-written expressions.
     #[test]
     fn a_zero_damage_hit_is_never_lethal() {
-        // A miss, a fully-absorbed swing, and a godmode target all arrive here as 0 damage. None of
-        // them may kill — not even a target already sitting at 0 hp.
         assert!(!is_lethal(1, 0));
         assert!(!is_lethal(0, 0));
     }
 
     #[test]
     fn a_hit_at_or_above_remaining_health_is_lethal() {
-        assert!(is_lethal(10, 10)); // exactly lethal
-        assert!(is_lethal(10, 11)); // overkill
-        assert!(!is_lethal(10, 9)); // one short — the target survives at 1 hp
+        assert!(is_lethal(10, 10));
+        assert!(is_lethal(10, 11));
+        assert!(!is_lethal(10, 9));
     }
 
     #[test]

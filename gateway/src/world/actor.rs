@@ -1,9 +1,5 @@
-//! The Character a Durable Request acts as.
-
 use std::num::NonZeroU64;
 
-/// A resolved Actor guid. Guid 0 means the World Session has no Character yet, so it is never an
-/// Actor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Actor(NonZeroU64);
 

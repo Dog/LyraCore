@@ -1,6 +1,3 @@
-//! Talent-pane + faction/reputation cache-accessor methods — pure code-motion split of the
-//! former `reads.rs`.
-
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -8,15 +5,6 @@ use super::super::bindings::*;
 use super::super::connection::Coordinator;
 
 impl Coordinator {
-    /// Does `npc_guid` REFUSE to interact with `player_guid` (vanilla
-    /// `Unit::GetReactionTo` for the gossip/vendor/trainer/questgiver windows)? The NPC's
-    /// faction_template resolves to its parent faction:
-    /// - parent has a REP BAR (`reputation_index >= 0`) and the player has a standing row → use
-    ///   its rank and At-War state; refuse at Unfriendly (2) or below.
-    /// - no player standing row or no rep bar → FactionTemplate mask fallback, which is race-safe.
-    /// - no rep bar → FactionTemplate mask fallback: refuse when the NPC is HOSTILE to the player.
-    ///
-    /// Missing data anywhere → do NOT refuse (fail-open: an unfactioned fixture NPC keeps working).
     pub fn npc_refuses_interaction(&self, npc_guid: u64, player_guid: u64) -> Result<bool> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -71,12 +59,12 @@ mod tests {
     #[test]
     fn reputation_rank_thresholds_match_mangos() {
         use lyracore_shared::faction::reputation_rank;
-        assert_eq!(reputation_rank(42000), 7); // Exalted
-        assert_eq!(reputation_rank(9000), 5); // Honored
-        assert_eq!(reputation_rank(0), 3); // Neutral
-        assert_eq!(reputation_rank(-1), 2); // Unfriendly
-        assert_eq!(reputation_rank(-3001), 1); // Hostile
-        assert_eq!(reputation_rank(-42000), 0); // Hated
+        assert_eq!(reputation_rank(42000), 7);
+        assert_eq!(reputation_rank(9000), 5);
+        assert_eq!(reputation_rank(0), 3);
+        assert_eq!(reputation_rank(-1), 2);
+        assert_eq!(reputation_rank(-3001), 1);
+        assert_eq!(reputation_rank(-42000), 0);
         assert!(reputation_rank(-1) <= 2, "Unfriendly refuses");
         assert!(reputation_rank(0) > 2, "Neutral interacts");
     }
@@ -99,7 +87,6 @@ mod tests {
             friend_2: 0,
             friend_3: 0,
         };
-        // Monster (group mask): enemy_group intersects the player's faction_group → hostile.
         let monster = ft(14, 14, 8, 1, 0, 0);
         let player = ft(1, 1, 1, 0, 0, 0);
         assert!(super::faction_template_hostile(&monster, &player));
@@ -107,7 +94,6 @@ mod tests {
             !super::faction_template_hostile(&player, &monster),
             "player group 0 enemy mask"
         );
-        // Explicit friend list beats the mask; explicit enemy list beats everything.
         let befriended = ft(2, 14, 8, 1, 0, 1);
         assert!(!super::faction_template_hostile(&befriended, &player));
         let sworn = ft(3, 14, 8, 0, 1, 0);

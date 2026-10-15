@@ -1,8 +1,3 @@
-//! The Script Artifact's shape: what it reads, and the bytes it writes back.
-//!
-//! The JSON here is written by hand, the way a Datascript generator would emit it, so these
-//! exercise the parser rather than a builder that could drift with it.
-
 use lyracore_package_delta::{ScriptArtifact, HOOK_EVENT_NAMES, PACKAGE_SCRIPT_ID_FLOOR};
 
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -47,7 +42,6 @@ fn an_artifact_may_ship_no_scripts_at_all() {
     assert!(parsed.scripts().is_empty());
 }
 
-/// A disabled script is applied to the Shard and never invoked, so it has to survive the parse.
 #[test]
 fn a_disabled_script_is_read_rather_than_dropped() {
     let parsed = ScriptArtifact::parse(&artifact(
@@ -75,8 +69,6 @@ fn scripts_come_back_in_identifier_order_however_they_were_written() {
     assert_eq!(ids, [100_002, 100_009]);
 }
 
-/// Every event the Module fires must be bindable, or a package author meets a refusal for an event
-/// that plainly exists.
 #[test]
 fn every_event_in_the_catalogue_is_bindable() {
     for event in HOOK_EVENT_NAMES {
@@ -92,8 +84,6 @@ fn every_event_in_the_catalogue_is_bindable() {
     }
 }
 
-/// A Package Event is how a Package asks its own scripts a question the hook catalogue has no name
-/// for. The artifact's own Package identity is the prefix, so the parser accepts it as written.
 #[test]
 fn a_package_binds_a_package_event_of_its_own() {
     let parsed = ScriptArtifact::parse(&artifact(
@@ -114,8 +104,6 @@ fn a_package_binds_a_package_event_of_its_own() {
     );
 }
 
-/// The Package Event travels through the canonical bytes unchanged: it is the label the Module's
-/// dispatch matches on, so a rewrite of it would unbind every script that uses it.
 #[test]
 fn a_package_event_survives_the_canonical_round_trip() {
     let parsed = ScriptArtifact::parse(&artifact(
@@ -140,10 +128,6 @@ fn a_package_event_survives_the_canonical_round_trip() {
     );
 }
 
-// ===========================================================================================
-//  Canonical bytes
-// ===========================================================================================
-
 #[test]
 fn the_canonical_form_has_a_fixed_member_order_and_no_whitespace() {
     let parsed = ScriptArtifact::parse(&artifact(
@@ -163,9 +147,6 @@ fn the_canonical_form_has_a_fixed_member_order_and_no_whitespace() {
     );
 }
 
-/// The canonical bytes are what a digest, a diff and a provenance row all describe, so how the
-/// artifact was spelled must not reach them.
-/// Member order, whitespace and the sign on a number are all spellings, not content.
 #[test]
 fn how_the_artifact_was_written_cannot_change_its_canonical_bytes() {
     let compact = artifact(
@@ -198,8 +179,6 @@ fn how_the_artifact_was_written_cannot_change_its_canonical_bytes() {
     );
 }
 
-/// The applier packs several artifacts one per line, which only works because a canonical artifact
-/// escapes every control character. Lua source is the member most likely to hold a newline.
 #[test]
 fn a_canonical_artifact_never_contains_a_raw_newline_however_the_lua_is_written() {
     let json = format!(

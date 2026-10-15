@@ -1,25 +1,13 @@
-//! Bank family: open the bank window, right-click to bank, right-click to withdraw. Same shape as
-//! the vendor family.
-
 use super::super::*;
 use super::show_bank;
 use crate::stdb::{classify, DurableFailure};
 
-/// Bank Durable Requests.
 pub(crate) trait BankStore: Send + Sync {
-    /// Auto-bank/auto-store-bank the item in `slot` (`CMSG_AUTOBANK_ITEM`/`CMSG_AUTOSTORE_BANK_ITEM`
-    /// — right-click to bank, right-click to withdraw). The module infers the direction from `slot`
-    /// and resolves the receiving free slot itself; a full destination (bank or carry space) is a
-    /// per-action `Err`.
     fn auto_bank_item(&self, actor: Actor, slot: u8) -> Result<()>;
 
-    /// Buy the next bank bag slot from `banker_guid` (`CMSG_BUY_BANK_SLOT`). A refusal `Err` leads
-    /// with its `SMSG_BUY_BANK_SLOT_RESULT` code in brackets (the trainer `[N]` precedent).
     fn buy_bank_slot(&self, actor: Actor, banker_guid: u64) -> Result<()>;
 }
 
-/// Move the item in `slot_index` between carry space and the bank. A Refusal, or no Character yet,
-/// answers `SMSG_INVENTORY_CHANGE_FAILURE`; a Transport Loss ends the World Session.
 fn auto_bank<St: BankStore + ?Sized>(
     outbound: &mut Vec<Outbound>,
     store: &St,
@@ -49,12 +37,6 @@ fn auto_bank<St: BankStore + ?Sized>(
     }
 }
 
-/// Bank family: `CMSG_BANKER_ACTIVATE` opens the bank window (a standing-refusing banker gets no
-/// reply at all, matching the vendor `CMSG_LIST_INVENTORY` gate); `CMSG_AUTOBANK_ITEM` deposits a
-/// carried item into the first free bank slot, `CMSG_AUTOSTORE_BANK_ITEM` withdraws a banked item
-/// into the first free carry slot — both resolve to the same module entry point, which infers the
-/// direction from the source slot and carries the banker-proximity gate for free (it reuses the
-/// move core). Only the main pseudo-bag (255) is addressed, matching the item handler's restriction.
 pub(crate) struct Bank;
 
 impl<St: BankStore + NpcStore + ?Sized> ProtocolFamily<St> for Bank {
@@ -65,7 +47,7 @@ impl<St: BankStore + NpcStore + ?Sized> ProtocolFamily<St> for Bank {
     ) -> Result<ProtocolReply> {
         let msg = request.message()?;
         let mut outbound = Vec::new();
-        const MAIN_BAG: u8 = 255; // INVENTORY_SLOT_BAG_0 — same restriction as the item handler
+        const MAIN_BAG: u8 = 255;
         match msg {
             ClientOpcodeMessage::CMSG_BANKER_ACTIVATE(c) => {
                 let banker_guid = c.guid.guid();
@@ -79,7 +61,6 @@ impl<St: BankStore + NpcStore + ?Sized> ProtocolFamily<St> for Bank {
                 }
                 outbound.push(show_bank(banker_guid));
             }
-            // Right-click a bag item with the bank open → deposit into the first free bank slot.
             ClientOpcodeMessage::CMSG_AUTOBANK_ITEM(c) => {
                 if c.bag_index == MAIN_BAG {
                     auto_bank(&mut outbound, store, conn, c.slot_index, "deposit")?;
@@ -91,11 +72,8 @@ impl<St: BankStore + NpcStore + ?Sized> ProtocolFamily<St> for Bank {
                     );
                 }
             }
-            // Buy the next bank bag slot from the named banker. Success and every refusal relay
-            // `SMSG_BUY_BANK_SLOT_RESULT`; the refusal code rides the module's `[N]` error tag.
             ClientOpcodeMessage::CMSG_BUY_BANK_SLOT(c) => {
                 let banker_guid = c.guid.guid();
-                // No Character yet gets an untagged reason, which answers NotBanker.
                 let refusal = match conn
                     .self_guid()
                     .and_then(Actor::new)
@@ -120,7 +98,6 @@ impl<St: BankStore + NpcStore + ?Sized> ProtocolFamily<St> for Bank {
                     ),
                 ));
             }
-            // Right-click a banked item → withdraw into the first free backpack/bag slot.
             ClientOpcodeMessage::CMSG_AUTOSTORE_BANK_ITEM(c) => {
                 if c.bag_index == MAIN_BAG {
                     auto_bank(&mut outbound, store, conn, c.slot_index, "withdraw")?;

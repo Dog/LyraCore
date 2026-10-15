@@ -1,9 +1,5 @@
-//! Dungeon-instancing fixture + operator levers, plus the nav-probe and
-//! one-time-backfill levers that accreted next to them (no section of their own).
-
 use spacetimedb::{log, reducer, ReducerContext, Table};
 
-// trait imports — VmapChunk/NavChunk are module-private, no crate-root glob re-export
 use crate::creatures::build_creature_entity;
 use crate::nav::game_nav_chunk;
 use crate::vmap::game_vmap_chunk;
@@ -12,24 +8,6 @@ use crate::{
     game_world_entity, CreatureSpawn, ServerConfig,
 };
 
-/// THE FIXTURE DUNGEON (headless, zero imports): resolve-or-create an instance of
-/// the character's CURRENT map through the REAL production path (`resolve_or_create_instance`:
-/// own binding → party's live instance → create, 5-cap enforced) and same-map-teleport them into
-/// it in place. On the dev map this instances the SEEDED world — the chicken/wolf/trainer roster
-/// copies in as the per-instance population, so two ungrouped characters get DISJOINT populations
-/// (distinct instance ids, distinct creature guids) and two GROUPED characters land in the SAME
-/// one. Call it twice for one character → the second call RESOLVES the binding (same id back).
-/// Verify: `spacetime sql "SELECT * FROM game_instance"` / `"... FROM game_instance_binding"`,
-/// and the log line below carries the id.
-///
-/// CLIENT-VIEW CAVEAT (dev-only, inherent to the same-map hop): a same-map instance switch is a
-/// MSG_MOVE_TELEPORT_ACK teleport — the gateway's per-viewer `created` dedup set only resets on a
-/// CROSS-map transfer (the enter_world resubscribe), so a live 1.12 client keeps rendering the
-/// instance-0 objects it already saw (frozen — their relays are now instance-gated) until relog.
-/// SERVER-side isolation is full either way (module gates + relay gates); wire assertions about
-/// "sees only its own population" should therefore be made on a FRESH login after the switch
-/// (login rebuilds into `pending_instance_id` with a fresh created set + initial-apply sweep).
-/// The real dungeon flow (areatrigger portal) is cross-map and has no such caveat.
 #[reducer]
 pub fn debug_create_fixture_instance(
     ctx: &ReducerContext,
@@ -39,7 +17,6 @@ pub fn debug_create_fixture_instance(
     let player = crate::helpers::live_entity(ctx, character_guid)?;
     let map_id = player.map_id;
     let instance_id = crate::instance::resolve_or_create_instance(ctx, character_guid, map_id)?;
-    // Same-map teleport in place: the in-place branch stamps entity + Character with the instance.
     crate::world::teleport_player(
         ctx,
         character_guid,
@@ -54,10 +31,6 @@ pub fn debug_create_fixture_instance(
     Ok(())
 }
 
-/// Place a character into an EXISTING instance on their current map (bypasses binding/resolve —
-/// the raw placement lever for cap/isolation experiments). Same-map only: a cross-map placement
-/// would land them at their current coords on a foreign map (garbage) — use the areatrigger path
-/// or `debug_teleport` + `debug_enter_instance` in two steps for cross-map trips.
 #[reducer]
 pub fn debug_enter_instance(
     ctx: &ReducerContext,
@@ -93,9 +66,6 @@ pub fn debug_enter_instance(
     Ok(())
 }
 
-/// Force-reap an instance NOW (the full teardown: population → encounter sweep → tick row
-/// → bindings → row) without waiting out the 30min empty window. It refuses the same live-player,
-/// pending-intent, and Escrow claims as the scheduled reaper. The headless reap-verification lever.
 #[reducer]
 pub fn debug_reap_instance(ctx: &ReducerContext, instance_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -120,9 +90,6 @@ pub fn debug_reap_instance(ctx: &ReducerContext, instance_id: u64) -> Result<(),
     Ok(())
 }
 
-/// Drive the player-facing `reset_instance` core by explicit guid (the CLI identity owns no
-/// entity): flags every UNOCCUPIED instance the character may reset; the reaper (60s) tears each
-/// down on its next firing. Returns Err when nothing was eligible, mirroring the player reducer.
 #[reducer]
 pub fn debug_reset_instance(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -131,8 +98,6 @@ pub fn debug_reset_instance(ctx: &ReducerContext, character_guid: u64) -> Result
     })
 }
 
-/// 241 spot-probe: log walkability + obstruction at (x, y) on `map`. The rasterizer's
-/// server-side verification hook (nav has no client-visible readback until 243 wires it).
 #[reducer]
 pub fn debug_nav_probe(ctx: &ReducerContext, map: u32, x: f32, y: f32) {
     let walk = crate::nav::walkable(ctx, map, x, y);
@@ -143,8 +108,6 @@ pub fn debug_nav_probe(ctx: &ReducerContext, map: u32, x: f32, y: f32) {
     );
 }
 
-/// Toggle nav-grid consumption (`game_config.nav_enabled`), upserts row 0 like
-/// `debug_set_xp_rate`. OFF = straight-line movement + wall-blind aggro/casts.
 #[reducer]
 pub fn debug_set_nav_enabled(ctx: &ReducerContext, enabled: bool) -> Result<(), String> {
     let cfg = ctx.db.game_config();
@@ -168,12 +131,9 @@ pub fn debug_set_nav_enabled(ctx: &ReducerContext, enabled: bool) -> Result<(), 
     Ok(())
 }
 
-/// 243 spot-probe: log the nav-aware leg from (x0,y0) to (x1,y1) — the exact query
-/// `nav_step` runs. Shows the string-pulled waypoints (detour) or the fast/fallback shape.
 #[reducer]
 pub fn debug_nav_leg(ctx: &ReducerContext, map: u32, x0: f32, y0: f32, x1: f32, y1: f32) {
     let enabled = crate::nav::nav_enabled(ctx);
-    // LoS/collision endpoints stand on the ground like real units (falls back to z=0 off-slice).
     let z0 = crate::terrain::ground_z(ctx, map, x0, y0).unwrap_or(0.0);
     let z1 = crate::terrain::ground_z(ctx, map, x1, y1).unwrap_or(0.0);
     let step = crate::nav::nav_step(ctx, map, 0, (x0, y0), (x1, y1), 4.0, 0.0, z0);
@@ -185,8 +145,6 @@ pub fn debug_nav_leg(ctx: &ReducerContext, map: u32, x0: f32, y0: f32, x1: f32, 
     );
 }
 
-/// Toggle vmap ray consumption (`game_config.vmap_enabled`) — upserts row 0 like
-/// `debug_set_nav_enabled`. OFF = every ray query returns clear (no vmap data consulted).
 #[reducer]
 pub fn debug_set_vmap_enabled(ctx: &ReducerContext, enabled: bool) -> Result<(), String> {
     let cfg = ctx.db.game_config();
@@ -210,9 +168,6 @@ pub fn debug_set_vmap_enabled(ctx: &ReducerContext, enabled: bool) -> Result<(),
     Ok(())
 }
 
-/// Toggle vmap-derived nav coverage in path planning (`game_config.nav_coverage_enabled`) —
-/// upserts row 0 like `debug_set_vmap_enabled`. OFF = planning reads the imported nav grid alone.
-/// This is the one-command rollback for a coverage rollout.
 #[reducer]
 pub fn debug_set_nav_coverage_enabled(ctx: &ReducerContext, enabled: bool) -> Result<(), String> {
     let cfg = ctx.db.game_config();
@@ -236,9 +191,8 @@ pub fn debug_set_nav_coverage_enabled(ctx: &ReducerContext, enabled: bool) -> Re
     Ok(())
 }
 
-/// Probe both ray flavors in instance 0. Preserve the original Operator command signature.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // A reducer's arguments are its call signature.
+#[allow(clippy::too_many_arguments)]
 pub fn debug_vmap_ray(
     ctx: &ReducerContext,
     map: u32,
@@ -252,10 +206,8 @@ pub fn debug_vmap_ray(
     debug_vmap_ray_instance(ctx, map, x0, y0, z0, x1, y1, z1, 0);
 }
 
-/// Probe both ray flavors in one instance, independent of the gameplay Gate.
-/// Static doodads affect collision only; closed DOOR/BUTTON geometry affects both flavors.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // A reducer's arguments are its call signature.
+#[allow(clippy::too_many_arguments)]
 pub fn debug_vmap_ray_instance(
     ctx: &ReducerContext,
     map: u32,
@@ -276,10 +228,6 @@ pub fn debug_vmap_ray_instance(
     );
 }
 
-/// 526 spot-probe: log the model floor at `(x, y)` for `map`, both the raw `vmap::floor_z` and
-/// `terrain::snap_z`'s combined `max(terrain, floor)` — the server-side verification hook for a
-/// bridge/WMO-interior coordinate where the two disagree (done-when: returns the model floor, not
-/// the terrain underneath it). Analogue of `debug_nav_probe`.
 #[reducer]
 pub fn debug_floor_probe(ctx: &ReducerContext, map: u32, x: f32, y: f32, probe_z: f32) {
     let enabled = crate::vmap::vmap_enabled(ctx, map);
@@ -291,11 +239,6 @@ pub fn debug_floor_probe(ctx: &ReducerContext, map: u32, x: f32, y: f32, probe_z
     );
 }
 
-/// 527 spot-probe: log the WMO area-info at `(x, y, z)` for `map` — which group (if any) contains
-/// the point and whether it's indoor. Analogue of `debug_vmap_ray`/`debug_floor_probe`; vmap has
-/// no client-visible readback, so this is the server-side verification hook (decision §query
-/// surface). Done-when's live check: a point inside the Northshire abbey logs `indoor=true` with a
-/// group id, a point outside logs `indoor=None`/no group.
 #[reducer]
 pub fn debug_vmap_area_info(ctx: &ReducerContext, map: u32, x: f32, y: f32, z: f32) {
     let enabled = crate::vmap::vmap_enabled(ctx, map);
@@ -315,10 +258,10 @@ pub fn debug_assert_floor_snap(
 ) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
 
-    const ORIGIN: (f32, f32) = (2600.0, 2600.0); // an unimported-terrain patch: ground_z is None
-    const FLOOR_Z: f32 = 20.0; // the synthetic "bridge deck"
-    const PROBE_UNDERSHOOT_YD: f32 = 0.5; // inside floor_z's FLOOR_PROBE_UP_YD margin
-    const TERRAIN_FALLBACK: f32 = FLOOR_Z - PROBE_UNDERSHOOT_YD; // what a spawn/movement candidate near (but not exactly on) the deck carries
+    const ORIGIN: (f32, f32) = (2600.0, 2600.0);
+    const FLOOR_Z: f32 = 20.0;
+    const PROBE_UNDERSHOOT_YD: f32 = 0.5;
+    const TERRAIN_FALLBACK: f32 = FLOOR_Z - PROBE_UNDERSHOOT_YD;
 
     let tris = [
         lyracore_shared::vmap::VmapTri {
@@ -361,7 +304,7 @@ pub fn debug_assert_floor_snap(
                 continue;
             }
             let row = vmap_chunks.insert(crate::vmap::VmapChunk {
-                id: 0, // auto_inc
+                id: 0,
                 key: lyracore_shared::terrain::cell_key(map_id, cx, cy),
                 map_id,
                 cell_x: cx,
@@ -392,20 +335,12 @@ pub fn debug_assert_floor_snap(
         }
     }
 
-    // (1) the raw floor probe, from above the deck looking down.
     let floor = crate::vmap::floor_z(ctx, map_id, 0, ORIGIN.0, ORIGIN.1, FLOOR_Z + 5.0);
-    // (2) the combined snap a movement/targeting call site actually uses.
     let snapped = crate::terrain::snap_z(ctx, map_id, 0, ORIGIN.0, ORIGIN.1, TERRAIN_FALLBACK);
     let ground = crate::terrain::ground_z(ctx, map_id, ORIGIN.0, ORIGIN.1);
 
-    // (3) spawn a creature AT the terrain-less fallback z (i.e. what an imported spawn row with
-    // no floor awareness would carry) through the real insert chokepoint.
     const HIGHGUID_UNIT: u64 = 0xF130;
     let entry_hi = (creature_entry as u64) << 24;
-    // Max over BOTH spawn rows AND live entities of this entry, one past it — never a fixed
-    // low-24 suffix. A spawn-rows-only scan (or a fixed suffix) can re-collide with a lingering
-    // entity from a prior crashed run and panic on insert (see debug/mod.rs's
-    // debug_spawn_test_creature, live find 2026-07-10).
     let spawn_max = ctx
         .db
         .game_creature_spawn()
@@ -423,7 +358,7 @@ pub fn debug_assert_floor_snap(
         .max()
         .unwrap_or(0);
     let next_low = spawn_max.max(entity_max) + 1;
-    let new_guid = (HIGHGUID_UNIT << 48) | entry_hi | next_low; // scratch guid, cleaned up below
+    let new_guid = (HIGHGUID_UNIT << 48) | entry_hi | next_low;
     let mut spawned_entity_guid = None;
     let spawn_result: Result<(), String> = (|| {
         let tmpl = ctx
@@ -459,8 +394,6 @@ pub fn debug_assert_floor_snap(
         .and_then(|g| ctx.db.game_world_entity().guid().find(g))
         .map(|e| e.z);
 
-    // Cleanup FIRST — never leave synthetic geometry, a spawn/entity row or a flipped flag behind,
-    // even on assert failure.
     for id in inserted_ids {
         ctx.db.game_vmap_chunk().id().delete(id);
     }
@@ -506,23 +439,6 @@ pub fn debug_assert_floor_snap(
     Ok(())
 }
 
-/// Done-when: server-side proof that Blink's collision clamp lands SHORT of an obstacle
-/// plane instead of teleporting through it — the headless substitute for a client screenshot at
-/// the abbey columns. Wires a synthetic 2-triangle vertical wall straight out of
-/// `lyracore_shared::vmap::encode` (the SAME codec `import_vmap_chunks` writes — not a shortcut
-/// codec) directly into `game_vmap_chunk`, duplicated into every cell the probe's bounding box
-/// could touch (mirrors the importer's AABB-duplication contract `vmap::cast_ray`'s doc comment
-/// relies on, so the exact ~33.3yd cell boundary the fixed probe point happens to land on never
-/// matters). Force-enables `vmap_enabled` for the probe and restores whatever it found after —
-/// never leaves a live database in a different state than it found it. Teleports
-/// `character_guid` to a fixed point 10yd short of the wall facing it (orientation 0, +x), then
-/// calls `spell::blink_forward` — the EXACT function `E_BLINK`'s cast dispatch calls, not a
-/// reimplementation of it — at Blink's real DBC radius (20yd, so an uncapped Blink would overshoot
-/// the wall by 10yd if the clamp did nothing). Asserts the landed position moved meaningfully
-/// forward (the clamp isn't just "gave up and stayed put") AND stopped short of the wall's x-plane
-/// (the clamp isn't just "ignored the wall"). `Err` (never a panic) carries the actual coordinates
-/// on failure — a debuggable assert, not a crash. Synthetic rows + the config flag are cleaned up
-/// before returning either way.
 #[reducer]
 pub fn debug_assert_blink_clamp(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -534,7 +450,7 @@ pub fn debug_assert_blink_clamp(ctx: &ReducerContext, character_guid: u64) -> Re
     let map_id = start.map_id;
 
     const ORIGIN: (f32, f32, f32) = (1200.0, 1200.0, 0.0);
-    const WALL_X: f32 = ORIGIN.0 + 10.0; // 10yd ahead — inside Blink's 20yd reach
+    const WALL_X: f32 = ORIGIN.0 + 10.0;
     const BLINK_YD: f32 = 20.0;
 
     let tris = [
@@ -578,7 +494,7 @@ pub fn debug_assert_blink_clamp(ctx: &ReducerContext, character_guid: u64) -> Re
                 continue;
             }
             let row = vmap_chunks.insert(crate::vmap::VmapChunk {
-                id: 0, // auto_inc
+                id: 0,
                 key: lyracore_shared::terrain::cell_key(map_id, cx, cy),
                 map_id,
                 cell_x: cx,
@@ -617,13 +533,12 @@ pub fn debug_assert_blink_clamp(ctx: &ReducerContext, character_guid: u64) -> Re
         ORIGIN.0,
         ORIGIN.1,
         ORIGIN.2,
-        0.0, // orientation 0 = facing +x, straight at the wall
+        0.0,
     );
     crate::spell::blink_forward(ctx, character_guid, BLINK_YD);
 
     let landed = ctx.db.game_world_entity().guid().find(character_guid);
 
-    // Cleanup FIRST — never leave synthetic geometry or a flipped flag behind, even on assert failure.
     for id in inserted_ids {
         ctx.db.game_vmap_chunk().id().delete(id);
     }
@@ -655,19 +570,6 @@ pub fn debug_assert_blink_clamp(ctx: &ReducerContext, character_guid: u64) -> Re
     Ok(())
 }
 
-/// Done-when: server-side proof that a COMMITTED `nav_step` move stops at a known column
-/// instead of walking through it — the headless substitute for driving a live chase and eyeballing
-/// the client. Same synthetic-wall rig as `debug_assert_blink_clamp` (the exact
-/// `lyracore_shared::vmap::encode` codec, duplicated across every cell the wall's AABB could
-/// touch), but probes `nav::nav_step` — the ONE choke point every movement pass (chase/return/
-/// wander/flee/pet-follow) calls through — instead of `blink_forward`. Doesn't move
-/// `character_guid`'s own entity: it reads that guid only to resolve a live map/instance to test
-/// against, then calls `nav_step` directly as a pure query (`cur` fixed short of the wall, `dest`
-/// far beyond it, `max_step` large enough to reach `dest` in one step if nothing blocked it).
-/// Asserts the returned step advanced meaningfully forward (the gate isn't just "gave up") AND
-/// stopped short of the wall's x-plane (the gate isn't just "ignored the wall"). Force-enables
-/// `vmap_enabled` for the probe and restores whatever it found after — never leaves the database in
-/// a different state than it found it.
 #[reducer]
 pub fn debug_assert_chase_stops_at_column(
     ctx: &ReducerContext,
@@ -683,9 +585,9 @@ pub fn debug_assert_chase_stops_at_column(
     let map_id = start.map_id;
 
     const ORIGIN: (f32, f32, f32) = (1400.0, 1400.0, 0.0);
-    const WALL_X: f32 = ORIGIN.0 + 15.0; // the "column"
-    const DEST_X: f32 = ORIGIN.0 + 30.0; // 30yd forward — well past the wall if the gate did nothing
-    const STEP_YD: f32 = 100.0; // one committed step can cover the whole leg if nothing blocked it
+    const WALL_X: f32 = ORIGIN.0 + 15.0;
+    const DEST_X: f32 = ORIGIN.0 + 30.0;
+    const STEP_YD: f32 = 100.0;
 
     let tris = [
         lyracore_shared::vmap::VmapTri {
@@ -728,7 +630,7 @@ pub fn debug_assert_chase_stops_at_column(
                 continue;
             }
             let row = vmap_chunks.insert(crate::vmap::VmapChunk {
-                id: 0, // auto_inc
+                id: 0,
                 key: lyracore_shared::terrain::cell_key(map_id, cx, cy),
                 map_id,
                 cell_x: cx,
@@ -770,7 +672,6 @@ pub fn debug_assert_chase_stops_at_column(
         ORIGIN.2,
     );
 
-    // Cleanup FIRST — never leave synthetic geometry or a flipped flag behind, even on assert failure.
     for id in inserted_ids {
         ctx.db.game_vmap_chunk().id().delete(id);
     }
@@ -801,8 +702,6 @@ pub fn debug_assert_chase_stops_at_column(
     Ok(())
 }
 
-/// Proves that an unreachable grid-tier goal cannot make a unit cross a synthetic wall.
-/// The probe restores the nav row and consumption flags it temporarily replaces.
 #[reducer]
 pub fn debug_assert_unreachable_goal_stops_at_wall(
     ctx: &ReducerContext,
@@ -822,27 +721,23 @@ pub fn debug_assert_unreachable_goal_stops_at_wall(
         .ok_or_else(|| format!("no live entity for guid {character_guid}"))?;
     let map_id = start.map_id;
 
-    // Wall down the walk-nx=32 line (obs ox=16) of the cell at (1400, 1400) — same probe corner
-    // All positions derive from the cell so nothing straddles a cell boundary.
     let (cx, cy) = (
         cell_index(1400.0).ok_or("probe corner off map")?,
         cell_index(1400.0).ok_or("probe corner off map")?,
     );
     let wall_x = sub_center(cx, 32, WALK_DIM);
-    let cur = (sub_center(cx, 8, WALK_DIM), sub_center(cy, 32, WALK_DIM)); // ~12.5 yd before the wall
-    let dest = (wall_x, cur.1); // ON the wall line — unwalkable goal, `find_leg` returns None
+    let cur = (sub_center(cx, 8, WALK_DIM), sub_center(cy, 32, WALK_DIM));
+    let dest = (wall_x, cur.1);
 
     let mut walk = vec![0xFFu8; WALK_BYTES];
     let mut obs = vec![OBS_NONE; OBS_BYTES];
     for ny in 0..WALK_DIM {
         walk_set(&mut walk, 32, ny, false);
     }
-    // A short wall catches an extra height offset in the grid collision query.
     for oy in 0..OBS_DIM {
         obs_raise(&mut obs, 0.0, 16, oy, 2.5);
     }
 
-    // Stash-and-replace any REAL nav row at the probe cell (dev imports could cover it).
     let key = cell_key(map_id, cx, cy);
     let nav_chunks = ctx.db.game_nav_chunk();
     let prior_row = nav_chunks
@@ -885,7 +780,6 @@ pub fn debug_assert_unreachable_goal_stops_at_wall(
 
     let stepped = crate::nav::nav_step(ctx, map_id, start.instance_id, cur, dest, 100.0, 0.0, 0.0);
 
-    // Cleanup FIRST — never leave synthetic nav data or flipped flags behind, even on assert failure.
     nav_chunks.key().delete(key);
     if let Some((base_z, walk, obs)) = prior_row {
         nav_chunks.insert(crate::nav::NavChunk {
@@ -906,7 +800,7 @@ pub fn debug_assert_unreachable_goal_stops_at_wall(
         }
     }
 
-    let advanced = cur.0 - stepped.0; // the step walks toward -x (higher walk index = lower coord)
+    let advanced = cur.0 - stepped.0;
     let clearance = stepped.0 - wall_x;
     log::info!(
         "debug_assert_unreachable_goal_stops_at_wall: stepped ({:.2},{:.2}) advanced={advanced:.2}yd clearance={clearance:.2}yd (wall at x={wall_x:.1})",
@@ -926,20 +820,8 @@ pub fn debug_assert_unreachable_goal_stops_at_wall(
     Ok(())
 }
 
-/// Benchmark harness: run `directions` synthetic LoS queries around EVERY real creature
-/// (`type_mask::CREATURE`) inside `[min_x,max_x]×[min_y,max_y]` on `map` — one probe segment per
-/// creature per compass direction at `radius` yd, i.e. exactly the (creature × in-range-candidate)
-/// shape `best_aggro_target` walks on a sense tick (`sense.rs`), scaled to a box of real,
-/// live-imported creature positions instead of synthetic ones. `exact=false` times the grid
-/// `nav::has_los` baseline (§8); `exact=true` times the new `vmap::los_ray` (§10). Both flavors
-/// query the SAME segments so the comparison is apples-to-apples. Deliberately a single reducer
-/// call per batch: total wall time for the whole batch is readable off the node's own
-/// `spacetime_reducer_plus_query_duration_sec{reducer="debug_bench_los"}` metric (docs/testing
-/// has no in-module clock — `std::time::Instant` does not exist on `wasm32-unknown-unknown`), so
-/// this reducer does no timing itself — it only produces the query volume and logs a checksum
-/// (`hits`) so two runs can be diffed for correctness, not just speed.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // A reducer's arguments are its call signature.
+#[allow(clippy::too_many_arguments)]
 pub fn debug_bench_los(
     ctx: &ReducerContext,
     map: u32,
@@ -954,9 +836,6 @@ pub fn debug_bench_los(
     use lyracore_shared::constants;
     use std::f32::consts::TAU;
 
-    // Grid-indexed radius scan (open world, instance 0) covering the box, not a raw table scan —
-    // `entities_near` is the shardable/scale-safe fetch (`tripwires::no_unwhitelisted_raw_spatial_scans`);
-    // the exact box + creature-type filter below is a cheap in-memory pass over its (small) result.
     let (cx, cy) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
     let half_diag = (((max_x - min_x) / 2.0).powi(2) + ((max_y - min_y) / 2.0).powi(2)).sqrt();
     let creatures: Vec<(f32, f32, f32)> =
@@ -996,7 +875,7 @@ pub fn debug_bench_los(
 }
 
 #[reducer]
-#[allow(clippy::too_many_arguments)] // A reducer's arguments are its call signature.
+#[allow(clippy::too_many_arguments)]
 pub fn debug_bench_collision_gate(
     ctx: &ReducerContext,
     map: u32,
@@ -1044,16 +923,11 @@ pub fn debug_bench_collision_gate(
     );
 }
 
-/// Backfill the imported default action bar onto an EXISTING character,
-/// chars created before the `game_createinfo_action` import have no `game_player_action` rows and
-/// fall back to the gateway's known-spells synth (which slots passives and misses the stance
-/// pages). Idempotent per button (the grant skips occupied ones). Takes effect next login.
 #[reducer]
 pub fn debug_grant_default_actions(
     ctx: &ReducerContext,
     character_name: String,
 ) -> Result<(), String> {
-    // REFUSE verdict — harness writers get the same fence as production ones.
     let c = crate::helpers::character_by_name(ctx, &character_name)
         .ok_or_else(|| format!("no character named {character_name}"))?;
     crate::action_bar::grant_createinfo_actions(ctx, c.guid, c.owner_identity, c.race, c.class);
@@ -1061,8 +935,6 @@ pub fn debug_grant_default_actions(
     Ok(())
 }
 
-/// One-time backfill: stamp grid_x/grid_y on every existing gameobject row from its (x, y)
-/// — imported/seeded rows predate the columns. Idempotent.
 #[reducer]
 pub fn debug_backfill_go_grid(ctx: &ReducerContext) {
     let gos = ctx.db.game_gameobject();
@@ -1071,7 +943,6 @@ pub fn debug_backfill_go_grid(ctx: &ReducerContext) {
     for guid in all {
         if let Some(mut g) = gos.guid().find(guid) {
             let (gx, gy) = lyracore_shared::spatial::grid_cell(g.x, g.y);
-            // `cell` too — see `debug_regrid`'s note; a migrated row's grid is already right.
             if g.grid_x != gx
                 || g.grid_y != gy
                 || g.cell != lyracore_shared::spatial::grid_cell_id(gx, gy)
@@ -1087,14 +958,10 @@ pub fn debug_backfill_go_grid(ctx: &ReducerContext) {
     log::info!("debug_backfill_go_grid: {n} rows stamped");
 }
 
-/// The Instance Removal fixture's Deadmines instance.
 const REMOVAL_FIXTURE_INSTANCE: u64 = 509_295_100;
-/// Inside Deadmines, at the entrance trigger's arrival point.
 const REMOVAL_FIXTURE_INSIDE: (u32, f32, f32, f32) = (36, -16.4, -383.07, 61.78);
-/// Every fixture Character's hearthstone home: Northshire Abbey, zone 12.
 const REMOVAL_FIXTURE_HOME: (u32, f32, f32, f32, u32) = (0, -8949.95, -132.493, 83.5312, 12);
 
-/// One fixture Character: guid, name, GM level, standing inside the instance, World Session.
 const REMOVAL_FIXTURE_CHARACTERS: [(u64, &str, u8, bool, bool); 6] = [
     (509_295_001, "Removalalpha", 0, true, true),
     (509_295_002, "Removalbravo", 0, true, true),
@@ -1104,10 +971,6 @@ const REMOVAL_FIXTURE_CHARACTERS: [(u64, &str, u8, bool, bool); 6] = [
     (509_295_006, "Removalfoxtrot", 0, true, false),
 ];
 
-/// Stage the Instance Removal fixture: a Deadmines instance owned by `party_id`, and six live
-/// Characters cloned from the seeded Tester. Four stand inside with a World Session, one of them a
-/// GM. One stands outside at home. One stands inside with no World Session, as a session-less bot
-/// does. Every home is Northshire. Membership is left to the caller. Reruns replace the rows.
 #[reducer]
 pub fn debug_stage_instance_removal_fixture(
     ctx: &ReducerContext,
@@ -1157,8 +1020,6 @@ pub fn debug_stage_instance_removal_fixture(
     Ok(())
 }
 
-/// Push every running Instance Removal a day ahead, so a test fires one only through
-/// [`debug_expire_instance_removal`] and never races the real 60 s.
 #[reducer]
 pub fn debug_hold_instance_removals(ctx: &ReducerContext) -> Result<(), String> {
     use crate::game_instance_removal;
@@ -1168,7 +1029,6 @@ pub fn debug_hold_instance_removals(ctx: &ReducerContext) -> Result<(), String> 
         ctx.timestamp.to_micros_since_unix_epoch() + DAY_MICROS,
     );
     let removals = ctx.db.game_instance_removal();
-    // Delete and insert, as the Mail Timer re-arms, so the scheduler takes the new due time.
     for mut removal in removals.iter().collect::<Vec<_>>() {
         removals.scheduled_id().delete(removal.scheduled_id);
         removal.scheduled_id = 0;
@@ -1178,7 +1038,6 @@ pub fn debug_hold_instance_removals(ctx: &ReducerContext) -> Result<(), String> 
     Ok(())
 }
 
-/// Run `character_guid`'s Instance Removal expiry now, as if its countdown had run out.
 #[reducer]
 pub fn debug_expire_instance_removal(
     ctx: &ReducerContext,
@@ -1196,7 +1055,6 @@ pub fn debug_expire_instance_removal(
     Ok(())
 }
 
-/// Log `character_guid` out through the same core a disconnect takes.
 #[reducer]
 pub fn debug_logout_character(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;

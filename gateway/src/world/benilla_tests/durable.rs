@@ -1,5 +1,3 @@
-//! Benilla packets across the Gateway and a private Module instance.
-
 use super::*;
 use crate::accept::BlockingTaskCapacity;
 use crate::config::GatewayConfig;
@@ -211,7 +209,6 @@ fn benilla_durable_target_selection_during_taxi_keeps_the_world_session_connecte
     let realm = Realm::start("benilla-taxi-selection");
     let (mut client, gateway) = realm.connect("TEST");
     client.enter_world();
-    // Stage an active flight without a schedule so selection cannot race landing.
     realm.standalone.assert_sql(
         "INSERT INTO game_active_taxi_flight \
          (character_guid,path_id,source_node_id,destination_node_id,mount_display_id,fare,\
@@ -303,7 +300,6 @@ fn benilla_durable_created_character_appears_in_the_first_roster() {
         client.socket.shutdown(std::net::Shutdown::Both).unwrap();
         (result, roster)
     });
-    // Call pipes can finish while the subscribed Coordinator cannot advance its cache.
     let early = completion.recv_timeout(Duration::from_secs(1));
     realm.coordinator.resume_pump_for_test();
     let (result, roster) = reader.join().unwrap();

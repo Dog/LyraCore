@@ -1,15 +1,10 @@
 #![cfg_attr(not(has_packages), allow(dead_code, unused_imports))]
 
-//! Setup and observation steps for a Package's own debug fixtures. The root exists only with
-//! `debug_reducers`, so a release build has none of it, and the Package API lint accepts it only in
-//! a Package file gated on that feature.
-
 use spacetimedb::{ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::creatures::{game_creature_move_schedule, GLOBAL_TICK_INSTANCE};
 use crate::import_meta::game_import_meta;
 
-/// The highest-threat living source on the creature's map and instance. Ties go to the lower guid.
 pub(crate) use crate::threat::top_threat_target;
 
 pub(crate) use crate::account_ownership::SessionActor;
@@ -30,9 +25,6 @@ pub(crate) use crate::spell::{
 };
 pub(crate) use crate::xp::grant_xp;
 
-/// Damage a live, living target through the real Core damage pipeline as a main-hand hit from
-/// `attacker_guid` (0 means anonymous). Damage is capped one below the target's health, so the
-/// call never kills.
 pub fn apply_damage(
     ctx: &ReducerContext,
     target_guid: u64,
@@ -42,8 +34,6 @@ pub fn apply_damage(
     crate::debug::debug_apply_damage(ctx, target_guid, amount, attacker_guid)
 }
 
-/// Remove a live Character from the world as a logout does: `on_logout` fires, the Character keeps
-/// its position and progress, and its combat, duel, trade and corpse end. The Character row stays.
 pub fn remove_live_character(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     let entity = crate::helpers::live_entity(ctx, character_guid)?;
     if !entity.is_player() {
@@ -53,8 +43,6 @@ pub fn remove_live_character(ctx: &ReducerContext, character_guid: u64) -> Resul
     Ok(())
 }
 
-/// Refuse when the Shard holds imported content. The temporary weather seed a fresh Module stamps
-/// is Core's own data, so it does not count.
 pub fn require_no_imported_content(ctx: &ReducerContext) -> Result<(), String> {
     match ctx
         .db
@@ -70,7 +58,6 @@ pub fn require_no_imported_content(ctx: &ReducerContext) -> Result<(), String> {
     }
 }
 
-/// Cast through the Gates a client cast passes, as the Session Actor `caster_guid`.
 pub fn client_cast(
     ctx: &ReducerContext,
     caster_guid: u64,
@@ -88,9 +75,6 @@ pub fn client_cast(
     )
 }
 
-/// Stage instance `instance_id` of `map_id` for `party_id` as a dungeon entry leaves it, and bind
-/// `character_guid` to it. `request_actor` passes the instance placement Gates. Refuses when entry
-/// resolves to another instance.
 pub fn admit_to_instance(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -109,8 +93,6 @@ pub fn admit_to_instance(
     Ok(())
 }
 
-/// Record a finished Transfer of `character_guid` to `map_id` and `instance_id` in Realm-core's
-/// character-to-shard index. The index revision advances only when the map or instance changes.
 pub fn record_completed_transfer(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -120,9 +102,6 @@ pub fn record_completed_transfer(
     crate::realm_core::record_shard(ctx, character_guid, map_id, instance_id);
 }
 
-/// Declare that the next creature movement tick fires once, `delay` from now. Refuses unless the
-/// catch-all row is the only movement schedule, which holds on a fresh Shard. The row then fires
-/// once, not on an interval.
 pub fn declare_next_movement_tick(ctx: &ReducerContext, delay: TimeDuration) -> Result<(), String> {
     let schedules = ctx.db.game_creature_move_schedule();
     let mut rows = schedules.iter().take(2);

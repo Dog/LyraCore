@@ -8,13 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::realm_core::RealmDb;
 
-/// Default sampling cadence — matches the internal capacity-benchmark harness's own read of the same
-/// node metric, and is short enough that a `SHARD_LOAD_RING` of 20
-/// (`module/src/load.rs`) covers ~10 minutes of history.
 const DEFAULT_SAMPLE_SECS: u64 = 30;
 
-/// How long to sleep between samples — `LYRACORE_LOAD_SAMPLE_SECS`, default [`DEFAULT_SAMPLE_SECS`]. `0`
-/// or unparseable falls back to the default rather than busy-looping.
 pub(crate) fn sample_interval() -> Duration {
     let secs = std::env::var("LYRACORE_LOAD_SAMPLE_SECS")
         .ok()
@@ -24,14 +19,6 @@ pub(crate) fn sample_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Deterministic 64-bit FNV-1a hash of this gateway's own identity string (`GatewayConfig::gateway_id`,
-/// `LYRACORE_GATEWAY_ID`). `game_shard_load.gateway_key` is `u64`, not `String`: a
-/// `String` END-appended to an existing table cannot carry a `#[default(...)]`
-/// (`docs/danger-zones.md` §1.2, "cannot default a `String` column"), so the raw identity never
-/// crosses the wire into the table — this hash does instead. FNV-1a (not `DefaultHasher`) because
-/// it is a fixed, documented algorithm: `std::collections::hash_map::DefaultHasher`'s algorithm is
-/// explicitly NOT guaranteed stable across Rust versions, which would silently reshuffle which ring
-/// bucket a redeployed gateway's samples land in.
 pub(crate) fn gateway_key(id: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -43,14 +30,6 @@ pub(crate) fn gateway_key(id: &str) -> u64 {
     hash
 }
 
-/// `<shard>=<hex-identity-prefix>` pairs, comma/semicolon/newline separated, `#` comments — the
-/// same separator convention `ShardMap::parse` uses for its rule text.
-///
-/// This mapping exists because SpacetimeDB's `/v1/metrics` labels samples by database IDENTITY
-/// (`db="<hex>"`), not by the friendly name the gateway's own config uses
-/// (the internal capacity-benchmark tool's `--db` flag takes the identical prefix, for the
-/// identical reason). Discover a shard's identity the same way that tool does: a `--dry-run`
-/// query against `/v1/metrics` lists every identity the node currently exposes.
 pub(crate) fn parse_db_ids(text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for raw in text.split(['\n', ',', ';']) {
@@ -68,20 +47,9 @@ pub(crate) fn parse_db_ids(text: &str) -> HashMap<String, String> {
     out
 }
 
-// ===================================================================================================
-//  Prometheus scrape + parse — a from-scratch reimplementation of
-//  the wire harness's `src/bin/bench/metrics.rs`'s identical computation, trimmed to the one family
-//  this task needs (see the module doc for why it is not shared as a library).
-// ===================================================================================================
-
-/// One scrape, keyed on the verbatim `name{labels}` text of each sample line — same shape as the
-/// capacity benchmark's `Snapshot`, and for the same reason: a key-wise lookup is all `sum` needs,
-/// and the raw key keeps label filtering to a substring match.
 #[derive(Clone, Debug, Default)]
 struct Snapshot(BTreeMap<String, f64>);
 
-/// The one metric family this task reads: "time spent executing a transaction, EXCLUDING time
-/// spent waiting to acquire database locks" — i.e. the serialized writer's busy time.
 const OCCUPANCY_FAMILY: &str = "spacetime_txn_cpu_time_sec_sum";
 
 fn http_get(url: &str) -> Result<String> {
@@ -141,15 +109,11 @@ fn split_key(key: &str) -> (&str, &str) {
     }
 }
 
-/// Substring filter selecting one database on the node: `db="<prefix>`.
 fn db_filter(db_id: &str) -> String {
     format!("db=\"{db_id}")
 }
 
 impl Snapshot {
-    /// Sum every sample of `name` whose label blob contains `filter` — same rule the capacity
-    /// benchmark's `Snapshot::sum` uses, trimmed to a single filter (this task only ever filters by
-    /// one shard's `db=` prefix at a time).
     fn sum(&self, name: &str, filter: &str) -> f64 {
         self.0
             .iter()
@@ -162,9 +126,6 @@ impl Snapshot {
     }
 }
 
-/// Occupancy percentage from a CPU-time delta over a wall-clock delta (the same computation the
-/// internal capacity-benchmark tool uses). Pure, so it is the one piece of this
-/// module pinned directly against concrete numbers.
 pub(crate) fn occupancy_pct(cpu_sec_delta: f64, wall_dt_secs: f64) -> f32 {
     if wall_dt_secs <= 0.0 || !cpu_sec_delta.is_finite() {
         return 0.0;
@@ -172,26 +133,13 @@ pub(crate) fn occupancy_pct(cpu_sec_delta: f64, wall_dt_secs: f64) -> f32 {
     ((cpu_sec_delta / wall_dt_secs) * 100.0).max(0.0) as f32
 }
 
-/// Scrapes `metrics_url` on demand and turns the delta since the PREVIOUS scrape into an
-/// occupancy-percentage-per-shard map, for every shard named in `db_ids`.
-///
-/// One scrape serves every configured shard (the node's `/v1/metrics` already reports every
-/// database it hosts in one response) — this samples the endpoint ONCE per cycle and slices it by
-/// `db=` label per shard, rather than re-scraping per shard.
 pub(crate) struct OccupancySampler {
     metrics_url: String,
-    /// shard name -> database identity hex prefix (`LYRACORE_METRICS_DB_IDS`).
     db_ids: HashMap<String, String>,
-    /// The previous cycle's scrape + the instant it was taken, shared across every configured
-    /// shard (they all delta against the SAME two scrapes).
     last: Mutex<Option<(Snapshot, Instant)>>,
 }
 
 impl OccupancySampler {
-    /// `stdb_base_url` is `LYRACORE_SPACETIMEDB_URL` (the same node every shard's coordinator connection
-    /// targets) — `/v1/metrics` is appended here. Reads `LYRACORE_METRICS_DB_IDS` once; warns (loudly,
-    /// once, at startup — the AC's "fails loudly when [manual config] disagrees with the topology")
-    /// if it names nothing, since every shard then samples sessions but never occupancy.
     pub(crate) fn from_env(stdb_base_url: &str) -> Self {
         let db_ids = parse_db_ids(&std::env::var("LYRACORE_METRICS_DB_IDS").unwrap_or_default());
         if db_ids.is_empty() {
@@ -209,11 +157,6 @@ impl OccupancySampler {
         }
     }
 
-    /// One sampling cycle: scrape, then return `{shard -> occupancy_pct}` for every shard with a
-    /// configured identity AND a prior baseline to delta against. A shard absent from the result is
-    /// UNMEASURED this cycle (no configured id, this is the first-ever scrape, or the scrape
-    /// itself failed) — never a measured zero; the caller must not conflate the two (the same care
-    /// the internal capacity-benchmark tool takes over the identical trap).
     pub(crate) fn sample_all(&self) -> HashMap<String, f32> {
         if self.db_ids.is_empty() {
             return HashMap::new();
@@ -242,18 +185,12 @@ impl OccupancySampler {
                     })
                     .collect()
             }
-            // First scrape ever: no baseline, so nothing can be DELTA'd yet — every shard is
-            // unmeasured for exactly this one cycle.
             None => HashMap::new(),
         };
         *guard = Some((snap, now));
         out
     }
 }
-
-// ===================================================================================================
-//  The driver — pure given the RealmDb abstraction, tested against `realm_core::fake::Handle`.
-// ===================================================================================================
 
 pub(crate) fn sample_and_record<D: RealmDb>(
     db: &D,
@@ -299,10 +236,6 @@ pub(crate) fn sample_and_record<D: RealmDb>(
 mod tests {
     use super::*;
 
-    // -------------------------------------------------------------------------------------
-    //  Pure math: parsing, filtering, occupancy.
-    // -------------------------------------------------------------------------------------
-
     const SAMPLE: &str = r#"
 # HELP spacetime_txn_cpu_time_sec_sum the writer's busy time
 spacetime_txn_cpu_time_sec_sum{db="abc123",txn_type="Reducer"} 10.0
@@ -337,15 +270,11 @@ spacetime_txn_cpu_time_sec_sum{db="zzz999",txn_type="Reducer"} 99.0
 
     #[test]
     fn occupancy_pct_does_not_clamp_a_brief_overrun_to_100() {
-        // A real momentary skew can read slightly over 100% — clamping it away would hide a real
-        // saturation signal behind a false ceiling. See the function's own doc.
         assert_eq!(occupancy_pct(33.0, 30.0), 110.0);
     }
 
     #[test]
     fn occupancy_pct_floors_a_negative_delta_at_zero_instead_of_going_negative() {
-        // A counter reset (node restart / republish mid-window) makes the delta negative; reading
-        // that as a negative percentage would make no sense on a graph.
         assert_eq!(occupancy_pct(-5.0, 30.0), 0.0);
     }
 
@@ -440,7 +369,7 @@ spacetime_txn_cpu_time_sec_sum{db="zzz999",txn_type="Reducer"} 99.0
     fn sample_and_record_marks_a_shard_with_no_occupancy_entry_as_unmeasured_not_zero() {
         let h = one_shard_realm();
         *h.db_at(WORLD).open_sessions.lock().unwrap() = 3;
-        let occ = HashMap::new(); // nothing measured this cycle
+        let occ = HashMap::new();
 
         let lines = sample_and_record(&h, &occ, 99);
 
@@ -462,10 +391,6 @@ spacetime_txn_cpu_time_sec_sum{db="zzz999",txn_type="Reducer"} 99.0
 
     #[test]
     fn sample_and_record_samples_every_connected_world_shard_not_just_the_first() {
-        // `world_shards()` is the default database plus every RULE's target (`ShardMap::shards`'s
-        // own doc) — a database that is merely connected, with no rule naming it, is not one of
-        // them. "1:*=world-b" is what actually puts world-b in the set, mirroring how a real
-        // second world shard is declared.
         let h = realm(&["world-a", "world-b", CORE], "1:*=world-b", Some(CORE));
         *h.db_at("world-a").open_sessions.lock().unwrap() = 10;
         *h.db_at("world-b").open_sessions.lock().unwrap() = 20;
@@ -554,8 +479,6 @@ spacetime_txn_cpu_time_sec_sum{db="zzz999",txn_type="Reducer"} 99.0
 
     #[test]
     fn an_unconfigured_single_database_gateway_samples_and_records_onto_itself() {
-        // No LYRACORE_REALM_CORE: `realm_core()` answers `self`, so the sample still lands SOMEWHERE
-        // sensible rather than silently doing nothing.
         let h = realm(&[WORLD], "", None);
         *h.db_at(WORLD).open_sessions.lock().unwrap() = 4;
         sample_and_record(&h, &HashMap::from([(WORLD.to_string(), 33.0f32)]), 1);

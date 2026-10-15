@@ -1,17 +1,13 @@
-//! Targeting and sheathing through the Combat Store.
-
 use super::handlers::{Combat, CombatStore};
 use super::*;
 use crate::stdb::ReducerCallError;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-/// What each Character has selected and how it carries its weapons.
 #[derive(Default)]
 struct CombatFake {
     selected: Mutex<BTreeMap<u64, u64>>,
     sheath: Mutex<BTreeMap<u64, u8>>,
-    /// Answered once by the next request, in place of success.
     failure: Mutex<Option<ReducerCallError>>,
 }
 
@@ -60,7 +56,6 @@ impl CombatStore for CombatFake {
     }
 }
 
-/// Handle `msg` as Character 1 of Account 7.
 fn run(store: &CombatFake, msg: impl Into<ClientOpcodeMessage>) {
     let mut session = ProtocolSession::in_world(7, 1);
     let reply = Combat::handle(store, &mut session, ProtocolRequest::Message(msg.into())).unwrap();

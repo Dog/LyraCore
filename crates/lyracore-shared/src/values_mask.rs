@@ -1,32 +1,22 @@
-//! Raw decoder for `SMSG_UPDATE_OBJECT` VALUES blocks (testing-hardening §3.1).
+// Only leading VALUES blocks are decoded; CREATE and MOVEMENT payloads cannot be skipped.
 
-//!
-//! Scope: VALUES blocks only, and only the LEADING run of them — a CREATE/MOVEMENT block has a
-//! variable-length movement payload this deliberately does not decode (the typed reader handles
-//! full CREATEs fine; VALUES is the gap). Frames that interleave a CREATE before a VALUES lose the
-//! tail — acceptable for asserts, which watch many frames.
-
-/// One decoded VALUES block: which entity, and every `(field_index, raw_word)` the mask carried.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValuesUpdate {
     pub guid: u64,
     pub fields: Vec<(u16, u32)>,
 }
 
-/// Parse the leading VALUES objects from a raw `SMSG_UPDATE_OBJECT` body. Malformed/truncated
-/// input returns what was decoded so far (asserts treat "nothing matched" as the failure signal —
-/// a parser panic would kill the whole probe on the first exotic frame).
 pub fn parse_values_updates(body: &[u8]) -> Vec<ValuesUpdate> {
     let mut out = Vec::new();
     let mut r = Reader { b: body, i: 0 };
     let Some(count) = r.u32() else { return out };
     if r.u8().is_none() {
-        return out; // has_transport
+        return out;
     }
     for _ in 0..count {
         match r.u8() {
-            Some(0) => {} // UPDATE_TYPE_VALUES — the only block this decodes
-            _ => break,   // CREATE/MOVEMENT/OOR: variable-length payloads we don't skip
+            Some(0) => {}
+            _ => break,
         }
         let Some(guid) = r.packed_guid() else { break };
         let Some(n_blocks) = r.u8() else { break };
@@ -83,14 +73,11 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
-    /// Hand-assemble a VALUES frame: one object, guid 9, field 718 = 356 (a Fishing skill word)
-    /// and field 22 = 41 (UNIT_FIELD_HEALTH) — two mask blocks apart, exercising block indexing.
     fn frame(fields: &[(u16, u32)], guid: u64) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(&1u32.to_le_bytes()); // count
-        b.push(0); // has_transport
-        b.push(0); // UPDATE_TYPE_VALUES
-                   // packed guid: low bytes only
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.push(0);
+        b.push(0);
         let gb = guid.to_le_bytes();
         let mut mask = 0u8;
         let mut bytes = Vec::new();
@@ -144,11 +131,10 @@ mod tests {
     fn truncated_or_foreign_blocks_never_panic() {
         let body = frame(&[(22, 41)], 0x9);
         for cut in 0..body.len() {
-            let _ = parse_values_updates(&body[..cut]); // must not panic at any truncation
+            let _ = parse_values_updates(&body[..cut]);
         }
-        // A CREATE-typed first block yields nothing (we don't skip movement payloads).
         let mut create = body.clone();
-        create[5] = 2; // UPDATE_TYPE_CREATE_OBJECT
+        create[5] = 2;
         assert!(parse_values_updates(&create).is_empty());
     }
 }

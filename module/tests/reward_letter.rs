@@ -5,16 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use support::{actor, Standalone};
 
-/// The seeded Tester, who turns the fixture quests in.
 const TESTER: &str = "1";
-/// The fixture's quest ender: a clone of the seed chicken, creature 620, next to the Tester.
 const GIVER: &str = "17379390972441394945";
-/// Shaped like quest 3645, Membership Card Renewal: the quest ender sends one Tempered Blade
-/// (5090050, max durability 70) after 86,400 s.
 const CARD_QUEST: &str = "509091";
-/// Shaped like quest 8728: creature 11811 sends 1,000,000 copper after 129,600 s.
 const ELDER_QUEST: &str = "509092";
-/// A quest with no reward mail.
 const PLAIN_QUEST: &str = "509093";
 const CARD_BODY: &str = "Your membership card, $n.";
 const ELDER_BODY: &str = "The elders thank you, $n.";
@@ -36,7 +30,6 @@ fn escrows(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     ))
 }
 
-/// The one Reward Letter from `sender_entry` in the Tester's mailbox.
 fn letter_from(standalone: &Standalone, sender_entry: &str) -> BTreeMap<String, String> {
     let rows: Vec<_> = standalone
         .query_rows(&format!(
@@ -53,8 +46,6 @@ fn turn_in(standalone: &Standalone, quest: &str) -> std::process::Output {
     standalone.call("gw_turn_in_quest", &[&actor(TESTER), GIVER, quest, "0"])
 }
 
-/// The Gateway's drive of a held Reward Letter, with the arguments its escrow row holds. Returns
-/// the commit's wall-clock window.
 #[allow(clippy::too_many_arguments)]
 fn drive(
     standalone: &Standalone,
@@ -98,9 +89,6 @@ fn drive(
     (from, by)
 }
 
-/// A World Session turn-in files its Reward Letter as Escrow in the same transaction, and the
-/// drive on one database writes one letter from the quest giver that arrives after the quest's
-/// delay. A playerbot's turn-in, a quest with no reward mail and a refused turn-in file nothing.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_turn_in_files_one_reward_letter_that_arrives_from_its_quest_giver() {
@@ -180,7 +168,6 @@ fn a_turn_in_files_one_reward_letter_that_arrives_from_its_quest_giver() {
         (from + day..=by + day).contains(&deliver),
         "the letter arrives 86,400 s after the commit: {mail:?}"
     );
-    // Deliver it now, so the return reaches the sender Gate rather than the delivery one.
     standalone.assert_sql(&format!(
         "UPDATE game_mail SET deliver_micros = 0 WHERE id = {}",
         mail["id"]
@@ -230,8 +217,6 @@ fn a_turn_in_files_one_reward_letter_that_arrives_from_its_quest_giver() {
     );
 }
 
-/// Commit the card renewal letter held under `escrow_id` on `mail_plane`, with the arguments its
-/// escrow row holds.
 fn commit_card(mail_plane: &Standalone, escrow_id: &str) {
     let body = quoted(CARD_BODY);
     mail_plane.assert_call(
@@ -260,10 +245,6 @@ fn commit_card(mail_plane: &Standalone, escrow_id: &str) {
     );
 }
 
-/// A Reward Letter still held when its Character crosses a Shard Boundary travels with the
-/// Character, keeps its escrow id and is delivered from the new Home Shard once. The drive before
-/// the hop reached the commit, so the drive after it replays the commit and writes no second
-/// letter. The source standalone also plays Realm-core.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_held_reward_letter_travels_with_its_character_and_arrives_once() {
@@ -278,7 +259,6 @@ fn a_held_reward_letter_travels_with_its_character_and_arrives_once() {
     assert_eq!(held.len(), 1, "{held:?}");
     let escrow_id = held[0]["escrow_id"].clone();
 
-    // The Gateway stopped after the commit, before the attestation.
     commit_card(&source, &escrow_id);
 
     let tester = actor(TESTER);

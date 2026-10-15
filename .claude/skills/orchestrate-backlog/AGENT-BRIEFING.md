@@ -9,8 +9,11 @@ Lines to carry in every implementer dispatch prompt. The orchestrator pastes wha
 
 ## Verification
 
+- Read `AGENTS.md` in your checkout. Complete the
+  [comment review](../../../CODING_STANDARDS.md#comment-review) and include its scope and result in
+  your handoff.
 - Before excepting any failing test, confirm it fails identically on the unmodified base commit; report it as pre-existing with that evidence.
-- Format touched files individually (`rustfmt <file>` and inspect the diff). Repo-wide formatting rewrites ~75 files of pre-existing drift.
+- Format the files you change and run the formatting check in `docs/testing.md`.
 - Zero new clippy warnings in touched files; wasm check for module changes.
 
 ## Scope discipline

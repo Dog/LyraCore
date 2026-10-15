@@ -4,24 +4,18 @@ use std::collections::BTreeMap;
 
 use support::{actor, Standalone};
 
-/// The fixture Character that sends every staged letter (`module/src/debug/mail.rs`).
 const SENDER: &str = "5090070";
-/// The recipient of the letter delivered about 2 s after staging.
 const DELAYED_RECIPIENT: &str = "5090072";
-/// The seeded Tester, whose live purse receives the take fixture's payout.
 const TAKER: &str = "1";
 const TAKE_MONEY_ESCROW: &str = "5090070";
 const TAKE_ITEM_ESCROW: &str = "5090071";
 const COD_ESCROW: &str = "5090072";
-/// The COD fixture's price, the Tester's purse before the payment, and the blade it carries.
 const COD: &str = "250";
 const PURSE: u64 = 1_000;
 const BLADE: &str = "5090050";
-/// A Mail with a COD price lives 3 days (cmangos `Mail.cpp:311`), and 30 days without one.
 const PAST_COD_LIFE_SECS: &str = "259260";
 const PAST_LIFE_SECS: &str = "2592060";
 
-/// Rows inserted into and deleted from the captured query by each committed transaction.
 fn changes(updates: &[serde_json::Value], side: &str) -> Vec<usize> {
     updates
         .iter()
@@ -41,7 +35,6 @@ fn timers(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     standalone.query_rows("SELECT * FROM game_mail_timer")
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn expired_mail_returns_or_is_deleted_once_and_each_arrival_fires_once() {
@@ -50,15 +43,12 @@ fn expired_mail_returns_or_is_deleted_once_and_each_arrival_fires_once() {
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
 
-    // The stage refuses unless each visible letter sent exactly one Mail Arrival and the delayed
-    // letter sent none. Two letters return at once, so their sender hears of each one.
     let delayed = standalone.capture_updates(&arrivals_of(DELAYED_RECIPIENT), 2, || {
         let returned = standalone.capture_updates(&arrivals_of(SENDER), 2, || {
             standalone.assert_call("debug_stage_mail_expiry_fixture", &[]);
         });
         assert_eq!(changes(&returned, "inserts"), [1, 1], "{returned:?}");
     });
-    // The delayed letter's arrival comes when it is delivered, alone, and the event GC reaps it.
     assert_eq!(changes(&delayed, "inserts"), [1, 0], "{delayed:?}");
     assert_eq!(changes(&delayed, "deletes"), [0, 1], "{delayed:?}");
     standalone.wait_until_call_succeeds("debug_verify_mail_expiry_fixture", &[]);
@@ -66,8 +56,6 @@ fn expired_mail_returns_or_is_deleted_once_and_each_arrival_fires_once() {
     standalone.assert_call("debug_replay_mail_timer_fixture", &[]);
     standalone.assert_call("debug_verify_mail_expiry_fixture", &[]);
 
-    // Mail written before the Mail Timer existed gets one timer from the repair pass, and a Mail
-    // past its life expires at once.
     standalone.assert_call("debug_stage_mail_legacy_fixture", &[]);
     standalone.assert_call("debug_repair_after_publish", &[]);
     standalone.wait_until_call_succeeds("debug_verify_mail_legacy_fixture", &[]);
@@ -104,7 +92,6 @@ fn quoted(text: &str) -> String {
     format!("\"{text}\"")
 }
 
-/// The row `recipient` holds under `subject`.
 fn letter(standalone: &Standalone, recipient: &str, subject: &str) -> BTreeMap<String, String> {
     standalone
         .query_rows(&format!(
@@ -145,8 +132,6 @@ fn tester_at_the_mailbox(test_name: &str) -> Standalone {
     standalone
 }
 
-/// A take fence moves the copper or the item into Escrow before Mail Expiry deletes the emptied
-/// letter. The payout reads only the Escrow, so it still completes.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_take_fenced_before_expiry_still_pays_out_after_the_letter_is_deleted() {
@@ -195,9 +180,6 @@ fn a_take_fenced_before_expiry_still_pays_out_after_the_letter_is_deleted() {
     assert_eq!(blades(&standalone), blades_before + 1);
 }
 
-/// The payment fence takes the payer's copper on their Shard before Realm-core commits it. When
-/// Mail Expiry sends the priced letter back in between, the commit returns the copper to the payer
-/// as a Returned Mail, and the Gateway can confirm and settle the fence.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_cod_payment_fenced_before_the_letter_expires_comes_back_to_the_payer() {

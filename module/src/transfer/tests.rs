@@ -1,15 +1,6 @@
-//! The crash matrix, the pure-planner enumerations, and the transport ratchets.
-//!
-//! Split out of `transfer.rs`; `harness.rs` holds the half that EXECUTES the protocol
-//! against two in-memory databases.
-
 use super::*;
 use crate::Aura;
 use spacetimedb::Timestamp;
-
-// -------------------------------------------------------------------------------------
-// Manifest / blob
-// -------------------------------------------------------------------------------------
 
 #[test]
 fn manifest_is_the_generated_enumeration_minus_the_machinery() {
@@ -43,8 +34,6 @@ fn manifest_is_the_generated_enumeration_minus_the_machinery() {
 fn manifest_exclude_holds_only_transfer_machinery() {
     assert_eq!(
         MANIFEST_EXCLUDE,
-        // `game_transfer_out` is the escrow row itself: it must not ride inside its own export
-        // blob. No table a CHARACTER owns belongs on this list.
         ["game_transfer_out"],
         "MANIFEST_EXCLUDE changed. Every name on it is dropped from the transfer manifest, from \
              every export blob, AND from the set an arriving payload must cover — so a \
@@ -55,8 +44,6 @@ fn manifest_exclude_holds_only_transfer_machinery() {
 
 #[test]
 fn generated_table_names_look_like_real_accessors() {
-    // build.rs derives these by stripping `sweep_delete_` off the marker fn names; a rename that
-    // broke the convention would put a bogus table in every export blob.
     for t in crate::CHARACTER_OWNED_TABLES {
         assert!(
             t.starts_with("game_") || t.starts_with("pkg_"),
@@ -129,14 +116,6 @@ fn hot_marks_name_only_real_manifest_tables() {
     );
 }
 
-// -------------------------------------------------------------------------------------
-// Hot-state audit: auras ON the character (buffs/debuffs/Stealth) must ride the
-// blob like every other manifest table. Before this, `game_aura` had NO `character_owned!`
-// marker at all (its columns name `target_guid`/`caster_guid`, neither of which the tripwire
-// in tripwires.rs recognizes), so a warm handoff silently dropped every buff, DoT, HoT and the
-// Rogue's Stealth presence on the source database — the destination simply never got them.
-// -------------------------------------------------------------------------------------
-
 #[test]
 fn aura_rows_are_a_manifest_table_marked_hot() {
     let m = manifest();
@@ -148,26 +127,15 @@ fn aura_rows_are_a_manifest_table_marked_hot() {
         );
 }
 
-/// The exact question asked: does a 10-minute buff resume with the right REMAINING
-/// time, or does the export/import round trip re-base it? `applied_at`/`expires_at` are
-/// `Timestamp` — an ABSOLUTE point in wall-clock time, never a duration — so the answer should
-/// be "unchanged bit-for-bit", and remaining-duration-against-a-fixed-`now` should therefore be
-/// identical before and after. `encode_rows`/`decode_rows` are the exact codec
-/// `sweep_transfer_game_aura`'s `move_rows` call drives (pure, so testable with no
-/// `ReducerContext`); a bug that re-derived `expires_at` from "duration remaining" at export
-/// time (the relative-time trap the issue explicitly called out) would still pass a bsatn
-/// round-trip, but would desync from `now` between the two sides — which is what the second
-/// assertion below actually checks, not just that the bytes decode.
 #[test]
 fn aura_absolute_expiry_survives_the_export_import_round_trip_with_the_same_remaining_time() {
     let applied_at = Timestamp::from_micros_since_unix_epoch(1_000_000_000);
-    // A 10-minute buff.
     let expires_at = Timestamp::from_micros_since_unix_epoch(1_000_000_000 + 10 * 60 * 1_000_000);
     let aura = Aura {
         id: 77,
         target_guid: 42,
         caster_guid: 42,
-        spell_id: 19750, // Flash of Light-shaped fixture id; value is inert here
+        spell_id: 19750,
         slot: 0,
         level: 60,
         flags: 0,
@@ -210,7 +178,6 @@ fn aura_absolute_expiry_survives_the_export_import_round_trip_with_the_same_rema
     );
     assert_eq!(decoded.len(), 1);
 
-    // Bit-for-bit: the codec must not touch the timestamp at all.
     assert_eq!(
         decoded[0].expires_at, expires_at,
         "expires_at was altered by the round trip"
@@ -220,8 +187,6 @@ fn aura_absolute_expiry_survives_the_export_import_round_trip_with_the_same_rema
         "applied_at was altered by the round trip"
     );
 
-    // The actual player-visible property: remaining time against a fixed `now` 4 minutes in —
-    // i.e. 6 minutes still owed — must be identical whether read before or after the hop.
     let now = Timestamp::from_micros_since_unix_epoch(1_000_000_000 + 4 * 60 * 1_000_000);
     let remaining_before =
         expires_at.to_micros_since_unix_epoch() - now.to_micros_since_unix_epoch();
@@ -268,16 +233,6 @@ fn export_blob_round_trips_through_bsatn() {
     );
 }
 
-// -------------------------------------------------------------------------------------
-// The model: a two-sided world driven by the SAME pure fns the reducers execute
-// -------------------------------------------------------------------------------------
-
-/// The observable world, modelled with the SOURCE and DESTINATION durable copies as separate
-/// facts (the cross-database truth). The same-database reducers implement this as one
-/// re-partitioned row, which is a strictly safer refinement — one row can never be lost while a
-/// copy exists, nor duplicated.
-/// The one character the single-transfer model moves. Named because `plan_begin` now compares
-/// the escrowed guid against the caller's (see the id-collision tests below).
 const GUID: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -297,9 +252,6 @@ impl Model {
             in_row: false,
         }
     }
-    /// A live, actable copy exists here iff a durable copy exists AND the in-transit fence is
-    /// down — exactly what `login_allowed` gates and what deleting the `game_world_entity` row
-    /// in `begin_transfer` enforces for every targeting/aggro/threat/AOI gate in the module.
     fn live_src(&self) -> bool {
         self.src_durable && login_allowed(self.out_row, self.in_row)
     }
@@ -311,20 +263,13 @@ impl Model {
     }
 }
 
-/// Every step is ONE transaction: it either applies wholly or not at all. A CRASH DURING a step
-/// is therefore the same observable as never having run it — which is why enumerating all step
-/// sequences (including every truncation) is exactly the crash matrix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     Begin,
     Import,
     Finish,
-    /// The reaper firing before the escrow is stale (must be inert).
     ReapFresh,
-    /// The reaper firing on a stale escrow.
     ReapStale,
-    /// The reaper firing on a stale escrow while the destination cannot be consulted
-    /// (cross-database partition — must never guess).
     ReapUnreachable,
 }
 
@@ -338,8 +283,6 @@ const ALL_STEPS: &[Step] = &[
 ];
 
 fn complete(m: Model) -> Model {
-    // Delete-last: the source copy goes, then both escrow rows. The destination copy — already
-    // durable, which `plan_finish`/`recovery` guarantee before we get here — is released.
     Model {
         src_durable: false,
         dst_durable: m.dst_durable,
@@ -351,7 +294,6 @@ fn complete(m: Model) -> Model {
 fn step(m: Model, s: Step) -> Model {
     match s {
         Step::Begin => match plan_begin(
-            // One character, one transfer id: the id is "in use" exactly while a row names it.
             if m.out_row || m.in_row {
                 Some(GUID)
             } else {
@@ -396,10 +338,6 @@ fn reap(m: Model, dest_imported: Option<bool>, age: i64) -> Model {
     }
 }
 
-/// The two invariants this whole ticket exists for, plus the two that keep them true.
-// Each assertion is spelled `!(<the bad state>)` so the predicate reads as the negation of the
-// failure its message names. De Morgan'd forms (`!a || b`) are equivalent but no longer line up
-// with the messages, which is the only way these invariants stay checkable by eye.
 #[allow(clippy::nonminimal_bool)]
 fn check(m: Model, trace: &[Step]) {
     assert!(
@@ -422,7 +360,6 @@ fn check(m: Model, trace: &[Step]) {
     );
 }
 
-/// Drive the reaper to a fixpoint (what an abandoned transfer eventually gets).
 fn reap_to_fixpoint(mut m: Model) -> Model {
     for _ in 0..8 {
         let next = step(m, Step::ReapStale);
@@ -434,16 +371,8 @@ fn reap_to_fixpoint(mut m: Model) -> Model {
     panic!("reaper did not reach a fixpoint from {m:?}");
 }
 
-// -------------------------------------------------------------------------------------
-// Property: every interleaving, every crash point
-// -------------------------------------------------------------------------------------
-
 #[test]
 fn exhaustive_interleavings_never_dupe_and_never_lose_the_character() {
-    // Every sequence of up to DEPTH steps over the full step alphabet. Because a step is one
-    // transaction, TRUNCATING a sequence models a crash at that step boundary, and every
-    // truncation of every enumerated sequence is itself enumerated — so this is the crash matrix
-    // and the interleaving matrix at once.
     const DEPTH: usize = 6;
     let mut trace = Vec::with_capacity(DEPTH);
     let mut states = std::collections::HashSet::new();
@@ -465,7 +394,6 @@ fn exhaustive_interleavings_never_dupe_and_never_lose_the_character() {
         }
     }
     walk(Model::initial(), DEPTH, &mut trace, &mut states);
-    // Sanity that the walk actually explored the protocol rather than sitting still.
     assert!(
         states.len() >= 4,
         "the walk only reached {} distinct states — the model is not moving",
@@ -503,13 +431,8 @@ fn every_reachable_state_settles_whole_on_exactly_one_side() {
     walk(Model::initial(), DEPTH, &mut Vec::new());
 }
 
-// -------------------------------------------------------------------------------------
-// The named crash points (the same facts the property test covers, spelled out as evidence)
-// -------------------------------------------------------------------------------------
-
 #[test]
 fn crash_point_a_during_begin_leaves_the_character_resident() {
-    // An aborted transaction commits nothing: identical to never having called begin.
     let m = Model::initial();
     assert!(m.live_src() && !m.live_dst() && m.settled());
     assert_eq!(
@@ -531,7 +454,6 @@ fn crash_point_b_after_begin_rolls_back() {
         m.src_durable,
         "the source copy is still durable — nothing has been deleted yet"
     );
-    // Fresh reaper: inert. Stale reaper: rollback.
     assert_eq!(step(m, Step::ReapFresh), m);
     let recovered = reap_to_fixpoint(m);
     assert!(
@@ -543,7 +465,7 @@ fn crash_point_b_after_begin_rolls_back() {
 #[test]
 fn crash_point_c_during_import_is_indistinguishable_from_crash_point_b() {
     let m = step(Model::initial(), Step::Begin);
-    let aborted = m; // the import transaction rolled back
+    let aborted = m;
     assert_eq!(aborted, step(m, Step::ReapFresh));
     assert!(reap_to_fixpoint(aborted).live_src());
 }
@@ -572,7 +494,6 @@ fn crash_point_d_after_import_rolls_forward_never_back() {
 #[test]
 fn crash_point_e_during_finish_is_retryable() {
     let imported = step(step(Model::initial(), Step::Begin), Step::Import);
-    // Aborted finish == no state change; a retry completes.
     let retried = step(imported, Step::Finish);
     assert!(retried.live_dst() && !retried.src_durable && retried.settled());
     assert_eq!(reap_to_fixpoint(imported), retried);
@@ -616,7 +537,6 @@ fn import_replay_is_a_no_op() {
         ImportPlan::Replay
     );
     assert_eq!(step(imported, Step::Import), imported);
-    // And an import with no escrow (e.g. replayed after finish) is refused outright.
     assert_eq!(plan_import(false, false), ImportPlan::NoEscrow);
 }
 
@@ -627,16 +547,11 @@ fn begin_replay_is_a_no_op_in_both_escrowed_and_imported_phases() {
     assert_eq!(step(escrowed, Step::Begin), escrowed);
     let imported = step(escrowed, Step::Import);
     assert_eq!(step(imported, Step::Begin), imported);
-    // A begin against a character with no durable source copy is an error, not an escrow.
     assert_eq!(plan_begin(None, GUID, false, false), BeginPlan::NoSource);
 }
 
 #[test]
 fn a_transfer_id_reused_for_a_different_character_is_refused_not_replayed() {
-    // `transfer_id` is CALLER-chosen, so a driver can reuse one that is still escrowed for
-    // someone else. Answering `Replay` (= `Ok(())`) there tells that driver its character is
-    // escrowed when it is not; the driver then drives import/finish on the id and moves the
-    // OTHER character to ITS destination, reporting success for a transfer that never happened.
     assert_eq!(
         plan_begin(Some(GUID), GUID + 1, true, false),
         BeginPlan::IdCollision
@@ -645,27 +560,20 @@ fn a_transfer_id_reused_for_a_different_character_is_refused_not_replayed() {
         plan_begin(Some(GUID), GUID + 1, true, true),
         BeginPlan::IdCollision
     );
-    // The matching guid is still an honest replay.
     assert_eq!(plan_begin(Some(GUID), GUID, true, true), BeginPlan::Replay);
 }
 
 #[test]
 fn a_character_already_escrowed_under_another_id_cannot_be_escrowed_twice() {
-    // Two escrows on one character = two destinations each holding a claim on it. Cross-database
-    // both would import and the character is DUPLICATED — and no per-transfer-id check can see
-    // it, because the second id's ledger rows are empty. Only the by-character lookup can.
     assert_eq!(
         plan_begin(None, GUID, true, true),
         BeginPlan::AlreadyInTransit
     );
-    // A fresh id for a character that is NOT in transit is the normal escrow.
     assert_eq!(plan_begin(None, GUID, true, false), BeginPlan::Escrow);
 }
 
 #[test]
 fn reaper_never_guesses_when_the_destination_cannot_be_consulted() {
-    // The cross-database partition case: rolling back against a successful import DUPES,
-    // rolling forward against a failed one DELETES. Holding is the only safe answer.
     assert_eq!(
         recovery(true, None, TRANSFER_STALE_MICROS * 1000),
         Recovery::Hold
@@ -690,30 +598,14 @@ fn reaper_is_inert_before_the_stale_window_and_with_no_escrow() {
         recovery(false, Some(false), TRANSFER_STALE_MICROS * 10),
         Recovery::Hold
     );
-    // Exactly at the window it acts (inclusive boundary, the instance-reaper precedent).
     assert_eq!(
         recovery(true, Some(false), TRANSFER_STALE_MICROS),
         Recovery::Rollback
     );
 }
 
-/// The ENTIRE recovery decision, enumerated rather than sampled.
-///
-/// The tests above sample `recovery` at the points that mattered when each was written. This
-/// walks every combination of its three inputs — `has_out` × `dest_imported` (all three states,
-/// `None` included) × the age boundary and both sides of it — and states the expected verdict
-/// for each in one table.
-///
-/// Worth having as well as the samples because the failure it catches is a MISSING arm, not a
-/// wrong one: an arm that stops being reached (a reordered `if`, a `>=` become `>`, a `None`
-/// folded into `Some(false)`) leaves every sampled point still passing while some other point
-/// silently changes verdict. Each of those verdicts is either a duplicated character or a
-/// deleted one — this is the function whose doc calls it "the single most load-bearing" in the
-/// file, and the reason `dest_imported` is an `Option` at all.
 #[test]
 fn the_recovery_verdict_is_enumerated_over_its_whole_input_space() {
-    // Ages spanning the staleness boundary, including the exact edge (inclusive) and the
-    // degenerate values a clock skew or an unset timestamp can produce.
     let fresh = [i64::MIN, -1, 0, 1, TRANSFER_STALE_MICROS - 1];
     let stale = [
         TRANSFER_STALE_MICROS,
@@ -769,29 +661,18 @@ fn the_recovery_verdict_is_enumerated_over_its_whole_input_space() {
     }
 }
 
-/// The remaining pure planners, likewise enumerated: their inputs are one or two booleans plus a
-/// guid comparison, so the whole space is small enough to state outright.
-///
-/// `login_allowed` is the in-transit fence — the predicate that stops a character being
-/// materialised on a shard while a copy of it is mid-flight elsewhere. Every non-Resident phase
-/// must refuse, INCLUDING the `(false, true)` shape `phase` documents as unreachable: an
-/// arrival in-row that outlived its out-row still means another database is holding a claim, so
-/// the fence must not relax just because the state "cannot happen".
 #[test]
 fn the_pure_planners_are_enumerated_over_their_whole_input_space() {
-    // phase
     assert_eq!(phase(false, false), Phase::Resident);
     assert_eq!(phase(false, true), Phase::Resident);
     assert_eq!(phase(true, false), Phase::Escrowed);
     assert_eq!(phase(true, true), Phase::Imported);
 
-    // plan_import
     assert_eq!(plan_import(false, false), ImportPlan::NoEscrow);
     assert_eq!(plan_import(true, false), ImportPlan::Apply);
     assert_eq!(plan_import(false, true), ImportPlan::Replay);
     assert_eq!(plan_import(true, true), ImportPlan::Replay);
 
-    // plan_finish
     assert_eq!(plan_finish(false, false), FinishPlan::AlreadyDone);
     assert_eq!(plan_finish(false, true), FinishPlan::AlreadyDone);
     assert_eq!(
@@ -802,7 +683,6 @@ fn the_pure_planners_are_enumerated_over_their_whole_input_space() {
     );
     assert_eq!(plan_finish(true, true), FinishPlan::Complete);
 
-    // login_allowed — only a fully resident character may be materialised.
     assert!(login_allowed(false, false));
     assert!(
         !login_allowed(true, false),
@@ -816,7 +696,6 @@ fn the_pure_planners_are_enumerated_over_their_whole_input_space() {
     );
     assert!(!login_allowed(true, true));
 
-    // escrowed_guid — out-row first, in-row as the fallback that un-strands blocker 2.
     assert_eq!(escrowed_guid(None, None), None);
     assert_eq!(escrowed_guid(Some(7), None), Some(7));
     assert_eq!(
@@ -830,7 +709,6 @@ fn the_pure_planners_are_enumerated_over_their_whole_input_space() {
         "the source out-row wins: it names the copy that is actually frozen here"
     );
 
-    // plan_begin — the id-reuse and double-escrow refusals, over every input shape.
     for source_durable in [false, true] {
         for in_transit in [false, true] {
             assert_eq!(
@@ -869,7 +747,6 @@ fn the_pure_planners_are_enumerated_over_their_whole_input_space() {
 
 #[test]
 fn a_character_round_trips_between_two_partitions() {
-    // The tracer: A -> B, then B -> A. Each leg is the full three-step protocol.
     let mut m = Model::initial();
     for leg in 0..2 {
         m = step(m, Step::Begin);
@@ -884,7 +761,6 @@ fn a_character_round_trips_between_two_partitions() {
             m.src_durable, m.dst_durable,
             "leg {leg}: exactly one durable copy"
         );
-        // Re-home for the return leg: the destination becomes the next leg's source.
         m = Model {
             src_durable: true,
             dst_durable: false,
@@ -894,7 +770,6 @@ fn a_character_round_trips_between_two_partitions() {
     }
 }
 
-/// The pure half of the DEFER verdict, driven directly: value in, value out, nothing dropped.
 #[test]
 fn folding_a_money_delta_adds_it_to_the_escrowed_blob() {
     let blob = ExportBlob {
@@ -921,7 +796,6 @@ fn folding_a_money_delta_adds_it_to_the_escrowed_blob() {
         out.money, 1_250,
         "the deferred copper must land in the blob"
     );
-    // Everything else is untouched — the fold is a delta, not a rewrite.
     assert_eq!(
         ExportBlob {
             money: 1_000,
@@ -930,8 +804,6 @@ fn folding_a_money_delta_adds_it_to_the_escrowed_blob() {
         blob
     );
 
-    // Saturating, like every other purse write in the module: an overflowing delta clamps
-    // rather than wrapping a character's fortune back to nothing.
     let rich = spacetimedb::sats::bsatn::to_vec(&ExportBlob {
         money: u32::MAX - 1,
         ..blob
@@ -941,33 +813,9 @@ fn folding_a_money_delta_adds_it_to_the_escrowed_blob() {
     let out: ExportBlob = spacetimedb::sats::bsatn::from_slice(&folded).expect("round-trips");
     assert_eq!(out.money, u32::MAX);
 
-    // A corrupt blob is an Err, never a silent zero — the escrow is left byte-identical so the
-    // single loud failure stays at `import_character`.
     assert!(fold_money_delta(b"not a blob", 1).is_err());
 }
 
-// -------------------------------------------------------------------------------------
-// CROSS-DATABASE: the transport ratchet, and the six-step crash matrix
-// -------------------------------------------------------------------------------------
-
-/// THE RATCHET. A character-owned table with no `character_owned!(transfer, ..)` arm does not
-/// cross a database boundary — and unlike a missing delete sweep (which leaks rows, loudly,
-/// forever) that failure is INVISIBLE: the character simply arrives without that table's data,
-/// and the source copy it came from has already been cascade-deleted. There is no second chance
-/// and no error anywhere. So: every manifest table must have an arm, and a NEW character-owned
-/// table fails this test by name in the same edit that adds it.
-///
-/// "Not transported" is a legal answer, via the `character_owned!(not_transported, ..)` marker
-/// kind, written AT the table (see `rest.rs` / `group.rs`'s invite row) — because a decision
-/// recorded at the table is a different thing from an omission nobody noticed.
-///
-/// Reads `crate::CHARACTER_OWNED_TRANSFER_NAMES`, the plain-string half of the generated
-/// registry. Deliberately not `crate::CHARACTER_OWNED_TRANSFERS` itself: referencing that
-/// array materializes every registered fn's POINTER, which drags the SpacetimeDB host imports
-/// (`datastore_insert_bsatn`, `row_iter_bsatn_advance`, …) into this native test binary, which
-/// cannot link them. Same reasoning — and the same discovery-by-linker-error — as
-/// `tripwires::build_scan_strip_tripwire::commented_out_markers_do_not_register`. Before this test string-parsed the
-/// generated Rust source to get the same list; build.rs emits it directly now.
 #[test]
 fn every_manifest_table_can_cross_a_database_boundary() {
     let transports: Vec<String> = crate::CHARACTER_OWNED_TRANSFER_NAMES
@@ -996,7 +844,6 @@ fn every_manifest_table_can_cross_a_database_boundary() {
              next to the table (see any of the existing arms), or `transfer::not_transported(io)` if \
              the rows genuinely must not cross — but write the decision AT the table."
         );
-    // `sweep_transfer_<accessor>` name stale would ship rows under a table nobody imports).
     let tables: Vec<String> = manifest().into_iter().map(|e| e.table).collect();
     for t in &transports {
         assert!(
@@ -1034,12 +881,6 @@ fn the_not_transported_allowlist_matches_the_arms_that_decline() {
     );
 }
 
-/// One table, one transport arm — the invariant that keeps
-/// [`the_not_transported_allowlist_matches_the_arms_that_decline`] honest now that it only covers
-/// core tables. A second arm for a table that already has one exports its rows twice, and a second
-/// arm that DECLINES is how a drop-in Package would stop a core table from crossing without any
-/// core file changing. build.rs refuses to emit such a registry at all; this is the outcome of that
-/// refusal, asserted where a reader of the allowlist will find it.
 #[test]
 fn every_transported_table_has_exactly_one_arm() {
     let mut seen: Vec<&str> = Vec::new();
@@ -1081,13 +922,10 @@ fn the_row_codec_round_trips_and_refuses_garbage() {
     assert!(outcome.is_ok());
     assert_eq!(back, rows, "every arriving row must come back, in order");
 
-    // An empty payload is "this table had no rows", not an error.
     let mut outcome = Ok(());
     let none: Vec<ManifestEntry> = decode_rows(&[], &mut outcome);
     assert!(none.is_empty() && outcome.is_ok());
 
-    // Garbage is refused LOUDLY and yields nothing — a half-applied table is the one outcome
-    // worse than none, because the in-row filed afterwards licenses deleting the source copy.
     let mut outcome = Ok(());
     let broken: Vec<ManifestEntry> = decode_rows(&[0xff, 0xff, 0xff, 0xff], &mut outcome);
     assert!(
@@ -1107,9 +945,6 @@ fn the_row_codec_round_trips_and_refuses_garbage() {
     );
 }
 
-/// The cross-database world: FOUR ledger facts instead of two, because neither database can
-/// read the other's. `in_row_src` is the ATTESTATION (`confirm_import`); `in_row_dst` is the
-/// arrival copy's own fence, cleared by `release_transfer`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 struct Xdb {
     src_durable: bool,
@@ -1129,13 +964,10 @@ impl Xdb {
             in_row_dst: false,
         }
     }
-    /// The SAME predicate the real gates use, applied to each database's own ledger rows.
     fn live_src(&self) -> bool {
         self.src_durable && login_allowed(self.out_row, self.in_row_src)
     }
     fn live_dst(&self) -> bool {
-        // The destination holds no out-row (the escrow's source claim is on the other database),
-        // so its fence is the in-row alone — which `login_allowed` already covers.
         self.dst_durable && login_allowed(false, self.in_row_dst)
     }
     fn settled(&self) -> bool {
@@ -1146,20 +978,11 @@ impl Xdb {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum XStep {
     Begin,
-    /// `import_character_blob` at the destination. Only reachable when the source escrow
-    /// exists, because the blob the gateway carries is what `begin_transfer` produced.
     Import,
-    /// `confirm_import` on the source. GATED on the destination copy being durable — that gate
-    /// is the gateway's obligation (`run_transfer` calls it only after the import committed),
-    /// not something the source database can check.
     Confirm,
-    /// `finish_transfer` on the source.
     Finish,
-    /// `release_transfer` at the destination.
     Release,
-    /// The SOURCE reaper on a stale escrow.
     ReapSrcStale,
-    /// The DESTINATION reaper on its stale arrival row — must be inert (no out-row there).
     ReapDst,
 }
 
@@ -1184,7 +1007,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
             BeginPlan::Escrow => Xdb { out_row: true, ..m },
             _ => m,
         },
-        // No blob without an escrow; replay on the in-row PK.
         XStep::Import => {
             if !m.out_row || m.in_row_dst {
                 m
@@ -1196,7 +1018,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
                 }
             }
         }
-        // `confirm_import` refuses with no out-row; the gateway only calls it post-import.
         XStep::Confirm => {
             if m.out_row && m.in_row_dst {
                 Xdb {
@@ -1208,7 +1029,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
             }
         }
         XStep::Finish => match plan_finish(m.out_row, m.in_row_src) {
-            // Delete-last: the source copy is cascade-deleted, then the escrow rows.
             FinishPlan::Complete => Xdb {
                 src_durable: false,
                 out_row: false,
@@ -1222,8 +1042,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
             ..m
         },
         XStep::ReapSrcStale => {
-            // The cross-database reading of the local in-row: absent means UNATTESTED, not
-            // "not imported".
             let imported = if m.in_row_src { Some(true) } else { None };
             match recovery(m.out_row, imported, TRANSFER_STALE_MICROS) {
                 Recovery::Hold => m,
@@ -1239,8 +1057,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
                 },
             }
         }
-        // The destination has no out-row, so `recovery` answers Hold: an arrival copy is never
-        // reaped by the database it arrived on.
         XStep::ReapDst => {
             assert_eq!(
                 recovery(false, Some(m.in_row_dst), TRANSFER_STALE_MICROS),
@@ -1251,7 +1067,6 @@ fn xstep(m: Xdb, s: XStep) -> Xdb {
     }
 }
 
-// Same `!(<the bad state>)` convention as `check` above, for the same readability reason.
 #[allow(clippy::nonminimal_bool)]
 fn xcheck(m: Xdb, trace: &[XStep]) {
     assert!(
@@ -1278,10 +1093,6 @@ fn xcheck(m: Xdb, trace: &[XStep]) {
 
 #[test]
 fn the_cross_database_sequence_never_dupes_and_never_loses_the_character() {
-    // Same reasoning as the same-database walk: one step = one transaction, so TRUNCATING a
-    // sequence models a crash at that boundary, and every truncation is itself enumerated.
-    // Depth 7 covers the full happy path (begin→import→confirm→finish→release) plus two
-    // arbitrary extra steps at any position.
     const DEPTH: usize = 7;
     let mut seen = std::collections::HashSet::new();
     fn walk(
@@ -1307,8 +1118,6 @@ fn the_cross_database_sequence_never_dupes_and_never_loses_the_character() {
         "the walk only reached {} states — the model is not moving",
         seen.len()
     );
-    // The happy path really does end with the character live on the destination and NOTHING
-    // durable on the source (i.e. the walk above is not vacuously safe by never moving).
     let mut m = Xdb::initial();
     for s in [
         XStep::Begin,
@@ -1324,9 +1133,6 @@ fn the_cross_database_sequence_never_dupes_and_never_loses_the_character() {
 
 #[test]
 fn a_cross_database_escrow_is_never_rolled_back_before_it_is_attested() {
-    // THE cross-database safety rule. Rolling back would unfreeze the source copy — and the
-    // destination copy may already be durable and live, because the source cannot see it. The
-    // reaper must HOLD (recoverable) rather than guess (a duplicated character).
     let escrowed = xstep(Xdb::initial(), XStep::Begin);
     let imported = xstep(escrowed, XStep::Import);
     for m in [escrowed, imported] {
@@ -1336,8 +1142,6 @@ fn a_cross_database_escrow_is_never_rolled_back_before_it_is_attested() {
             "an unattested cross-database escrow must be HELD, not rolled back: {m:?}"
         );
     }
-    // Once attested, roll-forward IS correct — a driver that died between confirm and finish
-    // is completed by the reaper rather than leaving the player frozen forever.
     let attested = xstep(imported, XStep::Confirm);
     let reaped = xstep(attested, XStep::ReapSrcStale);
     assert!(!reaped.src_durable && !reaped.out_row, "{reaped:?}");
@@ -1349,10 +1153,6 @@ fn a_cross_database_escrow_is_never_rolled_back_before_it_is_attested() {
 
 #[test]
 fn finish_before_the_attestation_cannot_destroy_the_source_copy() {
-    // `finish_transfer` is the only step that destroys the source copy, and cross-database the
-    // in-row it demands is the gateway's attestation that the destination copy is durable. An
-    // out-of-order finish therefore refuses — the same `plan_finish` guard as same-database,
-    // which is the point of routing the cross-database flow back through it.
     let escrowed = xstep(Xdb::initial(), XStep::Begin);
     let imported = xstep(escrowed, XStep::Import);
     assert_eq!(
@@ -1369,9 +1169,6 @@ fn finish_before_the_attestation_cannot_destroy_the_source_copy() {
 
 #[test]
 fn the_arrival_copy_stays_fenced_until_the_source_copy_is_gone() {
-    // Release is LAST for a reason: while the source copy still exists, a live destination copy
-    // plus a source that could be unfrozen is the dupe. Walk the happy path and assert the
-    // destination is not live until finish has run.
     let mut m = Xdb::initial();
     for s in [XStep::Begin, XStep::Import, XStep::Confirm] {
         m = xstep(m, s);
@@ -1393,14 +1190,6 @@ fn the_arrival_copy_stays_fenced_until_the_source_copy_is_gone() {
     assert!(released.live_dst() && released.settled(), "{released:?}");
 }
 
-/// (group slice) DELETED the interim group mirror — membership is realm-core's,
-/// and the blob carrying a `begin_transfer` snapshot of it would race the authority (which is
-/// what made a party SPLIT across the boundary unable to see itself in the first place).
-///
-/// This is the inverse of the tripwire it replaces. Re-adding a transport arm for
-/// `game_group_member` would put a second writer on membership: the blob's snapshot would land
-/// at the destination AFTER the gateway pushed realm-core's roster there, so the stale copy
-/// would win — silently, and only for characters that crossed a boundary.
 #[test]
 fn party_membership_does_not_ride_the_export_blob() {
     assert!(
@@ -1421,9 +1210,6 @@ fn party_membership_does_not_ride_the_export_blob() {
     );
 }
 
-/// An Instance Removal belongs to the instance it counts down for. The source cascade deletes the
-/// row when the Character leaves, and the blob carries nothing, so a Character that walks out of
-/// the Instance Pool through the portal is never sent home later.
 #[test]
 fn the_instance_removal_dies_with_the_source_copy_and_is_not_carried() {
     assert!(
@@ -1439,8 +1225,6 @@ fn the_instance_removal_dies_with_the_source_copy_and_is_not_carried() {
     assert!(NOT_TRANSPORTED.contains(&"game_instance_removal"));
 }
 
-/// The tables an older blob may lack, written out: every manifest table added since Core commit
-/// `decd7821`.
 const OLD_BLOBS_MAY_LACK: [&str; 6] = [
     "game_auction_bid_hold",
     "game_auction_hold",
@@ -1450,7 +1234,6 @@ const OLD_BLOBS_MAY_LACK: [&str; 6] = [
     "game_instance_removal",
 ];
 
-/// This build's manifest without `lacking`, as a build without those tables exported it.
 fn manifest_without(lacking: &[&str]) -> Vec<ManifestEntry> {
     manifest()
         .into_iter()
@@ -1465,8 +1248,6 @@ fn empty(table: &str) -> TableRows {
     }
 }
 
-/// A blob from an older build lacks some of the listed tables. Each one alone, and all of them
-/// together, must import, so a Transfer in flight across the publish finishes.
 #[test]
 fn a_blob_lacking_any_listed_table_imports_with_it_empty() {
     let carried = TableRows {
@@ -1499,8 +1280,6 @@ fn a_blob_lacking_any_listed_table_imports_with_it_empty() {
     );
 }
 
-/// Only the listed tables may be missing. Any other gap, an extra table, or a changed hot mark is
-/// still drift.
 #[test]
 fn any_other_manifest_difference_is_still_drift() {
     let mismatch = |arriving: &[ManifestEntry]| {
@@ -1529,7 +1308,6 @@ fn any_other_manifest_difference_is_still_drift() {
     assert!(mismatch(&rehot));
 }
 
-/// The filled payload passes the coverage check that refuses a partial import.
 #[test]
 fn a_filled_old_payload_covers_every_transport_arm() {
     fn count(applied: &std::cell::Cell<usize>, _: u64, _: &mut RowIo<'_>) {
@@ -1561,9 +1339,6 @@ fn a_filled_old_payload_covers_every_transport_arm() {
     assert_eq!(applied.get(), 7);
 }
 
-/// Pins the list and the Core manifest by count. A Core table added to the manifest fails here:
-/// add it to `TRANSFER_TABLES_OLD_BLOBS_MAY_LACK` too, then change these numbers. A linked Package
-/// adds its own tables, so the counts hold only for a build without one.
 #[test]
 fn the_tables_old_blobs_may_lack_are_pinned() {
     assert_eq!(TRANSFER_TABLES_OLD_BLOBS_MAY_LACK, OLD_BLOBS_MAY_LACK);

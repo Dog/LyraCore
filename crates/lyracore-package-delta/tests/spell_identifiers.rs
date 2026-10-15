@@ -1,6 +1,3 @@
-//! The spell identifier policy: which rows a Package may claim, and how a child effect key is
-//! derived from the spell it belongs to.
-
 mod common;
 
 use common::{artifact, effect_claim, spell_claim, WHOLE_EFFECT_ROW, WHOLE_SPELL_ROW};
@@ -9,8 +6,6 @@ use lyracore_package_delta::{
     MAX_SPELL_EFFECT_INDEX, PACKAGE_SPELL_ID_CEIL, PACKAGE_SPELL_ID_FLOOR,
 };
 
-/// Every fixture spell the seed and the fixtures module park in the reserved cluster. A Package that
-/// overwrote one of these would turn the Module's own tests into a report about the Package.
 const FIXTURE_SPELLS: [u32; 6] = [50_000, 50_072, 50_110, 50_137, 50_310, 50_311];
 
 const A_COOLDOWN: &str = r#"{"cooldown_ms":{"type":"u32","value":1500}}"#;
@@ -18,8 +13,6 @@ const A_BASE_POINT: &str = r#"{"base_points":{"type":"i32","value":7}}"#;
 
 #[test]
 fn a_spell_effect_key_is_the_spell_shifted_left_by_two_plus_the_effect_index() {
-    // Worked by hand from the formula the Module's `SpellEffect.id` column already uses:
-    // 133 * 4 = 532, plus the effect index.
     let expected = [(0_u8, 532_u64), (1, 533), (2, 534)];
 
     for (effect_index, row_id) in expected {
@@ -31,7 +24,6 @@ fn a_spell_effect_key_is_the_spell_shifted_left_by_two_plus_the_effect_index() {
 
 #[test]
 fn a_package_spell_effect_key_stays_inside_a_u64() {
-    // 6000001 * 4 = 24000004, plus effect index 2.
     let key = PrimaryKey::spell_effect(6_000_001, 2).expect("a Package spell has this effect");
 
     assert_eq!(key.row_id(), 24_000_006);
@@ -58,8 +50,6 @@ fn a_package_may_insert_a_spell_inside_the_package_range() {
 
 #[test]
 fn an_insert_outside_the_package_range_is_refused() {
-    // A real client spell, a curated trainer identifier, the value just below the floor, and the
-    // value just above the ceiling.
     for spell_id in [
         133,
         5_200_000,
@@ -94,8 +84,6 @@ fn an_inserted_effect_obeys_the_same_range_as_its_spell() {
 
 #[test]
 fn an_update_may_name_a_real_client_spell() {
-    // Tuning a real spell is the common case, and the reason the range applies to inserts alone: a
-    // Package that could not touch spell 133 could not change Fireball.
     let json = artifact("example.pkg", &spell_claim(133, "update", A_COOLDOWN));
 
     let delta = PackageDelta::parse(&json).expect("a real spell is updatable");
@@ -153,8 +141,6 @@ fn no_operation_may_claim_the_project_wide_fixture_reserved_band() {
 
 #[test]
 fn the_bands_next_to_the_fixture_clusters_stay_claimable() {
-    // The edges matter: one off in either direction and a real spell becomes unclaimable, or a
-    // fixture becomes claimable.
     for spell_id in [49_999, 51_000, 5_089_999, 5_100_000] {
         let json = artifact("example.pkg", &spell_claim(spell_id, "update", A_COOLDOWN));
 

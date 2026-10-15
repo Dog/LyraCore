@@ -1,18 +1,9 @@
-//! Mail cache-accessor methods: the mailbox list, and the mailbox-proximity gate.
-//!
-//! Both read the privileged coordinator cache. Which DATABASE that cache belongs to is the caller's
-//! decision, not this file's — `world::mail` asks the realm-core handle when there is one and the
-//! session's own handle when there is not, and both reach the same body here.
-
 use std::collections::{BTreeSet, HashMap};
 
 use spacetimedb_sdk::{Table, TableWithPrimaryKey};
 
 use super::super::bindings::*;
 
-/// The mail escrow ids each Character holds on one Shard, kept from the `game_mail_escrow` row
-/// callbacks. A drive runs after every quest turn-in, at world entry and at every mailbox visit, so
-/// it reads a Character's fences by primary key instead of scanning the cache.
 #[derive(Default)]
 pub(crate) struct MailEscrowIndex {
     by_sender: HashMap<u64, BTreeSet<u64>>,
@@ -35,7 +26,6 @@ impl MailEscrowIndex {
         }
     }
 
-    /// The escrow ids `sender_guid` holds, lowest id first.
     pub(in crate::stdb) fn of(&self, sender_guid: u64) -> Vec<u64> {
         self.by_sender
             .get(&sender_guid)
@@ -44,8 +34,6 @@ impl MailEscrowIndex {
     }
 }
 
-/// Keep a [`MailEscrowIndex`] current from the escrow row callbacks. Initial subscription rows
-/// arrive as inserts.
 pub(crate) fn watch_mail_escrows(
     conn: &DbConnection,
 ) -> std::sync::Arc<std::sync::RwLock<MailEscrowIndex>> {

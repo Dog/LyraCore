@@ -1,6 +1,3 @@
-//! A kill starts the corpse's loot from nothing: rows a live creature's guid already carries, such
-//! as pickpocket loot, never collide with the kill roll.
-
 mod support;
 
 use support::{wolves_beside, Standalone};

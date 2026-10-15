@@ -1,19 +1,3 @@
-//! The broadcast creature-move event + the creature tick schedule and the scheduled `tick_creatures`
-//! shell. [server]/[event]
-//!
-//! No behavior pass lives here. `tick_creatures` authorizes the firing, resolves coverage and
-//! cadence, and runs ONE behavior cycle; the pass list and its load-bearing order are
-//! [`crate::creatures::cycle`]'s alone.
-//!
-//!   - `mod.rs` (this file) — the two tables + the schedule table, the `tick_creatures` shell, the
-//!     active-cell sweep and rows-visited evidence logs, the shared candidate gate
-//!     `movable_creature`, the rout predicates, and the one spline writer
-//!     (`emit_move_spline`/`emit_creature_leg`) every movement decision funnels through, with
-//!     the stop between firings (`stop_where_rendered`) and the persist gate for a leg advance
-//!     (`advance_needs_persist`).
-//!   - [`lifecycle`] — the canonical despawn checklist + decay/respawn/GO-respawn, the
-//!     due-time passes that run regardless of proximity.
-
 use lyracore_shared::spatial;
 use spacetimedb::{log, reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
@@ -26,20 +10,10 @@ use super::*;
 
 mod lifecycle;
 
-// The behavior cycle (`creatures::cycle`) owns WHEN each pass runs, so it needs to name them. These
-// three are not behavior — they keep their owner here and the cycle only sequences them.
 pub(crate) use lifecycle::{pass_decay, pass_gameobject_respawn, pass_respawn};
 
-// Encounter and instance removal share the same creature despawn operation.
 pub(crate) use lifecycle::despawn_creature_entity;
 
-// ===========================================================================================
-//  Creature movement event [event] — broadcast (public, no RLS)
-// ===========================================================================================
-
-/// A server-driven creature movement leg to relay as `SMSG_MONSTER_MOVE`. Broadcast (public, no
-/// RLS) — the gateway fans it out to every in-world client, matching the global `game_world_entity`
-/// visibility placeholder. [event]
 #[table(accessor = game_creature_move_event, public)]
 pub struct CreatureMoveEvent {
     #[primary_key]
@@ -53,58 +27,30 @@ pub struct CreatureMoveEvent {
     pub dest_y: f32,
     pub dest_z: f32,
     pub duration_ms: u32,
-    pub spline_id: u32, // strictly increasing per creature (the client rejects a stale spline)
+    pub spline_id: u32,
     pub created_at: Timestamp,
-    // RUN_MODE flag for the relayed SMSG_MONSTER_MOVE: true = run animation (chase/return/flee/fear at
-    // RUN speed), false = walk (patrol/wander at WALK). Without it every leg walk-animated → RUN-speed
-    // legs moonwalked. `#[default(false)]` + end-appended → auto-migrates (existing rows read as walk).
     #[default(false)]
     pub run: bool,
 }
 
-/// SPLINE MODEL — the active movement leg for a creature. The client interpolates the emitted
-/// `SMSG_MONSTER_MOVE` (start→dest over `dur_ms`) on its own; the SERVER advances the authoritative
-/// `game_world_entity` position by lerping this SAME spline each tick in `pass_advance_splines`, instead
-/// of snapping the row to the leg END at leg-start (the old "leg-lead" that made every range/melee/aggro
-/// check read the creature ahead of where it renders — the "movement feels off vs vanilla" cause). One
-/// row per moving creature; cleared on arrival (t≥1), on CC (halt), or when the creature is gone.
-/// **PUBLIC and grid-scoped since the creature-relay change** — this row now IS the creature-movement
-/// relay, replacing the per-move `game_creature_move_event` insert (the same move perf catalog 2.1
-/// made for player movement, applied to creatures as 2.3 asks).
-///
-/// Why: `game_creature_move_event` was a globally-subscribed table (`SELECT *`), so EVERY creature
-/// leg was delivered to EVERY connected player and then discarded by the gateway's `created`-set
-/// guard. Measured at 100 dispersed players: 121.7 inserts/s + 121.6 reaps/s, each fanned to all 100
-/// sessions. This row already existed, is already one-per-creature, and is already written on every
-/// leg — so carrying the relay on it costs nothing extra and makes the delivery grid-scoped.
-///
-/// The grid columns mirror `game_world_entity`'s so the AOI tracker can subscribe this table with the
-/// identical 5×5 box query it already builds for entities and motion.
 #[table(
     accessor = game_creature_spline,
     public,
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y])),
-    // The AOI cell index — exactly 3 columns, all matched by equality terms, which is the
-    // only shape SpacetimeDB 2.7.1's subscription planner can serve (see the `cell` column).
+    // AOI subscriptions require three equality columns in SpacetimeDB 2.7.1.
     index(accessor = by_cell, btree(columns = [map_id, instance_id, cell]))
 )]
 pub struct CreatureSpline {
     #[primary_key]
     pub guid: u64,
-    pub start_micros: u64, // ctx.timestamp micros at leg-start
+    pub start_micros: u64,
     pub dur_ms: u32,
     pub sx: f32,
     pub sy: f32,
-    pub sz: f32, // leg START (authoritative pos at emit)
+    pub sz: f32,
     pub dx: f32,
     pub dy: f32,
-    pub dz: f32, // leg DEST (snapped landing)
-    // --- END-APPENDED, all defaulted (migration rule): the relay half. ---
-    /// The mover's grid address at leg-start — the AOI box predicate.
-    // TYPED literals, not a bare `0`: `#[default(0)]` on a u64 encodes as 4 bytes and the publish
-    // fails with "data too short for u64: Expected 8, given 4". Caught by the preflight check that
-    // runs before every publish, which is the only thing that checks default ENCODINGS — the
-    // compiler and the test suites are both blind to it (`docs/danger-zones.md` §2).
+    pub dz: f32,
     #[default(0u32)]
     pub map_id: u32,
     #[default(0u64)]
@@ -113,115 +59,36 @@ pub struct CreatureSpline {
     pub grid_x: i32,
     #[default(0i32)]
     pub grid_y: i32,
-    /// `SMSG_MONSTER_MOVE`'s spline id (the old event's `spline_id`, = `now_ms` at emit) and gait.
-    /// A client keys its interpolation off the id, so it must CHANGE per leg — that is also what
-    /// makes an in-place update observable as a new leg rather than a no-op.
+    // The client keys interpolation by spline id; it must change for every replacement leg.
     #[default(0u32)]
     pub spline_id: u32,
     #[default(false)]
     pub run: bool,
-    /// `(grid_x, grid_y)` packed into ONE indexed value — the AOI subscription's cell key.
-    ///
-    /// SpacetimeDB 2.7.1's subscription planner can only serve a query from an index when EVERY
-    /// column of that index is matched by an equality term, and it skips any index with more than 3
-    /// columns outright (`MAX_EXACT_INDEX_COLS`); range predicates are never index-served at all
-    /// (`IndexProbe::Range` — "we currently never construct this variant") and an `OR` is evaluated
-    /// row-by-row. So a `grid_x BETWEEN .. AND grid_y BETWEEN ..` box degrades to a full partition
-    /// scan — 1.1 BILLION rows examined on `game_gameobject` in a 445-player measurement. Folding the
-    /// two grid columns into one makes `by_cell` a 3-column all-equality index, which the planner CAN
-    /// serve, and the AOI box becomes 25 point probes instead of a scan.
-    ///
-    /// ALWAYS written from `spatial::grid_cell_id(grid_x, grid_y)` in the SAME statement that writes
-    /// `grid_x`/`grid_y` — a stale value here does not merely slow a query down, it puts the row in
-    /// the wrong cell and shows players the wrong world. `module/src/tripwires.rs::grid_cell_tripwire`
-    /// is the enforcement.
-    ///
-    /// `#[default(0i64)]` (typed — an i64 column needs an explicitly-typed literal) + END-appended so
-    /// `publish` auto-migrates. **The default is cell (0, 0), not "unset"**, so a pre-existing row is
-    /// mis-addressed until its next leg re-stamps it (sub-second for anything actually moving);
-    /// `backfill_cell_ids` covers it for completeness.
     #[default(0i64)]
     pub cell: i64,
-    /// This leg is a FACING-ONLY packet (the mover does NOT move — `sx/sy/sz` == `dx/dy/dz`,
-    /// `dur_ms` is 0) and `facing_angle` is the new heading the client should snap to
-    /// (`SMSG_MONSTER_MOVE`'s `FacingAngle` variant). A stationary stand-and-swing creature never
-    /// throws a normal leg (nothing to interpolate), so without this the client never learns its
-    /// heading changed — the "keeps its pre-combat orientation until you move" bug. `false`/`0.0`
-    /// reproduces the `Normal`-type stop exactly, so every other caller
-    /// of [`emit_move_spline`] is unaffected. END-appended + defaulted (migration rule).
     #[default(false)]
     pub facing: bool,
     #[default(0.0f32)]
     pub facing_angle: f32,
-    /// Intermediate points and destination for one linear ground path. None retains one-leg behavior.
     #[default(None::<CreaturePath>)]
     pub path: Option<CreaturePath>,
 }
 
-// ===========================================================================================
-//  Patrol scheduling [server]
-// ===========================================================================================
-
-/// Drives the creature tick, one row per FIRING SCOPE. The seeded row is the
-/// GLOBAL/CATCH-ALL ticker (`instance_id == GLOBAL_TICK_INSTANCE`); an optional DEDICATED row per
-/// instance makes that instance tick at its own cadence while the catch-all skips it (`TickScope` in
-/// ai.rs is the coverage rule — a partition, never an overlap, so a second row DIVIDES the per-firing
-/// work instead of multiplying it).
-///
-/// HONEST BOUND: SpacetimeDB serializes every reducer on ONE commit stream, this is
-/// LATENCY SMOOTHING + WORK AVOIDANCE, **NOT parallelism**. Each extra row's firings preempt the
-/// shared stream (10 instances at 100ms = 100 extra transactions/sec), so tight per-instance
-/// cadences are a knob to use sparingly, measured via the per-pass rows-visited log below.
-///
-/// PER-INSTANCE `tick_ms` KNOB: the cadence IS `scheduled_at` (`ScheduleAt::Interval(tick_ms)`) on
-/// the dedicated row. There is no separate `tick_ms` column, because it would duplicate
-/// `scheduled_at`. `create_instance` inserts the dedicated row
-/// `{scheduled_id: 0, scheduled_at: ScheduleAt::Interval(tick_ms), instance_id: N}` and the instance
-/// reap deletes it, which returns coverage of N to the catch-all. The operator retunes a row via
-/// `debug_arm_instance_tick` (`debug/mod.rs`). [server]
 #[table(accessor = game_creature_move_schedule, scheduled(tick_creatures))]
 pub struct CreatureMoveSchedule {
     #[primary_key]
     #[auto_inc]
     pub scheduled_id: u64,
     pub scheduled_at: ScheduleAt,
-    // END-APPENDED defaulted column (additive auto-migration — danger-zones §2). Which instance this
-    // row ticks. The literal default MUST equal `GLOBAL_TICK_INSTANCE` (u64::MAX; the `#[default]`
-    // macro wants a literal). NOTE: no test can pin this attribute literal itself — it is migration
-    // metadata, not Rust `Default`; ai.rs's `global_tick_instance_sentinel_is_u64_max` pins only the
-    // CONST — so editing this literal alone reds nothing: treat it as hand-synced with ai.rs so the
-    // EXISTING seeded row auto-migrates into the catch-all — every live creature keeps exactly one
-    // ticker, no re-seed needed. This table is NOT gateway-subscribed (no entry in connection.rs's
-    // subscription list or gateway/tests/schema_parity.rs's manifest) → no binding hand-sync needed
-    // (playbook failure-mode, the "No" branch).
     #[default(18_446_744_073_709_551_615u64)]
     pub instance_id: u64,
 }
 
-/// World tick (scheduled, scheduler-only): fires every `MOVE_TICK_SECS` (0.5s) on the seeded
-/// catch-all row, plus once per dedicated instance row at that row's own cadence. This reducer is a
-/// SHELL: it authorizes the firing, resolves which instances the firing covers and how long its
-/// movement step is, then runs ONE behavior cycle. The pass list and its load-bearing order live in
-/// `creatures::cycle::run_cycle` and nowhere else.
-///
-/// MOVEMENT EVERY FIRING, SENSING QUANTIZED: the expensive O(N)-scan sensing passes run about once
-/// per 4s (`is_sense_tick_for_interval`) no matter how fast this row fires, so HP-regen rate, wander
-/// frequency and respawn cadence stay vanilla; the movement step (`tick_secs_for_interval`) scales
-/// with the interval so creature speed is cadence-invariant. Both are byte-identical at the seeded
-/// 0.5s row. This is mangos's one-loop-with-recheck-timers model on one scheduled reducer — a single
-/// tick, so no cross-scheduler `spline_id` collision.
-///
-/// INSTANCE SCOPE (latency smoothing + work avoidance, NOT parallelism; see the
-/// `CreatureMoveSchedule` doc): every firing resolves a `TickScope` from ITS OWN schedule row. The
-/// catch-all row covers every instance without a dedicated row; a dedicated row covers exactly its
-/// instance. Coverage is a PARTITION, so no creature is ever ticked by two rows.
 #[reducer]
 pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
     if ctx.sender() != ctx.database_identity() {
         return;
     }
-    // The scope build scans only the schedule table itself (one catch-all + one row per dedicated
-    // instance — a handful), never a creature/entity table.
     let scope = TickScope::from_rows(
         schedule.instance_id,
         ctx.db
@@ -231,7 +98,6 @@ pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
     );
     let interval_micros = match &schedule.scheduled_at {
         ScheduleAt::Interval(d) => d.to_micros(),
-        // A one-shot Time row (nothing inserts one today) falls back to the default cadence math.
         ScheduleAt::Time(_) => MOVE_TICK_MICROS,
     };
     let now_micros = ctx.timestamp.to_micros_since_unix_epoch();
@@ -243,7 +109,6 @@ pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
         sense_secs: sense_period_secs_for_interval(interval_micros),
         scope,
     };
-    // Kept for the evidence lines below, which outlive the cycle the context is moved into.
     let (sense, global, scope_label) = (
         tick.sense,
         tick.scope.runs_global_passes(),
@@ -253,7 +118,6 @@ pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
     let outcome = crate::creatures::cycle::run(ctx, tick);
 
     if global {
-        // World counters exclude dedicated rows, which report their own scoped pass counts.
         log_active_cell_stats(ctx, outcome.awake);
         log_narrowed_pass_stats(ctx);
     }
@@ -266,23 +130,8 @@ pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
     );
 }
 
-// ===========================================================================================
-//  Active cells [server]: grid-activation; only cells near players tick
-// ===========================================================================================
-
-/// Rough heartbeat period (micros) for the active-cell rows-visited log line. NOT every tick (would spam `RUST_LOG=info` at the 0.5s movement cadence);
-/// roughly once a minute is plenty to eyeball the before/after ratio on a live node.
 const ACTIVE_CELL_LOG_PERIOD_MICROS: i64 = 60_000_000;
 
-/// The active-cell footprint radius (yards) for THIS tick: the larger of the combat activation radius
-/// (`ai::combat_active_radius` — ~55yd at today's template data, aggro+assist) and the AOI visibility
-/// radius the gateway subscribes to (`BOX_HALF_SPAN * GRID_CELL_SIZE`, 100yd guaranteed-visible). The
-/// visibility floor matters for the MOVEMENT passes (patrol/return/wander): without it a creature
-/// outside the (smaller) combat radius but still inside a player's view would visibly FREEZE mid-
-/// route — an observable divergence the item's "byte-identical... anything a player could observe"
-/// forbids. Taking the max means one active-cell set safely serves both concerns.
-/// `game_creature_template` is a small reference table (tens of rows), not the ~2500-creature live
-/// population this item exists to stop scanning — reading it once per tick is cheap.
 fn active_cell_radius(ctx: &ReducerContext) -> f32 {
     let visible = spatial::BOX_HALF_SPAN as f32 * spatial::GRID_CELL_SIZE;
 
@@ -298,9 +147,6 @@ fn active_cell_radius(ctx: &ReducerContext) -> f32 {
     combat_active_radius(template_aggro_max).max(visible)
 }
 
-/// Read each occupied neighborhood once, preserving map and instance isolation.
-/// Authored active objects stay awake without a nearby Character. Pets and combat
-/// candidates retain their separate sense-firing discovery. An Idle Bot wakes no cell.
 pub(crate) fn active_cell_creatures(
     ctx: &ReducerContext,
     scope: &TickScope,
@@ -315,9 +161,6 @@ pub(crate) fn active_cell_creatures(
     let mut pets: Vec<u64> = Vec::new();
     let mut in_combat: Vec<u64> = Vec::new();
 
-    // Pet behavior consumes its candidates only on sense firings. The global combat-drop and regen
-    // passes consume IN_COMBAT candidates on global sense firings. Keep their shared table-order scan
-    // on that cadence; non-sense movement firings no longer read the world to build unused lists.
     if sense {
         let global = scope.runs_global_passes();
         for e in entities.iter() {
@@ -373,12 +216,8 @@ fn active_object_enters_scope(is_player: bool, partition_covered: bool, active: 
     !is_player && partition_covered && active
 }
 
-/// How long a Package-controlled Character stands still out of combat before it is an Idle Bot.
 const IDLE_BOT_AFTER_MS: u32 = 30_000;
 
-/// Is this Character an Idle Bot? `package_controlled` reports a Sessionless Action Consent row and
-/// runs last because it is a lookup. A leg advance stamps the move clock every firing, so a
-/// Character on a movement leg is never idle.
 fn is_idle_bot(
     character: &WorldEntity,
     now_ms: u32,
@@ -389,26 +228,17 @@ fn is_idle_bot(
         && package_controlled()
 }
 
-/// One firing's active-cell creature set plus the sense-cadence pet and in-combat candidate lists.
 #[derive(Default)]
 pub(crate) struct TickSweep {
-    /// Creatures within `active_cell_radius` of at least one covered Character that is not an Idle
-    /// Bot.
     pub(crate) active: std::collections::HashSet<u64>,
-    /// Live pets (`owner_guid != 0`), in table order — the cycle's pet-phase candidate list.
     pub(crate) pets: Vec<u64>,
-    /// Units carrying `UNIT_FLAG_IN_COMBAT`, in table order — the candidate list the cycle's combat
-    /// exit sweeps, and the flag half of regeneration's in-combat verdict.
     pub(crate) in_combat: Vec<u64>,
 }
 
-/// Evidence log for the active-cell sweep: the rows-visited/total ratio, roughly once a
-/// minute. `total` (a full non-player-entity count) is deliberately gated behind the SAME rare window
-/// so the O(N) count itself never reintroduces the per-tick cost the active-cell sweep removes.
 fn log_active_cell_stats(ctx: &ReducerContext, awake: usize) {
     let us = ctx.timestamp.to_micros_since_unix_epoch();
     if us.rem_euclid(ACTIVE_CELL_LOG_PERIOD_MICROS) >= MOVE_TICK_MICROS {
-        return; // only the one tick per period that lands in the window logs
+        return;
     }
     let total = ctx
         .db
@@ -419,17 +249,10 @@ fn log_active_cell_stats(ctx: &ReducerContext, awake: usize) {
     log::info!("tick_creatures active-cell: {awake}/{total} creatures visited this tick");
 }
 
-/// Evidence log for the narrowed passes: the cast/rout/fear rows-visited drop, in
-/// the SAME rare window `log_active_cell_stats` uses (reusing its throttle — no extra per-tick cost).
-/// `melee_rows` is the candidate universe BOTH the cycle's cast and rout phases outer-loop (identical
-/// gate: "currently the attacker in `game_melee_attack`"); `fear_rows` is what the fear phase
-/// outer-loops (the `A_CONTROL(M_FEAR)` aura rows). `total_all` is a full `game_world_entity` count
-/// (players included) — what EVERY ONE of the three fully `entities.iter()`-scanned before this item,
-/// so it's the honest "before" denominator the rows-visited ratio is measured against.
 fn log_narrowed_pass_stats(ctx: &ReducerContext) {
     let us = ctx.timestamp.to_micros_since_unix_epoch();
     if us.rem_euclid(ACTIVE_CELL_LOG_PERIOD_MICROS) >= MOVE_TICK_MICROS {
-        return; // only the one tick per period that lands in the window logs
+        return;
     }
     let total_all = ctx.db.game_world_entity().iter().count();
     let melee_rows = ctx.db.game_melee_attack().iter().count();
@@ -445,7 +268,6 @@ fn log_narrowed_pass_stats(ctx: &ReducerContext) {
     );
 }
 
-/// How the pass rows-visited line names this firing's coverage.
 fn scope_label(scope: &TickScope) -> String {
     match scope {
         TickScope::CatchAll { dedicated } => {
@@ -455,8 +277,6 @@ fn scope_label(scope: &TickScope) -> String {
     }
 }
 
-/// Sample per-pass row visits once per minute without adding diagnostic table writes.
-/// Catch-all samples include the sense pass; dedicated samples report whether it ran.
 fn log_pass_stats(
     ctx: &ReducerContext,
     scope_label: &str,
@@ -478,34 +298,6 @@ fn log_pass_stats(
     );
 }
 
-/// The ONE shared creature move-leg writer: every movement decision (the cycle's
-/// idle and chase legs, flee, fear-flee) funnels its ALREADY-STEPPED landing point through here, so a
-/// single ground-snap / anti-desync fix applies to ALL of them at once. The per-pass
-/// STEP is computed by the caller BEFORE this call (different math per pass — waypoint segment / chase
-/// step / walk-home / wander hop / flee dash); this owns only what every pass shares:
-///   1. ground-snap the landing point (`snap_z`) — off-slice / unimported areas fall back to the
-///      caller's `z_fallback` (target z / home z / current z), byte-identical to the pre-terrain leg;
-///   2. insert the `CreatureMoveEvent` (leg START = the mover's CURRENT position, DEST = the snapped
-///      landing point, `spline_id = now_ms` — one leg per creature per tick);
-///   3. advance the authoritative row to the leg END (x/y/z/grid/last_move), and — for the ETA-gated
-///      IDLE passes only (`set_leg_ends`: patrol + wander) — arm `leg_ends_ms` so the leg plays to
-///      completion instead of being re-thrown next tick (the RUN passes re-step every tick, no gate).
-///
-/// The mover row `e` is taken BY VALUE (every caller owns a freshly-found row and needs nothing back —
-/// so no `&mut` refetch/clone dance) and written once. `run` picks the SMSG_MONSTER_MOVE walk/run
-/// animation. Anything pass-specific (patrol's `wp_target`, return's `moved_this_tick`, flee's combat
-/// re-stamp) stays in the caller — this writer is purely the shared leg emission.
-/// Write ONE movement leg for `guid` as the AOI-scoped spline row — the single relay path since
-/// perf 2.3, and the only thing a client ever sees a non-player move through.
-///
-/// `dur_ms == 0` with `dest == start` is a STOP (snap-and-hold): the client halts where it is.
-/// Separate from [`emit_creature_leg`] because the stop/rush callers do their own entity bookkeeping
-/// (a CC freeze writes the render point, Charge moves the caster) and only need the relay.
-///
-/// EXISTS BECAUSE 2.3 CONVERTED ONE WRITER AND LEFT FOUR: `game_creature_move_event` inserts stayed
-/// in the CC freeze, the chase-stop, `encounter::move_creature_to` and Charge, while the same commit
-/// removed the gateway's subscription to that table ("nothing writes this any more"). Every one of
-/// them went silently undelivered — the server moved, the client did not. Route new movement here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_move_spline(
     ctx: &ReducerContext,
@@ -547,13 +339,6 @@ pub(crate) fn emit_move_spline(
     }
 }
 
-/// Write a FACING-ONLY spline row — `guid` doesn't move (start == dest, `dur_ms` 0) but its
-/// heading changes to `angle_rad`. Routes through the SAME `game_creature_spline` relay carrier as
-/// every other creature leg (one AOI-scoped table, one gateway subscription) rather than a new one;
-/// the gateway distinguishes it by the `facing` flag and emits `SMSG_MONSTER_MOVE`'s `FacingAngle`
-/// variant instead of `Normal`. Callers own the epsilon gate (don't call this every tick — see
-/// the cycle's chase phase) and the entity row's `orientation` write; this is purely
-/// the relay half, mirroring [`emit_move_spline`]'s split.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_facing_spline(
     ctx: &ReducerContext,
@@ -606,9 +391,6 @@ pub struct CreaturePathPoint {
     pub z: f32,
 }
 
-/// Publish the already checked path as one movement, shared by server advance and client relay.
-/// A mover on a leg starts the path where [`stop_where_rendered`] would stop it, so a renewal
-/// between two advance firings does not move the client back.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn emit_creature_path(
     ctx: &ReducerContext,
@@ -627,7 +409,6 @@ pub(crate) fn emit_creature_path(
         return;
     }
     if length <= 0.0 {
-        // Already drawn on the destination: end the old leg here, as `move_to_point` does.
         stop_where_rendered(ctx, &mut mover);
         ctx.db.game_world_entity().guid().update(mover);
         return;
@@ -661,7 +442,6 @@ pub(crate) fn emit_creature_path(
     ctx.db.game_world_entity().guid().update(mover);
 }
 
-// A movement leg's full geometry (from/to/speed/timing); a struct built at the one call site and destructured here would be write-only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_creature_leg(
     ctx: &ReducerContext,
@@ -673,12 +453,7 @@ pub(crate) fn emit_creature_leg(
     now_ms: u32,
     set_leg_ends: bool,
 ) {
-    // Ground-snap THIS leg's landing point, one snap now covers every pass.
     let nz = crate::terrain::snap_z(ctx, e.map_id, e.instance_id, to.0, to.1, z_fallback);
-    // REFUSE a non-finite leg (see `ai::finite_point`). Writing one makes the creature invisible to
-    // this very tick — its grid cell casts to `i32::MIN`, so no active cell ever contains it again —
-    // while `tick_melee` keeps swinging off the melee row. It becomes an unshakeable attacker. Loud,
-    // because the source of the corruption is still unknown and this log is what will name it.
     if !crate::creatures::ai::finite_point(to.0, to.1, nz) {
         spacetimedb::log::error!(
             "refused a non-finite leg for guid {} -> ({}, {}, {}) — creature left at its last good \
@@ -687,44 +462,25 @@ pub(crate) fn emit_creature_leg(
         );
         return;
     }
-    // ONE WRITER: funnel the row build + upsert through `emit_move_spline`, the
-    // SAME call the cycle's spline-advance halt and its chase stop
-    // already use, so "one spline writer" is a fact the type system enforces, not doctrine repeated at
-    // each call site. Was: a `game_creature_move_event` INSERT (globally subscribed — so every leg was
-    // delivered to EVERY connected session and then discarded by most of them via the `created`-set
-    // guard) PLUS a hand-rolled spline DELETE+INSERT here. Measured at 100 dispersed players: 121.7
-    // inserts/s and 121.6 reaps/s of the event table alone — see `emit_move_spline`'s own doc for the
-    // AOI-box-scoped replacement.
-    //
-    // SPLINE MODEL (unchanged): the client interpolates start→dest over `duration_ms`; the SERVER
-    // advances the authoritative position along the SAME spline each tick in `pass_advance_splines`
-    // rather than snapping to the leg END here. e.x/e.y/e.z stay at the leg START.
     emit_move_spline(
         ctx,
         e.guid,
         (e.x, e.y, e.z),
         (to.0, to.1, nz),
-        duration_ms.max(1), // avoid /0 in the lerp; a 0-dur snap just completes next advance
+        duration_ms.max(1),
         run,
-        now_ms, // spline id: must CHANGE per leg (see the field doc) — `now_ms` at emit time
+        now_ms,
         e.map_id,
         e.instance_id,
         (e.grid_x, e.grid_y),
     );
     e.last_move_ms = now_ms;
     if set_leg_ends {
-        // ETA gate (patrol + wander): hold this leg until it lands, no mid-leg re-emit.
         e.leg_ends_ms = now_ms + duration_ms;
     }
     ctx.db.game_world_entity().guid().update(e);
 }
 
-/// Stop `mover`'s leg where the client renders it now, facing along its Route Path. The row moves
-/// to that point and a zero-duration stop there replaces the leg, so the stored position and the
-/// stop packet agree with the client. Without this, a stop between two advance firings holds the
-/// position the last firing wrote, behind the client. A blocked Route Path segment or changed
-/// navigation inputs halt the stop where a leg advance would halt, so it never lands past an
-/// obstruction. The caller writes `mover`. A mover with no leg is unchanged.
 pub(crate) fn stop_where_rendered(ctx: &ReducerContext, mover: &mut WorldEntity) {
     let Some(previous) = place_where_rendered(ctx, mover) else {
         return;
@@ -745,11 +501,8 @@ pub(crate) fn stop_where_rendered(ctx: &ReducerContext, mover: &mut WorldEntity)
     );
 }
 
-/// Stop `mover` where the client renders it, then turn it in place to face `point`. The facing row
-/// replaces the stop, so it takes a newer spline id. The caller writes `mover`.
 pub(crate) fn stop_facing(ctx: &ReducerContext, mover: &mut WorldEntity, point: (f32, f32)) {
     stop_where_rendered(ctx, mover);
-    // A stopped leg is over, so a patrol must not wait for its old ETA.
     mover.leg_ends_ms = 0;
     mover.orientation = (point.1 - mover.y).atan2(point.0 - mover.x);
     let replaced = ctx
@@ -770,16 +523,11 @@ pub(crate) fn stop_facing(ctx: &ReducerContext, mover: &mut WorldEntity, point: 
     );
 }
 
-/// Prepare `mover` for a new leg that replaces its current one: place it where a stop now would
-/// leave it, and return the spline id the new leg takes. The caller emits the leg and writes
-/// `mover`.
 pub(crate) fn begin_leg(ctx: &ReducerContext, mover: &mut WorldEntity) -> u32 {
     let now_ms = now_ms(ctx);
     place_where_rendered(ctx, mover).map_or(now_ms, |previous| next_spline_id(now_ms, previous))
 }
 
-/// Move `mover` to where a stop now would leave it on its leg, and return that leg's spline id.
-/// `None` for a mover with no leg, which stays unchanged. The caller writes `mover`.
 fn place_where_rendered(ctx: &ReducerContext, mover: &mut WorldEntity) -> Option<u32> {
     let leg = ctx.db.game_creature_spline().guid().find(mover.guid)?;
     let spline_id = leg.spline_id;
@@ -789,20 +537,15 @@ fn place_where_rendered(ctx: &ReducerContext, mover: &mut WorldEntity) -> Option
     Some(spline_id)
 }
 
-/// The id for a leg that replaces one with id `previous`. The client ignores an id that does not
-/// exceed the one it replaces, so a second leg in the same millisecond takes `previous + 1`.
+// The client ignores a replacement id that does not exceed the previous spline id.
 pub(crate) fn next_spline_id(now_ms: u32, previous: u32) -> u32 {
     now_ms.max(previous.wrapping_add(1))
 }
 
-/// The transaction's clock as the wrapping millisecond count that spline ids and `last_move_ms`
-/// use.
 pub(crate) fn now_ms(ctx: &ReducerContext) -> u32 {
     (ctx.timestamp.to_micros_since_unix_epoch() / 1000) as u32
 }
 
-/// Move `mover` to `stop`: position, grid address and packed cell together, and the stop's heading
-/// when it has one.
 pub(crate) fn place_stopped(mover: &mut WorldEntity, stop: super::cycle::Stop) {
     let (grid_x, grid_y) = spatial::grid_cell(stop.at.x, stop.at.y);
     mover.x = stop.at.x;
@@ -816,11 +559,6 @@ pub(crate) fn place_stopped(mover: &mut WorldEntity, stop: super::cycle::Stop) {
     }
 }
 
-/// Must a leg advance stay in the creature's stored row once the firing ends? The cycle's passes
-/// always read the advanced row; only the commit log may skip it. `stored` is the row before the
-/// advance, `advanced` the row it wrote, `settled` the row at the end of the firing, and `leg` the
-/// mover's spline row then. Arrival, a new leg, a halt, any other write, a cell change, a turn,
-/// combat and a Character all keep the advance.
 pub(crate) fn advance_needs_persist(
     stored: &WorldEntity,
     advanced: &WorldEntity,
@@ -828,8 +566,6 @@ pub(crate) fn advance_needs_persist(
     leg: Option<&CreatureSpline>,
     now_micros: u64,
 ) -> bool {
-    // Range and line-of-sight checks outside the cycle may read a walking creature up to this far
-    // behind, the trade Characters' own heartbeat gate makes.
     let max_drift = crate::world::PERSIST_MAX_DRIFT_YD;
     let drift_sq = (advanced.x - stored.x).powi(2)
         + (advanced.y - stored.y).powi(2)
@@ -844,15 +580,6 @@ pub(crate) fn advance_needs_persist(
         || drift_sq > max_drift * max_drift
 }
 
-/// The shared gate ladder every ENGAGED/table-driven phase (cast, threat retarget, chase, rout and
-/// fear) opens its per-candidate loop with: resolve `guid` to a live CREATURE (no PLAYER bit, not
-/// dead) whose instance THIS firing's `scope` covers. `None` collapses each site's `let Some(c) = ...
-/// else { continue }; if c.is_player() || c.dead { continue }; if !scope.covers(c.instance_id) {
-/// continue }` into one check — every call site still increments its own `visited` counter only on
-/// `Some`, matching the existing "gate first, then count" order everywhere.
-///
-/// `pub(crate)` for the cycle's production adapter, which opens the cast, threat-retarget and chase
-/// candidate lists with it.
 pub(crate) fn movable_creature(
     ctx: &ReducerContext,
     guid: u64,
@@ -865,12 +592,6 @@ pub(crate) fn movable_creature(
     Some(c)
 }
 
-/// May this creature rout at all? The HP threshold (`should_flee`) plus the per-TYPE gate
-/// (`flee_eligible` — only HUMANOIDS rout; BEASTS/undead/elementals fight to the death). It decides
-/// whether a rout may START, never whether one is running — that is `creature_is_routing`. The two
-/// non-engaged sites (the cycle's aggro and assist phases) ask THIS question: they act on creatures
-/// with no engagement row, which therefore have no rout clock to read. A missing template ⇒ not eligible (safe default).
-/// [server]
 pub(crate) fn rout_eligible(ctx: &ReducerContext, c: &WorldEntity) -> bool {
     should_flee(c.health, c.max_health)
         && ctx
@@ -881,23 +602,6 @@ pub(crate) fn rout_eligible(ctx: &ReducerContext, c: &WorldEntity) -> bool {
             .is_some_and(|t| flee_eligible(t.creature_type))
 }
 
-/// Is this creature ACTIVELY routing — inside an open rout window on its own engagement row, entitled
-/// to that window, and able to move? The ONE place that question is answered, so the three engaged
-/// sites agree: the chase→rout divert, the rout leg itself, and the swing pass. If only some of them
-/// knew about the window, a creature would be diverted out of chasing yet never routed — standing
-/// FROZEN instead of fighting. A spent window means not routing, so a creature that has used its rout
-/// chases and swings like any other attacker. CC counts as not routing for the same reason: the rout
-/// leg is suppressed for a rooted/stunned/feared creature, so it must keep swinging rather than stand
-/// silent. [server]
-///
-/// Two things entitle a creature to the window. The fixed rout's own gate (`rout_eligible`: below the
-/// flee threshold AND of a kind that runs) opens it for the ordinary near-death humanoid. An authored
-/// flee opens it for anyone the script says flees, a beast at 30% health included, because the
-/// script's window is the only thing that stamped it, and the fixed gate is switched OFF for such a
-/// creature. Reading only the fixed gate left an authored flee with an open window and nothing that
-/// would move it.
-///
-/// `pub(crate)` because the swing pass in `combat::swing` is one of the three sites.
 pub(crate) fn creature_is_routing(ctx: &ReducerContext, c: &WorldEntity) -> bool {
     let now_ms = (ctx.timestamp.to_micros_since_unix_epoch() / 1000) as u32;
     ctx.db
@@ -976,7 +680,6 @@ mod advance_persist_gate {
     const NOW_MICROS: u64 = 60_000_000;
     const NOW_MS: u32 = 60_000;
 
-    /// An out-of-combat creature at `(x, 0)` whose move clock reads `moved_ms`.
     fn creature_at(x: f32, moved_ms: u32) -> WorldEntity {
         let (gx, gy) = spatial::grid_cell(x, 0.0);
         let mut creature = crate::helpers::tests::entity(7, 0, 0, gx, gy);
@@ -1009,8 +712,6 @@ mod advance_persist_gate {
         }
     }
 
-    /// One advance to judge: stored at `from_x`, advanced to `to_x` one second into an eight-second
-    /// leg, with nothing else writing the row this firing.
     struct Walk {
         stored: WorldEntity,
         advanced: WorldEntity,
@@ -1121,7 +822,6 @@ mod stop_between_firings {
     use crate::WorldEntity;
     use lyracore_shared::spatial;
 
-    /// A creature the last firing stored at (`x`, 0, 0), in the cell that point lies in.
     fn creature_stored_at(x: f32) -> WorldEntity {
         let (grid_x, grid_y) = spatial::grid_cell(x, 0.0);
         let mut creature = crate::helpers::tests::entity(42, 0, 0, grid_x, grid_y);
@@ -1132,7 +832,6 @@ mod stop_between_firings {
 
     #[test]
     fn a_stop_past_a_cell_edge_moves_the_creature_into_the_next_cell() {
-        // x = 16.67 is a cell edge. The last firing stored the creature short of it.
         let mut creature = creature_stored_at(15.0);
         let before = (creature.grid_x, creature.cell);
         place_stopped(
@@ -1188,7 +887,6 @@ mod idle_bot {
 
     const NOW_MS: u32 = 3_600_000;
 
-    /// An out-of-combat Character whose move clock last ticked `still_ms` ago.
     fn character_still_for(still_ms: u32) -> WorldEntity {
         let mut character = crate::helpers::tests::entity(42, 0, 0, 0, 0);
         character.type_mask = type_mask::PLAYER_BIT;
@@ -1204,7 +902,6 @@ mod idle_bot {
 
     #[test]
     fn a_character_without_consent_is_never_an_idle_bot() {
-        // Humans and test fixture Characters have no Sessionless Action Consent row.
         let human = character_still_for(600_000);
         assert!(!is_idle_bot(&human, NOW_MS, || false));
     }
@@ -1218,7 +915,6 @@ mod idle_bot {
 
     #[test]
     fn a_bot_on_a_movement_leg_is_not_idle() {
-        // The leg advance stamped the move clock on the last firing.
         assert!(!is_idle_bot(&character_still_for(500), NOW_MS, || true));
     }
 

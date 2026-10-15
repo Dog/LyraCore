@@ -1,53 +1,28 @@
-//!
-//! Existence alone (a durable `game_character` row) never needs proof of absence: it is a positive
-//! signal, read best-effort from whichever connected Shard answers first. A NEGATIVE claim —
-//! `Whereabouts::Offline`, or [`of`] answering `None` for a guid with no row anywhere — needs every
-//! configured World Shard to vouch that it genuinely has nothing, because a Shard whose Coordinator
-//! subscription has gone stale could be hiding the Character. [`SocialStore::every_shard_vouches_for_absence`]
-//! is that gate, and [`of`] never returns either without it succeeding first.
-
 use crate::world::{CharacterStore, SessionStore, ShardRoutingStore, SocialStore};
 use anyhow::Result;
 
 use crate::codec;
 
-/// One Character's Realm Presence, as whichever World Shard holds it reports it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RealmPresence {
     pub guid: u64,
     pub name: String,
     pub race: u8,
     pub class: u8,
-    /// From the live entity when [`Whereabouts::InWorld`] (current); otherwise the durable
-    /// `game_character` row, which only `persist_entity` refreshes (logout, cross-map teleport,
-    /// Transfer) — stale by however long the Character has been away.
     pub level: u8,
     pub zone_id: u32,
-    /// `game_character.online`, the session flag. Bots never set it. A frozen pre-Transfer copy
-    /// keeps this `true` with no live entity anywhere (`begin_transfer` persists with
-    /// `set_offline: false`) — read [`Whereabouts`] for whether the Character is actually here,
-    /// never this flag alone.
     pub session_online: bool,
     pub whereabouts: Whereabouts,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Whereabouts {
-    /// A live `game_world_entity` on some World Shard. Bots count.
     InWorld {
         away: AwayStatus,
         entity: codec::MemberEntity,
-        /// [`ShardRoutingStore::shard_name`] of the Shard the live entity answered from — Member Stats'
-        /// own aura and pet reads key off it.
         shard_name: String,
     },
-    /// No live entity, but the Character is between two places: a pending Transfer (Realm-core's
-    /// own signal), a bot's Transfer Intent, or a Shard's own Character row reading online with no
-    /// entity there (a map-change loading screen, or the frozen source copy of a human Transfer).
-    /// Reporting either offline would flicker the party frame and Member Stats mid-crossing.
     InTransit,
-    /// No live entity anywhere, not between places, and every configured World Shard vouches for
-    /// the absence.
     Offline,
 }
 
@@ -58,8 +33,6 @@ pub(crate) enum AwayStatus {
     Dnd,
 }
 
-/// A live entity's Away Status from its `PLAYER_FLAGS`, with
-/// [`lyracore_shared::chat::chat_tag_for`] semantics: DND wins when both bits are set.
 pub(crate) fn away_from_player_flags(player_flags: u32) -> AwayStatus {
     use lyracore_shared::chat::chat_tag;
     match lyracore_shared::chat::chat_tag_for(player_flags) {
@@ -69,20 +42,12 @@ pub(crate) fn away_from_player_flags(player_flags: u32) -> AwayStatus {
     }
 }
 
-/// The Auto-Reply a whisperer gets from a Character with an Away Status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AutoReply {
-    /// `Afk` or `Dnd`, never `None`.
     pub away: AwayStatus,
-    /// The stored text. Empty when the Shard holds none, which the Module answers with the default.
     pub message: String,
 }
 
-/// The Auto-Reply of the Character `presence` describes, or `None` when it has no Away Status.
-///
-/// Takes the Realm Presence the caller already read, so one decision reads it once. The Away
-/// Status comes from the live entity's `PLAYER_FLAGS`; the text is read on the Shard that
-/// answered with that entity, because the Auto-Reply lives beside it on the Home Shard.
 pub(crate) fn auto_reply<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     presence: &RealmPresence,
@@ -114,8 +79,6 @@ pub(crate) fn auto_reply<St: ShardRoutingStore + SocialStore + ?Sized>(
     }))
 }
 
-/// A durable `game_character` row's identity and session flag, from one Shard — [`of`]'s existence
-/// signal, before it knows whether the Character is in world, in transit, or offline.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CharacterIdentity {
     pub guid: u64,
@@ -128,9 +91,6 @@ pub(crate) struct CharacterIdentity {
 }
 
 impl CharacterIdentity {
-    /// A guid with no known durable row — [`of`]'s fallback when a positive signal (a live entity,
-    /// or a between-places match) fires for a Character no connected Shard's `game_character`
-    /// happened to name, such as a bot whose Transfer Intent exists before its row does.
     fn unknown(guid: u64) -> Self {
         Self {
             guid,
@@ -143,8 +103,6 @@ impl CharacterIdentity {
         }
     }
 
-    /// Finish into a [`RealmPresence`] that keeps this identity's own level and zone — the
-    /// `InTransit` and `Offline` cases, which have no live entity to read fresher ones from.
     fn stationary(self, whereabouts: Whereabouts) -> RealmPresence {
         RealmPresence {
             guid: self.guid,
@@ -158,7 +116,6 @@ impl CharacterIdentity {
         }
     }
 
-    /// Finish into a [`RealmPresence`] with level and zone read fresh from a live entity.
     fn in_world(self, shard_name: String, entity: codec::MemberEntity) -> RealmPresence {
         let level = u8::try_from(entity.level).unwrap_or(u8::MAX);
         let zone_id = entity.zone_id;
@@ -180,15 +137,6 @@ impl CharacterIdentity {
     }
 }
 
-/// `guid`'s Realm Presence from whichever connected Shard holds it.
-///
-/// A live entity on any connected Shard wins outright, whatever that Shard's own health — a
-/// stale-but-connected cache still answers from its last-known state, same as `entity_in_world`.
-/// Failing that, a pending Transfer (Realm-core's own signal, or a Shard's between-places match)
-/// answers `InTransit`. Only once neither fires does the answer become a negative claim —
-/// `Offline`, or `None` for a guid no Shard ever named — and a negative claim needs every
-/// configured Shard to vouch first (see the module doc), and fails with [`PresenceUnknown`] when
-/// one cannot.
 pub(crate) fn of<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     guid: u64,
@@ -204,9 +152,6 @@ pub(crate) fn of<St: ShardRoutingStore + SocialStore + ?Sized>(
         return Ok(Some(identity.stationary(Whereabouts::InTransit)));
     }
 
-    // Both `InTransit` (via a Shard's own between-places match) and `Offline` are negative claims
-    // from here on: no configured Shard may be unreachable, or a stale cache could be hiding the
-    // Character.
     store
         .every_shard_vouches_for_absence()
         .map_err(PresenceUnknown)?;
@@ -224,9 +169,6 @@ pub(crate) fn of<St: ShardRoutingStore + SocialStore + ?Sized>(
     })
 }
 
-/// A negative claim [`of`] could not make: a configured World Shard did not vouch for absence,
-/// or Realm-core could not answer whether a Transfer is pending. A caller answers as it would
-/// for a Character it cannot see, without ending this World Session.
 #[derive(Debug)]
 pub(crate) struct PresenceUnknown(pub(crate) anyhow::Error);
 
@@ -238,13 +180,10 @@ impl std::fmt::Display for PresenceUnknown {
 
 impl std::error::Error for PresenceUnknown {}
 
-/// Is `error`, or any cause it wraps, a [`PresenceUnknown`]?
 pub(crate) fn is_unknown(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PresenceUnknown>())
 }
 
-/// `result` with a [`PresenceUnknown`] read as `None`, the answer for a Character nobody can see.
-/// Every other error passes through.
 pub(crate) fn unknown_as_absent<T>(result: Result<Option<T>>) -> Result<Option<T>> {
     match result {
         Err(error) if is_unknown(&error) => {
@@ -255,14 +194,6 @@ pub(crate) fn unknown_as_absent<T>(result: Result<Option<T>>) -> Result<Option<T
     }
 }
 
-/// [`CharacterIdentity`] from whichever connected Shard answers first: this handle, then every
-/// `world_stores()` peer. Best-effort — a hit is a positive signal that needs no health proof.
-///
-/// `pub(crate)` because it is also the best-effort race read a caller reaches for when it must
-/// NEVER end a World Session or a Relay pump over an unreachable Shard, but a wrong guessed race
-/// would be worse than answering nothing: `world::social::resolve_add_contact` (a friend add's
-/// Enemy Gate) and `stdb::world_view::claim_edge_outcome` (the Account Claim Relay's OFFLINE
-/// edge) both read it in place of the full, health-checked [`of`].
 pub(crate) fn character_identity_anywhere<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     guid: u64,
@@ -278,7 +209,6 @@ pub(crate) fn character_identity_anywhere<St: ShardRoutingStore + SocialStore + 
     Ok(None)
 }
 
-/// A live entity from whichever connected Shard answers first, paired with that Shard's name.
 fn live_entity_anywhere<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     guid: u64,
@@ -293,8 +223,6 @@ fn live_entity_anywhere<St: ShardRoutingStore + SocialStore + ?Sized>(
     })
 }
 
-/// Realm-core's own pending-Transfer signal for `guid`. `false` on an unsharded Gateway, which has
-/// no Realm-core to ask (`realm_store()` answers `Ok(None)`).
 fn realm_transfer_pending<St: ShardRoutingStore + ?Sized>(store: &St, guid: u64) -> Result<bool> {
     let Some(realm) = store.realm_store()? else {
         return Ok(false);
@@ -304,10 +232,6 @@ fn realm_transfer_pending<St: ShardRoutingStore + ?Sized>(store: &St, guid: u64)
         .is_some_and(|partition| partition.transfer_pending))
 }
 
-/// The union of every connected Shard's in-world players, deduplicated by guid — `/who`'s ultimate
-/// source. Scans each Shard exactly once: `world_stores()` already includes a handle for this
-/// Shard's own database once there is more than one connected, so this handle is asked directly
-/// only when `world_stores()` is empty (unsharded).
 pub(crate) fn in_world_characters<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
 ) -> Result<Vec<RealmPresence>> {
@@ -332,9 +256,6 @@ pub(crate) fn in_world_characters<St: ShardRoutingStore + SocialStore + ?Sized>(
     Ok(out)
 }
 
-/// Resolve a typed Character name to a guid across every connected Shard: this handle first, then
-/// every `world_stores()` handle, first hit wins. `world_stores()` is empty on an unsharded
-/// Gateway, so this is the one cache read it always was.
 pub(crate) fn resolve_by_name<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     name: &str,
@@ -350,10 +271,6 @@ pub(crate) fn resolve_by_name<St: ShardRoutingStore + SocialStore + ?Sized>(
     Ok(None)
 }
 
-/// [`resolve_by_name`] without the first-hit short-circuit: every guid `name` resolves to, across
-/// every connected Shard. Character names are unique per Shard, not per Realm, so the same name
-/// can name two different Characters at once; a caller that needs one picks among the candidates
-/// (see [`super::whisper`]). Deduped, because `world_stores()` includes the asking Shard.
 pub(crate) fn resolve_all_by_name<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     name: &str,
@@ -372,8 +289,6 @@ pub(crate) fn resolve_all_by_name<St: ShardRoutingStore + SocialStore + ?Sized>(
     Ok(guids)
 }
 
-/// [`resolve_by_name`] inverted: the Character row for `guid` from whichever connected Shard holds
-/// it. Same first-hit-wins union, same unsharded short-circuit.
 pub(crate) fn character_anywhere<St: CharacterStore + ShardRoutingStore + ?Sized>(
     store: &St,
     guid: u64,
@@ -389,11 +304,6 @@ pub(crate) fn character_anywhere<St: CharacterStore + ShardRoutingStore + ?Sized
     Ok(None)
 }
 
-/// Does `guid` have a live entity on any connected Shard — `game_world_entity`, unioned across the
-/// boundary. NOT `game_character.online`: a session-less Character is inserted straight into
-/// `game_world_entity` and never runs `player_login`, so its session flag stays false for its
-/// whole life. [`of`] exposes both, as `Whereabouts::InWorld` and `session_online`; this is the
-/// `in_world`-only shortcut a caller that does not need the rest of [`RealmPresence`] keeps using.
 pub(crate) fn live_anywhere<St: SessionStore + ShardRoutingStore + ?Sized>(
     store: &St,
     guid: u64,

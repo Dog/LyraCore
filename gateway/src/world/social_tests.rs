@@ -1,10 +1,5 @@
-//! Friends and ignore lists over an encrypted World Session.
-
 use super::*;
 
-/// Read one `SMSG_FRIEND_STATUS` frame — RAW always, now that `ONLINE`/`ADDED_ONLINE` carry
-/// trailing fields gtker 0.3 cannot type (see `codec::build_friend_status_raw`). Returns the
-/// result, the other party's guid, and the trailing bytes (empty unless online).
 fn read_friend_status(
     client: &mut UnixStream,
     dec: &mut DecrypterHalf,
@@ -22,8 +17,6 @@ fn read_friend_status(
 
 #[test]
 fn add_friend_by_name_then_friend_list_carries_online_presence() {
-    // CMSG_ADD_FRIEND "Buddy" -> SMSG_FRIEND_STATUS AddedOnline (guid 2, resolved by
-    // name); a follow-up CMSG_FRIEND_LIST then carries them online with their level/class/zone.
     let mut s = quest_store();
     s.characters = vec![codec::CharacterView {
         guid: 2,
@@ -38,7 +31,7 @@ fn add_friend_by_name_then_friend_list_carries_online_presence() {
 
     CMSG_ADD_FRIEND {
         name: "buddy".into(),
-    } // case-insensitive match
+    }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
     let (result, guid, trailer) = read_friend_status(&mut client, &mut c_dec);
@@ -65,7 +58,6 @@ fn add_friend_by_name_then_friend_list_carries_online_presence() {
         other => panic!("expected SMSG_IGNORE_LIST, got {other}"),
     }
 
-    // Removing it replies Removed and the friend list empties out.
     CMSG_DEL_FRIEND { guid: Guid::new(2) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -76,9 +68,6 @@ fn add_friend_by_name_then_friend_list_carries_online_presence() {
     server.join().unwrap();
 }
 
-/// A friend on ANOTHER Shard resolves. Vim lives on `instances`; Ginger (this Gateway's own
-/// Shard) adds them by name and gets ADDED_ONLINE with Vim's real presence, byte-exact against
-/// the raw encoder.
 #[test]
 fn add_friend_on_another_shard_answers_added_online_with_presence() {
     let mut s = quest_store();
@@ -97,13 +86,11 @@ fn add_friend_on_another_shard_answers_added_online_with_presence() {
         characters: vec![codec::CharacterView {
             guid: 2,
             name: "Vim".into(),
-            race: 1, // same team as Ginger
+            race: 1,
             class: 4,
             ..Default::default()
         }],
         social: SocialState {
-            // Vim standing IN the instance: a live entity, not just a durable row, so the ADDED_ONLINE
-            // fields below come off `Whereabouts::InWorld`.
             member_entities: std::sync::Mutex::new(vec![(
                 2,
                 codec::MemberEntity {
@@ -126,19 +113,15 @@ fn add_friend_on_another_shard_answers_added_online_with_presence() {
     let (result, guid, trailer) = read_friend_status(&mut client, &mut c_dec);
     assert_eq!(result, FriendResult::AddedOnline);
     assert_eq!(guid, 2);
-    let mut expected = vec![1u8]; // status ONLINE
-    expected.extend(33u32.to_le_bytes()); // area
-    expected.extend(22u32.to_le_bytes()); // level
-    expected.extend(4u32.to_le_bytes()); // class
+    let mut expected = vec![1u8];
+    expected.extend(33u32.to_le_bytes());
+    expected.extend(22u32.to_le_bytes());
+    expected.extend(4u32.to_le_bytes());
     assert_eq!(trailer, expected);
     drop(client);
     server.join().unwrap();
 }
 
-/// A friend standing in another Shard's instance shows ONLINE with real level/class/zone through
-/// `CMSG_FRIEND_LIST`, and AFK/DND status follow the live entity's `PLAYER_FLAGS` — exercised
-/// through the actual socket dispatch, so it runs the SAME `world::social::friend_views`
-/// composition a Coordinator serves, not a Store Fake's own reimplementation of it.
 #[test]
 fn friend_list_shows_a_friend_in_another_shards_instance_online_afk_or_dnd() {
     let mut s = quest_store();
@@ -148,7 +131,7 @@ fn friend_list_shows_a_friend_in_another_shards_instance_online_afk_or_dnd() {
         race: 1,
         ..Default::default()
     }];
-    s.social.contacts = std::sync::Mutex::new(vec![(1, 2, false)]); // Ginger already friends Vim
+    s.social.contacts = std::sync::Mutex::new(vec![(1, 2, false)]);
     let store = std::sync::Arc::new(s);
     let peer = std::sync::Arc::new(WorldFake {
         topology: TopologyState {
@@ -158,7 +141,7 @@ fn friend_list_shows_a_friend_in_another_shards_instance_online_afk_or_dnd() {
         characters: vec![codec::CharacterView {
             guid: 2,
             name: "Vim".into(),
-            race: 1, // same team as Ginger
+            race: 1,
             class: 4,
             ..Default::default()
         }],
@@ -198,9 +181,7 @@ fn friend_list_shows_a_friend_in_another_shards_instance_online_afk_or_dnd() {
         }
         other => panic!("expected SMSG_FRIEND_LIST, got {other}"),
     }
-    // CMSG_FRIEND_LIST always answers with BOTH lists; leaving the SMSG_IGNORE_LIST reply unread
-    // and dropping the client closes the socket with a queued write still in flight, which Linux
-    // reports to the server as a reset rather than a clean EOF.
+    // Drain both list replies before closing, or Linux can reset the queued writer.
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_IGNORE_LIST(l) => assert!(l.ignored.is_empty()),
         other => panic!("expected SMSG_IGNORE_LIST, got {other}"),
@@ -209,9 +190,6 @@ fn friend_list_shows_a_friend_in_another_shards_instance_online_afk_or_dnd() {
     server.join().unwrap();
 }
 
-/// An enemy-faction friend answers FRIEND_ENEMY. The companion half — the same target is a legal
-/// ignore — is a Module rule this Store Fake cannot express; it is pinned durably in
-/// `module/tests/friends.rs`.
 #[test]
 fn add_friend_enemy_faction_answers_friend_enemy() {
     let mut s = quest_store();
@@ -219,13 +197,13 @@ fn add_friend_enemy_faction_answers_friend_enemy() {
         codec::CharacterView {
             guid: 1,
             name: "Ginger".into(),
-            race: 1, // Human, Alliance
+            race: 1,
             ..Default::default()
         },
         codec::CharacterView {
             guid: 2,
             name: "Grunt".into(),
-            race: 2, // Orc, Horde
+            race: 2,
             ..Default::default()
         },
     ];
@@ -261,7 +239,6 @@ fn add_friend_unknown_name_replies_not_found() {
     server.join().unwrap();
 }
 
-/// The ignore list has its own "unknown name" code.
 #[test]
 fn add_ignore_unknown_name_replies_ignore_not_found() {
     let store = std::sync::Arc::new(quest_store());
@@ -356,8 +333,6 @@ fn add_ignore_maps_already_and_full_errors_to_the_ignore_variants() {
     }
 }
 
-/// Every contact Refusal the Module can send reaches the client as exactly one `FriendResult`, and
-/// the friends and ignore lists get their own code family for the same condition.
 #[test]
 fn every_contact_refusal_reaches_the_client_as_one_friend_result() {
     for refusal in ContactRefusal::ALL {
@@ -400,7 +375,6 @@ fn every_contact_refusal_reaches_the_client_as_one_friend_result() {
     }
 }
 
-/// The contact half of the same rule: a Transport Loss left the list in an unknown state.
 #[test]
 fn an_add_friend_transport_loss_is_not_answered_as_a_refusal() {
     let mut s = quest_store();
@@ -474,13 +448,11 @@ fn del_ignore_round_trips_added_then_unknown_is_ignore_not_found() {
     let (result, ..) = read_friend_status(&mut client, &mut c_dec);
     assert_eq!(result, FriendResult::IgnoreAdded);
 
-    // Removing the just-added contact: IgnoreRemoved.
     CMSG_DEL_IGNORE { guid: Guid::new(3) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
     let (result, ..) = read_friend_status(&mut client, &mut c_dec);
     assert_eq!(result, FriendResult::IgnoreRemoved);
-    // Removing it again: no longer on the list -> IgnoreNotFound.
     CMSG_DEL_IGNORE { guid: Guid::new(3) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();

@@ -1,56 +1,3 @@
-//! Vanilla-data importer. Reads the operator's OWN inputs — a cmangos `classic-db` dump (never
-//! executed) and/or their own legally-owned 1.12.1 client `Data/` archives — maps them to our
-//! `game_*` schema, and loads via SQL clear+reload (see docs/data-ingestion.md for the strategy
-//! and the licensing firewall this implements: we ship the tools, the operator supplies the data,
-//! neither ships in the repo). The live `tick_creatures` respawn pass turns imported spawns into
-//! world entities, so we never hand-encode the entity row.
-//!
-//! One binary, six modes (pick by flag; the ones that write honor --db/--server/--apply,
-//! defaulting to a dry run that prints the plan and writes nothing):
-//!   --dump <classic-db .sql[.gz]>   cmangos creature/etc ETL
-//!                                   [--world-profile alliance-eastern|alliance-kalimdor|
-//!                                    alliance-single|starting-eastern|starting-kalimdor|instances|
-//!                                    full-world|full-eastern|full-kalimdor|full-instances]
-//!                                   [--eventai-profile cmangos-classic-z2815]
-//!                                   [advanced: --map 0 --center X,Y,Z --radius 180]
-//!                                   [--print-extents derives --box from the dump's real spawn
-//!                                    extents; always a dry run]
-//!   --dbc  <client Data/ dir>       client DBC extraction/checks (dbc.rs); add --spells for the
-//!                                   Spell.dbc importer (spell.rs) or --talents for the
-//!                                   TalentTab.dbc/Talent.dbc importer (talent.rs)
-//!                                   Standalone catalogue import needs --taxi-mounts <dump.sql[.gz]>.
-//!                                   Required with --dump when items reference Random Properties.
-//!                                   [--packages <enabled packages root> reapplies every enabled
-//!                                    Package's Delta claims after the base spell rows are back;
-//!                                    without --apply it prints the plan and writes nothing —
-//!                                    package_delta.rs]
-//!   --spell-snapshot <path>         with --dbc: write the Base Snapshot a Datascript reads (the
-//!                                   same derived spell rows the import would load) and touch no
-//!                                   database — spell_snapshot.rs
-//!   --terrain <client Data/ dir>    ADT heightmap stream (terrain.rs)
-//!   --nav <client Data/ dir>        WMO/M2 nav-grid rasterizer (nav.rs)
-//!   --vmap <client Data/ dir>       exact bounded collision-triangle extract + pack + import
-//!                                   (--apply loads `game_vmap_chunk` via import_vmap_chunks; a
-//!                                   dry run stops at report, vmap.rs)
-//!   --vmap-prepare-coverage <id>    derive path-grid coverage for an already-staged vmap
-//!                                   generation (--apply calls prepare_/finalize_vmap_nav_coverage,
-//!                                   resumable; a dry run reports the plan) — vmap.rs::run_coverage
-//!   --go-models <client Data/ dir>  DOOR/BUTTON display → M2 bounding-mesh extract + import,
-//!                                   needs --dump too (--apply loads `game_go_model` via
-//!                                   import_go_models; a dry run stops at report — go_model.rs)
-//!   --dump-collision <client Data/ dir>  WMO/M2 collision-geometry inspector — dry-run only,
-//!                                   no --apply (collision.rs)
-//!   --pack-client <client Data/ dir>  builds the client patch MPQ + installs addons into the
-//!                                   OPERATOR's OWN client (pack_client.rs); standalone, writes
-//!                                   to the client dir, not a `game_*` table
-//!   --pack-out <dir>                writes the same package-authored client content into <dir>
-//!                                   for distribution. Reads no client, refuses baseline-derived
-//!                                   files, takes no --apply (pack_client.rs)
-//! e.g.  importer --dump .import/classic-db-full.sql --apply
-//!       importer --dbc ../wowclient/Data --taxi-mounts .import/classic-db-full.sql
-//!       importer --dbc ../wowclient/Data --talents --apply
-//!       importer --dump .import/classic-db-full.sql --map 0 --print-extents
-
 mod collision;
 mod creature_population;
 mod dbc;
@@ -83,14 +30,10 @@ use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use world_import_scope::{WorldImportProfile, WorldImportScope};
 
-// Kept in step with `module::items::tables`: the importer cannot depend on the wasm Module, but
-// it owns the ClassicDB `-1` sentinel conversion that makes these values durable.
 const ALL_PLAYABLE_CLASS_MASK: u32 = 0x5df;
 const ALL_PLAYABLE_RACE_MASK: u32 = 0xff;
 
-// --- cmangos column indices (verified against ClassicDB_1_12_1_z2815 schema) -------------------
 mod ct {
-    // creature_template
     pub const ENTRY: usize = 0;
     pub const NAME: usize = 1;
     pub const SUBNAME: usize = 2;
@@ -107,49 +50,36 @@ mod ct {
     pub const RANK: usize = 33;
     pub const MIN_LEVEL_HEALTH: usize = 40;
     pub const MAX_LEVEL_HEALTH: usize = 41;
-    pub const MIN_MELEE_DMG: usize = 44; // float; per-creature swing damage
+    pub const MIN_MELEE_DMG: usize = 44;
     pub const MAX_MELEE_DMG: usize = 45;
-    pub const ARMOR: usize = 48; // → game_creature_template.armor (0 = unmitigated, module fallback)
+    pub const ARMOR: usize = 48;
     pub const MELEE_BASE_ATTACK_TIME: usize = 51;
     pub const MIN_LOOT_GOLD: usize = 54;
     pub const MAX_LOOT_GOLD: usize = 55;
-    pub const LOOT_ID: usize = 56; // → creature_loot_template.entry (0 = no loot table)
-                                   // Loot-family completeness: PickpocketLootId/SkinLootId sit IMMEDIATELY after LootId
-                                   // (LootId, PickpocketLootId, SkinningLootId are consecutive columns). These two carried a `[V]`
-                                   // "confirm against your own dump" caveat until the pinned dump's DDL was enumerated directly —
-                                   // both are now confirmed, along with every other const here.
-    pub const PICKPOCKET_LOOT_ID: usize = 57; // → pickpocketing_loot_template.entry (0 = no table)
-    pub const SKIN_LOOT_ID: usize = 58; // → skinning_loot_template.entry (0 = no table)
-                                        // Trainer service block: TrainerType, TrainerSpell, TrainerClass, TrainerRace, TrainerTemplateId
-                                        // run 71..75, bracketed by the verified `SKIN_LOOT_ID` and `GOSSIP_MENU_ID` anchors. Enumerated
-                                        // from the pinned dump's own CREATE TABLE — mangos-classic master has since gained
-                                        // DisplayIdProbability1-4 and five stat multipliers, so its order is 4 columns out here and 9 at
-                                        // `LootId`. TrainerSpell/TrainerRace/TrainerTemplateId are not ingested: no consumer.
-    pub const TRAINER_TYPE: usize = 71; // cmangos enum: CLASS 0 · MOUNTS 1 · TRADESKILLS 2 · PETS 3
-    pub const TRAINER_CLASS: usize = 73; // class ID (1..11), NOT a mask; 0 = serves every class
-    pub const GOSSIP_MENU_ID: usize = 77; // creature_template.GossipMenuId
+    pub const LOOT_ID: usize = 56;
+    pub const PICKPOCKET_LOOT_ID: usize = 57;
+    pub const SKIN_LOOT_ID: usize = 58;
+    pub const TRAINER_TYPE: usize = 71;
+    pub const TRAINER_CLASS: usize = 73; // Class id, not a mask; zero serves every class.
+    pub const GOSSIP_MENU_ID: usize = 77;
 }
 mod gm {
-    // gossip_menu: entry(=creature_template.GossipMenuId), text_id, script_id, condition_id
     pub const ENTRY: usize = 0;
     pub const TEXT_ID: usize = 1;
     pub const CONDITION_ID: usize = 3;
 }
 mod npct {
-    // npc_text (full 81-col format): ID, text0_0, text0_1, lang0, prob0, em0_0..5, text1_0, ...
+    // Legacy npc_text layout: ID plus eight 10-column male/female/language/probability/emote slots.
     pub const ID: usize = 0;
-    pub const NCOLS_FULL: usize = 81; // 1 + 8*(2+1+1+6) = 81 (old schema with embedded strings)
-                                      // New cmangos schema packs each slot as a single BroadcastTextId. 17 cols: ID + 8 probs + 8 ids.
-    pub const NCOLS_SHORT: usize = 17; // ID, Prob0..7, BroadcastTextId0..7
-    /// Full-schema per-slot column formula (all 8 slots not just the first): each slot
-    /// occupies 10 columns starting at `1 + slot*10` — male, female, lang, prob, em0..em5.
+    pub const NCOLS_FULL: usize = 81;
+    // BroadcastText npc_text layout: ID, eight probabilities, eight BroadcastText ids.
+    pub const NCOLS_SHORT: usize = 17;
     pub const fn full_slot_base(slot: usize) -> usize {
         1 + slot * 10
     }
     pub const FULL_SLOT_MALE_OFFSET: usize = 0;
     pub const FULL_SLOT_FEMALE_OFFSET: usize = 1;
     pub const FULL_SLOT_PROB_OFFSET: usize = 3;
-    /// Short-schema per-slot column formula: prob at `1+slot`, BroadcastTextId at `9+slot`.
     pub const fn short_slot_prob(slot: usize) -> usize {
         1 + slot
     }
@@ -158,31 +88,23 @@ mod npct {
     }
 }
 pub(crate) mod bt {
-    // broadcast_text: Id, Text (male), Text1 (female), ChatTypeID, LanguageID, ...
     pub const ID: usize = 0;
-    pub const TEXT: usize = 1; // male greeting text
-    pub const TEXT1: usize = 2; // female greeting text
+    pub const TEXT: usize = 1;
+    pub const TEXT1: usize = 2;
     pub const CHAT_TYPE: usize = 3;
     pub const LANGUAGE: usize = 4;
 }
 mod gmo {
-    // gossip_menu_option — DUMP-VERIFIED 2026-07-10 (the [V] guess had OPTION_TYPE at 4, which is
-    // option_broadcast_text in this dump — every imported option's `action` was a broadcast_text id
-    // like 5299, so the gateway's TRAINER/VENDOR action match never fired and selecting "train me"
-    // just closed the window; live find). Real 15-col layout, read off the dump's CREATE TABLE:
-    //   menu_id, id, option_icon, option_text, option_broadcast_text, option_id,
-    //   npc_option_npcflag, action_menu_id, action_poi_id, action_script_id,
-    //   box_coded, box_money, box_text, box_broadcast_text, condition_id
     pub const MENU_ID: usize = 0;
-    pub const ID: usize = 1; // dense ordinal within the menu (cmangos row order — importer re-indexes)
+    pub const ID: usize = 1;
     pub const OPTION_ICON: usize = 2;
-    pub const OPTION_TEXT: usize = 3; // literal text, OR (new-schema dumps) a broadcast_text id — both tried
-    pub const OPTION_TYPE: usize = 5; // option_id/action — see `lyracore_shared::constants::gossip_option`
+    pub const OPTION_TEXT: usize = 3;
+    pub const OPTION_TYPE: usize = 5;
     pub const ACTION_MENU_ID: usize = 7;
-    /// THIS dump's vintage: 15 cols, trailing generic-`conditions` FK id.
+    // The 15-column layout ends with a conditions foreign key.
     pub const NCOLS_15_CONDITION_FK: usize = 15;
     pub const CONDITION_ID_15: usize = 14;
-    /// Legacy vintage fallbacks (other dumps): trailing FK at 10 (11 cols) / inline cond at 11..12 (14 cols).
+    // Legacy layouts use a foreign key at column 10 or inline conditions at columns 11..13.
     pub const NCOLS_WITH_CONDITION_FK: usize = 11;
     pub const CONDITION_ID: usize = 10;
     pub const NCOLS_WITH_INLINE_COND: usize = 14;
@@ -190,62 +112,40 @@ mod gmo {
     pub const INLINE_COND_VALUE1: usize = 12;
 }
 mod cond {
-    // conditions (mangos/cmangos generic condition table): condition_entry, type, value1, value2.
-    // [V] confirm — mangos `ConditionType` (subset this importer maps to the minimal 217 condition
-    // set): 8 = CONDITION_QUESTREWARDED, 9 = CONDITION_QUESTTAKEN. Anything else fails open
-    // (`lyracore_shared::constants::gossip_condition::NONE`) rather than silently hiding an option.
     pub const ENTRY: usize = 0;
     pub const TYPE: usize = 1;
     pub const VALUE1: usize = 2;
     pub const MANGOS_QUESTREWARDED: u64 = 8;
     pub const MANGOS_QUESTTAKEN: u64 = 9;
-    /// `CONDITION_ACTIVE_GAME_EVENT` [V]. No game-event calendar exists here, so this gate must fail
-    /// CLOSED — fail-open pitches Children's Week in July.
     pub const MANGOS_ACTIVE_GAME_EVENT: u64 = 12;
 }
 mod cts {
-    // creature_template_spells — ClassicDB_1_12_1_z2815: entry, setId, spell1..spell10
-    // (PK (entry,setId)). The modern cmangos dump moved the caster-mob rotation OFF creature_template's
-    // old spell1-4 columns into this table; spell1 is the primary nuke for every Elwynn caster
-    // (476 Kobold Geomancer → 133 Fireball; 474 Defias Rogue Wizard → 13322 Frostbolt).
     pub const ENTRY: usize = 0;
     pub const SET_ID: usize = 1;
     pub const SPELL1: usize = 2;
 }
 mod cr {
-    // creature (spawn) — ClassicDB_1_12_1_z2815: guid,id,map,spawnMask,position_x,position_y,
-    // position_z,orientation,spawntimesecsmin,spawntimesecsmax,spawndist,MovementType...
     pub const GUID: usize = 0;
-    pub const ID: usize = 1; // == creature_template.Entry
+    pub const ID: usize = 1;
     pub const MAP: usize = 2;
     pub const X: usize = 4;
     pub const Y: usize = 5;
     pub const Z: usize = 6;
     pub const O: usize = 7;
     pub const SPAWN_TIME_SECS_MIN: usize = 8;
-    pub const MOVEMENT_TYPE: usize = 11; // 0 idle / 1 random-wander / 2 waypoint
+    pub const MOVEMENT_TYPE: usize = 11;
 }
 mod cm {
-    // creature_movement
-    pub const ID: usize = 0; // == creature.guid
+    pub const ID: usize = 0;
     pub const X: usize = 2;
     pub const Y: usize = 3;
     pub const Z: usize = 4;
 }
 mod cmt {
-    // cmangos `creature_movement_template` — the ENTRY-keyed twin of `creature_movement`'s
-    // guid-keyed paths: Deadmines patrols whose MovementType=2 spawns carry no
-    // per-guid rows. [V] BOTH vintages below are cmangos-1.12-from-knowledge, NOT verified against
-    // an in-repo dump (none in this sandbox), and no neighbor-anchor is possible (first import from
-    // this table). Vintage is sniffed by COLUMN COUNT, the `npct`/`gmo` precedent:
-    //   >= 9 cols: Entry, PathId, Point, PositionX, PositionY, PositionZ, Orientation, WaitTime, ScriptId
-    //   <  9 cols: Entry,         Point, PositionX, PositionY, PositionZ, Orientation, WaitTime, ScriptId
-    // Only PathId 0 (the default path) imports — the module's waypoint cursor models one route per
-    // creature. Confirm via `SHOW CREATE TABLE creature_movement_template` on your real dump.
+    // Template paths are keyed by entry; direct creature_movement paths are keyed by spawn guid.
     pub const ENTRY: usize = 0;
     pub const NCOLS_WITH_PATH_ID: usize = 9;
-    pub const PATH_ID: usize = 1; // only in the >= 9-col vintage
-    /// (point, x, y, z) column indices for a row of `ncols` — the vintage sniff.
+    pub const PATH_ID: usize = 1;
     pub const fn pos_indices(ncols: usize) -> (usize, usize, usize, usize) {
         if ncols >= NCOLS_WITH_PATH_ID {
             (2, 3, 4, 5)
@@ -255,14 +155,12 @@ mod cmt {
     }
 }
 mod cls {
-    // player_classlevelstats: (class, level, basehp, basemana), PK (class, level)
     pub const CLASS: usize = 0;
     pub const LEVEL: usize = 1;
     pub const BASEHP: usize = 2;
     pub const BASEMANA: usize = 3;
 }
 mod lvl {
-    // player_levelstats: (race, class, level, str, agi, sta, inte, spi), PK (race, class, level)
     pub const RACE: usize = 0;
     pub const CLASS: usize = 1;
     pub const LEVEL: usize = 2;
@@ -273,7 +171,6 @@ mod lvl {
     pub const SPI: usize = 7;
 }
 mod pc {
-    // playercreateinfo: (race, class, map, zone, x, y, z, orientation), PK (race, class)
     pub const RACE: usize = 0;
     pub const CLASS: usize = 1;
     pub const MAP: usize = 2;
@@ -284,53 +181,30 @@ mod pc {
     pub const O: usize = 7;
 }
 mod pcs {
-    // playercreateinfo_spell — cmangos/mangos-classic 1.12 schema: race, class, Spell(, Note). [V] —
-    // anchored against the well-known cmangos community schema (race TINYINT, class TINYINT, Spell
-    // MEDIUMINT[, Note TEXT]), NOT verified against an in-repo dump (this sandbox has none). CONFIRM
-    // these column indices against your own `classic-db` dump's `playercreateinfo_spell` before
-    // trusting the import — a wrong column here silently mis-teaches spells to the wrong race/class.
-    pub const RACE: usize = 0; // [V]
-    pub const CLASS: usize = 1; // [V]
-    pub const SPELL: usize = 2; // [V]
+    pub const RACE: usize = 0;
+    pub const CLASS: usize = 1;
+    pub const SPELL: usize = 2;
 }
 mod pca {
-    // playercreateinfo_action — cmangos/mangos-classic 1.12 schema: race, class, button, action, type.
-    // [V] — same community-schema provenance/caveat as `pcs` above; CONFIRM against your own dump.
-    pub const RACE: usize = 0; // [V]
-    pub const CLASS: usize = 1; // [V]
-    pub const BUTTON: usize = 2; // [V]
-    pub const ACTION: usize = 3; // [V]
-    pub const TYPE: usize = 4; // [V]
+    pub const RACE: usize = 0;
+    pub const CLASS: usize = 1;
+    pub const BUTTON: usize = 2;
+    pub const ACTION: usize = 3;
+    pub const TYPE: usize = 4;
 }
 mod pci {
-    // playercreateinfo_item — cmangos/mangos-classic 1.12 schema: race, class, itemid, amount. [V] —
-    // same community-schema provenance/caveat as `pcs` above; CONFIRM against your own dump. `amount`
-    // is parsed but currently unused (game_start_item carries no stack-count column — every starter
-    // item grants as a single stack, matching the existing CharStartOutfit-sourced rows).
-    pub const RACE: usize = 0; // [V]
-    pub const CLASS: usize = 1; // [V]
-    pub const ITEM: usize = 2; // [V]
+    pub const RACE: usize = 0;
+    pub const CLASS: usize = 1;
+    pub const ITEM: usize = 2;
     #[allow(dead_code)]
-    pub const AMOUNT: usize = 3; // [V] — unused (see above)
+    pub const AMOUNT: usize = 3;
 }
 mod gz {
-    // game_graveyard_zone: id(=world_safe_locs id / game_graveyard.id), ghost_zone, faction
-    // (0 = both factions; else the cmangos team-faction id — see module/src/world.rs
-    // graveyard::team_for_race). PK (id, ghost_zone) in the cmangos schema (a graveyard can serve
-    // more than one zone) — we assign our own sequential row_id (build_graveyard_zone_sql), like
-    // start_item_sql's explicit-but-sequential id convention.
     pub const ID: usize = 0;
     pub const GHOST_ZONE: usize = 1;
     pub const FACTION: usize = 2;
 }
 mod at {
-    // cmangos `areatrigger_teleport`, VERIFIED against the real dump 2026-07-10. The
-    // original [V] guess was off by FOUR columns and every imported portal row was garbage (the
-    // Deadmines "no entrance" gap). Real row shape, read off the dump's own INSERT:
-    //   (id, name, required_level, req_item, req_quest?, req_?, target_map, x, y, z, o, message, ?)
-    // e.g. (78,'Deadmines - Entering',10,0,0,0,36,-14.5732,-385.475,62.4561,1.5708,'You must be at
-    // least level 10 to enter.',0). required_level(2) is not yet consumed (portal level gates are a
-    // future item); the three condition columns are skipped.
     pub const ID: usize = 0;
     pub const NAME: usize = 1;
     pub const TARGET_MAP: usize = 6;
@@ -340,54 +214,33 @@ mod at {
     pub const TARGET_O: usize = 10;
 }
 mod it {
-    // item_template — ClassicDB_1_12_1_z2815. Only the columns game_item_template uses.
     pub const ENTRY: usize = 0;
     pub const CLASS: usize = 1;
     pub const SUBCLASS: usize = 2;
     pub const NAME: usize = 3;
     pub const DISPLAY_ID: usize = 4;
     pub const QUALITY: usize = 5;
-    // Flags: the raw item_template.Flags bitmask (unique/conjured/etc, ItemFlag on
-    // the wire). Sits right after Quality(5), before BuyCount(7)/BuyPrice(8) — anchored by the
-    // already-verified BUY_PRICE=8 two columns later (Quality(5), Flags(6), BuyCount(7), BuyPrice(8)
-    // is the standard cmangos 1.12 item_template column run).
     pub const FLAGS: usize = 6;
-    // BuyCount: the per-purchase stack a vendor hands over (water/food ×5, ammo ×200) —
-    // anchored between the verified Flags(6) and BUY_PRICE(8).
     pub const BUY_COUNT: usize = 7;
     pub const BUY_PRICE: usize = 8;
     pub const SELL_PRICE: usize = 9;
     pub const INVENTORY_TYPE: usize = 10;
-    // ClassicDB_1_12_1_z2815 follows the canonical cmangos run: InventoryType(10),
-    // AllowableClass(11), AllowableRace(12), ItemLevel(13).  `-1` is the dump's unrestricted
-    // sentinel; restrictive masks are unsigned bits and must stay byte-for-byte intact.
+    // ClassicDB uses -1 for an unrestricted allowable-class or allowable-race mask.
     pub const ALLOWED_CLASS: usize = 11;
     pub const ALLOWED_RACE: usize = 12;
-    // RequiredSkill/RequiredSkillRank: weapon-skill / mail-plate proficiency gate.
-    // Anchored tightly between the already-verified REQUIRED_LEVEL(14) and STACKABLE(23): 14
-    // RequiredLevel, 15 RequiredSkill, 16 RequiredSkillRank, 17 RequiredSpell, 18 RequiredHonorRank,
-    // 19 RequiredCityRank, 20 RequiredReputationFaction, 21 RequiredReputationRank, 22 maxcount,
-    // 23 Stackable(confirmed) — the run lands exactly on the existing STACKABLE=23 anchor.
     pub const REQUIRED_SKILL: usize = 15;
     pub const REQUIRED_SKILL_RANK: usize = 16;
-    // RequiredReputationFaction/Rank: the item's reputation gate. Same anchored run as above.
     pub const REQUIRED_REPUTATION_FACTION: usize = 20;
     pub const REQUIRED_REPUTATION_RANK: usize = 21;
-    // maxcount: unique-item stack cap. Same anchored run, one column before the
-    // already-verified STACKABLE=23.
     pub const MAX_COUNT: usize = 22;
     pub const ITEM_LEVEL: usize = 13;
     pub const REQUIRED_LEVEL: usize = 14;
     pub const STACKABLE: usize = 23;
-    pub const CONTAINER_SLOTS: usize = 24; // how many slots this bag provides (0 for non-bags)
-    pub const STAT_TYPE1: usize = 25; // 10 pairs: type{i}=25+2(i-1), value{i}=26+2(i-1)
+    pub const CONTAINER_SLOTS: usize = 24;
+    pub const STAT_TYPE1: usize = 25;
     pub const DMG_MIN1: usize = 45;
     pub const DMG_MAX1: usize = 46;
     pub const ARMOR: usize = 60;
-    // The 6 resistance schools, cmangos lays them out immediately after Armor(60)
-    // and immediately before the already-verified DELAY=67: 60 Armor, 61 HolyRes, 62 FireRes,
-    // 63 NatureRes, 64 FrostRes, 65 ShadowRes, 66 ArcaneRes, 67 Delay(confirmed) — the run lands
-    // exactly on the existing DELAY anchor.
     pub const HOLY_RES: usize = 61;
     pub const FIRE_RES: usize = 62;
     pub const NATURE_RES: usize = 63;
@@ -395,16 +248,10 @@ mod it {
     pub const SHADOW_RES: usize = 65;
     pub const ARCANE_RES: usize = 66;
     pub const DELAY: usize = 67;
-    // On-use/on-equip spell slots (7 cols each: spellid, spelltrigger, charges, ppmRate, cooldown,
-    // category, categorycooldown). We import slots 1-2's id+trigger for the client green "Use:" text.
     pub const SPELLID_1: usize = 70;
     pub const SPELLTRIGGER_1: usize = 71;
     pub const SPELLID_2: usize = 77;
     pub const SPELLTRIGGER_2: usize = 78;
-    // Spell slots 3-5: each slot is 7 columns wide, same shape as slots 1-2 above.
-    // Slot 3 starts right after slot 2's 7 columns (77..=83), slot 4 after slot 3's (84..=90), slot 5
-    // after slot 4's (91..=97) — and slot 5's own 7 columns (98..=104) land exactly on the
-    // already-verified BONDING=105 anchor one column later, confirming all three slots.
     pub const SPELLID_3: usize = 84;
     pub const SPELLTRIGGER_3: usize = 85;
     pub const SPELLID_4: usize = 91;
@@ -412,116 +259,78 @@ mod it {
     pub const SPELLID_5: usize = 98;
     pub const SPELLTRIGGER_5: usize = 99;
     pub const BONDING: usize = 105;
-    // description(106), PageText(107), LanguageID(108), PageMaterial(109), startquest(110),
-    // lockid(111), Material(112) sit between BONDING(105, confirmed) and the already-verified
-    // SHEATH=113 below, PAGE_TEXT and START_QUEST land on that same anchored run.
     pub const PAGE_TEXT: usize = 107;
     pub const START_QUEST: usize = 110;
-    pub const SHEATH: usize = 113; // sheath posture, sent verbatim to the client (0=no stow, 1H sword=3,
-                                   // shield=4 — opaque client indices, see items/tables.rs::sheath)
+    pub const SHEATH: usize = 113;
     pub const RANDOM_PROPERTY: usize = 114;
-    pub const BLOCK: usize = 115; // shield block value (CREATE TABLE: …RandomProperty(114), block(115), itemset(116))
+    pub const BLOCK: usize = 115;
     pub const MAX_DURABILITY: usize = 117;
-    // BagFamily: bag-type restriction bitmask. Anchored right after the
-    // already-verified MAX_DURABILITY=117: 117 MaxDurability(confirmed), 118 area, 119 Map,
-    // 120 BagFamily.
     pub const BAG_FAMILY: usize = 120;
-    // FoodType follows ScriptName(121) and DisenchantID(122) in the current ClassicDB schema.
-    // Values 1..=8 map to CreatureFamily.pet_food_mask bits; 0 is not pet food.
     pub const FOOD_TYPE: usize = 123;
 }
 mod clt {
-    // creature_loot_template: entry(=creature_template.LootId), item, ChanceOrQuestChance, groupid,
-    // mincountOrRef, maxcount, condition_id, comments.
     pub const ENTRY: usize = 0;
     pub const ITEM: usize = 1;
-    pub const CHANCE: usize = 2; // >0 = drop %, <0 = quest item (skip — no quest system yet)
-    pub const GROUPID: usize = 3; // 0 = independent; >0 = pick-one group within this loot table
-    pub const MINCOUNT_OR_REF: usize = 4; // <0 = reference to a shared pool (expanded as a group)
+    pub const CHANCE: usize = 2; // Negative ChanceOrQuestChance marks a quest-only drop.
+    pub const GROUPID: usize = 3; // 0 = independent; >0 = pick one.
+    pub const MINCOUNT_OR_REF: usize = 4; // Negative mincountOrRef refers to a shared loot pool.
     pub const MAXCOUNT: usize = 5;
 }
 mod nv {
-    // npc_vendor: entry(=creature_template.entry), item, maxcount, incrtime, slot, condition_id, comments.
     pub const ENTRY: usize = 0;
     pub const ITEM: usize = 1;
     pub const MAXCOUNT: usize = 2;
     pub const SLOT: usize = 4;
 }
 mod qt {
-    // quest_template — only the columns game_quest_template + objectives/rewards need (verified against
-    // the ClassicDB CREATE TABLE). ReqCreatureOrGOId/Count + RewItemId/Count are 4 contiguous slots each.
     pub const ENTRY: usize = 0;
-    pub const ZONE_OR_SORT: usize = 2; // quest-log category: >0 AreaTable zone, <0 QuestSort id
+    pub const ZONE_OR_SORT: usize = 2;
     pub const MIN_LEVEL: usize = 3;
     pub const QUEST_LEVEL: usize = 5;
-    // Type (cm:ObjectMgr.cpp:4239, cm:QuestDef.cpp:31): 62 is QUEST_TYPE_RAID, everything else an
-    // ordinary quest. Anchored between the already-trusted QUEST_LEVEL and REQUIRED_CLASSES.
     pub const TYPE: usize = 6;
-    pub const REQUIRED_CLASSES: usize = 7; // bitmask, 0 = all classes
-    pub const REQUIRED_RACES: usize = 8; // bitmask, 0 = all races
-                                         // [V] LimitTime (seconds from accept, 0 = untimed) — unverified column index (no cmangos dump in
-                                         // this sandbox to confirm against). Anchored by bracketing against the two already-trusted
-                                         // constants either side: cmangos's real `quest_template` layout runs
-                                         // exactly 2 slots before the already-verified SPECIAL_FLAGS=21 (QuestFlags at 20 between them).
-                                         // Coverage-printed at import time (timed-quest count) rather than hard floor-gated — plausible
-                                         // this Elwynn/Westfall slice has ZERO genuinely timed quests (escort quests, the usual timed
-                                         // pairing, are deliberately out of scope), so a floor here would risk a false
-                                         // failure on a legitimate import; the coverage print is the fail-LOUD net instead.
+    pub const REQUIRED_CLASSES: usize = 7;
+    pub const REQUIRED_RACES: usize = 8;
+    // LimitTime is seconds after acceptance; zero means untimed.
     pub const LIMIT_TIME: usize = 19;
-    pub const SPECIAL_FLAGS: usize = 21; // bit0 = QUEST_SPECIAL_FLAGS_REPEATABLE
-    pub const PREV_QUEST_ID: usize = 22; // prerequisite quest (must be turned in first); 0 = none
-                                         // ClassicDB names columns 23 through 26 NextQuestId, ExclusiveGroup, BreadcrumbForQuestId,
-                                         // and NextQuestInChain. The forward chain is column 26. Quest 783 carries 0 at column 25 and 7
-                                         // at column 26, so using the breadcrumb column silently loses its link to quest 7.
+    pub const SPECIAL_FLAGS: usize = 21;
+    pub const PREV_QUEST_ID: usize = 22;
     pub const NEXT_QUEST_IN_CHAIN: usize = 26;
-    pub const SRC_ITEM_ID: usize = 27; // SrcItemId — item HANDED to the player on accept (provided item)
-    pub const SRC_ITEM_COUNT: usize = 28; // SrcItemCount (0 in the dump means 1)
+    pub const SRC_ITEM_ID: usize = 27;
+    pub const SRC_ITEM_COUNT: usize = 28; // SrcItemCount zero means one.
     pub const TITLE: usize = 30;
-    pub const DETAILS: usize = 31; // quest description / story text
-    pub const OBJECTIVES: usize = 32; // objective summary line(s)
-    pub const OFFER_REWARD_TEXT: usize = 33; // text on the turn-in reward screen
-    pub const REQUEST_ITEMS_TEXT: usize = 34; // text on the "not finished yet" screen
-    pub const REQ_ITEM_ID1: usize = 40; // ..=43; collect-objective item entries
-    pub const REQ_ITEM_COUNT1: usize = 44; // ..=47
-    pub const REQ_CREATURE_OR_GO_ID1: usize = 56; // ..=59; >0 = creature entry, <0 = gameobject (skip)
-    pub const REQ_CREATURE_OR_GO_COUNT1: usize = 60; // ..=63
-    pub const REQ_SPELL_CAST1: usize = 64; // ..=67; 0 = ordinary kill/use objective
-    pub const REW_CHOICE_ITEM_ID1: usize = 68; // ..=73 RewChoiceItemId1-6 (pick-1-of-N choice rewards)
-    pub const REW_CHOICE_ITEM_COUNT1: usize = 74; // ..=79 RewChoiceItemCount1-6
-    pub const REW_ITEM_ID1: usize = 80; // ..=83 (guaranteed reward items)
-    pub const REW_ITEM_COUNT1: usize = 84; // ..=87
-    pub const REW_REP_FACTION1: usize = 88; // ..=92 RewRepFaction1..5 (we model 2 slots; +1 = faction2)
-    pub const REW_REP_VALUE1: usize = 93; // ..=97 RewRepValue1..5 (parallel to the faction cols; +1 = value2)
-    pub const REW_OR_REQ_MONEY: usize = 98; // >0 = reward copper, <0 = required copper (clamp ≥ 0)
-    pub const REW_SPELL: usize = 100; // reward display, also the cast when RewSpellCast is zero
-    pub const REW_SPELL_CAST: usize = 101; // overrides the reward cast
-    pub const REW_MONEY_MAX_LEVEL: usize = 99; // cmangos RewMoneyMaxLevel (col 99, right after 98); /0.6 = authentic quest XP
+    pub const DETAILS: usize = 31;
+    pub const OBJECTIVES: usize = 32;
+    pub const OFFER_REWARD_TEXT: usize = 33;
+    pub const REQUEST_ITEMS_TEXT: usize = 34;
+    pub const REQ_ITEM_ID1: usize = 40;
+    pub const REQ_ITEM_COUNT1: usize = 44;
+    pub const REQ_CREATURE_OR_GO_ID1: usize = 56;
+    pub const REQ_CREATURE_OR_GO_COUNT1: usize = 60;
+    pub const REQ_SPELL_CAST1: usize = 64;
+    pub const REW_CHOICE_ITEM_ID1: usize = 68;
+    pub const REW_CHOICE_ITEM_COUNT1: usize = 74;
+    pub const REW_ITEM_ID1: usize = 80;
+    pub const REW_ITEM_COUNT1: usize = 84;
+    pub const REW_REP_FACTION1: usize = 88;
+    pub const REW_REP_VALUE1: usize = 93;
+    pub const REW_OR_REQ_MONEY: usize = 98;
+    pub const REW_SPELL: usize = 100;
+    pub const REW_SPELL_CAST: usize = 101;
+    pub const REW_MONEY_MAX_LEVEL: usize = 99;
 
-    // Reward-mail (T3): the letter a quest giver sends at turn-in. Column positions verified
-    // against the pinned dump's own `CREATE TABLE quest_template` — RewMailTemplateId sits at 102,
-    // RewMailDelaySecs at 103, immediately after RewSpellCast(101). 74 of 4,245 quest_template rows
-    // in the pinned dump carry a non-zero template.
     pub const REW_MAIL_TEMPLATE_ID: usize = 102;
     pub const REW_MAIL_DELAY_SECS: usize = 103;
 }
 mod dse {
-    // dbscripts_on_quest_end — verified against the pinned dump's own `CREATE TABLE`: id, delay,
-    // priority, command, datalong, datalong2, datalong3, buddy_entry, search_radius, data_flags,
-    // dataint, .... SCRIPT_COMMAND_SEND_MAIL (cm:ScriptMgr.cpp:2850-2866) is the only command this
-    // importer reads from this table.
-    pub const ID: usize = 0; // quest_template.entry the script fires on turn-in
+    pub const ID: usize = 0;
     pub const COMMAND: usize = 3;
-    pub const DATALONG: usize = 4; // mail template id
-    pub const DATALONG2: usize = 5; // alternative sender creature entry (0 = the turn-in giver)
-    pub const DATALONG3: usize = 6; // money, in copper
-    pub const DATAINT: usize = 10; // delay, in seconds
-    pub const SEND_MAIL: u32 = 38; // SCRIPT_COMMAND_SEND_MAIL
+    pub const DATALONG: usize = 4;
+    pub const DATALONG2: usize = 5;
+    pub const DATALONG3: usize = 6; // Copper.
+    pub const DATAINT: usize = 10; // Seconds.
+    pub const SEND_MAIL: u32 = 38;
 }
 mod mlt {
-    // mail_loot_template — verified against the pinned dump's own `CREATE TABLE`: entry (the mail
-    // template id), item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, condition_id,
-    // comments. Every real row is chance 100, group 0, count 1, no condition (a mail carries at
-    // most one item, cm:Mail.h:49).
     pub const ENTRY: usize = 0;
     pub const ITEM: usize = 1;
     pub const CHANCE: usize = 2;
@@ -531,57 +340,34 @@ mod mlt {
     pub const CONDITION_ID: usize = 6;
 }
 mod qr {
-    // creature_questrelation (START) AND creature_involvedrelation (END) share this 2-col layout —
-    // as do their GAMEOBJECT twins gameobject_questrelation (START) / gameobject_involvedrelation
-    // (END): id = gameobject_template.entry, quest = quest_template.entry.
-    pub const CREATURE: usize = 0; // id = creature_template.entry (or gameobject_template.entry for the GO tables)
+    pub const CREATURE: usize = 0;
     pub const QUEST: usize = 1;
 }
 const HIGHGUID_UNIT: u64 = 0xF130;
 
-/// Our deterministic creature guid from the cmangos entry + spawn guid (HIGHGUID_UNIT-encoded, like
-/// the seed). Stable across re-imports → clear+reload is idempotent. (entry<<24)|(low 24 of db guid).
 fn world_guid(entry: u64, db_guid: u64) -> u64 {
     (HIGHGUID_UNIT << 48) | ((entry & 0xFF_FFFF) << 24) | (db_guid & 0xFF_FFFF)
 }
 
 const HIGHGUID_GAMEOBJECT: u64 = 0xF110;
 
-/// GO guid from the cmangos gameobject.guid (HIGHGUID_GAMEOBJECT-encoded, matching the gameobject seed's
-/// 0xF110<<48 scheme). Stable across re-imports → the import_gameobjects clear+reload is idempotent.
 fn go_guid(db_guid: u64) -> u64 {
     (HIGHGUID_GAMEOBJECT << 48) | (db_guid & 0xFFFF_FFFF_FFFF)
 }
 
-/// Uniform GATHER-node respawn window (seconds). The dump carries spawntimesecsmin=max=300 for these
-/// entries (one Copper outlier at 45/90) — use the real vanilla 300s for all, NOT the module's 180s
-/// fallback. (Per-node respawn variance from the spawn row is DEFERRED — single shared value for 8 nodes.)
 const GATHER_RESPAWN_SECS: u32 = 300;
 
-/// The known Elwynn gather-node gameobjects, keyed by GO entry →
-/// (gather_skill_line, granted item entry, required skill level, gray ceiling).
-/// HARDCODED allowlist — cmangos models mining veins + herbs as locked type-3
-/// CHESTs (a blind "all type-3" pulls in 30+ treasure chests). The granted item is the chance-100,
-/// group-0 row of gameobject_loot_template[lootId]; the required level is Lock.dbc-derived (well-known
-/// vanilla values — the importer reads no loot table / Lock.dbc, not worth building for 8 known nodes).
-/// MINING = 186, HERBALISM = 182 (matches module skill::skill_line).
-/// The `gray` ceiling is the vanilla skillup gray threshold for the node: at/above this skill a gather
-/// never yields +1 (skillup_chance_bp returns 0). Values sourced from the vanilla 1.12 skill color bands
-/// (orange/yellow/green/gray). The linear collapse (orange→gray) is our simplified single-band model.
 const GATHER_NODES: &[(u64, u32, u32, u32, u32)] = &[
-    // entry, skill_line, item, orange(=required), gray
     (1731, 186, 2770, 1, 100),
-    (1732, 186, 2771, 65, 140), // Copper Vein / Tin Vein
+    (1732, 186, 2771, 65, 140),
     (1617, 182, 765, 1, 75),
-    (1618, 182, 2447, 1, 75), // Silverleaf / Peacebloom
+    (1618, 182, 2447, 1, 75),
     (1619, 182, 2449, 15, 90),
-    (1620, 182, 785, 50, 125), // Earthroot / Mageroyal
+    (1620, 182, 785, 50, 125),
     (1621, 182, 2450, 70, 145),
-    (1622, 182, 2453, 100, 175), // Briarthorn / Bruiseweed
+    (1622, 182, 2453, 100, 175),
 ];
 
-/// Lookup a gather node by GO entry → (skill_line, granted item entry, required level, gray ceiling),
-/// or None if the entry is not a known gather node.
 fn gather_node(entry: u64) -> Option<(u32, u32, u32, u32)> {
     GATHER_NODES
         .iter()
@@ -591,28 +377,20 @@ fn gather_node(entry: u64) -> Option<(u32, u32, u32, u32)> {
 
 pub(crate) const GO_DOOR: u8 = 0;
 pub(crate) const GO_BUTTON: u8 = 1;
-const GO_QUESTGIVER: u8 = lyracore_shared::constants::go_type::QUESTGIVER; // shared const — no drift
+const GO_QUESTGIVER: u8 = lyracore_shared::constants::go_type::QUESTGIVER;
 const GO_CHEST: u8 = 3;
 const GO_GOOBER: u8 = 10;
 const GO_MEETINGSTONE: u8 = lyracore_shared::constants::go_type::MEETINGSTONE;
-/// Synthetic — must equal module `go_type::GATHER`. Vanilla's REAL type 25 is
-/// GAMEOBJECT_TYPE_FISHINGHOLE; see the TYPE-25 COLLISION GUARD in `classify_go_type`.
+// Synthetic GATHER collides with vanilla FISHINGHOLE type 25; classify raw types first.
 const GO_GATHER: u8 = 25;
-/// The real cmangos type that collides with [`GO_GATHER`] — see `classify_go_type`.
 const CMANGOS_FISHINGHOLE_TYPE: u32 = 25;
 
-/// Classify one `gameobject_template` row's cmangos TYPE into this repo's stored `type_id` — `None`
-/// means DROP the row from import entirely (template AND spawn). Pure + fixture-tested.
-///
-/// Every other in-scope raw type passes through IDENTITY (this repo's type ids match cmangos' for
-/// every value except the 3→25 gather remap and the 25 drop) — `main.rs`'s per-type dispatch decides
-/// LIVE vs INERT from the resulting value, not from this function.
 pub(crate) fn classify_go_type(entry: u64, raw_type: u32) -> Option<u8> {
     match raw_type {
         3 if gather_node(entry).is_some() => Some(GO_GATHER),
         CMANGOS_FISHINGHOLE_TYPE => None,
         t if t <= u8::MAX as u32 => Some(t as u8),
-        _ => None, // an out-of-range raw type (corrupt dump row) — drop rather than truncate
+        _ => None,
     }
 }
 
@@ -658,13 +436,10 @@ fn go_template_row(
         other => (
             format!("({entry},{other},{disp},{n},0,0,0,0,0,0,{size})"),
             None,
-        ), // QUESTGIVER + every INERT type
+        ),
     }
 }
 
-/// DOOR/BUTTON's initial SPAWN state from the dump's own `data0` (cmangos `startOpen` [V]): nonzero →
-/// spawns OPEN (state 1), else CLOSED (state 0). Every other type
-/// always spawns state 0 (CHEST closed/unlooted, GOOBER/GATHER/inert unused). Pure + fixture-tested.
 fn go_initial_state(stored_type: u8, data0: u32) -> u8 {
     if (stored_type == GO_DOOR || stored_type == GO_BUTTON) && data0 != 0 {
         1
@@ -674,80 +449,50 @@ fn go_initial_state(stored_type: u8, data0: u32) -> u8 {
 }
 
 mod nt {
-    // npc_trainer: entry(=creature_template.entry), spell, spellcost, reqskill, reqskillvalue, reqlevel, ...
     pub const ENTRY: usize = 0;
     pub const SPELL: usize = 1;
     pub const COST: usize = 2;
-    pub const REQ_SKILL: usize = 3; // SkillLine the offering teaches/requires (0 = a class spell)
+    pub const REQ_SKILL: usize = 3;
     pub const REQ_LEVEL: usize = 5;
 }
 
-// A small reviewable CONST data table (the doc above says so): each tuple is one profession's learn ladder.
 #[allow(clippy::type_complexity)]
-/// Profession learn-spell tiers SYNTHESIZED into game_trainer_spell. cmangos delivers Apprentice→Artisan
-/// learning via the gossip "Train me" menu (core C++), NOT via npc_trainer — those rows (reqskill != 0)
-/// are RECIPES that REQUIRE the skill, not the skill-learn itself. So for every in-box trainer whose
-/// npc_trainer rows carry a reqskill matching one of our 12 skill_lines, we emit one synthesized learn-row
-/// per tier carrying the REAL Spell.dbc learn id as spell_id (so SMSG_LEARNED_SPELL resolves client-side,
-/// unlike the old 50080-88 markers) + learn_skill_line/learn_skill_cap set (the module routes the buy to
-/// crate::skill::learn_profession instead of a spell). Tuple: (skill_line, &[(spell_id, tier_index,
-/// required_level)]) — `tier_index` (0=Apprentice,1=Journeyman,2=Expert,3=Artisan) replaced a literal cap.
-/// The real cap now comes from `SkillTiers.dbc` (see `dbc::profession_tier_values`),
-/// checked against `LEGACY_TIER_CAPS` by `assert_profession_tier_parity` before it's ever emitted. This
-/// table itself no longer carries the number, just WHICH tier. The gather/secondary lines (Mining/
-/// Herbalism/Skinning/Cooking/First Aid) stop at Expert(2) HERE — their Artisan(3) tier is deferred (not
-/// load-bearing for 1-10); the crafting trios (Alchemy/BS/Tailoring/LW) go to Artisan(3). Tier ids verified
-/// vs the dump's spell_template (effect-118 base points = tier). The final three professions —
-/// Engineering(202)/Enchanting(333)/Fishing(356) — complete the 12: Eng/Ench go to Artisan(3), Fishing
-/// stops at Expert(2) like the other secondary lines. KEEP THIS A SMALL REVIEWABLE CONST.
+// CMaNGOS teaches profession tiers through gossip, so npc_trainer omits these rows.
 const PROFESSION_LEARN: &[(u32, &[(u32, u8, u8)])] = &[
-    (186, &[(2575, 0, 1), (2576, 1, 10), (3564, 2, 20)]), // Mining (2576=Jour, 3564=Expert)
-    (182, &[(2366, 0, 1), (2368, 1, 10), (3570, 2, 20)]), // Herbalism
-    (393, &[(8613, 0, 1), (8617, 1, 10), (8618, 2, 20)]), // Skinning (8618=Expert, not 10768=Artisan)
-    (185, &[(2550, 0, 1), (3102, 1, 10), (3413, 2, 20)]), // Cooking
-    (129, &[(3273, 0, 1), (3274, 1, 10), (7924, 2, 20)]), // First Aid
+    (186, &[(2575, 0, 1), (2576, 1, 10), (3564, 2, 20)]),
+    (182, &[(2366, 0, 1), (2368, 1, 10), (3570, 2, 20)]),
+    (393, &[(8613, 0, 1), (8617, 1, 10), (8618, 2, 20)]),
+    (185, &[(2550, 0, 1), (3102, 1, 10), (3413, 2, 20)]),
+    (129, &[(3273, 0, 1), (3274, 1, 10), (7924, 2, 20)]),
     (
         171,
         &[(2259, 0, 1), (3101, 1, 10), (3464, 2, 20), (11611, 3, 35)],
-    ), // Alchemy
+    ),
     (
         164,
         &[(2018, 0, 1), (3100, 1, 10), (3538, 2, 20), (9785, 3, 35)],
-    ), // Blacksmithing (3538=Expert; 9785=Artisan, NOT 9787 Weaponsmith)
+    ),
     (
         197,
         &[(3908, 0, 1), (3909, 1, 10), (3910, 2, 20), (12180, 3, 35)],
-    ), // Tailoring
+    ),
     (
         165,
         &[(2108, 0, 1), (3104, 1, 10), (3811, 2, 20), (10662, 3, 35)],
-    ), // Leatherworking
-    // --- The final three (completing the 12). Tier ids VERIFIED vs the dump's spell_template (Effect2=118
-    // SKILL, MiscVal2=skill_line, BasePoints2=tier → cap=(BP2+1)*75). Fishing's ids were corrected: the
-    // original spec was shifted two tiers (7733 is a LearnSpell wrapper, NOT a skill tier); the real
-    // Effect2=118/MiscVal=356 tiers are 7620/7731/7732/18248 → use 7620/7731/7732 (stop at Expert 2).
+    ),
     (
         202,
         &[(4036, 0, 1), (4037, 1, 10), (4038, 2, 20), (12656, 3, 35)],
-    ), // Engineering → Artisan
+    ),
     (
         333,
         &[(7411, 0, 1), (7412, 1, 10), (7413, 2, 20), (13920, 3, 35)],
-    ), // Enchanting → Artisan
-    (356, &[(7620, 0, 1), (7731, 1, 10), (7732, 2, 20)]), // Fishing (stops at Expert, like other secondaries)
+    ),
+    (356, &[(7620, 0, 1), (7731, 1, 10), (7732, 2, 20)]),
 ];
 
-/// The legacy Apprentice/Journeyman/Expert/Artisan tier caps `PROFESSION_LEARN` hardcoded before
-/// wired in the real client's `SkillTiers.dbc` data, every profession in vanilla rides
-/// this exact 75/150/225/300 progression, indexed by `tier_index`. `assert_profession_tier_parity`
-/// checks the DBC-derived caps against this constant; the synthesis loop (below) falls back to it
-/// directly when `--dbc` wasn't given (no client data available to check against, so no parity guard
-/// is possible — documented fallback).
 const LEGACY_TIER_CAPS: [u32; 4] = [75, 150, 225, 300];
 
-/// The tier list a trainer should TEACH, given a SkillLine seen on its npc_trainer rows — `Some(tiers)`
-/// iff `line` is one of our 12 mapped professions, else `None` (a class spell or a deferred line). The ONE
-/// check on the spell->(skill_line,tier_index) map.
 fn profession_tiers(line: u32) -> Option<&'static [(u32, u8, u8)]> {
     PROFESSION_LEARN
         .iter()
@@ -755,8 +500,6 @@ fn profession_tiers(line: u32) -> Option<&'static [(u32, u8, u8)]> {
         .map(|(_, t)| *t)
 }
 
-/// Verify client skill-tier values match the importer's 75/150/225/300 progression.
-/// Refuse mismatches before writing trainer offers.
 pub(crate) fn assert_profession_tier_parity(
     tier_values: &std::collections::HashMap<u32, [u16; 4]>,
 ) -> Result<()> {
@@ -777,59 +520,46 @@ pub(crate) fn assert_profession_tier_parity(
     Ok(())
 }
 mod sc {
-    // spell_chain (cmangos/mangos-classic 1.12 schema): spell_id, prev_spell, first_spell, rank,
-    // req_spell. [V] — anchored against the well-known cmangos community schema column ORDER, NOT
-    // verified against an in-repo dump (this sandbox has no cmangos dump — same caveat as `pcs` above).
-    // CONFIRM these column indices against your own `classic-db` dump's `spell_chain` table before
-    // trusting the import — a wrong column here silently mis-gates rank purchases.
-    pub const SPELL_ID: usize = 0; // [V]
-    pub const PREV_SPELL: usize = 1; // [V]
-    pub const FIRST_SPELL: usize = 2; // [V]
-    pub const RANK: usize = 3; // [V]
-    pub const REQ_SPELL: usize = 4; // [V]
+    pub const SPELL_ID: usize = 0;
+    pub const PREV_SPELL: usize = 1;
+    pub const FIRST_SPELL: usize = 2;
+    pub const RANK: usize = 3;
+    pub const REQ_SPELL: usize = 4;
 }
 mod sls {
 
-    pub const ENTRY: usize = 0; // [V] parent_spell
-    pub const SPELL_ID: usize = 1; // [V] learn_spell
-    pub const ACTIVE: usize = 2; // [V] parsed-but-unused
+    pub const ENTRY: usize = 0;
+    pub const SPELL_ID: usize = 1;
+    pub const ACTIVE: usize = 2;
 }
 mod spe {
-    // Legacy rows carry one family mask. Current rows carry one mask per effect before procFlags.
-    pub const ENTRY: usize = 0; // [V]
-    pub const SCHOOL_MASK: usize = 1; // [V]
-    pub const FAMILY_NAME: usize = 2; // [V]
-    pub const FAMILY_MASK: usize = 3; // [V]
-    pub const PROC_FLAGS: usize = 4; // [V] override; 0 = use the Spell.dbc header's mask
-    pub const PROC_EX: usize = 5; // [V]
-    pub const PPM_RATE: usize = 6; // [V]
-    pub const CUSTOM_CHANCE: usize = 7; // [V] a float percent in the dump; our column is a u8 percent
-    /// The internal cooldown, in SECONDS ([V] — cmangos holds it as `std::chrono::seconds`, and the
-    /// dump's own values are small integers: a 45-second trinket reads 45, not 45000). The module
-    /// column is milliseconds, so `build_spell_proc_event_sql` scales it.
+    // Legacy proc rows have one family mask; current rows have one per effect.
+    pub const ENTRY: usize = 0;
+    pub const SCHOOL_MASK: usize = 1;
+    pub const FAMILY_NAME: usize = 2;
+    pub const FAMILY_MASK: usize = 3;
+    pub const PROC_FLAGS: usize = 4;
+    pub const PROC_EX: usize = 5;
+    pub const PPM_RATE: usize = 6;
+    pub const CUSTOM_CHANCE: usize = 7;
+    // The dump cooldown uses seconds; durable rows use milliseconds.
     pub const COOLDOWN: usize = 8;
-    /// How many columns a row must have to be mapped at all.
     pub const COLUMNS: usize = 9;
 }
 pub(crate) mod got {
-    // gameobject_template: entry, type, displayId, name, faction, flags, ExtraFlags, size, data0..23, ...
     pub const ENTRY: usize = 0;
     pub const TYPE: usize = 1;
     pub const DISPLAY_ID: usize = 2;
     pub const NAME: usize = 3;
-    // The prop's render scale (OBJECT_FIELD_SCALE_X); gathering nodes are authentically sub-1.0.
-    // Carried verbatim — the 0/absent → 1.0 fallback lives in the gateway codec, not here.
     pub const SIZE: usize = 7;
 
     pub const DATA0: usize = 8;
     pub const DATA1: usize = 9;
-    /// MEETINGSTONE: the dungeon's AreaTable id.
     pub const DATA2: usize = 10;
     pub const DATA3: usize = 11;
     pub const DATA5: usize = 13;
 }
 mod go {
-    // gameobject (spawn): guid, id(=gameobject_template.entry), map, spawnMask, x, y, z, orientation, rot0..3, ...
     pub const GUID: usize = 0;
     pub const ID: usize = 1;
     pub const MAP: usize = 2;
@@ -837,25 +567,17 @@ mod go {
     pub const Y: usize = 5;
     pub const Z: usize = 6;
     pub const O: usize = 7;
-    // The cmangos spawn quaternion, the client's real prop orientation, `orientation`
-    // (O, above) alone only drives movement-facing math. Positionally right after O per the dump
-    // schema comment; carried through byte-verbatim (no derive/snap here — that fallback lives in
-    // the gateway codec for the all-zero case, not the importer).
+    // The spawn quaternion determines render orientation; orientation alone is movement facing.
     pub const ROT0: usize = 8;
     pub const ROT1: usize = 9;
     pub const ROT2: usize = 10;
     pub const ROT3: usize = 11;
 }
 mod ai {
-    // areatrigger_involvedrelation: id(=areatrigger id), quest.
     pub const TRIGGER: usize = 0;
     pub const QUEST: usize = 1;
 }
 
-// --- mysqldump INSERT parser ------------------------------------------------------------------
-// Extracts every value tuple from `INSERT INTO `<table>` VALUES (..),(..);` statements. Handles
-// single-quoted strings with `\` escapes (names contain commas/apostrophes). Returns each field as
-// an unescaped String (quotes stripped). We PARSE, never execute (the firewall: no GPL code runs).
 pub(crate) fn parse_table(dump: &str, table: &str) -> Vec<Vec<String>> {
     parse_table_inserts(dump, table).0
 }
@@ -876,7 +598,6 @@ fn parse_table_inserts(dump: &str, table: &str) -> (Vec<Vec<String>>, bool) {
     while let Some(rel) = dump[search..].find(&needle) {
         let mut i = search + rel + needle.len();
         let bytes = dump.as_bytes();
-        // Parse tuples until the terminating `;` at top level.
         let mut field = String::new();
         let mut tuple: Vec<String> = Vec::new();
         let mut in_tuple = false;
@@ -885,7 +606,6 @@ fn parse_table_inserts(dump: &str, table: &str) -> (Vec<Vec<String>>, bool) {
             let c = bytes[i] as char;
             if in_quote {
                 if c == '\\' && i + 1 < bytes.len() {
-                    // escaped char, take the next literally (\' \\ \n...)
                     let n = bytes[i + 1] as char;
                     field.push(match n {
                         'n' => '\n',
@@ -933,9 +653,7 @@ pub(crate) fn field(row: &[String], idx: usize) -> &str {
     row.get(idx).map(|s| s.trim()).unwrap_or("")
 }
 
-/// ClassicDB uses signed `-1` for an unrestricted allowable-class/race column.  It is normalized
-/// only at this import boundary; every other mask is parsed as raw unsigned bits so unknown bits
-/// survive into the Module and its item-query response.
+// Normalize ClassicDB -1 masks only at this import boundary.
 fn normalize_item_mask(source: &str, unrestricted: u32) -> u32 {
     if source == "-1" {
         unrestricted
@@ -943,14 +661,7 @@ fn normalize_item_mask(source: &str, unrestricted: u32) -> u32 {
         source.parse().unwrap_or(0)
     }
 }
-/// Drink discriminator → `game_item_template.restores_power` (food vs drink). In classicdb z2815 BOTH
-/// food and drink are class 0 (Consumable) with subclass 0 (generic) OR 5 (Food&Drink) — they do NOT
-/// split on subclass — so we gate class 0 + subclass {0,5} (excluding potions=1/elixirs=2/flasks=3/
-/// scrolls=4/bandages=7 so "Elixir of Water Walking" can't false-positive) and discriminate by NAME.
-/// Match WHOLE WORDS, not substrings, so "S`tea`k" / "Snapvine `Water`melon" (food) don't match; drop
-/// the collision-prone "beer"/"brew" ("`Beer` Basted Boar Ribs"). wine/ale stay (Dalaran Red Wine is a
-/// real mana drink). Deliberate simplification: name-match; the canonical signal is the on-use
-/// spell (E_ENERGIZE) — wire that only if a beverage is ever misclassified.
+// ClassicDB z2815 uses subclass zero for both food and drink.
 fn is_drink_consumable(class: u8, subclass: u8, name: &str) -> bool {
     if class != 0 || (subclass != 0 && subclass != 5) {
         return false;
@@ -962,13 +673,10 @@ fn is_drink_consumable(class: u8, subclass: u8, name: &str) -> bool {
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|w| DRINK_WORDS.contains(&w))
 }
-/// SQL string literal with single-quotes doubled.
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
-/// SQL text from a cmangos field, mapping the literal `NULL` token to an empty string. Our parser
-/// strips quotes, so a quoted `'NULL'` and an unquoted `NULL` are indistinguishable — but no creature
-/// is named "NULL", so collapsing it to empty is safe and keeps the column NOT-NULL (no `'NULL'` text).
+// The tuple parser cannot distinguish quoted NULL text from an unquoted NULL token.
 pub(crate) fn sql_text(s: &str) -> String {
     if s == "NULL" {
         "''".into()
@@ -979,65 +687,37 @@ pub(crate) fn sql_text(s: &str) -> String {
 
 pub(crate) struct Args {
     taxi_mounts: Option<String>,
-    dump: Option<String>,               // cmangos creature ETL input (.sql[.gz])
-    dbc: Option<String>,                // client Data/ dir for the DBC stream
-    pub(crate) terrain: Option<String>, // client Data/ dir for the ADT heightmap stream (see terrain.rs)
-    pub(crate) dump_collision: Option<String>, // client Data/ dir: spike, WMO/M2 collision dry-run (see collision.rs)
-    pub(crate) nav: Option<String>,            // client Data/ dir: nav-grid rasterizer (see nav.rs)
-    pub(crate) vmap: Option<String>, // Client geometry input for the per-cell collision catalogue.
-    pub(crate) vmap_status: bool, // print active-generation provenance/status without opening client data
-    pub(crate) vmap_prepare_coverage: Option<u64>, // generation id: derive path-grid coverage from an already-staged generation (see vmap.rs::run_coverage)
-    pub(crate) go_models: Option<String>, // client Data/ dir: DOOR/BUTTON display -> M2 bounding-mesh extract+import (see go_model.rs); needs --dump too
-    pack_client: Option<String>, // client Data/ dir for the --pack-client packager (see pack_client.rs)
-    pack_out: Option<String>, // output dir for the --pack-out packager: package-authored client content only (see pack_client.rs)
+    dump: Option<String>,
+    dbc: Option<String>,
+    pub(crate) terrain: Option<String>,
+    pub(crate) dump_collision: Option<String>,
+    pub(crate) nav: Option<String>,
+    pub(crate) vmap: Option<String>,
+    pub(crate) vmap_status: bool,
+    pub(crate) vmap_prepare_coverage: Option<u64>,
+    pub(crate) go_models: Option<String>,
+    pack_client: Option<String>,
+    pack_out: Option<String>,
     print_extents: bool,
-    spells: bool, // with --dbc: import Spell.dbc → game_spell/game_spell_effect (see spell.rs)
-    talents: bool, // with --dbc: import TalentTab.dbc + Talent.dbc → game_talent_tab/game_talent (see talent.rs)
-    pub(crate) only: Vec<u32>, // with --spells: import ONLY these spell ids ADDITIVELY (surgical
-    // delete+reload, no wholesale wipe) — preserves the seed + synthetic test fixtures.
-    pub(crate) trainers: Vec<(u32, Vec<u32>)>, // with --spells: repeatable `--trainer <entry>=<id,id,…>`
-    // → emit a game_trainer_spell row per id keyed to that trainer CREATURE-TEMPLATE
-    // entry. `required_level`/`cost` are DBC-DERIVED (the spell's own spell_level +
-    // our formula) — NO cmangos npc_trainer value is read. The ids ARE the per-class
-    // offering list (a subset of --only); the importer auto-adds them to the allowlist.
+    spells: bool,
+    talents: bool,
+    pub(crate) only: Vec<u32>,
+    pub(crate) trainers: Vec<(u32, Vec<u32>)>,
     pub(crate) world_profile: Option<WorldImportProfile>,
     map: i64,
     include_maps: Vec<i64>,
-    // rows import WHOLE-MAP (no --box/--radius/--exclude geometry — an instance map like Deadmines 36
-    // is small and self-contained; its scope IS the map id). The primary --map keeps its box scoping.
-    // Same single-run clear+reload as the box slice — this is the "no additive two-pass path" answer
-    // for instance maps (see importer/scripts/import-world.sh's ONE-BOX note).
     center: (f64, f64, f64),
     radius: f64,
-    // --include-creatures <e1,e2..>: FORCE-import these creature entries (template + spawns + quest
-    // START/END relations + vendor/loot/gossip) regardless of the --box/--exclude geometry — the
-    // mechanism to recover out-of-box quest givers (e.g. a Westfall/Stormwind courier NPC whose
-    // sibling giver is in-band). Implemented in the spawn loop: a row whose entry is force-included
-    // bypasses the geometry gate, so its spawn survives → it flows into `entries` (derived from
-    // `spawns`) → every creature-scoped consumer picks it up. See importer/scripts/import-world.sh.
     include_creatures: Vec<u64>,
-    bbox: Option<(f64, f64, f64, f64)>, // --box X0,X1,Y0,Y1: a coordinate rectangle that REPLACES the
-    // radius sphere for the spawn slice (a radius from a zone corner bleeds into neighbours; a box is exact).
-    exclude: Option<(f64, f64, f64, f64)>, // --exclude X0,X1,Y0,Y1: a SUBTRACTED rectangle (in-box but
-    // in-exclude → dropped). Carves an inner neighbour out of the box (e.g. the Stormwind front inside Elwynn).
+    bbox: Option<(f64, f64, f64, f64)>,
+    exclude: Option<(f64, f64, f64, f64)>,
     db: String,
     server: String,
     pub(crate) apply: bool,
     pub(crate) family: Option<String>,
-    // clear+reload instead of the full ETL. `None` = full run.
     pub(crate) source_sha: String,
-    // classic-db commit this dump came from. It is threaded into every `stamp_import_meta` call this
-    // run makes. Empty string ("") when not given (no external provenance to record).
     pub(crate) eventai_profile: String,
-    // --packages <dir>: the enabled Package Inventory root (normally `packages/`). After a family's
-    // base rows are back, every enabled Package's generated Delta artifacts under
-    // `<dir>/<package>/data/.generated/*.json` are reapplied in one reducer call. `None` = the stage
-    // does not run AND the base import says so loudly: an absent flag is "the operator did not say",
-    // never "no Package claims this family".
     pub(crate) packages: Option<String>,
-    // --spell-snapshot <path>: with --dbc, derive the spell rows and write them to <path> as the
-    // Base Snapshot a Datascript reads. A terminal mode — it never loads, never stamps provenance
-    // and never opens a database, so it is safe to run against a live realm's operator machine.
     pub(crate) spell_snapshot: Option<String>,
 }
 
@@ -1045,7 +725,7 @@ fn parse_args() -> Result<Args> {
     parse_args_from(std::env::args().skip(1))
 }
 
-#[allow(clippy::too_many_lines)] // One arm per CLI flag.
+#[allow(clippy::too_many_lines)]
 fn parse_args_from<I, S>(args: I) -> Result<Args>
 where
     I: IntoIterator<Item = S>,
@@ -1074,7 +754,7 @@ where
         map: 0,
         include_maps: Vec::new(),
         include_creatures: Vec::new(),
-        center: (-8949.95, -132.493, 83.5312), // human/Northshire start
+        center: (-8949.95, -132.493, 83.5312),
         radius: 180.0,
         bbox: None,
         exclude: None,
@@ -1129,15 +809,10 @@ where
                 )
             }
             "--pack-out" => a.pack_out = Some(it.next().context("--pack-out needs an output dir")?),
-            // Derive the operator's OWN spawn bounding box for --map from their dump instead of trusting a
-            // remembered rectangle: the Westfall widening needed a way to compute --box from
-            // real data, not from memory. Prints min/max X/Y/Z + spawn count and returns — writes nothing.
             "--print-extents" => a.print_extents = true,
             "--spells" => a.spells = true,
             "--talents" => a.talents = true,
             "--only" => {
-                // Comma-separated spell ids → the additive allowlist. Fail loudly on a malformed id so
-                // a typo can't silently import the wrong (or empty) set.
                 let v = it
                     .next()
                     .context("--only needs comma-separated spell ids, e.g. 7386,1160")?;
@@ -1151,8 +826,6 @@ where
                 }
             }
             "--include-creatures" => {
-                // Comma-separated creature entries → force-import regardless of --box/--exclude. Fail
-                // loudly on a malformed entry (a typo would silently drop a quest giver).
                 let v = it.next().context(
                     "--include-creatures needs comma-separated creature entries, e.g. 344,266,415",
                 )?;
@@ -1166,10 +839,6 @@ where
                 }
             }
             "--trainer" => {
-                // Repeatable `--trainer <entry>=<id,id,…>`: bind a per-class offering list to a trainer
-                // CREATURE-TEMPLATE entry. The ids are emitted as game_trainer_spell rows with a
-                // DBC-derived required_level + a level-keyed cost (NO cmangos value). Fail loudly on a
-                // malformed spec so a typo can't silently skip a class's whole trainer tree.
                 let v = it.next().context("--trainer needs <entry>=<id,id,…>")?;
                 let (entry_s, ids_s) = v
                     .split_once('=')
@@ -1201,8 +870,6 @@ where
             }
             "--include-map" => {
                 legacy_spatial_args.push("--include-map");
-                // Repeatable: a WHOLE additional map in the slice (Deadmines, map 36).
-                // Fail loudly on a malformed id so a typo can't silently skip the dungeon's content.
                 let m: i64 = it
                     .next()
                     .context("--include-map <map id>")?
@@ -1218,8 +885,6 @@ where
             }
             "--box" => {
                 legacy_spatial_args.push("--box");
-                // A coordinate rectangle X0,X1,Y0,Y1 (REPLACES --radius for the spawn slice). Fail
-                // loudly on a malformed box so a typo can't silently import the wrong region.
                 let v = it.next().context("--box X0,X1,Y0,Y1")?;
                 let p: Vec<f64> = v
                     .split(',')
@@ -1241,7 +906,6 @@ where
             }
             "--exclude" => {
                 legacy_spatial_args.push("--exclude");
-                // A rectangle SUBTRACTED from --box (in-box AND in-exclude → dropped). Same parse as --box.
                 let v = it.next().context("--exclude X0,X1,Y0,Y1")?;
                 let p: Vec<f64> = v
                     .split(',')
@@ -1265,9 +929,6 @@ where
             "--server" => a.server = it.next().context("--server")?,
             "--apply" => a.apply = true,
             "--family" => {
-                // Reload ONE --dump family's clear+reload instead of the full ETL.
-                // Validated against the fixed FAMILIES set below (right here, not deferred) so a typo
-                // bails loudly before any dump parsing work happens.
                 let v = it.next().context("--family <name>")?;
                 if !FAMILIES.contains(&v.as_str()) {
                     bail!(
@@ -1298,8 +959,6 @@ where
             "--center" => {
                 legacy_spatial_args.push("--center");
                 let v = it.next().context("--center X,Y,Z")?;
-                // Fail loudly on a malformed center — silently defaulting a bad value to (0,0,0) or
-                // keeping the default would import the WRONG slice without the operator noticing.
                 let p: Vec<f64> = v
                     .split(',')
                     .map(|s| s.trim().parse::<f64>())
@@ -1345,8 +1004,6 @@ where
     {
         bail!("--taxi-mounts is only valid with standalone --dbc catalogue import");
     }
-    // Need at least one input. `--dump` alone = cmangos creatures; `--dbc` alone = standalone DBC
-    // mode (proof/checks); BOTH = cmangos creatures with DBC-resolved scale (display-derived).
     if a.dump.is_none()
         && a.dbc.is_none()
         && a.pack_client.is_none()
@@ -1361,33 +1018,21 @@ where
     {
         bail!("need an input: --dump <classic-db .sql[.gz]>, --dbc <client Data/ dir>, --terrain <client Data/ dir>, --pack-client <client Data/ dir>, or --pack-out <dir>");
     }
-    // `--pack-out` writes a distributable directory, never a client, so there is no client state
-    // for `--apply` to guard.
     if a.pack_out.is_some() && a.apply {
         bail!("--pack-out writes its output directory directly and takes no --apply (--apply guards the operator's own client, which --pack-out never touches)");
     }
-    // The two packers write different trees under different rules: one into the operator's own
-    // client, one into a distributable directory. Dispatch can only run one, so asking for both
-    // is a mistake worth naming instead of silently dropping one.
     if a.pack_out.is_some() && a.pack_client.is_some() {
         bail!("--pack-client and --pack-out are separate outputs and cannot run together: --pack-client writes into the operator's own client, --pack-out writes a distributable directory. Run one, then the other");
     }
-    // `--go-models` resolves gameobject_template rows (the cmangos dump) against client-owned M2
-    // geometry — meaningless without a template source.
     if a.go_models.is_some() && a.dump.is_none() {
         bail!("--go-models needs --dump too (gameobject_template is the template source)");
     }
-    // `--print-extents` reads `creature` rows out of the cmangos dump — meaningless without `--dump`.
     if a.print_extents && a.dump.is_none() {
         bail!("--print-extents is only valid with --dump (it reads the cmangos creature table)");
     }
-    // `--only` is meaningless without the spell importer (it's the additive-allowlist for Spell.dbc).
     if !a.only.is_empty() && !a.spells {
         bail!("--only is only valid with --spells (the additive Spell.dbc allowlist)");
     }
-    // The Base Snapshot is derived from Spell.dbc, so it needs the client dir and nothing else. It
-    // is a terminal mode rather than an extra output of `--spells`: an author asking for a snapshot
-    // is not asking to load anything, and `--apply` beside it would read as "and import too".
     if a.spell_snapshot.is_some() {
         if a.dbc.is_none() || a.dump.is_some() {
             bail!("--spell-snapshot needs --dbc <client Data/ dir> and nothing else");
@@ -1402,13 +1047,9 @@ where
     if !a.include_creatures.is_empty() && a.dump.is_none() {
         bail!("--include-creatures is only valid with --dump (it force-imports cmangos creature rows)");
     }
-    // `--family` covers `--dump` families ONLY, terrain/dbc/spells are separate
-    // invocations with no family concept of their own.
     if a.family.is_some() && a.dump.is_none() {
         bail!("--family is only valid with --dump (it names one of the cmangos-dump ETL families)");
     }
-    // `--include-map` extends the `--dump` content slice only. Terrain and collision remain separate
-    // archive-derived modes, and the DBC/spell streams are map-agnostic.
     if !a.include_maps.is_empty() {
         if a.dump.is_none() {
             bail!("--include-map is only valid with --dump (it widens the cmangos content slice)");
@@ -1421,13 +1062,7 @@ where
             );
         }
     }
-    // Resolve and validate the complete scope before the caller opens a dump or client archive.
-    // `build_dump_plan` resolves the same pure value once and then uses its predicate end to end.
     a.world_import_scope()?;
-    // `--trainer` rides the spell importer too (it reads each offering's DBC spell_level). Auto-extend
-    // the allowlist with the trainer ids so every offered wrapper's game_spell header is imported in the
-    // SAME pass (so the required_level is DBC-derived and the buy path resolves a real rank). When ONLY
-    // --trainer was given (no --only), this seeds the allowlist — the surgical/additive path stays on.
     if !a.trainers.is_empty() {
         if !a.spells {
             bail!(
@@ -1458,24 +1093,17 @@ impl Args {
                 self.include_maps.clone(),
             ),
         }?;
-        // The legacy flag remains an explicit extension. Canonical dependencies live in the
-        // profile catalogue so callers cannot silently omit or copy them.
         scope.extend_forced_creatures(&self.include_creatures);
         Ok(scope)
     }
 }
 
-/// One `spacetime call` for a reducer whose only argument is a `String`.
-///
-/// The CLI parses each argument as Sats JSON. Encoding here keeps packed newlines and other control
-/// characters inside that one String instead of letting the CLI parse them as JSON syntax.
+// Each spacetime CLI argument is Sats JSON; encode the whole payload once.
 pub(crate) fn call_reducer(args: &Args, reducer: &str, payload: &str) -> Result<()> {
     let payload = serde_json::to_string(payload).context("encode reducer String argument")?;
     call_reducer_args(args, reducer, &[&payload])
 }
 
-/// The `spacetime` CLI. `lyracore import` passes a temporary owner config through
-/// `LYRACORE_SPACETIME_CONFIG_PATH` when its operator credential is server-issued.
 pub(crate) fn spacetime() -> Command {
     let mut command = Command::new("spacetime");
     if let Some(path) = std::env::var_os("LYRACORE_SPACETIME_CONFIG_PATH") {
@@ -1484,8 +1112,6 @@ pub(crate) fn spacetime() -> Command {
     command
 }
 
-/// Reducer call with separate positional arguments (generation lifecycle reducers carry both
-/// immutable manifest metadata and a packed batch).
 pub(crate) fn call_reducer_args(args: &Args, reducer: &str, values: &[&str]) -> Result<()> {
     let mut command = spacetime();
     command.args(["call", "-s", &args.server, &args.db, reducer]);
@@ -1499,11 +1125,6 @@ pub(crate) fn call_reducer_args(args: &Args, reducer: &str, values: &[&str]) -> 
     Ok(())
 }
 
-/// Stamp `family`'s import provenance via the `stamp_import_meta` reducer, called
-/// once per family that ACTUALLY ran, after the apply succeeds. Unlike `call_reducer`'s single
-/// packed-string payload (the spawn/gameobject batch shape), `stamp_import_meta` takes 4 separate
-/// positional args, so each rides its own CLI argument — the same multi-arg `spacetime call`
-/// convention `debug_setup_gather_pool`'s doc comment demonstrates (module/src/debug.rs).
 pub(crate) fn stamp_family(
     args: &Args,
     family: &str,
@@ -1535,12 +1156,6 @@ pub(crate) fn stamp_family(
     Ok(())
 }
 
-/// sha256 hex digest of `bytes` (`--source-sha`/provenance). This crate's `Cargo.lock`
-/// carries no `sha2` dependency, so — mirroring this importer's existing convention of shelling out to
-/// `spacetime` for reducer calls rather than adding a client SDK dependency — this shells out to the
-/// system `sha256sum` instead of adding one. Feeds the dump bytes on stdin (`sha256sum -` reads
-/// stdin), so no temp file is needed. Returns the lowercase hex digest (`sha256sum`'s first
-/// whitespace-delimited field).
 pub(crate) fn sha256_hex(bytes: &[u8]) -> Result<String> {
     use std::io::Write;
     let mut child = Command::new("sha256sum")
@@ -1568,8 +1183,6 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> Result<String> {
 
 pub(crate) fn read_dump(path: &str) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("read {path}"))?;
-    // mysqldumps are latin1/utf8-ish and may carry stray non-UTF8 bytes; decode lossily on BOTH paths
-    // (read_to_string would hard-fail the.gz path on the first bad byte, the plain path never did).
     let raw = if path.ends_with(".gz") {
         let mut v = Vec::new();
         GzDecoder::new(&bytes[..])
@@ -1582,10 +1195,6 @@ pub(crate) fn read_dump(path: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
-/// Clear+reload SQL for the two cmangos stat-curve tables (importer P3): `game_class_level_stats`
-/// (base HP/mana per class+level) + `game_level_stats` (attributes per race+class+level). Both are
-/// no-Timestamp → plain SQL. Keys are packed to match module/src/stats.rs: `(class<<8)|level` and
-/// `(race<<16)|(class<<8)|level`. Global (not zone-filtered). Chunked under 500 rows/INSERT.
 fn build_stats_sql(dump: &str) -> Vec<String> {
     let mut stmts: Vec<String> = vec![
         "DELETE FROM game_class_level_stats WHERE class_level >= 0".into(),
@@ -1641,10 +1250,6 @@ fn build_stats_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// Clear+reload SQL for `game_start_position` from cmangos `playercreateinfo` (importer P1) — the
-/// per-(race,class) start coords/map/zone for character creation. No Timestamp → plain SQL. PK packs
-/// `(race<<8)|class` (matching the module). `display_id` is now vestigial (player display comes from
-/// `game_race_info` at login) — emit 0.
 fn build_start_position_sql(dump: &str) -> Vec<String> {
     let rows: Vec<String> = parse_table(dump, "playercreateinfo")
         .iter()
@@ -1674,13 +1279,6 @@ fn build_start_position_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// Clear+reload SQL for `game_graveyard_zone` from cmangos `game_graveyard_zone`: the
-/// zone (+ optional faction restriction) each imported graveyard (`game_graveyard`, loaded separately
-/// from `WorldSafeLocs.dbc` by `dbc.rs::graveyard_sql`) serves. `module/src/world.rs`'s
-/// `graveyard::resolve_graveyard` reads this via the `by_zone` index to prefer a zone-linked
-/// graveyard over a merely-closer unlinked one. GLOBAL, not box-scoped (a small table, like
-/// `build_start_position_sql` above) — every graveyard/zone link imports regardless of the creature
-/// ETL's map/box filter. No Timestamp → plain SQL.
 fn build_graveyard_zone_sql(dump: &str) -> Vec<String> {
     let rows: Vec<String> = parse_table(dump, "game_graveyard_zone")
         .iter()
@@ -1706,19 +1304,6 @@ fn build_graveyard_zone_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// Clear+reload SQL for `game_areatrigger_teleport` from cmangos `areatrigger_teleport`:
-/// dungeon entrance/exit portals — trigger id → target map + destination position. `id` here is the
-/// SAME `AreaTrigger.dbc` trigger id `game_area_trigger` (`dbc.rs::area_trigger_sql`) carries as
-/// its primary key: that importer reads the trigger's GEOMETRY (position/shape, from the client DBC), this
-/// imports its TARGET (from the cmangos world dump) — two independent sources joined only by sharing
-/// the same id space, exactly like `game_graveyard`/`game_graveyard_zone`'s split. GLOBAL, not
-/// box-scoped, on purpose: an areatrigger's own geometry can sit anywhere (Moonbrook's entrance is in
-/// Westfall, its exit is inside map 36), and a portal a party can walk into from outside today's
-/// creature-ETL box must still resolve — box-scoping this table would silently drop a portal whose
-/// TRIGGER lands outside the box even though the trigger volume itself (`game_area_trigger`) is
-/// never box-filtered either. Same "small global table, own clear+reload" shape as
-/// `build_graveyard_zone_sql` above. `[V]` column layout — see the `at` module's doc comment; no dump
-/// in this sandbox to confirm against, and no neighbor-anchor is possible for this brand-new table.
 fn build_areatrigger_teleport_sql(dump: &str) -> (Vec<String>, usize) {
     let rows: Vec<String> = parse_table(dump, "areatrigger_teleport")
         .iter()
@@ -1747,10 +1332,6 @@ fn build_areatrigger_teleport_sql(dump: &str) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Count the distinct `(race, class)` combos among rows already formatted as `"(id,race,class...)"`
-/// SQL tuples — shared coverage-print helper for the three `playercreateinfo_*` builders below (each
-/// row string always starts `(id,race,class,`, so a light textual split is enough; no need to re-parse
-/// the source dump rows a second time).
 fn distinct_race_class_combos(rows: &[(u32, u32)]) -> usize {
     let mut combos: Vec<(u32, u32)> = rows.to_vec();
     combos.sort_unstable();
@@ -1758,18 +1339,6 @@ fn distinct_race_class_combos(rows: &[(u32, u32)]) -> usize {
     combos.len()
 }
 
-/// Clear+reload SQL for `game_createinfo_spell` from cmangos `playercreateinfo_spell`.
-/// **FLIPS THE SOURCE FROM SEED TO IMPORT**: `module/src/seed.rs::seed_createinfo_spells` only inserts
-/// the hand-authored `CREATEINFO_KIT` rows if the table is EMPTY (the `game_start_position` / Talent.dbc
-/// precedent — an importer clear+reload REPLACES whatever is there, seed or a prior import; it
-/// does not merge or coexist with it). The `id >= 0` DELETE is a tautology on the unsigned PK (mirrors
-/// the sibling loaders) — it's a wholesale wipe, not a conditional one. A character created BEFORE this
-/// import keeps the `game_player_spell` rows ITS creation already copied (durable, per-character); only
-/// characters created AFTER the import see the real dump-sourced kit. `race`/`class` are NOT
-/// re-validated as wildcards here — a dump row's own 0 (if any) passes through verbatim and
-/// `createinfo_row_matches` (module/src/spell/spellbook.rs) already treats 0 as a wildcard on read,
-/// so this importer needs no wildcard-specific handling. ALL races import (not just Human) — cheap, and
-/// race unlock becomes a pure gate flip later. No Timestamp → plain SQL.
 fn build_createinfo_spell_sql(dump: &str) -> Vec<String> {
     let mut race_class_pairs: Vec<(u32, u32)> = Vec::new();
     let rows: Vec<String> = parse_table(dump, "playercreateinfo_spell")
@@ -1798,13 +1367,6 @@ fn build_createinfo_spell_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// Clear+reload SQL for `game_createinfo_action` from cmangos `playercreateinfo_action`
-/// — the vanilla default action-bar layout per (race, class), read by `module/src/action_bar.rs`'s
-/// `grant_createinfo_actions` at character creation (copied into `game_player_action`) and, when a
-/// character has none (pre-import), by the gateway's login synth fallback
-/// (`gateway/src/codec/entity.rs::login_sequence_messages`). This table has NO hand-authored seed
-/// counterpart (unlike `game_createinfo_spell`) — an empty table is the fallback signal itself, not a
-/// transitional pre-import state to worry about orphaning. No Timestamp → plain SQL.
 fn build_createinfo_action_sql(dump: &str) -> Vec<String> {
     let mut race_class_pairs: Vec<(u32, u32)> = Vec::new();
     let rows: Vec<String> = parse_table(dump, "playercreateinfo_action")
@@ -1838,24 +1400,9 @@ fn build_createinfo_action_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// `game_start_item.id` floor for `playercreateinfo_item` EXTRAS, a disjoint range
-/// from `dbc.rs::start_item_sql`'s own densely-assigned-from-1 CharStartOutfit ids, so the two writers'
-/// clear+reload DELETEs never touch each other's rows regardless of which pass runs (the canonical
-/// `importer/scripts/import-world.sh` runs the `--dump` pass THEN the standalone `--dbc` pass — without a
-/// disjoint range the later `--dbc` pass's `DELETE FROM game_start_item WHERE id >= 0` would wipe
-/// these extras every single run). Comfortably above any realistic CharStartOutfit row count (a few
-/// hundred rows across every race/class/gender combo).
+// Starter extras need an id band disjoint from the DBC outfit clear-and-reload range.
 const CREATEINFO_ITEM_ID_FLOOR: u64 = 1_000_000;
 
-/// Clear+reload SQL for the `playercreateinfo_item` EXTRAS into `game_start_item`, the
-/// dump's per-(race,class) starter items BEYOND `CharStartOutfit.dbc`'s outfit (today's sole source —
-/// see `dbc.rs::start_item_sql`). Deduped against the outfit's own (race_class, item) pairs when
-/// `--dbc` is also given (via `dbc::outfit_item_set`) so the SAME item for the SAME (race, class) is
-/// never listed twice — `grant_starter_item` (module/src/items/ops.rs) has no dedup of its own, it
-/// trusts `game_start_item` to already be clean. Without `--dbc` (no client data available), dedup is
-/// skipped — there is nothing to dedup against in that case anyway (a `--dump`-only run has never
-/// loaded any outfit rows). Ids are assigned densely from `CREATEINFO_ITEM_ID_FLOOR` (see its doc) —
-/// this function's own DELETE only ever touches that range. No Timestamp → plain SQL.
 fn build_createinfo_item_sql(dump: &str, dbc_dir: Option<&str>) -> Result<Vec<String>> {
     let outfit_seen: std::collections::HashSet<(u32, i32)> = match dbc_dir {
         Some(dir) => {
@@ -1883,10 +1430,10 @@ fn build_createinfo_item_sql(dump: &str, dbc_dir: Option<&str>) -> Result<Vec<St
         let race_class = (race << 8) | class;
         if outfit_seen.contains(&(race_class, item)) {
             deduped += 1;
-            continue; // already granted by CharStartOutfit for this (race, class) — skip the dupe
+            continue;
         }
         if !seen_extra.insert((race_class, item)) {
-            continue; // the dump itself lists this (race,class,item) more than once
+            continue;
         }
         race_class_pairs.push((race, class));
         rows.push(format!("({id},{race_class},{item})"));
@@ -1909,13 +1456,6 @@ fn build_createinfo_item_sql(dump: &str, dbc_dir: Option<&str>) -> Result<Vec<St
     Ok(stmts)
 }
 
-/// Clear+reload SQL for `game_spell_chain` from cmangos `spell_chain`, REDUCED SCOPE:
-/// only the two module-only tables that had no overlap with an already-covered source. Talent's
-/// `rank_spell_N` covers TALENT ranks, not class-spell ranks, so this is genuinely new data.
-/// `module/src/trainer.rs`'s rank-prereq gate (`apply_trainer_buy`) reads this via `spell_id` (the PK)
-/// to require the previous rank already known before a higher rank can be trained. No Timestamp → plain
-/// SQL. `spell_id > 0` in the DELETE (not `>= 0`, unlike the unsigned-PK tables elsewhere) matches the
-/// module's `u32` PK exactly and is still a wholesale wipe (every real spell_id is > 0).
 fn build_spell_chain_sql(dump: &str, links: &[(u32, u32)]) -> Result<Vec<String>> {
     let parsed: Vec<(u32, String)> = parse_table(dump, "spell_chain")
         .iter()
@@ -1949,7 +1489,6 @@ fn build_spell_chain_sql(dump: &str, links: &[(u32, u32)]) -> Result<Vec<String>
     Ok(stmts)
 }
 
-/// Derive only families not owned by explicit dump rows, including deliberate partial overrides.
 fn client_spell_rank_rows(
     links: &[(u32, u32)],
     explicit: &std::collections::BTreeSet<u32>,
@@ -2022,14 +1561,6 @@ fn client_spell_rank_rows(
     Ok(rows)
 }
 
-///
-/// Also synthesizes the two armor-proficiency wrapper→passive rows (verified against ClassicDB 1.12):
-/// Plate Mail wrapper `PLATE_TRAINER_SPELL_ID` (7109) → passive `PLATE_PASSIVE_SPELL_ID` (750), and
-/// Mail wrapper `MAIL_TRAINER_SPELL_ID` (8738) → passive `MAIL_PASSIVE_SPELL_ID` (8737). cmangos
-/// `spell_learn_spell` carries no rows for these parents — the module's
-/// `learn_spell_with_dependents` (`module/src/spell/spellbook.rs`) needs them to grant the passive the
-/// equip Gate reads when a class trainer sells the wrapper. Skipped if the dump ever grows a real row
-/// for either parent, so a future upstream fix can't collide with the synthesized one.
 fn build_spell_learn_sql(dump: &str) -> Vec<String> {
     use lyracore_shared::constants::armor_proficiency;
 
@@ -2040,7 +1571,7 @@ fn build_spell_learn_sql(dump: &str) -> Vec<String> {
         .filter_map(|(i, r)| {
             let parent_spell: u32 = field(r, sls::ENTRY).parse().ok()?;
             let learn_spell: u32 = field(r, sls::SPELL_ID).parse().ok()?;
-            let _active: u8 = field(r, sls::ACTIVE).parse().unwrap_or(1); // parsed, unused (see doc)
+            let _active: u8 = field(r, sls::ACTIVE).parse().unwrap_or(1);
             parents_seen.insert(parent_spell);
             Some(format!("({},{parent_spell},{learn_spell})", i as u64 + 1))
         })
@@ -2057,7 +1588,7 @@ fn build_spell_learn_sql(dump: &str) -> Vec<String> {
         ),
     ] {
         if parents_seen.contains(&parent) {
-            continue; // dump already carries a real spell_learn_spell row for this wrapper
+            continue;
         }
         rows.push(format!("({next_id},{parent},{learn})"));
         next_id += 1;
@@ -2073,21 +1604,6 @@ fn build_spell_learn_sql(dump: &str) -> Vec<String> {
     stmts
 }
 
-/// Clear+reload SQL for `game_spell_proc_event` from cmangos `spell_proc_event` — the PROC OVERLAY.
-/// Spell.dbc carries a Proc's event mask, flat chance and charge count and nothing else; the
-/// procs-per-minute rate, the internal cooldown, the `procEx` hit rule and the school/family filter
-/// exist only here. `module/src/spell/proc.rs::freeze_profile` reads it once, at aura apply, by
-/// `spell_id` (the PK). No Timestamp → plain SQL.
-///
-/// Two column conversions, because the dump's units are not the module's:
-///   • `Cooldown` is SECONDS in cmangos and milliseconds on our row (see `spe::COOLDOWN`).
-///   • `CustomChance` is a float percent in the dump and a whole percent on our row. Vanilla's own
-///     values are whole numbers, so this rounds; a rate is what expresses a fractional chance, and
-///     that rides `ppm_rate` unchanged.
-///
-/// The DELETE stops at `SYNTHETIC_PROC_EVENT_FLOOR` rather than wiping wholesale like its `spell_chain`
-/// sibling: the seeded Proc fixtures own overlay rows in the synthetic range, and a world import must
-/// not silently disarm them (the same rule `importer/src/spell.rs` applies to `game_spell` itself).
 fn proc_family_mask(
     row: &[String],
     spell_id: u32,
@@ -2143,7 +1659,7 @@ fn build_spell_proc_event_sql(
             let shift = if r.len() == 11 { 2 } else { 0 };
             let Some(spell_id) = field(r, spe::ENTRY).parse::<u32>().ok() else { return Ok(None); };
             if spell_id == 0 || spell_id >= SYNTHETIC_PROC_EVENT_FLOOR {
-                return Ok(None); // outside the DELETE's reach — an INSERT here would PK-collide next reload
+                return Ok(None);
             }
             let Some(school_mask) = field(r, spe::SCHOOL_MASK).parse::<u8>().ok() else { return Ok(None); };
             let Some(family_name) = field(r, spe::FAMILY_NAME).parse::<u8>().ok() else { return Ok(None); };
@@ -2154,7 +1670,7 @@ fn build_spell_proc_event_sql(
             let Some(custom_chance) = field(r, spe::CUSTOM_CHANCE + shift).parse::<f32>().ok() else { return Ok(None); };
             let Some(cooldown_s) = field(r, spe::COOLDOWN + shift).parse::<u32>().ok() else { return Ok(None); };
             if !ppm_rate.is_finite() || ppm_rate < 0.0 || !custom_chance.is_finite() {
-                return Ok(None); // a corrupt rate would freeze onto every aura of this spell
+                return Ok(None);
             }
             let custom_chance = custom_chance.round().clamp(0.0, 100.0) as u8;
             let icd_ms = cooldown_s.saturating_mul(1000);
@@ -2176,14 +1692,8 @@ fn build_spell_proc_event_sql(
     Ok(stmts)
 }
 
-/// The reserved synthetic-spell floor, above which the seeded fixtures live and no real vanilla spell
-/// does. Hand-synced with `importer/src/spell.rs`'s `SYNTHETIC_SPELL_ID_FLOOR` and the module's own
-/// fixture ids; the two must stay equal.
 const SYNTHETIC_PROC_EVENT_FLOOR: u32 = 50_000;
 
-/// Map the literal `NULL` token (and pure whitespace) to an empty string for an INTERNAL string
-/// comparison — `sql_text` does the SQL-literal-quoted version of the same collapse for values that
-/// go straight into an INSERT.
 fn null_to_empty(s: &str) -> &str {
     let t = s.trim();
     if t == "NULL" {
@@ -2193,17 +1703,8 @@ fn null_to_empty(s: &str) -> &str {
     }
 }
 
-/// One npc_text slot: `(male, female, probability)`. Empty strings + probability 0.0 = unused slot.
 type NpcTextSlot = (String, String, f32);
 
-/// Parse ALL 8 weighted npc_text slots from a raw dump row, not just the first
-/// non-empty one. The client does its own weighted pick over the full 8 (see
-/// `gateway::codec::build_npc_text_update`). Handles both schema vintages `npc_text_first_nonempty`
-/// already distinguished:
-///   • Full 81-col rows: male/female text + probability embedded directly per slot.
-///   • Short 17-col rows: only a probability + a `broadcast_text` id per slot (the text lives in the
-///     `broadcast` map, resolved by the caller).
-/// An unrecognized row shape yields 8 empty/zero slots (same "nothing found" outcome as before).
 fn parse_npc_text_slots(
     row: &[String],
     broadcast: &HashMap<u64, (String, String)>,
@@ -2233,9 +1734,6 @@ fn parse_npc_text_slots(
     })
 }
 
-/// The first non-empty (male-then-female) text across all 8 slots — the back-compat single string
-/// (`game_npc_text.text`), derived from the SAME
-/// parsed slots the multi-slot table uses, so the two can never disagree.
 fn slots_first_nonempty(slots: &[NpcTextSlot; 8]) -> String {
     for (male, female, _) in slots {
         if !male.is_empty() {
@@ -2248,11 +1746,6 @@ fn slots_first_nonempty(slots: &[NpcTextSlot; 8]) -> String {
     String::new()
 }
 
-/// Resolve a `gossip_menu_option` row's mangos condition (inline columns, a `conditions`-table FK, or
-/// no condition support at all in this dump vintage) into our minimal `(cond_type, value1, value2)`
-/// set (`lyracore_shared::constants::gossip_condition`). An unmapped/unsupported mangos condition type
-/// FAILS OPEN (`NONE` = always shown) rather than silently hiding the option, and is logged so the
-/// operator can extend the mapping for their dump.
 fn resolve_gossip_option_condition(
     row: &[String],
     conditions: &HashMap<u64, (u64, u64)>,
@@ -2262,14 +1755,11 @@ fn resolve_gossip_option_condition(
         match mangos_type {
             cond::MANGOS_QUESTTAKEN => (gossip_condition::QUEST_TAKEN, value1 as u32, 0),
             cond::MANGOS_QUESTREWARDED => (gossip_condition::QUEST_REWARDED, value1 as u32, 0),
-            // Fail-CLOSED, against this map's fail-open default: a seasonal option shown year-round
-            // is a wrong pitch, where a hidden one is only absent.
             cond::MANGOS_ACTIVE_GAME_EVENT => (gossip_condition::NEVER, 0, 0),
             _ => (gossip_condition::NONE, 0, 0),
         }
     };
-    // 15-col vintage (THIS dump): trailing generic-conditions FK at 14 — checked FIRST (its col 11
-    // is box_money, which the legacy inline branch would misread as a condition type).
+    // Check the 15-column layout first; its column 11 is box_money, not an inline condition.
     if row.len() >= gmo::NCOLS_15_CONDITION_FK {
         let cond_id: u64 = field(row, gmo::CONDITION_ID_15).parse().unwrap_or(0);
         if cond_id == 0 {
@@ -2321,12 +1811,6 @@ fn resolve_gossip_option_condition(
     (gossip_condition::NONE, 0, 0)
 }
 
-/// Resolve a `gossip_menu_option` row's clickable label: mirrors the dual-schema handling
-/// `parse_npc_text_slots` already does for `npc_text` — a new-schema dump's `option_text` column
-/// carries a `broadcast_text` id (a bare integer) instead of literal text. Tries the broadcast-id
-/// interpretation FIRST, but only trusts it when the id actually resolves (a real hand-written option
-/// label is never a bare number that happens to collide with a live `broadcast_text` id, so this
-/// ordering is safe for both vintages); falls through to the literal column otherwise.
 fn resolve_gossip_option_text(
     row: &[String],
     broadcast: &HashMap<u64, (String, String)>,
@@ -2345,14 +1829,6 @@ fn resolve_gossip_option_text(
     null_to_empty(raw).to_string()
 }
 
-/// Reclassify a gossip option's `action` by its resolved TEXT, for the handful of cmangos rows whose
-/// real behavior is gated in C++ code at `GossipHello`, not by the dump's `OptionType` column — so
-/// the column the importer copies through unchanged (see `gossip_option`'s doc) doesn't carry it.
-/// Confirmed empirically: every "I wish to unlearn my talents." row across the live dump
-/// (38/38) imports with `OptionType=1` (`gossip_option::GOSSIP`), indistinguishable from a plain
-/// gossip line, so `filtered_gossip_options`' level-10 gate has nothing to key on without this pass.
-/// Falls through to the raw `action` for every other row (the importer-reclassify-by-name pattern —
-/// same shape as the wolf-faction and spell-kind reclassification passes).
 fn reclassify_gossip_option_action(text: &str, raw_action: u32) -> u32 {
     if text == "I wish to unlearn my talents." {
         lyracore_shared::constants::gossip_option::UNLEARNTALENTS
@@ -2361,11 +1837,6 @@ fn reclassify_gossip_option_action(text: &str, raw_action: u32) -> u32 {
     }
 }
 
-/// Build `game_gossip_menu` + `game_npc_text` + `game_npc_text_slot` + `game_gossip_option` SQL rows
-/// from the cmangos dump for the given in-box creature template entries. Two `npc_text` data paths:
-///   • Full 81-col npc_text rows → text extracted directly.
-///   • Short 17-col rows (broadcast_text schema) → BroadcastTextId0..7 → broadcast_text.Text.
-/// Returns `GossipEtl` (INSERT value-tuples per table).
 struct GossipEtl {
     menu_rows: Vec<String>,
     npc_text_rows: Vec<String>,
@@ -2378,7 +1849,6 @@ struct GossipEtl {
 fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64>) -> GossipEtl {
     use std::collections::{HashMap, HashSet};
 
-    // 1. Build broadcast_text id → (male, female) text map (new-schema npc_text AND gossip options).
     let mut broadcast: HashMap<u64, (String, String)> = HashMap::new();
     for row in parse_table(dump, "broadcast_text") {
         let id: u64 = field(&row, bt::ID).parse().unwrap_or(0);
@@ -2392,7 +1862,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         }
     }
 
-    // 2. Build npc_text id → (first-nonempty string, full 8-slot array) maps (both row schemas).
     let mut npc_texts: HashMap<u64, String> = HashMap::new();
     let mut npc_text_slots: HashMap<u64, [NpcTextSlot; 8]> = HashMap::new();
     for row in parse_table(dump, "npc_text") {
@@ -2408,10 +1877,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         }
     }
 
-    // 3. Parse gossip_menu (cmangos): collect (entry, text_id) pairs for in-box creatures.
-    //    gossip_menu.entry = creature_template.GossipMenuId. We emit ONE row per creature_entry. An
-    //    entry commonly has several rows — one unconditional greeting plus condition-gated variants —
-    //    and row order does not rank them, so the unconditional row is the default title.
     let mut menu_to_text: HashMap<u64, u64> = HashMap::new();
     let mut menu_text_is_conditional: HashMap<u64, bool> = HashMap::new();
     for row in parse_table(dump, "gossip_menu") {
@@ -2421,7 +1886,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
             continue;
         }
         let conditional = field(&row, gm::CONDITION_ID).parse::<u64>().unwrap_or(0) != 0;
-        // Among rows of the same kind the first seen wins, so the choice is deterministic.
         let held_conditional = menu_text_is_conditional.get(&entry).copied();
         if held_conditional.is_none() || (held_conditional == Some(true) && !conditional) {
             menu_to_text.insert(entry, text_id);
@@ -2429,12 +1893,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         }
     }
 
-    // 4. Map creature_entry → gossip_menu_id → text_id, collecting all needed text_ids. Also collect
-    //    creature_entry → gossip_menu_id UNCONDITIONALLY (needed_text_ids aside) for the option pass
-    //    below — a creature can have options without a resolvable title text, and vice versa.
-    // Fallback: many cmangos dumps have npc_text id = creature_entry (old convention). When the
-    // gossip_menu-resolved text_id is absent from npc_text (common with BroadcastText-era dumps
-    // that carry the new text_id but not the referenced npc_text row), try npc_text[entry] directly.
     let mut gossip_rows: Vec<String> = Vec::new();
     let mut needed_text_ids: HashSet<u64> = HashSet::new();
     let mut entry_to_menu: HashMap<u64, u64> = HashMap::new();
@@ -2449,18 +1907,14 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
             continue;
         }
         entry_to_menu.insert(entry, gossip_menu_id);
-        // Primary path: gossip_menu_id → text_id → npc_text lookup.
         let text_id = menu_to_text.get(&gossip_menu_id).copied().unwrap_or(0);
         if text_id != 0 && npc_texts.contains_key(&text_id) {
             gossip_rows.push(format!("({entry},{text_id})"));
             needed_text_ids.insert(text_id);
         } else if npc_texts.contains_key(&entry) {
-            // Fallback: npc_text id == creature_entry (old cmangos convention). Use it directly so
-            // the client sees the NPC's real text even when gossip_menu points to a missing text_id.
             gossip_rows.push(format!("({entry},{entry})"));
             needed_text_ids.insert(entry);
         }
-        // else: no text found for this creature — gateway falls back to the generic greeting.
     }
 
     const RELAY_GOSSIP_MENUS: [u64; 4] = [6_623, 6_687, 6_688, 6_949];
@@ -2473,7 +1927,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         needed_text_ids.insert(text_id);
     }
 
-    // 5. Emit game_npc_text + game_npc_text_slot rows for all referenced text_ids.
     let mut npc_text_rows: Vec<String> = Vec::new();
     let mut npc_text_slot_rows: Vec<String> = Vec::new();
     let mut slot_row_id: u64 = 1;
@@ -2485,7 +1938,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         if let Some(slots) = npc_text_slots.get(&text_id) {
             for (slot_index, (male, female, prob)) in slots.iter().enumerate() {
                 if male.is_empty() && female.is_empty() && *prob == 0.0 {
-                    continue; // unused slot — no row (the gateway treats "no rows" as legacy fallback)
+                    continue;
                 }
                 npc_text_slot_rows.push(format!(
                     "({slot_row_id},{text_id},{slot_index},{},{},{prob})",
@@ -2497,8 +1950,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         }
     }
 
-    // 6. gossip_menu_option → game_gossip_option, keyed by creature entry (collapsed like the title
-    //    text mapping above — a spawned creature only ever shows ITS OWN entry's menu).
     let mut conditions: HashMap<u64, (u64, u64)> = HashMap::new();
     for row in parse_table(dump, "conditions") {
         let id: u64 = field(&row, cond::ENTRY).parse().unwrap_or(0);
@@ -2527,9 +1978,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
             continue;
         };
         let mut sorted_opts: Vec<&Vec<String>> = opts.iter().collect();
-        // Dense, deterministic option_index — the cmangos `id` order (matches in-window order).
         sorted_opts.sort_by_key(|r| field(r, gmo::ID).parse::<u64>().unwrap_or(0));
-        // Counted rather than enumerated so a dropped row leaves no gap in the index.
         let mut option_index = 0u32;
         for row in sorted_opts.iter() {
             let icon: u32 = field(row, gmo::OPTION_ICON).parse().unwrap_or(0);
@@ -2538,7 +1987,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
                 &text,
                 field(row, gmo::OPTION_TYPE).parse().unwrap_or(0),
             );
-            // Quests ride the menu's own quest section, and these rows carry no usable label.
             if action == lyracore_shared::constants::gossip_option::QUESTGIVER {
                 continue;
             }
@@ -2600,8 +2048,6 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
     }
 }
 
-/// The normalized quest rows the ETL produces (SQL value-tuples ready to INSERT) plus the reward-item
-/// entry set the item-template load must include. A struct (not a tuple) so its outputs stay named.
 struct QuestEtl {
     templates: Vec<String>,
     texts: Vec<String>,
@@ -2611,34 +2057,16 @@ struct QuestEtl {
     reward_spells: Vec<String>,
     reward_choices: Vec<String>,
     relations: Vec<String>,
-    // GAMEOBJECT giver relations (GO 68 "Wanted Poster" starts q176 Wanted: Hogger,
-    // GO 55/56 "Lost Guards" corpses drive q37/q45/q71): the `game_gameobject_quest` twin of `relations`.
     go_relations: Vec<String>,
-    // Reward mail (T3): one row per in-scope quest that sends a letter at turn-in, from either
-    // `quest_template.RewMailTemplateId` or a `dbscripts_on_quest_end` `SCRIPT_COMMAND_SEND_MAIL`
-    // row. `reward_mail_template_ids` is the union of named templates, which scopes the
-    // `mail_loot_template` import to only the templates this run's reward mail actually names.
     reward_mail: Vec<String>,
     reward_mail_template_ids: std::collections::HashSet<u64>,
     reward_item_entries: std::collections::HashSet<u64>,
-    // Collect-objective ReqItemId entries — unioned into the item-template load so every collect-quest
-    // item is guaranteed a template even if item_template ever returns to a referenced subset.
     req_item_entries: std::collections::HashSet<u64>,
-    // Coverage counters: how many imported quests carry a non-zero next_quest_id
-    // (forward-chained) / limit_time (timed). Reported by the caller's eprintln! coverage line and
-    // backing `FLOOR_QUESTS_CHAINED` in importer/scripts/import-manifest.sh.
     chained_count: usize,
     timed_count: usize,
-    // How many imported quests carry QUEST_TYPE_RAID (62). Reported, not floor-gated: today's
-    // world slices may hold none.
     raid_quest_count: usize,
 }
 
-/// Build the RAW (unflattened) `reference_loot_template` map: pool entry → its own rows
-/// `(item, chance, mincountOrRef, maxcount)`. Kept separate from `parse_loot_family` so it is parsed
-/// ONCE and shared by every family — creature/pickpocket/gameobject/skinning/fishing all reference the
-/// SAME cmangos pool table. `mincountOrRef` is kept RAW (not pre-filtered to ≥0) — a pool row can itself
-/// be a reference to ANOTHER pool (`mincountOrRef < 0`), which `resolve_ref_pool` recurses into.
 fn parse_ref_pools(dump: &str) -> std::collections::HashMap<u64, Vec<(u64, f64, i64, u32)>> {
     let mut refs: std::collections::HashMap<u64, Vec<(u64, f64, i64, u32)>> =
         std::collections::HashMap::new();
@@ -2655,21 +2083,13 @@ fn parse_ref_pools(dump: &str) -> std::collections::HashMap<u64, Vec<(u64, f64, 
     refs
 }
 
-/// Recursively flatten a `reference_loot_template` pool (`pool_id`) into its direct item rows
-/// `(item, chance, count)`, expanding any NESTED `-ref` row (a pool that itself references another
-/// pool) to FULL DEPTH. The module's roll stays one-pass;
-/// nesting is entirely an import-time concern. `visited` cycle-guards a single top-level resolution: a
-/// pool reachable from itself (directly or transitively) stops re-entering rather than looping forever
-/// — cmangos data isn't expected to cycle, but the importer never trusts the operator's dump not to.
-/// Quest-only rows (`chance < 0`) inside a pool are skipped (no cmangos pool is quest-gated in this
-/// family).
 fn resolve_ref_pool(
     pool_id: u64,
     refs: &std::collections::HashMap<u64, Vec<(u64, f64, i64, u32)>>,
     visited: &mut std::collections::HashSet<u64>,
 ) -> Vec<(u64, f64, u32)> {
     if !visited.insert(pool_id) {
-        return Vec::new(); // TRUE cycle: this pool is on the CURRENT recursion path — stop
+        return Vec::new();
     }
     let Some(rows) = refs.get(&pool_id) else {
         visited.remove(&pool_id);
@@ -2678,10 +2098,7 @@ fn resolve_ref_pool(
     let mut out = Vec::new();
     for &(item, chance, mincount_or_ref, maxcount) in rows {
         if mincount_or_ref < 0 {
-            // Nested reference. cmangos semantics: the ref row's own chance GATES entry into the
-            // pool, which then rolls one item internally — so the flattened children's chances are
-            // NORMALIZED so their group total equals the gate (a 2-deep chain multiplies through).
-            // gate 0 = "always" in cmangos reference rows → splice children at their own chances.
+            // Reference chance zero means always; otherwise it gates the normalized child weights.
             let children = resolve_ref_pool((-mincount_or_ref) as u64, refs, visited);
             let gate = chance.abs();
             if gate > 0.0 {
@@ -2689,7 +2106,7 @@ fn resolve_ref_pool(
                 if child_total > 0.0 {
                     let scale = gate / child_total;
                     out.extend(children.into_iter().map(|(i, c, n)| (i, c * scale, n)));
-                } // all-zero-chance pool under a nonzero gate: nothing to weight — drop (loud in coverage)
+                }
             } else {
                 out.extend(children);
             }
@@ -2702,22 +2119,6 @@ fn resolve_ref_pool(
     out
 }
 
-/// Parse ANY cmangos `*_loot_template` table into entry-keyed drops `(item, chance_bp, count, group_id,
-/// quest_only)` — the five families (`creature_loot_template`, `pickpocketing_loot_template`,
-/// `fishing_loot_template` [zone-keyed — its `entry` column is an AreaTable zone id, not a
-/// creature/GO/skin id], `gameobject_loot_template`, `skinning_loot_template`) all share this IDENTICAL
-/// column layout (see `clt`). Lifted out of the old creature-only `parse_creature_drops` so the quest
-/// objective-emission gate (`creature_drop_item_set`) and every family's loot-row builder consume the
-/// SAME parse — they can never diverge on what an in-slice entry actually drops. Pure function of
-/// `dump`/`table`/`refs`. `reference_loot_template` pools are expanded RECURSIVELY at import
-/// (`resolve_ref_pool`, cycle-guarded), a FRESH `visited` set per referencing row, so the
-/// SAME pool resolves independently for every entry that references it (only a resolution's OWN
-/// recursion path is cycle-guarded, not the whole import). `quest_only` is cmangos's
-/// `ChanceOrQuestChance < 0` marker, KEPT (not folded away with `.abs()`) so
-/// the module can gate the roll on quest possession at roll time (see the module doc). A
-/// raw-chance-0 row is an empty placeholder → skipped.
-// ETL row shapes: each tuple is one parsed cmangos `*_loot_template` row, kept positional so the
-// parse and the emit stay side by side.
 #[allow(clippy::type_complexity)]
 fn parse_loot_family(
     dump: &str,
@@ -2725,12 +2126,7 @@ fn parse_loot_family(
     refs: &std::collections::HashMap<u64, Vec<(u64, f64, i64, u32)>>,
 ) -> std::collections::HashMap<u64, Vec<(u64, u32, u32, u32, bool)>> {
     use std::collections::HashMap;
-    // Chances are basis points (×100 from the dump's percent) so sub-1% odds survive. Direct rows keep
-    // cmangos's groupid (0 = independent; >0 = a pick-one group). A reference row (mincountOrRef<0)
-    // expands its (now recursively-flattened) shared pool into a pick-one GROUP gated by the row's
-    // chance: the group total weight = gate_bp, so it drops one pool item gate% of the time. Within the
-    // pool, explicit chances take gate_bp × chance/100; equal-chance (0) items split the leftover
-    // uniformly — the vanilla group algorithm, representable via chance_bp + group_id.
+    // Loot chances use basis points, preserving odds below one percent.
     let bp = |pct: f64| (pct * 100.0).round() as i64;
     let mut drops_by_entry: HashMap<u64, Vec<(u64, u32, u32, u32, bool)>> = HashMap::new();
     for row in parse_table(dump, table) {
@@ -2740,9 +2136,6 @@ fn parse_loot_family(
         let groupid: u32 = field(&row, clt::GROUPID).parse().unwrap_or(0);
         let ref_or_min: i64 = field(&row, clt::MINCOUNT_OR_REF).parse().unwrap_or(0);
         let maxcount: u32 = field(&row, clt::MAXCOUNT).parse().unwrap_or(1);
-        // A NEGATIVE `ChanceOrQuestChance` is cmangos's QUEST-drop marker: the item drops at |chance|%,
-        // but ONLY for a looter who currently needs it (see the module doc), kept as `quest_only`,
-        // not folded away. A 0 row is an empty placeholder → skip.
         let quest_only = raw_chance < 0.0;
         let chance = raw_chance.abs();
         if chance == 0.0 {
@@ -2750,9 +2143,7 @@ fn parse_loot_family(
         }
         let drops = drops_by_entry.entry(entry).or_default();
         if ref_or_min < 0 {
-            // Reference row → expand the (recursively-flattened) shared pool as a pick-one group gated
-            // by `chance`. A FRESH visited-set per row: the same pool_id resolves independently for
-            // every referencing row (only guards THIS resolution's own recursion path against a cycle).
+            // Each reference row needs its own recursion path to resolve shared pools.
             let pool_id = (-ref_or_min) as u64;
             let mut visited = std::collections::HashSet::new();
             let items = resolve_ref_pool(pool_id, refs, &mut visited);
@@ -2791,9 +2182,6 @@ fn parse_loot_family(
     drops_by_entry
 }
 
-/// `creature_loot_template` drops, keyed by LootId. Thin wrapper over `parse_loot_family` kept for its
-/// call sites' clarity (`build_items_and_loot`, `creature_drop_item_set`).
-// ETL row shape: one resolved creature drop per tuple.
 #[allow(clippy::type_complexity)]
 fn parse_creature_drops(
     dump: &str,
@@ -2802,12 +2190,6 @@ fn parse_creature_drops(
     parse_loot_family(dump, "creature_loot_template", &refs)
 }
 
-/// The set of item ids that drop from creatures WE ACTUALLY SPAWN (`creature_loot_ids` = in-slice
-/// entry→LootId). Drives the COLLECT-objective obtainability gate in `build_quests`: a quest may only
-/// emit a COLLECT_ITEM objective for a ReqItem that is in this set (drops in-slice) OR is the quest's
-/// SrcItem (granted on accept). Anything else would be an unobtainable objective → soft-lock, so it's
-/// skipped (the quest auto-completes instead). Uses the same `parse_creature_drops` the loot builder
-/// uses, so the two never disagree on what drops.
 fn creature_drop_item_set(
     dump: &str,
     creature_loot_ids: &std::collections::HashMap<u64, u64>,
@@ -2824,11 +2206,6 @@ fn creature_drop_item_set(
     set
 }
 
-/// Items lootable from IN-SLICE gameobjects (chests): `gameobject_template` type 3 rows among
-/// `used_go` carry their `gameobject_loot_template` lootId in DATA1; union those pools' items.
-/// Extends the obtainability gate — the grape/crate/wood collect quests want items that only
-/// GO loot drops, and skipping their objectives made the quests auto-complete for a free reward.
-/// Same `parse_loot_family` the GO-loot builder uses, so the two never disagree.
 fn gameobject_loot_item_set(
     dump: &str,
     used_go: &std::collections::HashSet<u64>,
@@ -2853,10 +2230,6 @@ fn gameobject_loot_item_set(
     set
 }
 
-/// Items sold by IN-SLICE vendors (direct `npc_vendor` rows + the `npc_vendor_template`
-/// indirection via creature_template col 76) — the third leg of the obtainability gate
-/// (q3861's kodo feed is vendor-only). A trimmed twin of the canonical vendor ETL in
-/// `build_items_and_loot` (which also carries slots/maxcount); only the ITEM SET matters here.
 fn vendor_stock_item_set(
     dump: &str,
     local_creatures: &std::collections::HashSet<u64>,
@@ -2893,10 +2266,7 @@ fn vendor_stock_item_set(
     set
 }
 
-/// Build quest definitions for the supplied content scope. `local_givers` restricts giver
-/// relations without removing definitions a transferred Character still needs. Required and reward
-/// item entries feed the item import; generated row IDs follow deterministic source orders.
-#[allow(clippy::too_many_lines)] // Column-by-column mapping of one imported dump family.
+#[allow(clippy::too_many_lines)]
 fn build_quests(
     dump: &str,
     catalogue_creatures: &std::collections::HashSet<u64>,
@@ -2910,7 +2280,6 @@ fn build_quests(
 ) -> Result<QuestEtl> {
     use std::collections::HashSet;
 
-    // Creature and gameobject giver tables share the same entry/quest column layout.
     let relations_for = |table: &str, entries: &HashSet<u64>| -> Vec<(u64, u64)> {
         parse_table(dump, table)
             .into_iter()
@@ -2933,15 +2302,12 @@ fn build_quests(
         .map(|&(_, q)| q)
         .collect();
 
-    // 1) quest_template rows for the candidate quests (a relation can dangle past the template set;
-    //    only quests with a real template are kept — they drive which relations/objectives we emit).
     let mut quest_rows: Vec<String> = Vec::new();
     let mut quest_text_rows: Vec<String> = Vec::new();
     let mut objective_rows: Vec<String> = Vec::new();
     let mut cast_objective_rows: Vec<String> = Vec::new();
     let mut reward_item_rows: Vec<String> = Vec::new();
     let mut reward_spell_rows = Vec::new();
-    // Single LearnSpell wrappers have no other reward behavior to preserve.
     let reward_learn_spells: HashMap<u32, u32> = parse_table(dump, "spell_template")
         .into_iter()
         .filter_map(|row| {
@@ -2958,9 +2324,6 @@ fn build_quests(
     let mut reward_item_entries: HashSet<u64> = HashSet::new();
     let mut req_item_entries: HashSet<u64> = HashSet::new();
     let mut valid_quests: HashSet<u64> = HashSet::new();
-    // Reward mail (T3): rows for `game_quest_reward_mail`, and the quest entries that already claimed
-    // one — a quest naming both a `quest_template` template AND a dbscripts send-mail row is a data
-    // shape the importer refuses (see the dbscripts pass below).
     let mut reward_mail_rows: Vec<String> = Vec::new();
     let mut reward_mail_template_ids: HashSet<u64> = HashSet::new();
     let mut reward_mail_quests: HashSet<u64> = HashSet::new();
@@ -2971,8 +2334,6 @@ fn build_quests(
     let mut cast_obj_id: u64 = 1;
     let mut rew_id: u64 = 1;
     let mut rew_choice_id: u64 = 1;
-    // Per-quest count of emitted objectives → the next obj_index for area-trigger objectives (added after
-    // the kill/collect loops) so they line up with CharacterQuest.counts.
     let mut quest_obj_count: std::collections::HashMap<u64, u8> = std::collections::HashMap::new();
     for row in parse_table(dump, "quest_template") {
         let entry: u64 = field(&row, qt::ENTRY).parse().unwrap_or(0);
@@ -2980,8 +2341,6 @@ fn build_quests(
             continue;
         }
         valid_quests.insert(entry);
-        // Reward mail (T3): RewMailTemplateId names the letter; the giver sends it (no alternative
-        // sender or money — those columns belong to the dbscripts source, handled after this loop).
         let mail_template: u32 = field(&row, qt::REW_MAIL_TEMPLATE_ID).parse().unwrap_or(0);
         if mail_template != 0 {
             let mail_delay: u32 = field(&row, qt::REW_MAIL_DELAY_SECS).parse().unwrap_or(0);
@@ -3002,37 +2361,19 @@ fn build_quests(
         let min_level: u32 = field(&row, qt::MIN_LEVEL).parse().unwrap_or(0);
         let quest_level: i64 = field(&row, qt::QUEST_LEVEL).parse().unwrap_or(0);
         let money: i64 = field(&row, qt::REW_OR_REQ_MONEY).parse().unwrap_or(0);
-        // cmangos RewMoneyMaxLevel — vanilla's Quest::XPValue divides this by 0.6 for the authentic
-        // quest XP (lyracore_shared::quest::quest_xp). ~18% of quests have 0 here (no-XP quests). Clamp ≥ 0.
         let reward_money_max_level: i64 = field(&row, qt::REW_MONEY_MAX_LEVEL).parse().unwrap_or(0);
-        // Availability gates: prerequisite quest (cmangos PrevQuestId can be negative for exclusive-group
-        // semantics we don't model yet — clamp <0 to 0 = "no prereq" so it doesn't wrongly block) +
-        // race/class bitmasks. reward_xp stays 0 (computed).
         let prev_quest: i64 = field(&row, qt::PREV_QUEST_ID).parse().unwrap_or(0);
-        // Repeatable (SpecialFlags bit0, QUEST_SPECIAL_FLAGS_REPEATABLE): lets the quest be re-accepted
-        // right after turn-in (module::quest::apply_turn_in_quest deletes rather than rewards-and-keeps
-        // the log row when set).
         let special_flags: u32 = field(&row, qt::SPECIAL_FLAGS).parse().unwrap_or(0);
         let repeatable = (special_flags & 1) != 0;
         let req_races: u32 = field(&row, qt::REQUIRED_RACES).parse().unwrap_or(0);
         let req_classes: u32 = field(&row, qt::REQUIRED_CLASSES).parse().unwrap_or(0);
         let zone_or_sort: i64 = field(&row, qt::ZONE_OR_SORT).parse().unwrap_or(0);
-        // Reputation rewards: 2 of the 5 cmangos RewRepFaction/Value slots (most Elwynn quests use
-        // ≤1). Faction id stays as-is (0 = none); the value keeps its sign (vanilla values are positive,
-        // but a rep LOSS is representable). Deliberate simplification: 2 slots — bump to 5 if a
-        // quest needs >2 factions.
         let rf1: u32 = field(&row, qt::REW_REP_FACTION1).parse().unwrap_or(0);
         let rv1: i64 = field(&row, qt::REW_REP_VALUE1).parse().unwrap_or(0);
         let rf2: u32 = field(&row, qt::REW_REP_FACTION1 + 1).parse().unwrap_or(0);
         let rv2: i64 = field(&row, qt::REW_REP_VALUE1 + 1).parse().unwrap_or(0);
-        // Provided "source" item (cmangos SrcItemId/SrcItemCount): the item handed to the player on
-        // accept. For a delivery quest SrcItemId == ReqItemId, so granting it on accept satisfies the
-        // COLLECT objective. A dump count of 0 means 1 (cmangos treats 0 as 1; the module floors at 1).
         let src_item: u64 = field(&row, qt::SRC_ITEM_ID).parse().unwrap_or(0);
         let src_item_count: u32 = field(&row, qt::SRC_ITEM_COUNT).parse().unwrap_or(0);
-        // Forward chains + timed quests: NextQuestInChain (0 = no successor; clamp
-        // negative to 0 like prev_quest above) and LimitTime seconds (0 = untimed; cmangos never emits
-        // a negative LimitTime, but clamp defensively the same way every other numeric column here does).
         let next_quest_raw: i64 = field(&row, qt::NEXT_QUEST_IN_CHAIN).parse().unwrap_or(0);
         let limit_time_raw: i64 = field(&row, qt::LIMIT_TIME).parse().unwrap_or(0);
         if next_quest_raw > 0 {
@@ -3041,9 +2382,6 @@ fn build_quests(
         if limit_time_raw > 0 {
             timed_count += 1;
         }
-        // Raid quest-credit rule: QUEST_TYPE_RAID = 62 (cm:QuestDef.h:121). Every other value is
-        // an ordinary quest; the module gates kill credit, quest-item need and quest-object need
-        // on it in a Raid.
         let quest_type: u32 = field(&row, qt::TYPE).parse().unwrap_or(0);
         if quest_type == 62 {
             raid_quest_count += 1;
@@ -3058,8 +2396,6 @@ fn build_quests(
             limit_time = limit_time_raw.max(0),
             rmm = reward_money_max_level.max(0),
         ));
-        // Body text (side table) — Details/Objectives/OfferReward/RequestItems, verbatim ($B/$N tokens
-        // and all), so the dialogs render real text instead of empty sections.
         quest_text_rows.push(format!(
             "({entry},{details},{objectives},{offer},{request})",
             details = sql_text(field(&row, qt::DETAILS)),
@@ -3067,9 +2403,6 @@ fn build_quests(
             offer = sql_text(field(&row, qt::OFFER_REWARD_TEXT)),
             request = sql_text(field(&row, qt::REQUEST_ITEMS_TEXT)),
         ));
-        // Objectives: up to 4 ReqCreatureOrGO slots; a POSITIVE id is a creature kill (negative = a
-        // gameobject, skipped). obj_index is the dense 0-based position among emitted objectives, so it
-        // lines up with CharacterQuest.counts in the module.
         let mut obj_index: u8 = 0;
         for i in 0..4 {
             let id: i64 = field(&row, qt::REQ_CREATURE_OR_GO_ID1 + i)
@@ -3083,9 +2416,7 @@ fn build_quests(
                 continue;
             }
             if id > 0 {
-                objective_rows.push(format!(
-                    "({obj_id},{entry},{obj_index},0,{id},{count})", // kind 0 = KILL_CREATURE
-                ));
+                objective_rows.push(format!("({obj_id},{entry},{obj_index},0,{id},{count})",));
                 if spell_id != 0 {
                     cast_objective_rows
                         .push(format!("({cast_obj_id},{entry},{obj_index},{spell_id})"));
@@ -3094,12 +2425,10 @@ fn build_quests(
                 obj_id += 1;
                 obj_index += 1;
             } else if id < 0 {
-                // A NEGATIVE id is a gameobject use-objective. Emit it ONLY if that GO is an imported
-                // GOOBER (type 10) — else the quest references an un-spawned object and would be stuck.
                 let go_entry = (-id) as u64;
                 if goobers.contains(&go_entry) {
                     objective_rows.push(format!(
-                        "({obj_id},{entry},{obj_index},2,{go_entry},{count})", // kind 2 = USE_GAMEOBJECT
+                        "({obj_id},{entry},{obj_index},2,{go_entry},{count})",
                     ));
                     if spell_id != 0 {
                         cast_objective_rows
@@ -3111,53 +2440,25 @@ fn build_quests(
                 }
             }
         }
-        // Collect objectives (parity): up to 4 ReqItemId slots → "hold N of item X". kind 1 =
-        // COLLECT_ITEM, target_entry = the item entry; the module checks a LIVE inventory count and
-        // consumes them on turn-in. Continues the same dense obj_index space as the kill loop above, so
-        // a quest with BOTH (kill + collect) sizes CharacterQuest.counts correctly.
-        //
-        // ENABLED (EMIT_COLLECT_OBJECTIVES = true): the loot ETL now drops the quest items. The loot path
-        // takes `chance.abs()` (build_items_and_loot:794), so cmangos negative-chance QUEST drops (e.g. 752
-        // Red Burlap Bandana, 182 Garrick's Head) drop for everyone — the prerequisite this flag waited on.
-        // The ReqItemId entries are ALSO force-included into the item-template load (req_item_entries below
-        // → extra_item_entries), so every collect item has a template even if item_template ever returns to
-        // a subset. With items obtainable, emitting these COLLECT objectives makes the collect quests
-        // genuinely completable instead of auto-completing (the old bug). The MODULE mechanic checks a LIVE
-        // inventory count + consumes on turn-in. 042: GO-chest loot + vendor stock now count as
-        // obtainable too (the gate below unions all three sources), so the grapes/wood/feed quests
-        // emit real objectives instead of auto-completing.
         const EMIT_COLLECT_OBJECTIVES: bool = true;
-        // The provided item itself needs a template (grant_item Errs "no such item" otherwise) — force
-        // it into the item-template load even if it isn't also a ReqItem.
         if src_item > 0 {
             req_item_entries.insert(src_item);
         }
-        // Always collect the ReqItemId entries for the item-template force-include, independent of whether
-        // the objective is emitted — guarantees a template for every collect item.
         for i in 0..4 {
             let item: i64 = field(&row, qt::REQ_ITEM_ID1 + i).parse().unwrap_or(0);
             let count: u32 = field(&row, qt::REQ_ITEM_COUNT1 + i).parse().unwrap_or(0);
             if item > 0 {
                 req_item_entries.insert(item as u64);
             }
-            // ZERO-STUCK-QUESTS: emit a COLLECT objective ONLY for an OBTAINABLE item — one that drops
-            // from an in-slice creature, drops from an in-slice CHEST, is sold by an in-slice VENDOR
-            // (the drops-only gate skipped GO/vendor ReqItems → empty objective set → free
-            // turn-in on accept), or is the quest's SrcItem (handed over on accept). A genuinely
-            // unobtainable ReqItem (mining/out-of-slice) still gets NO objective → the quest stays
-            // completable on its obtainable subset instead of soft-locking.
             let obtainable =
                 item > 0 && (obtainable_items.contains(&(item as u64)) || item as u64 == src_item);
             if EMIT_COLLECT_OBJECTIVES && obtainable && count > 0 {
-                objective_rows.push(format!(
-                    "({obj_id},{entry},{obj_index},1,{item},{count})", // kind 1 = COLLECT_ITEM
-                ));
+                objective_rows.push(format!("({obj_id},{entry},{obj_index},1,{item},{count})",));
                 obj_id += 1;
                 obj_index += 1;
             }
         }
         quest_obj_count.insert(entry, obj_index);
-        // Guaranteed reward items: up to 4 RewItemId slots.
         for i in 0..4 {
             let item: u64 = field(&row, qt::REW_ITEM_ID1 + i).parse().unwrap_or(0);
             let count: u32 = field(&row, qt::REW_ITEM_COUNT1 + i).parse().unwrap_or(0);
@@ -3170,13 +2471,6 @@ fn build_quests(
                 rew_id += 1;
             }
         }
-        // Choice reward items (pick-1-of-N): up to 6 RewChoiceItemId slots. choice_index = a DENSE rank
-        // (0-based over the PRESENT slots — `choice_rank`, NOT the raw dump slot `i`), so an empty leading
-        // slot is skipped: this matches the ARRAY POSITION the client shows and replies with as `reward`, and
-        // the packet order the gateway sends (it sorts rows by choice_index). All 553 real choice-quests are
-        // gap-free (rank == i), but a custom quest with a leading gap would otherwise mismatch the wire pick.
-        // The chosen item entries union into the SAME reward_item_entries set so they flow through
-        // extra_item_entries into the item-template load — no new union site.
         let mut choice_rank = 0u8;
         for i in 0..6 {
             let item: u64 = field(&row, qt::REW_CHOICE_ITEM_ID1 + i)
@@ -3197,10 +2491,6 @@ fn build_quests(
         }
     }
 
-    // 1.6) Reward mail from dbscripts_on_quest_end SCRIPT_COMMAND_SEND_MAIL (38) rows, for in-scope
-    //      quests (the pinned dump carries exactly three: 8728, 5237, 5238). A quest that ALSO
-    //      claimed a reward-mail row from quest_template above is refused — the two sources disagree
-    //      about which letter the quest sends, and picking one silently would hide that.
     for row in parse_table(dump, "dbscripts_on_quest_end") {
         let command: u32 = field(&row, dse::COMMAND).parse().unwrap_or(0);
         if command != dse::SEND_MAIL {
@@ -3226,10 +2516,6 @@ fn build_quests(
         ));
     }
 
-    // 1.5) Explore-area objectives (kind 3) from areatrigger_involvedrelation: a quest completed by
-    //      ENTERING a zone (Jasperlode/Fargodeep mines). For each imported quest, append an
-    //      EXPLORE_AREATRIGGER objective with target_entry = the trigger id; the client's CMSG_AREATRIGGER
-    //      drives enter_areatrigger → on_areatrigger_entered increments it.
     for row in parse_table(dump, "areatrigger_involvedrelation") {
         let trigger: u64 = field(&row, ai::TRIGGER).parse().unwrap_or(0);
         let quest: u64 = field(&row, ai::QUEST).parse().unwrap_or(0);
@@ -3237,14 +2523,11 @@ fn build_quests(
             continue;
         }
         let idx = quest_obj_count.get(&quest).copied().unwrap_or(0);
-        objective_rows.push(format!("({obj_id},{quest},{idx},3,{trigger},1)")); // kind 3 = EXPLORE_AREATRIGGER
+        objective_rows.push(format!("({obj_id},{quest},{idx},3,{trigger},1)"));
         obj_id += 1;
         quest_obj_count.insert(quest, idx + 1);
     }
 
-    // 2) creature_quest / gameobject_quest relation rows for the local relations whose quest survived
-    //    the template join. Sorted + counter-assigned ids so clear+reload is idempotent (each table's
-    //    ids are independent, so the two emitters below use SEPARATE counters). role: 0 = START, 1 = END.
     let mut creature_quest_rows: Vec<String> = Vec::new();
     let mut cq_id: u64 = 1;
     let mut emit_relations = |pairs: &[(u64, u64)], role: u8| {
@@ -3266,8 +2549,6 @@ fn build_quests(
     emit_relations(&starts, 0);
     emit_relations(&ends, 1);
 
-    // Same shape, `game_gameobject_quest` table. A SEPARATE counter (`gq_id`), this
-    // table's ids are independent of `game_creature_quest`'s.
     let mut go_quest_rows: Vec<String> = Vec::new();
     let mut gq_id: u64 = 1;
     let mut emit_go_relations = |pairs: &[(u64, u64)], role: u8| {
@@ -3309,12 +2590,7 @@ fn build_quests(
     })
 }
 
-/// First pass: DIRECT drops only — positive `ChanceOrQuestChance`, real item, `mincountOrRef >= 0`
-/// (a negative ref points at another loot group, which we don't expand yet). Quest drops (negative
-/// chance) are skipped until a quest system exists. Loot ids are counter-assigned over a sorted
-/// creature order so clear+reload stays idempotent. `extra_item_entries` (e.g. quest reward items) are
-/// force-included in the item-template load so every referenced item gets a template.
-#[allow(clippy::too_many_lines)] // Column-by-column mapping of one imported dump family.
+#[allow(clippy::too_many_lines)]
 fn build_items_and_loot(
     dump: &str,
     creature_loot_ids: &std::collections::HashMap<u64, u64>,
@@ -3324,22 +2600,15 @@ fn build_items_and_loot(
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
     use std::collections::HashSet;
 
-    // 0+1) Parse the LootId-keyed creature drops (reference-pool expansion + direct rows). Shared with
-    //       creature_drop_item_set so the quest objective-emission gate and the loot rows never diverge.
     let drops_by_lootid = parse_creature_drops(dump);
 
-    // 2) game_creature_loot rows (one per creature×drop) + the referenced item set. Force-include the
-    //    starter loadout entries so the login grant (resilient: skips a missing template) still arms a
-    //    real weapon after a wipe+reload.
     let mut loot_rows: Vec<String> = Vec::new();
     let mut item_ids: HashSet<u64> = [25, 50, 51, 52].into_iter().collect();
-    // Quest reward items (and any other forced entries) need templates too — the turn-in grant joins
-    // game_item_template, so a missing reward template would fail the turn-in.
     item_ids.extend(extra_item_entries.iter().copied());
     item_ids.extend(mail_loot_item_entries.iter().copied());
     let mut loot_id: u64 = 1;
     let mut creatures: Vec<(&u64, &u64)> = creature_loot_ids.iter().collect();
-    creatures.sort(); // deterministic loot-id assignment across re-imports
+    creatures.sort();
     for (creature_entry, lootid) in creatures {
         let Some(drops) = drops_by_lootid.get(lootid) else {
             continue;
@@ -3353,11 +2622,9 @@ fn build_items_and_loot(
         }
     }
 
-    // 2.5) game_npc_vendor rows for the imported VENDOR creatures, adding their stock to the item set so
-    //      every sold item gets a template (the gateway joins it for SMSG_LIST_INVENTORY + the buy path).
     let mut vendor_rows: Vec<String> = Vec::new();
     let mut vendor_id: u64 = 1;
-    let mut nv_seen: HashSet<(u64, u64)> = HashSet::new(); // dedupe (vendor, item) — cmangos lists variants
+    let mut nv_seen: HashSet<(u64, u64)> = HashSet::new();
     for row in parse_table(dump, "npc_vendor") {
         let entry: u64 = field(&row, nv::ENTRY).parse().unwrap_or(0);
         if !vendor_entries.contains(&entry) {
@@ -3374,12 +2641,6 @@ fn build_items_and_loot(
         vendor_id += 1;
     }
 
-    // 2.6) npc_vendor_template indirection: 11 spawned vendors (Corina Steele,
-    // Brog Hamfist, …) have ZERO direct npc_vendor rows — cmangos serves their goods via
-    // creature_template.VendorTemplateId → npc_vendor_template. Flatten that into the same
-    // per-creature game_npc_vendor rows (our schema deliberately has no template indirection).
-    // npc_vendor_template dump shape (CREATE TABLE, verified): entry, item, maxcount, incrtime,
-    // slot, condition_id, comments.
     let mut tmpl_stock: HashMap<u64, Vec<(u64, u32, u32)>> = HashMap::new();
     for row in parse_table(dump, "npc_vendor_template") {
         let t: u64 = field(&row, 0).parse().unwrap_or(0);
@@ -3393,8 +2654,6 @@ fn build_items_and_loot(
                 .push((item, slot, max_count));
         }
     }
-    // creature_template.VendorTemplateId — column 76 of 87, read off the dump's own CREATE TABLE
-    // (same dump-verified confidence as the `at::` fix).
     const CT_VENDOR_TEMPLATE_ID: usize = 76;
     for row in parse_table(dump, "creature_template") {
         let entry: u64 = field(&row, ct::ENTRY).parse().unwrap_or(0);
@@ -3407,7 +2666,7 @@ fn build_items_and_loot(
         };
         for &(item, slot, max_count) in stock {
             if !nv_seen.insert((entry, item)) {
-                continue; // direct rows win; template stock tops up
+                continue;
             }
             item_ids.insert(item);
             vendor_rows.push(format!("({vendor_id},{entry},{item},{slot},{max_count})"));
@@ -3416,18 +2675,18 @@ fn build_items_and_loot(
     }
 
     const USE_SPELL_OVERRIDE: &[(u64, u32)] = &[
-        (118, 50110),  // Minor Healing Potion -> Minor Healing (instant E_HEAL)
-        (1251, 50111), // Linen Bandage -> Linen Bandage (channeled A_PERIODIC_HEAL HoT)
-        (4360, 50096), // Rough Copper Bomb -> Rough Copper Bomb (E_DAMAGE AoE)
-        (2455, 50113), // Minor Mana Potion -> Minor Mana Potion (E_ENERGIZE, mana-class gated)
-        (159, 50114), // Refreshing Spring Water -> Refreshing Water (A_PERIODIC_ENERGIZE, mana-class gated)
-        (5350, 50114), // Conjured Water -> same drink spell
-        (4540, 50115), // Tough Hunk of Bread -> Eating (A_PERIODIC_HEAL food HoT)
-        (117, 50115), // Tough Jerky -> same food spell
-        (2681, 50115), // Roasted Boar Meat (level-1 food) -> same food spell, no Well-Fed buff
-        (2680, 50116), // Spiced Wolf Meat -> Well Fed (+Sta/+Spi buff)
-        (858, 50117), // Lesser Healing Potion -> Lesser Healing (E_HEAL, rank-2)
-        (2581, 50118), // Heavy Linen Bandage -> Heavy Linen Bandage (channeled HoT, rank-2)
+        (118, 50110),
+        (1251, 50111),
+        (4360, 50096),
+        (2455, 50113),
+        (159, 50114),
+        (5350, 50114),
+        (4540, 50115),
+        (117, 50115),
+        (2681, 50115),
+        (2680, 50116),
+        (858, 50117),
+        (2581, 50118),
     ];
     let use_spell_override = |entry: u64| -> Option<u32> {
         USE_SPELL_OVERRIDE
@@ -3437,9 +2696,6 @@ fn build_items_and_loot(
 
     let mut item_rows: Vec<String> = Vec::new();
     let mut emitted: HashSet<u64> = HashSet::new();
-    // Coverage counters: how many items carry a nonzero resistance (any of the 6
-    // schools) and how many carry a nonzero startquest link — printed after the loop so a re-import
-    // makes the new columns' reach visible without a manual SQL scan.
     let mut resist_nonzero_count: u64 = 0;
     let mut startquest_nonzero_count: u64 = 0;
     for row in parse_table(dump, "item_template") {
@@ -3448,9 +2704,6 @@ fn build_items_and_loot(
             continue;
         }
         emitted.insert(entry);
-        // Scan the 10 (stat_type, stat_value) pairs → our 5 primaries. cmangos 1.12 item mod types:
-        // 3=AGI 4=STR 5=INT 6=SPI 7=STA (0=mana / 1=health have no game column → dropped). Crit/hit
-        // come from item spell effects in 1.12, not base stats, so stat_crit/stat_hit stay 0 on import.
         let (mut s_str, mut s_agi, mut s_sta, mut s_int, mut s_spi) = (0i32, 0, 0, 0, 0);
         for i in 0..10 {
             let st: u8 = field(&row, it::STAT_TYPE1 + 2 * i).parse().unwrap_or(0);
@@ -3472,12 +2725,9 @@ fn build_items_and_loot(
             normalize_item_mask(field(&row, it::ALLOWED_CLASS), ALL_PLAYABLE_CLASS_MASK);
         let allowed_race =
             normalize_item_mask(field(&row, it::ALLOWED_RACE), ALL_PLAYABLE_RACE_MASK);
-        // Drink = Food&Drink consumable whose name reads as a beverage (see is_drink_consumable). The
-        // restores_power flag makes apply_item_use refill mana instead of HP. Generic predicate, no item-id list.
         let class_v: u8 = field(&row, it::CLASS).parse().unwrap_or(0);
         let subclass_v: u8 = field(&row, it::SUBCLASS).parse().unwrap_or(0);
         let is_drink = is_drink_consumable(class_v, subclass_v, field(&row, it::NAME));
-        // The 6 resistance schools, data plumbing only, no consumer reads these yet.
         let holy: i32 = field(&row, it::HOLY_RES).parse().unwrap_or(0);
         let fire: i32 = field(&row, it::FIRE_RES).parse().unwrap_or(0);
         let nature: i32 = field(&row, it::NATURE_RES).parse().unwrap_or(0);
@@ -3487,15 +2737,12 @@ fn build_items_and_loot(
         if holy != 0 || fire != 0 || nature != 0 || frost != 0 || shadow != 0 || arcane != 0 {
             resist_nonzero_count += 1;
         }
-        // Spell slots 3-5, completes the proc engine's item half; data plumbing
-        // only, same id+trigger shape as slots 1-2 above.
         let sp3: u32 = field(&row, it::SPELLID_3).parse().unwrap_or(0);
         let spt3: u8 = field(&row, it::SPELLTRIGGER_3).parse().unwrap_or(0);
         let sp4: u32 = field(&row, it::SPELLID_4).parse().unwrap_or(0);
         let spt4: u8 = field(&row, it::SPELLTRIGGER_4).parse().unwrap_or(0);
         let sp5: u32 = field(&row, it::SPELLID_5).parse().unwrap_or(0);
         let spt5: u8 = field(&row, it::SPELLTRIGGER_5).parse().unwrap_or(0);
-        // Skill/reputation gates: mail/plate proficiency and the reputation requirement.
         let req_skill: u32 = field(&row, it::REQUIRED_SKILL).parse().unwrap_or(0);
         let req_skill_rank: u32 = field(&row, it::REQUIRED_SKILL_RANK).parse().unwrap_or(0);
         let req_rep_faction: u32 = field(&row, it::REQUIRED_REPUTATION_FACTION)
@@ -3504,7 +2751,6 @@ fn build_items_and_loot(
         let req_rep_rank: u32 = field(&row, it::REQUIRED_REPUTATION_RANK)
             .parse()
             .unwrap_or(0);
-        // Maxcount/flags/page_text/startquest/bag_family, data plumbing only.
         let max_count: u32 = field(&row, it::MAX_COUNT).parse().unwrap_or(0);
         let item_flags: u32 = field(&row, it::FLAGS).parse().unwrap_or(0);
         let page_text: u32 = field(&row, it::PAGE_TEXT).parse().unwrap_or(0);
@@ -3513,13 +2759,8 @@ fn build_items_and_loot(
             startquest_nonzero_count += 1;
         }
         let bag_family: u32 = field(&row, it::BAG_FAMILY).parse().unwrap_or(0);
-        // BuyCount: floor at 1 — a 0 in the dump (or a parse miss) must not sell zero items.
         let buy_count: u32 = field(&row, it::BUY_COUNT).parse().unwrap_or(1).max(1);
         let food_type: u8 = field(&row, it::FOOD_TYPE).parse().unwrap_or(0);
-        // ON-USE SPELL OVERRIDE: a curated entry's spellid_1/spelltrigger_1 is OUR synthetic
-        // on-use cast, forced trigger 0 — see `USE_SPELL_OVERRIDE`'s doc above. Every other item keeps
-        // its raw dump value untouched (baseline-safe: the vast majority of the vanilla item catalog is
-        // unaffected).
         let (sp1, spt1): (u32, u8) = match use_spell_override(entry) {
             Some(spell_id) => (spell_id, 0),
             None => (
@@ -3527,20 +2768,12 @@ fn build_items_and_loot(
                 field(&row, it::SPELLTRIGGER_1).parse().unwrap_or(0),
             ),
         };
-        // game_item_template column order — see module/src/items/tables.rs. stat_crit/stat_hit
-        // are not in 1.12 item base stats, so 0,0 here. block_value is the shield's flat block (0 for
-        // non-shields) — makes imported shields actually block (combat::effective_block_value reads it).
-        // restores_power (drink) is a Bool → bare true/false SQL literal (the is_negative Bool-SQL note).
         item_rows.push(format!(
             "({entry},{class},{subclass},{name},{disp},{qual},{inv},{ilvl},{rlvl},{dur},{buy},{sell},{stack},{dmin},{dmax},{delay},{s_str},{s_agi},{s_sta},{s_int},{s_spi},0,0,{armor},{block},{drink},{sp1},{spt1},{sp2},{spt2},{cslots},{sheath},{bonding},{holy},{fire},{nature},{frost},{shadow},{arcane},{sp3},{spt3},{sp4},{spt4},{sp5},{spt5},{req_skill},{req_skill_rank},{req_rep_faction},{req_rep_rank},{max_count},{item_flags},{page_text},{start_quest},{bag_family},{buy_count},{food_type},{allowed_class},{allowed_race},{random_property})",
             sheath = field(&row, it::SHEATH).parse::<u8>().unwrap_or(0),
             sp2 = field(&row, it::SPELLID_2).parse::<u32>().unwrap_or(0),
             spt2 = field(&row, it::SPELLTRIGGER_2).parse::<u8>().unwrap_or(0),
-            // ContainerSlots — how many bag slots this item provides (0 for non-bags); col 24 in
-            // the cmangos 1.12 item_template schema, immediately after Stackable(23).
             cslots = field(&row, it::CONTAINER_SLOTS).parse::<u8>().unwrap_or(0),
-            // Bonding: 0=NoBind,1=BoP,2=BoE,3=BoU,4/5=QuestItem, mapped straight
-            // through to the client's "Binds when picked up/equipped" tooltip line.
             bonding = field(&row, it::BONDING).parse::<u8>().unwrap_or(0),
             class = field(&row, it::CLASS),
             subclass = field(&row, it::SUBCLASS),
@@ -3571,9 +2804,6 @@ fn build_items_and_loot(
         startquest_nonzero_count
     );
 
-    // Mail loot (T3) is held to a stricter rule than the general dangling guard below: a letter that
-    // names an item with no template would grant nothing, silently — fail loud instead, naming the
-    // item.
     let mut missing_mail_items: Vec<u64> = mail_loot_item_entries
         .iter()
         .copied()
@@ -3584,8 +2814,6 @@ fn build_items_and_loot(
         bail!("item_template: mail_loot_template item {item} has no item_template row");
     }
 
-    // Dangling-reference guard: any loot/vendor/quest-reward item with no item_template row would break
-    // that drop/turn-in. With the full set imported this should be empty; warn loudly if not.
     let mut dangling: Vec<u64> = item_ids
         .iter()
         .copied()
@@ -3603,11 +2831,6 @@ fn build_items_and_loot(
     Ok((item_rows, loot_rows, vendor_rows))
 }
 
-/// `game_mail_loot` rows for every template `reward_mail_template_ids` names, from cmangos
-/// `mail_loot_template`. Every real row is a 100% single item with group 0, count 1 and no condition
-/// (a mail carries at most one item) — anything outside that shape is refused, naming the table and
-/// the offending mail template, rather than silently dropped or truncated to the first match. A
-/// named template with no row here sends a text- or money-only letter.
 fn build_mail_loot(
     dump: &str,
     reward_mail_template_ids: &std::collections::HashSet<u64>,
@@ -3656,20 +2879,10 @@ fn build_mail_loot(
         item_entries.insert(item);
         rows.push((entry, format!("({entry},{item},1)")));
     }
-    rows.sort_unstable_by_key(|(entry, _)| *entry); // deterministic import order
+    rows.sort_unstable_by_key(|(entry, _)| *entry);
     Ok((rows.into_iter().map(|(_, sql)| sql).collect(), item_entries))
 }
 
-/// Append chunked `INSERT INTO {table} ({cols}) VALUES (...)` statements for `rows` — bounded BOTH by
-/// row count (≤500) AND by byte size (≤~32KB/statement). The byte bound matters for text-heavy tables
-/// like `game_quest_text`: at a full-Elwynn slice its 170 rows of quest prose are one 110KB statement
-/// that `spacetime sql` rejects (400) — row-count chunking alone never splits it. No-op for empty `rows`.
-/// Data-row count across a family's generated statement list: DELETEs contribute 0; each
-/// `push_insert`-shaped INSERT contributes its VALUES tuple count (`),(` separators + 1).
-/// Feeds the provenance stamps for families whose builders return statements
-/// rather than row vectors — statement `.len()` would under-report by the batch factor.
-/// Only sound for numeric-payload tables (a text value containing `),(` would over-count);
-/// the "globals" builders (stats/positions/graveyards/createinfo) are all numeric.
 fn insert_row_count(stmts: &[String]) -> u64 {
     stmts
         .iter()
@@ -3679,7 +2892,7 @@ fn insert_row_count(stmts: &[String]) -> u64 {
 }
 
 pub(crate) fn push_insert(stmts: &mut Vec<String>, table: &str, cols: &str, rows: &[String]) {
-    const MAX_BYTES: usize = 32 * 1024; // well under the observed spacetime-sql statement-size limit
+    const MAX_BYTES: usize = 32 * 1024;
     let mut batch: Vec<&str> = Vec::new();
     let mut bytes = 0usize;
     let flush = |batch: &mut Vec<&str>, stmts: &mut Vec<String>| {
@@ -3702,8 +2915,6 @@ pub(crate) fn push_insert(stmts: &mut Vec<String>, table: &str, cols: &str, rows
     flush(&mut batch, stmts);
 }
 
-/// Keep a creature inside the scope, or a forced entry anywhere on a planned map. Forced entries
-/// bypass geometry only; the map fence always applies. Pool slots cannot match a forced entry.
 fn creature_row_kept_in_scope(
     scope: &WorldImportScope,
     map: i64,
@@ -3746,12 +2957,6 @@ pub(crate) fn row_in_slice(args: &Args, map: i64, x: f64, y: f64, z: f64) -> boo
         .contains(map, x, y, z)
 }
 
-/// What `--print-extents` derived from the dump. `anchor` is the in-slice spawn CLOSEST to the
-/// rectangle's centre — a REAL cmangos ground point, which is exactly what `--center` needs (the
-/// terrain importer's interpolate self-check compares the ADT height at `--center` against the Z the
-/// operator supplied, and the nav importer requires `--center` to rasterize walkable).
-/// deriving a second continent's box also means deriving a second continent's centre, and the map-0
-/// default (Northshire) is off-slice there.
 struct Extents {
     count: u64,
     min: (f64, f64, f64),
@@ -3759,12 +2964,6 @@ struct Extents {
     anchor: (f64, f64, f64),
 }
 
-/// Pure spawn-bbox computation for `--print-extents`: scan every `creature` row on `map` — optionally
-/// pre-filtered to a CANDIDATE `--box` rectangle. A whole continent's extents are the
-/// continent, so deriving a starting-zone box is an iterate-and-narrow loop: pass a rough rectangle,
-/// read back the real spawn extents and count inside it. Returns `None` if no row matched
-/// (nothing to report). Split out from `print_extents` so the corner math is unit-tested against a
-/// synthetic dump without stdout.
 fn compute_extents(dump: &str, map: i64, bbox: Option<(f64, f64, f64, f64)>) -> Option<Extents> {
     let mut count = 0u64;
     let mut min = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
@@ -3789,8 +2988,6 @@ fn compute_extents(dump: &str, map: i64, bbox: Option<(f64, f64, f64, f64)>) -> 
     if count == 0 {
         return None;
     }
-    // The spawn nearest the derived rectangle's centre — a real ground point INSIDE the slice, so it
-    // is always a valid `--center` (2D distance: the centre of a Z range is meaningless terrain-wise).
     let (mid_x, mid_y) = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
     let anchor = *kept
         .iter()
@@ -3807,10 +3004,6 @@ fn compute_extents(dump: &str, map: i64, bbox: Option<(f64, f64, f64, f64)>) -> 
     })
 }
 
-/// The cmangos `playercreateinfo` start positions ON `map`, as `(race, class, zone, x, y, z)` — the
-/// canonical starting-zone ANCHORS of a continent: "where does a Kalimdor box go?" is
-/// answered by the dump's own Valley of Trials / Camp Narache / Shadowglen rows, not from memory.
-/// Pure so it is unit-testable without stdout; printed by `print_extents` below.
 fn start_positions_on_map(dump: &str, map: i64) -> Vec<(u32, u32, u32, f64, f64, f64)> {
     parse_table(dump, "playercreateinfo")
         .iter()
@@ -3866,9 +3059,7 @@ fn print_extents(dump: &str, map: i64, bbox: Option<(f64, f64, f64, f64)>) -> Re
     Ok(())
 }
 
-/// Run a sequence of `spacetime sql` statements as the owner. Each is a separate invocation (Simple
-/// Query Protocol — no multi-statement transaction), so on failure the sequence stops mid-way; the
-/// clear+reload is idempotent, so re-running recovers. Shared by the cmangos and DBC streams.
+// Each SQL statement commits separately; a failed sequence requires an idempotent rerun.
 pub(crate) fn run_sql_statements(args: &Args, stmts: &[String], label: &str) -> Result<()> {
     for (n, s) in stmts.iter().enumerate() {
         eprintln!(
@@ -3892,20 +3083,6 @@ pub(crate) fn run_sql_statements(args: &Args, stmts: &[String], label: &str) -> 
     Ok(())
 }
 
-/// The fixed set of `--family` values this importer recognizes, one per independent
-/// clear+reload block the `--dump` ETL below already builds (the inventory `import-world.sh`'s header
-/// comment describes: "the ETL is clear+reload PER FAMILY"). `--family` covers THESE families only —
-/// terrain (`--terrain`), client DBCs (`--dbc`), and Spell.dbc (`--dbc --spells`) are separate
-/// invocations with no family concept of their own. "globals" covers start
-/// positions, the class/level stat curve, graveyard-zone links, createinfo spells/actions/items and
-/// Area Trigger dungeon portals. They are not box-scoped, but each is its own
-/// clear+reload, so `--family quests` reloads QUESTS ALONE (not
-/// quests-plus-globals). "spellmeta" (reduced scope) is the same "global, not box-scoped,
-/// own clear+reload" shape as "globals" — kept as its OWN family rather than folded into "globals"
-/// because nothing else reads its output (compute-gateable too, unlike "globals"' entangled siblings —
-/// see `build_dump_plan`'s gate).
-/// Every family here also has a Package Delta stage of its own, so `main` runs the stage over this
-/// same list rather than a second one that could drift from it.
 pub(crate) const FAMILIES: &[&str] = &[
     "creatures",
     "items",
@@ -3920,14 +3097,8 @@ pub(crate) const FAMILIES: &[&str] = &[
     "spellmeta",
 ];
 
-/// The batch size for the two Timestamp-bearing spawn payloads (`import_creature_spawns`/
-/// `import_gameobjects` reducer args) — shared by `build_dump_plan` (which chunks the rows) and
-/// `main`'s dry-run print (which reports it).
 const SPAWN_BATCH: usize = 250;
 
-/// Whether `name`'s DELETE+INSERT block should be pushed/applied this run: true when `--family` was
-/// not given (full run — every family active) or when it names
-/// exactly this family.
 pub(crate) fn family_active(args: &Args, name: &str) -> bool {
     match &args.family {
         None => true,
@@ -3935,13 +3106,7 @@ pub(crate) fn family_active(args: &Args, name: &str) -> bool {
     }
 }
 
-/// One family's Package Delta stage: reapplies every enabled Package's claims on `family`'s tables
-/// once its base rows are back. This is the `--dump` block's counterpart to `spell::run_spells`'s stage.
-/// Runs whenever `family` is part of this invocation (`--family <name>` naming it, or a full run),
-/// on the dry-run path as well as `--apply`: a check has to print the same plan an apply would
-/// send, and `package_delta::reapply` itself decides which of those two this call is.
 fn run_package_stage(args: &Args, family: &str) -> Result<()> {
-    // Canonical quests also reload the EventAI quest completion rules.
     let quest_event_reload =
         family == "creature-ai" && args.world_profile.is_some() && family_active(args, "quests");
     if !family_active(args, family) && !quest_event_reload {
@@ -3954,11 +3119,6 @@ fn run_package_stage(args: &Args, family: &str) -> Result<()> {
     Ok(())
 }
 
-/// Everything the `--dump` ETL computes for ONE run: the plain-SQL clear+reload statements (already
-/// family-gated — see `family_active`), the two Timestamp-bearing spawn payloads (packed, batched),
-/// and the provenance `stamps` (family, row_count) for every family that actually had its block
-/// pushed. Built by `build_dump_plan`, applied by `main` (kept separate so tests can inspect a plan
-/// without shelling out to `spacetime call`).
 pub(crate) struct DumpPlan {
     pub(crate) stmts: Vec<String>,
     pub(crate) spawn_batches: Vec<String>,
@@ -3975,7 +3135,7 @@ pub(crate) struct DumpPlan {
 }
 
 impl DumpPlan {
-    /// GameObject dependencies precede AI; creatures can raise spawn events only after AI is ready.
+    // Load GameObject dependencies before AI, then creatures whose spawn events can invoke AI.
     fn reducer_batches<'a>(&'a self, args: &Args) -> Result<Vec<(&'static str, &'a str)>> {
         let mut batches = Vec::new();
         if family_active(args, "gameobjects") {
@@ -4023,13 +3183,6 @@ impl DumpPlan {
     }
 }
 
-/// Build the full `--dump` ETL plan. The `--family` split lives entirely in here, via
-/// `family_active` gates around each family's DELETE+INSERT block. It parses the cmangos dump, filters
-/// the content slice, maps every family's rows, and returns the ready-to-apply plan. Pure w.r.t. the
-/// outside world (no `spacetime call`/SQL execution) — `main` does that against the returned
-/// `DumpPlan`. `--family` gates ONLY which blocks are pushed into `stmts`/counted into `stamps`; every
-/// family's prerequisite parsing/scoping still runs (the quests/items builders are entangled — see
-/// the module doc — so their compute can't be conditional even when only one is requested).
 fn build_dump_plan(
     dump: &str,
     args: &Args,
@@ -4080,9 +3233,6 @@ fn build_dump_plan(
     } = gameobject_template_rows(&go_spawns, &eventai.forced_gameobject_entries)?;
     let trainer_rows = build_trainer_spell_rows(dump, &entries, profession_tier_values);
 
-    // A transferred Character needs the same quest text and objectives on every destination.
-    // Canonical profiles share the supported quest catalogue; giver relations stay local.
-    // Legacy slices keep their explicitly selected quest scope.
     let catalogue = if args.world_profile.is_some() {
         Some(build_quest_catalogue(dump, args, display_scales)?)
     } else {
@@ -4127,9 +3277,6 @@ fn build_dump_plan(
         quests.cast_objectives.len(), quests.reward_items.len(), quests.reward_choices.len(), quests.relations.len(),
         quests.go_relations.len(), quests.chained_count, quests.timed_count, quests.raid_quest_count,
     );
-    // Mail loot (T3): the single item each named reward-mail template attaches, scoped to the
-    // templates `quests.reward_mail` actually names — a template with no row here sends text/money
-    // only.
     let (mail_loot_rows, mail_loot_item_entries) =
         build_mail_loot(dump, &quests.reward_mail_template_ids)?;
     eprintln!(
@@ -4139,10 +3286,6 @@ fn build_dump_plan(
         mail_loot_rows.len(),
     );
 
-    // P4: real item templates + creature loot for the imported creatures (clear+reload, like above).
-    // game_item_template is wiped+reloaded with the loot-referenced set ∪ the starter loadout ∪ quest
-    // reward items ∪ quest COLLECT (ReqItem) items (so the login grant keeps a real weapon, turn-ins can
-    // deliver, AND every collect-quest item has a template); game_creature_loot is fully importer-owned.
     let extra_item_entries: std::collections::HashSet<u64> = quests
         .reward_item_entries
         .iter()
@@ -4171,10 +3314,6 @@ fn build_dump_plan(
         &creature_skin_ids,
         &chest_loot_ids_used,
     );
-    // Gossip menus + NPC text + menu options: map each in-box gossip NPC's
-    // creature_entry to the npc_text id shown in SMSG_GOSSIP_MESSAGE, import the resolved greeting
-    // strings (all 8 weighted slots, not just the first), and import its clickable menu options
-    // (vendor/innkeeper/trainer/plain-gossip, quest-status conditions folded). Four-table clear+reload.
     let gossip = build_gossip_sql(dump, &entries);
 
     let quest_event_requirements = catalogue
@@ -4204,10 +3343,6 @@ fn build_dump_plan(
         eventai: &eventai,
         quest_event_requirements: &quest_event_requirements,
     };
-    // 5) static content (no Timestamp columns) → plain SQL clear+reload, family by family, in the
-    //    order the tables must land. The spawns + live-entity reset are NOT here — they go through
-    //    the `import_creature_spawns` reducer (step 6), which clears every CREATURE entity + spawn
-    //    and loads the new spawns with a valid `ctx.timestamp`.
     let mut stmts: Vec<String> = Vec::new();
     let property_row_count = if family_active(args, "items") {
         let (property_sql, row_count) = item_property::dump_sql(dump, args.dbc.as_deref())?;
@@ -4224,10 +3359,7 @@ fn build_dump_plan(
     push_creature_behaviour_statements(args, content, &mut stmts);
     let (globals_row_count, spellmeta_row_count) = push_global_statements(args, dump, &mut stmts)?;
 
-    // The spawn payload can hold ~2k rows for a full zone — more than one `spacetime call` string arg
-    // takes — so split it into batches. Batch 0 goes to `import_creature_spawns` (clears the live
-    // roster + threat ONCE, then loads); every later batch goes to `import_creature_spawns_append`
-    // (load only), so the clear happens exactly once and every batch survives.
+    // Only the first spawn batch clears live state; later batches must append.
     let spawn_rows: Vec<&str> = packed_spawns.split(';').filter(|r| !r.is_empty()).collect();
     let batches: Vec<String> = spawn_rows
         .chunks(SPAWN_BATCH)
@@ -4269,8 +3401,6 @@ fn build_dump_plan(
     })
 }
 
-/// ETL row shape: one `game_creature_spawn` row per tuple, in the packed-payload column order —
-/// db_guid, entry, x, y, z, orientation, movement_type, respawn_secs, map.
 type CreatureSpawnRow = (u64, u64, f64, f64, f64, f64, u8, u32, i64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4279,15 +3409,12 @@ enum ScopePurpose {
     QuestCatalogue,
 }
 
-/// The creature template entries this run imports, with the EventAI plan that grew them.
 struct ScopeEntries {
     entries: std::collections::HashSet<u64>,
     eventai: eventai::EventAiPlan,
-    /// The rendered Compatibility Manifest — `None` when the creature-ai family is not part of the run.
     eventai_manifest: Option<String>,
 }
 
-/// The `game_creature_template` rows plus the per-entry loot ids and exclusions every later family reads.
 struct CreatureTemplates {
     templates: Vec<String>,
     creature_loot_ids: std::collections::HashMap<u64, u64>,
@@ -4296,13 +3423,11 @@ struct CreatureTemplates {
     class_trainer_count: usize,
 }
 
-/// The packed `import_creature_spawns` payload and the db_guid → world guid map the waypoints need.
 struct SpawnPayload {
     guid_of: std::collections::HashMap<u64, u64>,
     packed_spawns: String,
 }
 
-/// One imported `gameobject_template`, reduced to the columns the per-type row builder needs.
 struct GoMeta {
     stored_type: u8,
     disp: u32,
@@ -4311,12 +3436,10 @@ struct GoMeta {
     data1: u32,
     trap_spell_id: u32,
     trap_cooldown_secs: u32,
-    /// 0 for every type but MEETINGSTONE.
     meeting_stone_area_id: u32,
     size: f32,
 }
 
-/// The gameobject spawns the World Import Scope keeps, with the template metadata they resolved against.
 struct GameobjectSpawns {
     go_meta: std::collections::HashMap<u64, GoMeta>,
     dropped_type25: Vec<u64>,
@@ -4325,7 +3448,6 @@ struct GameobjectSpawns {
     used_go: std::collections::HashSet<u64>,
 }
 
-/// The four loot families that hang off an imported creature or chest.
 struct LootFamilyRows {
     pickpocket_rows: Vec<String>,
     skinning_rows: Vec<String>,
@@ -4371,8 +3493,6 @@ fn build_quest_catalogue(
     })
 }
 
-/// Every mapped row set the static-content SQL blocks and the provenance stamps read. Borrowed, so
-/// the push helpers below stay a view over `build_dump_plan`'s own values.
 #[derive(Clone, Copy)]
 struct MappedContent<'a> {
     templates: &'a [String],
@@ -4397,9 +3517,6 @@ struct MappedContent<'a> {
     quest_event_requirements: &'a [String],
 }
 
-/// The creature template entries this run imports, and the EventAI plan built against them. Accepted
-/// EventAI summons force their summoned templates into the entry set, to a fixpoint, so a summoned-only
-/// creature still gets a template.
 fn resolve_scope_entries(
     dump: &str,
     args: &Args,
@@ -4429,14 +3546,8 @@ fn resolve_scope_entries(
     {
         entries.extend(&all_templates);
     }
-    // Spell summons and the wisp body have no placed spawn.
     const SPELL_TEMPLATE_ENTRIES: &[u64] = &[416, 1860, 1863, 5676, 5677, 12861];
     entries.extend(SPELL_TEMPLATE_ENTRIES.iter().copied());
-    // Forced-creature template safety net: the spawn-loop gate above already keeps a force-listed
-    // entry's placed spawns, whether the profile owns it or the legacy flag extends the scope.
-    // But a giver with NO `creature` row (a pure-summon/instanced NPC) produces zero spawns — extend
-    // `entries` so its template + quest relations still import, and WARN LOUDLY that it will not
-    // physically exist in-world (so the operator doesn't ship a phantom giver).
     let scope_name = scope.name();
     for &e in &scope.forced_creature_entries {
         if !entries.contains(&e) {
@@ -4459,7 +3570,6 @@ fn resolve_scope_entries(
                 Some(entry)
             })
             .collect();
-    // Canonical quest reimports must retain summoned givers discovered by a full import.
     let (eventai, eventai_manifest) = if args.world_profile.is_some()
         || family_active(args, "creature-ai")
         || family_active(args, "gameobjects")
@@ -4526,25 +3636,18 @@ fn resolve_scope_entries(
     })
 }
 
-/// Creature definitions and the loot ids used by the selected catalogue.
 fn build_creature_templates(
     dump: &str,
     entries: &std::collections::HashSet<u64>,
     display_scales: &Option<std::collections::HashMap<u32, f32>>,
 ) -> CreatureTemplates {
-    // 2) templates for those entries.
     let mut templates: Vec<String> = Vec::new();
-    // entry → LootId for the imported creatures; drives the item + loot ETL below (0 = no loot table).
     let mut creature_loot_ids: std::collections::HashMap<u64, u64> =
         std::collections::HashMap::new();
-    // Entry → PickpocketLootId / SkinLootId, same "0 = no table" convention as LootId.
     let mut creature_pickpocket_ids: std::collections::HashMap<u64, u64> =
         std::collections::HashMap::new();
     let mut creature_skin_ids: std::collections::HashMap<u64, u64> =
         std::collections::HashMap::new();
-    // How many imported templates carry a nonzero `trainer_class`. Reported below so an operator can
-    // confirm the columns populated: a wrong index reads a real neighbouring cell, which is the one
-    // failure mode here that produces plausible data instead of an error.
     let mut class_trainer_count: usize = 0;
     for row in parse_table(dump, "creature_template") {
         let entry: u64 = field(&row, ct::ENTRY).parse().unwrap_or(0);
@@ -4555,9 +3658,6 @@ fn build_creature_templates(
         if loot_id > 0 {
             creature_loot_ids.insert(entry, loot_id);
         }
-        // Loot-family completeness: PickpocketLootId collapses onto creature_entry
-        // directly (like LootId, above); SkinLootId is recorded per-entry too but stays keyed on the
-        // loot-id ITSELF in game_skinning_loot (several creatures share one level-banded table).
         let pickpocket_loot_id: u64 = field(&row, ct::PICKPOCKET_LOOT_ID).parse().unwrap_or(0);
         if pickpocket_loot_id > 0 {
             creature_pickpocket_ids.insert(entry, pickpocket_loot_id);
@@ -4566,13 +3666,9 @@ fn build_creature_templates(
         if skin_loot_id > 0 {
             creature_skin_ids.insert(entry, skin_loot_id);
         }
-        // Resolve scale: cmangos Scale==0 means "use the client CreatureDisplayInfo scale". Resolve it
-        // from the DBC map when --dbc was given, else floor to 1.0 — never emit a literal 0 (the 5875
-        // client renders OBJECT_FIELD_SCALE_X=0 invisibly; see codec set_object_scale_x).
+        // Scale zero means use CreatureDisplayInfo scale.
         let display_id: u32 = field(&row, ct::MODEL_ID1).parse().unwrap_or(0);
         let cm_scale: f32 = field(&row, ct::SCALE).parse().unwrap_or(0.0);
-        // Accept only a POSITIVE scale (a 0 — or a corrupt negative — falls through to the DBC, then
-        // to the 1.0 floor); a negative OBJECT_FIELD_SCALE_X would render as broken as a 0.
         let scale_val: f32 = if cm_scale > 0.0 {
             cm_scale
         } else {
@@ -4582,8 +3678,6 @@ fn build_creature_templates(
                 .filter(|s| *s > 0.0)
                 .unwrap_or(1.0)
         };
-        // MaxLevel / MaxLevelHealth feed the spawn-time level roll; a dump missing the cell → "0"
-        // (the module reads 0 as "no range" and falls back to the min). End-appended, like the column.
         let num_or_zero = |idx: usize| {
             let v = field(&row, idx);
             if v.is_empty() {
@@ -4593,9 +3687,6 @@ fn build_creature_templates(
             }
         };
         let faction_template: u32 = field(&row, ct::FACTION).parse().unwrap_or(0);
-        // Per-creature melee damage: cmangos MinMeleeDmg/MaxMeleeDmg are floats; round to int
-        // (vanilla creature swings are whole-number ranges in practice). 0 stays 0 → the module's
-        // swing_range_ctx falls back to the flat CREATURE_MELEE range for that creature.
         let dmg_min: u32 = field(&row, ct::MIN_MELEE_DMG)
             .parse::<f32>()
             .unwrap_or(0.0)
@@ -4604,14 +3695,6 @@ fn build_creature_templates(
             .parse::<f32>()
             .unwrap_or(0.0)
             .round() as u32;
-        // game_creature_template column order (see module/src/creatures/spawn.rs). The trailing
-        // `aggro_range` (proximity aggro) has no cmangos source column, so emit 0 (passive —
-        // retaliate-only, the column default); aggression tuning is a separate content pass.
-        // `pickpocket_loot_id`/`skin_loot_id` are END-appended after `armor`.
-        // Trainer service columns, END-appended after `skin_loot_id`. Both parse to `u8` and fall to
-        // 0 on an absent or unparseable cell; for `trainer_class` that 0 is the fail-open "serves
-        // everyone" value. Not `num_or_zero`: it only rewrites an EMPTY cell and would splice a
-        // non-numeric one into the INSERT, aborting the statement.
         let trainer_type_val: u8 = field(&row, ct::TRAINER_TYPE).parse().unwrap_or(0);
         let trainer_class_val: u8 = field(&row, ct::TRAINER_CLASS).parse().unwrap_or(0);
         if trainer_class_val != 0 {
@@ -4656,42 +3739,19 @@ fn build_creature_templates(
     }
 }
 
-/// The legacy single-spell cast rows and the multi-spell rotation rows for the scope's casters.
 fn build_creature_cast_rows(
     dump: &str,
     entries: &std::collections::HashSet<u64>,
     spell_ids: Option<&std::collections::HashSet<u64>>,
 ) -> (Vec<String>, Vec<String>) {
-    // 2b) caster-mob cast rows (game_creature_cast, LEGACY) + rotation rows (game_creature_spell, rank 20).
-    //
-    //   LEGACY (game_creature_cast): one spell per entry (spell1), used by pass_cast as a fallback ONLY when
-    //   a creature has NO game_creature_spell rows. Kept for single-spell casters (no spell2+) so they are
-    //   byte-identical to the pre-rotation behaviour.
-    //
-    //   ROTATION (game_creature_spell): emitted for entries that carry spell2+ in creature_template_spells.
-    //   These creatures use the rotation path exclusively (pass_cast skips game_creature_cast when any
-    //   game_creature_spell rows exist for the entry). Rotation layout per entry:
-    //     • spell1 → condition ALWAYS (0), priority 10 — the primary nuke, always fires at the melee target.
-    //     • spell2..10 → condition SELF_MISSING_AURA (3), priority 20 — assumed to be self-buffs (e.g. Frost
-    //       Armor 12544 on entries 474/476); they fire FIRST (higher priority) when the buff is absent, then
-    //       fall silent once applied. If a spell2+ is actually an alternative nuke (same targets as spell1),
-    //       the self-cast will fail at resolve_cast_at target-type validation and the engine gracefully falls
-    //       through to spell1 — net behaviour is unchanged. Heals and debuffs need a reclassify pass (deferred
-    //       content tuning, not a code change).
-    //   With a client catalogue, derived cast rows retain only resolvable spell references.
-    //
-    // game_creature_spell condition discriminants (mirror module/src/creatures/spawn.rs cast_condition):
-    const COND_ALWAYS: u8 = 0; // unconditional — cast at melee target (nuke)
-    const COND_SELF_MISSING_AURA: u8 = 3; // cast at self when self lacks the spell's aura (buff)
+    const COND_ALWAYS: u8 = 0;
+    const COND_SELF_MISSING_AURA: u8 = 3;
 
     let mut creature_casts: Vec<String> = Vec::new();
-    // Explicit id counter for game_creature_spell (auto_inc field; we assign sequentially from 1 rather
-    // than relying on DB auto-assign, matching how game_trainer_spell works in this importer).
     let mut rotation_id: u64 = 1;
     let mut creature_rotation_rows: Vec<String> = Vec::new();
     for row in parse_table(dump, "creature_template_spells") {
         let entry: u64 = field(&row, cts::ENTRY).parse().unwrap_or(0);
-        // setId 0 = the creature's own (non-set) spell list; skip the (rare) shared-set rows.
         if field(&row, cts::SET_ID).parse::<u64>().unwrap_or(0) != 0 {
             continue;
         }
@@ -4700,14 +3760,12 @@ fn build_creature_cast_rows(
         }
         let spell1: u64 = field(&row, cts::SPELL1).parse().unwrap_or(0);
         if spell1 == 0 {
-            continue; // a row with no primary spell never casts — skip.
+            continue;
         }
-        // An unknown primary has no valid fallback; do not promote a secondary buff into its place.
         if spell_ids.is_some_and(|ids| !ids.contains(&spell1)) {
             eprintln!("casts: WARNING creature {entry} has unknown primary spell {spell1}; derived caster rows omitted");
             continue;
         }
-        // Collect non-zero spell2..spell10 (slots SPELL1+1 through SPELL1+9).
         let secondary: Vec<u64> = (1..=9)
             .filter_map(|i| {
                 let s: u64 = field(&row, cts::SPELL1 + i).parse().unwrap_or(0);
@@ -4720,19 +3778,13 @@ fn build_creature_cast_rows(
             .collect();
 
         if secondary.is_empty() {
-            // Single-spell caster: emit the legacy game_creature_cast row only.
             creature_casts.push(format!("({entry},{spell1})"));
         } else {
-            // Multi-spell caster: emit a FULL rotation into game_creature_spell (spell1 ALWAYS nuke +
-            // spell2+ SELF_MISSING_AURA buffs). The legacy game_creature_cast row is ALSO emitted so
-            // that a future re-import without rotation rows still has a working fallback.
             creature_casts.push(format!("({entry},{spell1})"));
-            // spell1: priority 10, ALWAYS (nuke at melee target).
             creature_rotation_rows.push(format!(
                 "({rotation_id},{entry},{spell1},10,{COND_ALWAYS},0)"
             ));
             rotation_id += 1;
-            // spell2+: priority 20 (fires before the nuke when the buff is absent), SELF_MISSING_AURA.
             for s in &secondary {
                 creature_rotation_rows.push(format!(
                     "({rotation_id},{entry},{s},20,{COND_SELF_MISSING_AURA},0)"
@@ -4755,25 +3807,13 @@ fn build_creature_cast_rows(
     (creature_casts, creature_rotation_rows)
 }
 
-/// The packed spawn payload the `import_creature_spawns` reducer loads.
 fn build_packed_spawn_payload(spawns: &[CreatureSpawnRow]) -> SpawnPayload {
-    // 3) spawn payload for the `import_creature_spawns` reducer — NOT SQL. `game_creature_spawn` has
-    //    Timestamp columns (respawn_at/despawn_at) and SpacetimeDB 2.5 SQL has no Timestamp literal,
-    //    so spawns load through a reducer (which stamps `ctx.timestamp`). Rows `;`-separated, fields
-    //    `,`: guid,entry,map,x,y,z,orientation,movement_type,respawn_secs. (u64 guids exceed JSON's safe-integer
-    //    range, so this is one delimited string — never a per-field JSON number that would lose precision.)
+    // Timestamp columns require reducer imports because SpacetimeDB SQL cannot write them.
     let guid_of: std::collections::HashMap<u64, u64> =
         spawns.iter().map(|s| (s.0, world_guid(s.1, s.0))).collect();
     let packed_spawns: String = spawns
         .iter()
         .map(|(db_guid, entry, x, y, z, o, mt, respawn_secs, map)| {
-            // `map` is the ROW's own map: an --include-map spawn (Deadmines 36)
-            // must land on ITS map, not the primary --map's. The dump Z rides through UNALTERED on
-            // every path: the importer NEVER snaps spawn Z to terrain (there is no ground_z here at
-            // all — runtime creature legs snap with a keep-current-Z fallback, module terrain.rs),
-            // Map 36 terrain remains absent because one height row cannot represent stacked floors,
-            // so a spawn keeps its floor-correct cmangos Z. Pinned by
-            // `include_map_spawns_import_whole_map_with_their_own_map_and_verbatim_z`.
             format!(
                 "{g},{entry},{map},{x},{y},{z},{o},{mt},{respawn_secs}",
                 g = world_guid(*entry, *db_guid),
@@ -4788,17 +3828,13 @@ fn build_packed_spawn_payload(spawns: &[CreatureSpawnRow]) -> SpawnPayload {
     }
 }
 
-/// The `game_creature_waypoint` rows for the imported spawns: guid-keyed routes first, then the
-/// entry-keyed template routes expanded onto every waypoint-typed spawn without one.
 fn build_waypoint_rows(
     dump: &str,
     spawns: &[CreatureSpawnRow],
     guid_of: &std::collections::HashMap<u64, u64>,
 ) -> Vec<String> {
-    // 4) waypoints for the imported spawns (id assigned by a counter — clear+reload is idempotent).
     let mut waypoints: Vec<String> = Vec::new();
     let mut wp_id: u64 = 1;
-    // Spawns that carry DIRECT (guid-keyed) rows — the template expansion below never overrides these.
     let mut direct_wp_guids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for row in parse_table(dump, "creature_movement") {
         let db_guid: u64 = field(&row, cm::ID).parse().unwrap_or(0);
@@ -4815,14 +3851,7 @@ fn build_waypoint_rows(
         direct_wp_guids.insert(db_guid);
         wp_id += 1;
     }
-    // 4b) creature_movement_template: ENTRY-keyed paths, expanded onto every
-    // in-slice MovementType=2 spawn of that entry that has NO direct rows (direct always wins).
-    // Waypoint Zs — like spawn Zs — ride through VERBATIM (no terrain snap exists in the importer;
-    // cmangos waypoints are floor-correct, which Map 36 needs while ground_z remains absent).
-    // Fail-open per row (a garbled row is skipped, the path just shortens) — waypoints are optional
-    // gating data (a pathless mob idles at its spawn), per the fail-open/fail-loud split (§5).
     {
-        // entry → [(point, x, y, z)] for PathId 0 (see `cmt`'s vintage sniff).
         let mut tmpl_paths: std::collections::HashMap<u64, Vec<(u32, String, String, String)>> =
             std::collections::HashMap::new();
         for row in parse_table(dump, "creature_movement_template") {
@@ -4833,7 +3862,7 @@ fn build_waypoint_rows(
             if row.len() >= cmt::NCOLS_WITH_PATH_ID
                 && field(&row, cmt::PATH_ID).parse::<u64>().unwrap_or(0) != 0
             {
-                continue; // non-default path — the module models one route per creature
+                continue;
             }
             let (pt_i, x_i, y_i, z_i) = cmt::pos_indices(row.len());
             let point: u32 = field(&row, pt_i).parse().unwrap_or(0);
@@ -4844,7 +3873,6 @@ fn build_waypoint_rows(
                 field(&row, z_i).to_string(),
             ));
         }
-        // Route order = the dump's Point column, not dump row order (defensive sort — cheap).
         for path in tmpl_paths.values_mut() {
             path.sort_by_key(|p| p.0);
         }
@@ -4852,14 +3880,14 @@ fn build_waypoint_rows(
         if !tmpl_paths.is_empty() {
             for (db_guid, entry, _x, _y, _z, _o, mt, _rs, _map) in spawns {
                 if *mt != 2 || direct_wp_guids.contains(db_guid) {
-                    continue; // not waypoint-typed, or already routed by direct rows
+                    continue;
                 }
                 let Some(path) = tmpl_paths.get(entry) else {
                     continue;
                 };
                 let Some(&g) = guid_of.get(db_guid) else {
                     continue;
-                }; // excluded entries have no guid
+                };
                 for (_pt, x, y, z) in path {
                     waypoints.push(format!("({wp_id},{g},{x},{y},{z})"));
                     wp_id += 1;
@@ -4876,15 +3904,7 @@ fn build_waypoint_rows(
     waypoints
 }
 
-/// The gameobject spawns the World Import Scope keeps, packed for the `import_gameobjects` reducer,
-/// with the classified template metadata they resolved against.
 fn collect_gameobject_spawns(dump: &str, scope: &WorldImportScope) -> GameobjectSpawns {
-    // Gameobjects (widened import): EVERY in-scope cmangos `gameobject_template` type
-    // now imports (template + spawn) — previously only an allowlisted subset (GOOBER/curated GATHER/
-    // curated CHEST/QUESTGIVER) did. `classify_go_type` decides the stored `type_id` (or drops the row
-    // — the TYPE-25 COLLISION GUARD); `go_template_row` then builds the per-type SQL row. The spawns
-    // load via the import_gameobjects reducer (game_gameobject has a Timestamp); the packed spawn row
-    // carries an `initial_state` field so a DOOR/BUTTON can spawn already-open.
     let go_tmpls = parse_table(dump, "gameobject_template");
     let mut dropped_type25: Vec<u64> = Vec::new();
     let go_meta: std::collections::HashMap<u64, GoMeta> = go_tmpls
@@ -4918,8 +3938,6 @@ fn collect_gameobject_spawns(dump: &str, scope: &WorldImportScope) -> Gameobject
             } else {
                 0
             };
-            // 0 on an unparseable/absent column — the gateway reads that as "no size stored" and
-            // sends 1.0, never an invisible prop.
             let size: f32 = field(row, got::SIZE).parse().unwrap_or(0.0);
             Some((
                 entry,
@@ -4937,17 +3955,11 @@ fn collect_gameobject_spawns(dump: &str, scope: &WorldImportScope) -> Gameobject
             ))
         })
         .collect();
-    // GOOBER entries (ALL, not just spawned) — kept for `build_quests`' USE_GAMEOBJECT objective gate
-    // below (a quest referencing a non-GOOBER or unimported GO entry
-    // is dropped rather than left stuck).
     let goober_entries: std::collections::HashSet<u64> = go_meta
         .iter()
         .filter(|(_, m)| m.stored_type == GO_GOOBER)
         .map(|(&e, _)| e)
         .collect();
-    // Spawn-membership test: widens this to EVERY classified template (previously a
-    // union of 4 allowlists) — the whole point of the widened import. `go_meta.get(&id)` below IS the
-    // membership test (a dropped/unclassified entry has no `go_meta` row).
     let mut go_packed_rows: Vec<String> = Vec::new();
     let mut used_go: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut go_slice_counts = vec![0usize; scope.bounded_slices.len()];
@@ -4962,21 +3974,17 @@ fn collect_gameobject_spawns(dump: &str, scope: &WorldImportScope) -> Gameobject
         let x: f64 = field(&row, go::X).parse().unwrap_or(0.0);
         let y: f64 = field(&row, go::Y).parse().unwrap_or(0.0);
         let z: f64 = field(&row, go::Z).parse().unwrap_or(0.0);
-        // Creature and GameObject rows consume the same scope predicate.
         if !scope.contains(map, x, y, z) {
             continue;
         }
         let db_guid: u64 = field(&row, go::GUID).parse().unwrap_or(0);
         let o: f64 = field(&row, go::O).parse().unwrap_or(0.0);
-        // The spawn quaternion — carried verbatim; 0,0,0,0 (a row with no rotation columns,
-        // or a genuinely-identity spawn) is a valid packed value, not a parse failure, so the
-        // fallback is `0.0` exactly like every other numeric field this loop parses.
+        // A zero quaternion is valid packed identity, not a signal to derive rotation from facing.
         let rot0: f64 = field(&row, go::ROT0).parse().unwrap_or(0.0);
         let rot1: f64 = field(&row, go::ROT1).parse().unwrap_or(0.0);
         let rot2: f64 = field(&row, go::ROT2).parse().unwrap_or(0.0);
         let rot3: f64 = field(&row, go::ROT3).parse().unwrap_or(0.0);
         let initial_state = go_initial_state(meta.stored_type, meta.data0);
-        // `m = map` (the row's own map, never args.map) — the packed-spawn precedent above.
         go_packed_rows.push(format!(
             "{g},{id},{m},{x},{y},{z},{o},{initial_state},{rot0},{rot1},{rot2},{rot3}",
             g = go_guid(db_guid),
@@ -5012,11 +4020,9 @@ fn collect_gameobject_spawns(dump: &str, scope: &WorldImportScope) -> Gameobject
     }
 }
 
-/// GameObject definitions for local spawns and accepted relay dependencies, plus chest loot IDs.
 struct GameobjectTemplateRows {
     templates: Vec<String>,
     traps: Vec<String>,
-    /// The only copy of a spawned stone's level range and dungeon area.
     meeting_stones: Vec<String>,
     chest_loot_ids: Vec<u32>,
 }
@@ -5032,7 +4038,6 @@ fn gameobject_template_rows(
         used_go,
         ..
     } = spawns;
-    // SQL INSERT must name every column; migration defaults do not apply to imported rows.
     let mut go_template_rows: Vec<String> = Vec::new();
     let mut go_trap_rows: Vec<String> = Vec::new();
     let mut go_meeting_stone_rows: Vec<String> = Vec::new();
@@ -5077,8 +4082,6 @@ fn gameobject_template_rows(
             chest_loot_ids_used.push(loot_id);
         }
     }
-    // Per-type coverage: loud so an operator sees exactly what a box pulled in, which
-    // types are LIVE (dispatched by `apply_use_gameobject`) vs INERT (template+spawn only, `use` no-ops).
     const GO_LIVE_TYPE_NAMES: &[(u8, &str)] = &[
         (GO_DOOR, "DOOR"),
         (GO_BUTTON, "BUTTON"),
@@ -5093,8 +4096,6 @@ fn gameobject_template_rows(
     );
     for (&type_id, &count) in &go_type_histogram {
         if type_id == GO_QUESTGIVER {
-            // Served by the quest-giver flow (game_gameobject_quest), not by `apply_use_gameobject` —
-            // neither LIVE (use-dispatched) nor INERT.
             eprintln!("  type {type_id:>2} QUESTGIVER {count} (quest flow, not use-dispatched)");
             continue;
         }
@@ -5125,25 +4126,13 @@ fn gameobject_template_rows(
     })
 }
 
-/// The `game_trainer_spell` rows for the scope's trainers: every cmangos offering, plus the
-/// synthesized profession learn-rows.
 fn build_trainer_spell_rows(
     dump: &str,
     entries: &std::collections::HashSet<u64>,
     profession_tier_values: &Option<std::collections::HashMap<u32, [u16; 4]>>,
 ) -> Vec<String> {
-    // Trainer spell lists: npc_trainer rows for the SPAWNED trainer creatures → game_trainer_spell
-    // (cmangos npc_trainer is all DIRECT entries — no template indirection). Lights up the trainer system.
-    // Two kinds of row are emitted:
-    //   1) CLASS-SPELL offerings — every npc_trainer row, verbatim, with learn_skill_line=0 (the unchanged
-    //      spell path; cmangos profession RECIPE rows (reqskill != 0) also ride here — their spells aren't
-    //      in game_spell so they're inert, exactly as before, but harmless).
-    //   2) SYNTHESIZED profession LEARN rows (PROFESSION_LEARN) — for each in-box trainer seen teaching one
-    //      of our 12 lines, the Apprentice→Artisan learn tiers with the REAL Spell.dbc id + learn_skill_line.
     let mut trainer_rows: Vec<String> = Vec::new();
     let mut trainer_id: u64 = 1;
-    // Per in-box trainer: the SkillLines it teaches (from reqskill != 0 rows) ∪ the spell ids it already
-    // offers (so a synthesized learn-row never collides with a class/recipe row for the SAME trainer).
     let mut trainer_lines: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>> =
         std::collections::BTreeMap::new();
     let mut trainer_spells: std::collections::HashMap<u64, std::collections::HashSet<u64>> =
@@ -5159,35 +4148,23 @@ fn build_trainer_spell_rows(
         }
         let cost: u64 = field(&row, nt::COST).parse().unwrap_or(0);
         let reqlevel: u32 = field(&row, nt::REQ_LEVEL).parse().unwrap_or(0);
-        // Record the profession lines this trainer teaches (reqskill matching one of our 12) + every spell
-        // id it offers, for the synthesis pass below (de-dup keyed on entry).
         let reqskill: u32 = field(&row, nt::REQ_SKILL).parse().unwrap_or(0);
         if profession_tiers(reqskill).is_some() {
             trainer_lines.entry(entry).or_default().insert(reqskill);
         }
         trainer_spells.entry(entry).or_default().insert(spell);
-        // CLASS-SPELL / recipe row: learn_skill_line=0, learn_skill_cap=75 — the unchanged spell path (the
-        // cap is ignored on a line-0 row but must be NAMED on the INSERT; the 75 matches the module's
-        // #[default(75u32)] so an explicit-INSERT row equals a migrated one).
         trainer_rows.push(format!(
             "({trainer_id},{entry},{spell},{cost},{reqlevel},0,75)"
         ));
         trainer_id += 1;
     }
-    // Synthesize the profession LEARN rows: for each in-box trainer teaching one of our 12 lines, emit
-    // the Apprentice→Artisan tiers (real Spell.dbc id → SMSG_LEARNED_SPELL resolves). cost 0 (the
-    // gossip-learn is free in vanilla). Skip a tier whose spell id already collides with a class/recipe
-    // row for THIS trainer (so a trainer can't double-insert the same spell_id). Every column is NAMED.
-    // The cap comes from the REAL client's SkillTiers.dbc data when
-    // --dbc was given (already parity-checked equal to LEGACY_TIER_CAPS above); without --dbc there's no
-    // client data to resolve, so it falls back to LEGACY_TIER_CAPS directly (documented fallback).
     let mut synthesized = 0usize;
     for (entry, lines) in &trainer_lines {
-        let offered = trainer_spells.get(entry); // the trainer's existing spell ids (de-dup guard)
+        let offered = trainer_spells.get(entry);
         for line in lines {
             for &(spell, tier_index, req) in profession_tiers(*line).unwrap() {
                 if offered.is_some_and(|s| s.contains(&(spell as u64))) {
-                    continue; // a class/recipe row already carries this spell_id for this trainer
+                    continue;
                 }
                 let cap = profession_tier_values
                     .as_ref()
@@ -5210,27 +4187,19 @@ fn build_trainer_spell_rows(
     trainer_rows
 }
 
-/// The pickpocket / skinning / gameobject(chest) / fishing loot rows, all off one parse of the
-/// shared reference-pool table.
 fn build_loot_family_rows(
     dump: &str,
     creature_pickpocket_ids: &std::collections::HashMap<u64, u64>,
     creature_skin_ids: &std::collections::HashMap<u64, u64>,
     chest_loot_ids_used: &[u32],
 ) -> LootFamilyRows {
-    // Loot-family completeness: pickpocket / skinning / gameobject(chest) / fishing.
-    // `refs` (the reference_loot_template pool map) is parsed ONCE here and shared by all four —
-    // `parse_creature_drops` above already parsed its own copy for the creature family; a second parse
-    // for these four is the same low-cost tradeoff this importer already accepts (content-slice sized).
     let refs = parse_ref_pools(dump);
 
-    // PICKPOCKET: keyed directly on CREATURE ENTRY (PickpocketLootId collapsed like LootId), scoped to
-    // in-slice creatures only (`creature_pickpocket_ids` is already restricted to `entries`).
     let drops_by_pickpocketid = parse_loot_family(dump, "pickpocketing_loot_template", &refs);
     let mut pickpocket_rows: Vec<String> = Vec::new();
     let mut pickpocket_row_id: u64 = 1;
     let mut pp_creatures: Vec<(&u64, &u64)> = creature_pickpocket_ids.iter().collect();
-    pp_creatures.sort(); // deterministic id assignment across re-imports
+    pp_creatures.sort();
     for (creature_entry, pp_loot_id) in pp_creatures {
         let Some(drops) = drops_by_pickpocketid.get(pp_loot_id) else {
             continue;
@@ -5241,9 +4210,6 @@ fn build_loot_family_rows(
         }
     }
 
-    // SKINNING: keyed on skin_loot_id DIRECTLY (NOT collapsed onto creature_entry — several creatures of
-    // the same level band share ONE table). Scope: the distinct skin_loot_ids actually used by in-slice
-    // creatures.
     let drops_by_skinid = parse_loot_family(dump, "skinning_loot_template", &refs);
     let mut skin_ids_used: Vec<u64> = creature_skin_ids.values().copied().collect();
     skin_ids_used.sort_unstable();
@@ -5255,8 +4221,6 @@ fn build_loot_family_rows(
             continue;
         };
         for &(item, chance_bp, count, group_id, _quest_only) in drops {
-            // game_skinning_loot carries no quest_only column (module doc: no cmangos skinning row is
-            // ever quest-gated) — discarded here, not emitted.
             skinning_rows.push(format!(
                 "({skinning_row_id},{skin_id},{item},{chance_bp},{count},{group_id})"
             ));
@@ -5264,9 +4228,6 @@ fn build_loot_family_rows(
         }
     }
 
-    // GAMEOBJECT (CHEST) loot: keyed on loot_id = the REAL `gameobject_template.Data1` (see `chest_meta`
-    // above). Scoped to the lootIds actually used by CHESTs spawned in this box (`chest_loot_ids_used`)
-    // — GATHER nodes never touch this table (they stay on the hardcoded GATHER_NODES grant).
     let drops_by_goloot = parse_loot_family(dump, "gameobject_loot_template", &refs);
     let mut go_loot_ids_used: Vec<u32> = chest_loot_ids_used.to_vec();
     go_loot_ids_used.sort_unstable();
@@ -5285,11 +4246,6 @@ fn build_loot_family_rows(
         }
     }
 
-    // FISHING: ZONE-keyed (`entry` IS an AreaTable zone id — no creature/GO indirection to scope by).
-    // Imported WHOLE — the same "harmless superset" precedent `item_template` already rides (P4, above):
-    // an out-of-slice zone's rows are simply unreachable at roll time (`fishing_zone_id` never resolves a
-    // zone we didn't import terrain+AreaTable coverage for), not a dangling-reference risk the way an
-    // unscoped creature/GO loot import would be.
     let drops_by_zone = parse_loot_family(dump, "fishing_loot_template", &refs);
     let mut fishing_rows: Vec<String> = Vec::new();
     let mut fishing_row_id: u64 = 1;
@@ -5297,7 +4253,6 @@ fn build_loot_family_rows(
     zones.sort();
     for zone in zones {
         for &(item, chance_bp, count, group_id, _quest_only) in &drops_by_zone[zone] {
-            // game_fishing_loot carries no quest_only column — discarded, not emitted.
             fishing_rows.push(format!(
                 "({fishing_row_id},{zone},{item},{chance_bp},{count},{group_id})"
             ));
@@ -5329,7 +4284,6 @@ fn build_loot_family_rows(
     }
 }
 
-/// The creature / item / loot / gossip clear+reload blocks, each behind its own family gate.
 fn push_world_content_statements(args: &Args, content: MappedContent, stmts: &mut Vec<String>) {
     let MappedContent {
         templates,
@@ -5407,10 +4361,7 @@ fn push_world_content_statements(args: &Args, content: MappedContent, stmts: &mu
     }
 
     if family_active(args, "gossip") {
-        // RESERVED RANGES: the ETL owns only the low id bands (it emits dense low ids); a
-        // PACKAGE that mints its own gossip (e.g. the dynamic-events guard) uses the high bands —
-        // menu.entry ≥ 1_000_000 (above every real creature entry), and option.row_id / text_id /
-        // slot.id ≥ 50_000 — so a routine import never wipes package rows. Documented in danger-zones.
+        // Base gossip reloads preserve menu entries >= 1_000_000 and row/text ids >= 50_000.
         stmts.push("DELETE FROM game_gossip_menu_profile_option WHERE row_id > 0".into());
         stmts.push("DELETE FROM game_gossip_menu_profile WHERE menu_id > 0".into());
         stmts.push("DELETE FROM game_gossip_menu WHERE entry > 0 AND entry < 1000000".into());
@@ -5451,7 +4402,6 @@ fn push_world_content_statements(args: &Args, content: MappedContent, stmts: &mu
     }
 }
 
-/// The quest / gameobject-template / trainer clear+reload blocks, each behind its own family gate.
 fn push_quest_and_gameobject_statements(
     args: &Args,
     content: MappedContent,
@@ -5466,9 +4416,6 @@ fn push_quest_and_gameobject_statements(
         trainer_rows,
         ..
     } = content;
-    // Quests: clear+reload the static quest tables (header / body text / objectives / cast objectives /
-    // reward items / creature giver relations / gameobject giver relations / reward mail / mail loot).
-    // game_character_quest (per-player progress) is born in the accept reducer, never here.
     if family_active(args, "quests") {
         stmts.push("DELETE FROM game_quest_template WHERE entry > 0".into());
         stmts.push("DELETE FROM game_quest_text WHERE quest_entry > 0".into());
@@ -5544,8 +4491,6 @@ fn push_quest_and_gameobject_statements(
         );
     }
 
-    // GOOBER gameobject templates (family "gameobjects" — no-Timestamp → plain SQL clear+reload).
-    // The gameobject SPAWNS load separately via the import_gameobjects reducer below (also family-gated).
     if family_active(args, "gameobjects") {
         stmts.push("DELETE FROM game_gameobject_trap WHERE entry > 0".into());
         stmts.push("DELETE FROM game_meeting_stone WHERE entry > 0".into());
@@ -5564,7 +4509,6 @@ fn push_quest_and_gameobject_statements(
             go_meeting_stone_rows,
         );
     }
-    // Trainer spell lists (family "trainers").
     if family_active(args, "trainers") {
         stmts.push("DELETE FROM game_trainer_spell WHERE id > 0".into());
         push_insert(
@@ -5576,7 +4520,6 @@ fn push_quest_and_gameobject_statements(
     }
 }
 
-/// The caster-mob rotation and EventAI clear+reload blocks, each behind its own family gate.
 fn push_creature_behaviour_statements(
     args: &Args,
     content: MappedContent,
@@ -5589,8 +4532,6 @@ fn push_creature_behaviour_statements(
         quest_event_requirements,
         ..
     } = content;
-    // Caster-mob cast + rotation rows (family "casts"). The primary-key is creature_entry, so clear ALL
-    // rows then reload the in-box set (importer-owned).
     if family_active(args, "casts") {
         stmts.push("DELETE FROM game_creature_cast WHERE creature_entry > 0".into());
         push_insert(
@@ -5599,10 +4540,6 @@ fn push_creature_behaviour_statements(
             "creature_entry,spell_id",
             creature_casts,
         );
-        // Rotation rows (game_creature_spell, rank 20): multi-spell casters use these instead of (or in
-        // addition to) game_creature_cast. Clear ALL rows first (same pattern as game_creature_cast: the
-        // importer owns this table, and an in-box re-import is a full reload). Then re-seed from
-        // creature_rotation_rows assembled above.
         stmts.push("DELETE FROM game_creature_spell WHERE id > 0".into());
         push_insert(
             stmts,
@@ -5642,7 +4579,6 @@ fn push_creature_behaviour_statements(
             &eventai.summon_rows,
         );
     }
-    // Event credit is part of the shared quest completion rule, even on another World Shard.
     if quest_events_active {
         push_insert(
             stmts,
@@ -5653,18 +4589,7 @@ fn push_creature_behaviour_statements(
     }
 }
 
-/// The two global (not box-scoped) families. Returns their row counts for the provenance stamps.
 fn push_global_statements(args: &Args, dump: &str, stmts: &mut Vec<String>) -> Result<(u64, u64)> {
-    // P3: the class/level stat curve + P1: all-(race,class) start positions + 209: graveyard-zone
-    // links (all global, plain SQL, not box-scoped) + Character creation spells, actions, and items
-    // + Area Trigger dungeon portals.
-    // Family "globals": not box-scoped, but its own clear+reload — gated too, so `--family quests`
-    // reloads QUESTS ALONE (not quests-plus-globals). No other family's builder reads these outputs, so
-    // gating their compute too (not just the push) is safe — unlike the entangled quests/items pair.
-    // Area-trigger teleports ride "globals" rather than a new dedicated family: `game_areatrigger_teleport` is a small
-    // world-wide reference table with the exact same shape as `game_graveyard_zone` right next to it
-    // (global, own clear+reload, nothing else in this function reads its output) — no new family value
-    // earns its keep for one more small table.
     let mut globals_row_count = 0u64;
     if family_active(args, "globals") {
         let stats_sql = build_stats_sql(dump);
@@ -5675,14 +4600,6 @@ fn push_global_statements(args: &Args, dump: &str, stmts: &mut Vec<String>) -> R
         let createinfo_item_sql = build_createinfo_item_sql(dump, args.dbc.as_deref())?;
         let (areatrigger_teleport_sql, areatrigger_teleport_count) =
             build_areatrigger_teleport_sql(dump);
-        // Count DATA ROWS, not statements: these builders return DELETE + batched-INSERT
-        // statement lists (push_insert packs up to 500 rows per INSERT), so `.len()` would
-        // under-report by the batch factor and defeat the provenance stamp's purpose.
-        // `areatrigger_teleport_count` is added as its OWN pre-counted `usize`, not via
-        // `insert_row_count` — that helper is "only sound for numeric-payload tables" (its own doc
-        // comment), and `game_areatrigger_teleport.name` is free text that could (in principle)
-        // contain the `),(` tuple separator `insert_row_count` scans for; `build_areatrigger_teleport_sql`
-        // already counts its own rows correctly before formatting them into SQL.
         globals_row_count = insert_row_count(&stats_sql)
             + insert_row_count(&start_pos_sql)
             + insert_row_count(&graveyard_sql)
@@ -5699,12 +4616,6 @@ fn push_global_statements(args: &Args, dump: &str, stmts: &mut Vec<String>) -> R
         stmts.extend(areatrigger_teleport_sql);
     }
 
-    // Spell metadata (family "spellmeta", reduced scope): rank chain, auto-learn
-    // dependents, and the proc overlay. Not box-scoped (global, like "globals"), plain SQL (no
-    // Timestamp). Every one of them is map-independent, so they land on the same destinations the
-    // spell catalogue does. Nothing else in this function reads any builder's output, so — unlike the
-    // entangled quests/items pair — it's safe to gate the COMPUTE too, not just the push (the
-    // "globals" precedent).
     let mut spellmeta_row_count = 0u64;
     if family_active(args, "spellmeta") {
         let links = args
@@ -5731,8 +4642,6 @@ fn push_global_statements(args: &Args, dump: &str, stmts: &mut Vec<String>) -> R
     Ok((globals_row_count, spellmeta_row_count))
 }
 
-/// One provenance stamp per family that actually had its block pushed — mirroring exactly the
-/// `family_active` gates the push helpers used.
 fn family_stamps(
     args: &Args,
     content: MappedContent,
@@ -5759,9 +4668,6 @@ fn family_stamps(
         quest_event_requirements,
         ..
     } = content;
-    // Provenance stamps: one entry per family that ACTUALLY had its block pushed
-    // above — mirrors exactly the `family_active` gates this function used, so a stamp only ever
-    // corresponds to data this run's plan actually carries.
     let mut stamps: Vec<(&'static str, u64)> = Vec::new();
     if family_active(args, "creatures") {
         stamps.push(("creatures", templates.len() as u64));
@@ -5841,54 +4747,38 @@ fn run_full_world_catalogues(dump: &str, args: &Args) -> Result<()> {
 fn main() -> Result<()> {
     let args = parse_args()?;
 
-    // `--pack-client` → build the client patch MPQ + install addons into the operator's own client.
-    // Standalone mode (independent of the cmangos/DBC import streams).
     if let Some(dir) = args.pack_client.clone() {
         return pack_client::run(&dir, &args);
     }
 
-    // `--pack-out` → write the package-authored client content into a plain directory. Reads no
-    // client at all.
     if let Some(dir) = args.pack_out.clone() {
         return pack_client::run_pack_out(&dir);
     }
 
-    // `--terrain` → the ADT heightmap stream (standalone, like --pack-client; see terrain.rs).
     if args.terrain.is_some() {
         return terrain::run(&args);
     }
 
-    // `--dump-collision` → the spike: WMO/M2 collision-geometry dry-run (see collision.rs).
     if args.dump_collision.is_some() {
         return collision::run(&args);
     }
 
-    // `--nav` → the nav-grid rasterizer (see nav.rs).
     if args.nav.is_some() {
         return nav::run(&args);
     }
 
-    // `--vmap` → the/ exact vmap triangle extract + pack + import (see vmap.rs).
     if args.vmap.is_some() || args.vmap_status {
         return vmap::run(&args);
     }
 
-    // `--vmap-prepare-coverage <generation_id>` → derive path-grid coverage from an already-staged
-    // generation's own geometry (see vmap.rs::run_coverage).
     if let Some(generation_id) = args.vmap_prepare_coverage {
         return vmap::run_coverage(&args, generation_id);
     }
 
-    // `--go-models` → DOOR/BUTTON display → M2 bounding-mesh extract + import (see go_model.rs).
-    // Reads `--dump` itself (`parse_args` requires both), so it dispatches before the cmangos ETL
-    // pass below consumes `args.dump`.
     if args.go_models.is_some() {
         return go_model::run(&args);
     }
 
-    // `--dbc` alone → standalone DBC mode (proof/checks), OR `--dbc --spells` → the Spell.dbc importer,
-    // OR `--dbc --talents` → the TalentTab.dbc/Talent.dbc importer. With `--dump`, the DBC dir instead
-    // enriches the cmangos templates (display-derived scale) below, so fall through to the cmangos path.
     if args.dump.is_none() {
         let dir = args
             .dbc
@@ -5912,16 +4802,10 @@ fn main() -> Result<()> {
         .expect("parse_args guarantees --dump here");
     let dump = read_dump(&dump_path)?;
 
-    // `--print-extents` → derive the operator's OWN spawn bbox for --map and STOP (write nothing).
-    // This is how the operator computes the exact --box rectangle for a new zone instead of eyeballing
-    // it from memory (the Westfall widening needed this the ETL didn't have before).
     if args.print_extents {
         return print_extents(&dump, args.map, args.bbox);
     }
 
-    // Optional DBC scale resolution: cmangos creature_template.Scale==0 means "use the client's
-    // CreatureDisplayInfo scale". Without it those creatures load at scale_x=0 (invisible). With
-    // --dbc we resolve them; without, they fall back to 1.0 (see the template loop).
     let display_scales: Option<std::collections::HashMap<u32, f32>> = match &args.dbc {
         Some(dir) => {
             let m = dbc::load_display_scales(dir)?;
@@ -5934,12 +4818,6 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    // Optional profession tier-cap resolution: SkillRaceClassInfo.dbc + SkillTiers.dbc
-    // give the REAL Apprentice→Artisan caps per profession skill line — checked immediately against
-    // `LEGACY_TIER_CAPS` (`assert_profession_tier_parity`, bailing loudly on any disagreement) before the
-    // trainer-synthesis pass below ever runs. Without --dbc there's no client data to check against, so
-    // the synthesis loop falls back to the legacy literal caps directly (documented fallback, no parity
-    // guard possible — see LEGACY_TIER_CAPS).
     let profession_tier_values: Option<std::collections::HashMap<u32, [u16; 4]>> = match &args.dbc {
         Some(dir) => {
             let m = dbc::profession_tier_values(dir)?;
@@ -6003,8 +4881,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // The spawn-batch emptiness check only matters when creatures are actually being (re)loaded this
-    // run — `--family quests` (etc.) on a box with zero matched spawns is a legitimate (if unusual) run.
     if family_active(&args, "creatures") && plan.spawn_batches.is_empty() {
         bail!("no spawns matched the filter — check --box / --radius / --center");
     }
@@ -6015,17 +4891,12 @@ fn main() -> Result<()> {
     }
     eprintln!("import applied.");
 
-    // Provenance stamps: `plan.stamps` already carries exactly the families whose
-    // block was pushed (see `build_dump_plan`) — stamp each one now that the apply above succeeded.
     let file_hash = sha256_hex(dump.as_bytes())?;
     for (family, row_count) in &plan.stamps {
         stamp_family(&args, family, &args.source_sha, &file_hash, *row_count)
             .with_context(|| format!("stamp_import_meta({family})"))?;
     }
 
-    // The Package Delta stage, last, one family at a time: each family's base rows are back and
-    // stamped, so every enabled Package's claims go on top of them (mirrors
-    // `spell::run_spells`'s placement).
     for family in FAMILIES {
         run_package_stage(&args, family)?;
     }
@@ -6042,8 +4913,8 @@ mod tests {
         let rows = parse_table(dump, "creature_template");
         assert_eq!(rows.len(), 2);
         assert_eq!(field(&rows[0], 0), "1");
-        assert_eq!(field(&rows[0], 1), "A, the Bold"); // comma inside the quoted name kept
-        assert_eq!(field(&rows[0], 2), "Sub's"); // \' unescaped
+        assert_eq!(field(&rows[0], 1), "A, the Bold");
+        assert_eq!(field(&rows[0], 2), "Sub's");
         assert_eq!(field(&rows[0], 3), "5");
         assert_eq!(field(&rows[1], 2), "NULL");
     }
@@ -6051,9 +4922,9 @@ mod tests {
     #[test]
     fn world_guid_is_highguid_unit_encoded_and_unique_per_spawn() {
         let g = world_guid(299, 42);
-        assert_eq!(g >> 48, HIGHGUID_UNIT); // high bits mark a creature for the client
-        assert_eq!((g >> 24) & 0xFF_FFFF, 299); // entry in the middle
-        assert_eq!(g & 0xFF_FFFF, 42); // spawn db-guid in the low bits
+        assert_eq!(g >> 48, HIGHGUID_UNIT);
+        assert_eq!((g >> 24) & 0xFF_FFFF, 299);
+        assert_eq!(g & 0xFF_FFFF, 42);
         assert_ne!(world_guid(299, 42), world_guid(299, 43));
     }
 
@@ -6064,19 +4935,16 @@ mod tests {
 
     #[test]
     fn gather_nodes_map_is_well_formed() {
-        // Lookup resolves the Copper Vein (mining) + Peacebloom (herb) anchors and rejects a non-node.
-        assert_eq!(gather_node(1731), Some((186, 2770, 1, 100))); // Copper Vein → Mining, Copper Ore, req 1, gray 100
-        assert_eq!(gather_node(1618), Some((182, 2447, 1, 75))); // Peacebloom → Herbalism, Peacebloom, req 1, gray 75
-        assert_eq!(gather_node(1732), Some((186, 2771, 65, 140))); // Tin Vein → Mining, Tin Ore, req 65, gray 140
-        assert_eq!(gather_node(106318), None); // Battered Chest (a treasure chest) is NOT a gather node
-        assert_eq!(gather_node(153453), None); // Solid Chest is NOT a gather node
+        assert_eq!(gather_node(1731), Some((186, 2770, 1, 100)));
+        assert_eq!(gather_node(1618), Some((182, 2447, 1, 75)));
+        assert_eq!(gather_node(1732), Some((186, 2771, 65, 140)));
+        assert_eq!(gather_node(106318), None);
+        assert_eq!(gather_node(153453), None);
         assert_eq!(gather_node(0), None);
-        // No duplicate GO entries (a dup would emit two templates for one entry → INSERT pk clash).
         let mut entries: Vec<u64> = GATHER_NODES.iter().map(|n| n.0).collect();
         entries.sort_unstable();
         let dups = entries.windows(2).filter(|w| w[0] == w[1]).count();
         assert_eq!(dups, 0, "GATHER_NODES has a duplicate GO entry");
-        // Every node uses a real gather skill (MINING 186 / HERBALISM 182) and grants a real item entry.
         for &(entry, skill, item, _req, _gray) in GATHER_NODES {
             assert!(
                 skill == 186 || skill == 182,
@@ -6086,73 +4954,50 @@ mod tests {
         }
     }
 
-    // ---- widened GO import, classifier, per-type row builder, TYPE-25 guard ----
-
     #[test]
     fn classify_go_type_remaps_gather_and_passes_everything_else_through_identity() {
-        // A GATHER_NODES entry (real cmangos type 3, a "locked CHEST" in cmangos' own model) remaps to
-        // the synthetic 25 marker — this is the ONLY entry point that ever produces stored type 25.
-        assert_eq!(classify_go_type(1731, 3), Some(GO_GATHER)); // Copper Vein
-                                                                // A type-3 entry NOT in GATHER_NODES is a real CHEST now (the widened import used
-                                                                // to require the TREASURE_CHESTS allowlist; ANY chest imports today).
+        assert_eq!(classify_go_type(1731, 3), Some(GO_GATHER));
         assert_eq!(classify_go_type(999_999, 3), Some(GO_CHEST));
-        assert_eq!(classify_go_type(106318, 3), Some(GO_CHEST)); // Battered Chest
-                                                                 // DOOR/BUTTON/QUESTGIVER/GOOBER pass through identity (this repo's ids match cmangos' here).
+        assert_eq!(classify_go_type(106318, 3), Some(GO_CHEST));
         assert_eq!(classify_go_type(1, 0), Some(GO_DOOR));
         assert_eq!(classify_go_type(2, 1), Some(GO_BUTTON));
         assert_eq!(classify_go_type(3, 2), Some(GO_QUESTGIVER));
         assert_eq!(classify_go_type(4, 10), Some(GO_GOOBER));
-        // An unhandled-but-in-scope type (e.g. 8 SPELL_FOCUS, 6 TRAP, 19 MAILBOX) imports INERT —
-        // identity passthrough, not a drop.
         assert_eq!(classify_go_type(5, 8), Some(8));
         assert_eq!(classify_go_type(6, 19), Some(19));
     }
 
     #[test]
     fn classify_go_type_25_collision_guard_drops_a_real_fishinghole_but_not_a_gather_node() {
-        // THE load-bearing case: cmangos' REAL type 25 (GAMEOBJECT_TYPE_FISHINGHOLE) must NEVER be
-        // stored as module type 25 (the synthetic GATHER marker) — it is dropped from import entirely.
         assert_eq!(
             classify_go_type(70000, 25),
             None,
             "a real FISHINGHOLE (type 25) must be dropped"
         );
-        // A GATHER_NODES entry stays classified as GATHER even though its STORED type (25) numerically
-        // equals the guarded raw type — because the raw type it actually carries in the dump is 3, not
-        // 25 (the guard only fires on the RAW type; the two paths never collide in practice).
         assert_eq!(classify_go_type(1731, 3), Some(GO_GATHER));
-        // A non-gather, non-fishinghole entry is unaffected by the guard.
         assert_eq!(classify_go_type(70001, 3), Some(GO_CHEST));
     }
 
     #[test]
     fn go_template_row_carries_lock_id_per_type_and_widens_chest_loot() {
-        // CHEST: dump data0 (lockId) -> template lock_id column; dump data1 (lootId) -> template data1,
-        // AND is returned as the "fold into chest_loot_ids_used" value (widened to EVERY chest now).
         let (row, loot_used) =
             go_template_row(106318, GO_CHEST, 259, "Battered Chest", 4242, 2277, 1.0);
         assert_eq!(row, "(106318,3,259,'Battered Chest',0,2277,0,0,0,4242,1)");
         assert_eq!(loot_used, Some(2277));
-        // A CHEST with lootId 0 (unimported drop table, or the seed/demo chest) does NOT get folded in.
         let (_, none_used) = go_template_row(1, GO_CHEST, 1, "No Loot Chest", 0, 0, 1.0);
         assert_eq!(none_used, None);
-        // DOOR/BUTTON: dump data1 (lockId) -> template lock_id column (data0 [startOpen] does NOT ride
-        // the template — it feeds the SPAWN row's initial state instead, see `go_initial_state`).
         let (door_row, door_loot) =
             go_template_row(2000, GO_DOOR, 100, "Stormwind Gate", 1, 555, 1.0);
         assert_eq!(door_row, "(2000,0,100,'Stormwind Gate',0,0,0,0,0,555,1)");
         assert_eq!(door_loot, None);
         let (button_row, _) = go_template_row(2001, GO_BUTTON, 101, "Lever", 0, 777, 1.0);
         assert_eq!(button_row, "(2001,1,101,'Lever',0,0,0,0,0,777,1)");
-        // GOOBER: dump data0 (lockId) -> template lock_id column.
         let (goober_row, _) =
             go_template_row(3000, GO_GOOBER, 200, "Suspicious Lever", 888, 999, 1.0);
         assert_eq!(
             goober_row,
             "(3000,10,200,'Suspicious Lever',0,0,0,0,0,888,1)"
         );
-        // GATHER: unaffected by lock_id (always 0) — the existing gather-row shape, now with a 10th
-        // (lock_id) + 11th (size) column appended. A node's sub-1.0 size rides through verbatim.
         let (gather_row, gather_loot) =
             go_template_row(1731, GO_GATHER, 259, "Copper Vein", 0, 0, 0.5);
         assert_eq!(
@@ -6160,7 +5005,6 @@ mod tests {
             "(1731,25,259,'Copper Vein',2770,1,186,300,100,0,0.5)"
         );
         assert_eq!(gather_loot, None);
-        // A quest giver has no type payload. A spell focus preserves its id and radius.
         let (qg_row, _) = go_template_row(4000, GO_QUESTGIVER, 50, "Wanted Poster", 1, 2, 0.0);
         assert_eq!(qg_row, "(4000,2,50,'Wanted Poster',0,0,0,0,0,0,0)");
         let (inert_row, _) = go_template_row(5000, 8, 60, "Spell Focus", 3, 4, 1.75);
@@ -6169,21 +5013,16 @@ mod tests {
 
     #[test]
     fn go_initial_state_opens_only_a_started_open_door_or_button() {
-        // DOOR/BUTTON with a nonzero startOpen (dump data0) spawn OPEN (state 1).
         assert_eq!(go_initial_state(GO_DOOR, 1), 1);
         assert_eq!(go_initial_state(GO_BUTTON, 1), 1);
-        // DOOR/BUTTON with startOpen == 0 spawn CLOSED (state 0).
         assert_eq!(go_initial_state(GO_DOOR, 0), 0);
         assert_eq!(go_initial_state(GO_BUTTON, 0), 0);
-        // Every OTHER type always spawns state 0 regardless of data0 (data0 means something else there
-        // — e.g. a CHEST's data0 is its lockId, not a startOpen flag).
         assert_eq!(go_initial_state(GO_CHEST, 1), 0);
         assert_eq!(go_initial_state(GO_GOOBER, 1), 0);
         assert_eq!(go_initial_state(GO_GATHER, 1), 0);
         assert_eq!(go_initial_state(GO_QUESTGIVER, 1), 0);
     }
 
-    /// The Deadmines stone is level 15 to 20 for area 1581.
     #[test]
     fn gameobject_family_emits_one_meeting_stone_row_per_spawned_stone() {
         let dump = "INSERT INTO `gameobject_template` VALUES \
@@ -6263,10 +5102,6 @@ mod tests {
 
     #[test]
     fn cr_columns_map_spawn_time_and_movement_type() {
-        // Creature (spawn) row layout, guid,id,map,spawnMask,x,y,z,o,
-        // spawntimesecsmin,spawntimesecsmax,spawndist,MovementType — verify the column CONSTANTS
-        // actually land on the cmangos min-respawn-seconds and MovementType fields, not neighbors
-        // (a silent off-by-one here would misread every imported creature's respawn timer).
         let dump = "x INSERT INTO `creature` VALUES (1,299,0,1,10.0,20.0,30.0,1.5,180,300,0,2); y";
         let rows = parse_table(dump, "creature");
         assert_eq!(rows.len(), 1);
@@ -6277,8 +5112,6 @@ mod tests {
         assert_eq!(field(&rows[0], cr::O), "1.5");
         assert_eq!(field(&rows[0], cr::SPAWN_TIME_SECS_MIN), "180");
         assert_eq!(field(&rows[0], cr::MOVEMENT_TYPE), "2");
-        // Absent/garbage spawntimesecsmin parses as the "not imported" sentinel (0), which the module
-        // reads as "fall back to the flat legacy respawn timer" (see CreatureSpawn::respawn_secs).
         let dump_missing = "x INSERT INTO `creature` VALUES (1,299,0,1,10.0,20.0,30.0,1.5); y";
         let rows_missing = parse_table(dump_missing, "creature");
         let respawn_secs: u32 = field(&rows_missing[0], cr::SPAWN_TIME_SECS_MIN)
@@ -6289,21 +5122,16 @@ mod tests {
 
     #[test]
     fn compute_extents_derives_min_max_xyz_and_count_for_the_target_map_only() {
-        // --print-extents derives the operator's real --box from THEIR dump. Three
-        // spawns on map 0 (min/max should span them) + one on map 1 (must be excluded).
         let dump = "x INSERT INTO `creature` VALUES \
             (1,100,0,1,-11000.0,1000.0,10.0,0,300,300,0,0),\
             (2,101,0,1,-9000.0,-500.0,50.0,0,300,300,0,0),\
             (3,102,0,1,-10000.0,2000.0,-5.0,0,300,300,0,0),\
             (4,103,1,1,0.0,0.0,0.0,0,300,300,0,0); y";
         let e = compute_extents(dump, 0, None).expect("map 0 has spawns");
-        assert_eq!(e.count, 3); // the map-1 row is excluded
+        assert_eq!(e.count, 3);
         assert_eq!(e.min, (-11000.0, -500.0, -5.0));
         assert_eq!(e.max, (-9000.0, 2000.0, 50.0));
-        // A map with no spawns at all reports None (nothing to derive a box from).
         assert!(compute_extents(dump, 7, None).is_none());
-        // Map 1's extents are derived from the MAP-1 rows alone, a second continent's box
-        // comes out of the same one code path, never out of the map-0 numbers.
         let k = compute_extents(dump, 1, None).expect("map 1 has one spawn");
         assert_eq!(
             (k.count, k.min, k.max),
@@ -6313,10 +5141,6 @@ mod tests {
 
     #[test]
     fn compute_extents_narrows_to_a_candidate_box_and_anchors_center_on_a_real_spawn() {
-        // a whole continent's extents ARE the continent, so deriving a starting-zone box is
-        // iterate-and-narrow — pass a rough rectangle and read back the true in-box extents + count.
-        // The anchor is the in-box spawn nearest the rectangle centre: a REAL cmangos ground point, so
-        // it is always a valid `--center` for the terrain interpolate / nav walkability self-checks.
         let dump = "x INSERT INTO `creature` VALUES \
             (1,100,1,1,-600.0,-4200.0,38.0,0,300,300,0,0),\
             (2,101,1,1,-500.0,-4100.0,40.0,0,300,300,0,0),\
@@ -6330,17 +5154,12 @@ mod tests {
         );
         assert_eq!(e.min, (-600.0, -4200.0, 38.0));
         assert_eq!(e.max, (-500.0, -4100.0, 40.0));
-        // Rectangle centre is (-550,-4150) — spawn 3 sits exactly on it, Z carried verbatim.
         assert_eq!(e.anchor, (-550.0, -4150.0, 39.0));
-        // A candidate box with nothing in it reports None rather than an empty/infinite rectangle.
         assert!(compute_extents(dump, 1, Some((0.0, 100.0, 0.0, 100.0))).is_none());
     }
 
     #[test]
     fn start_positions_are_listed_for_the_requested_map_only() {
-        // The printed starting-zone anchors come from the dump's OWN playercreateinfo, which
-        // is how a Kalimdor box gets drawn around Valley of Trials instead of around a remembered
-        // coordinate. Human(1) is map 0; Orc(2)/Tauren(6) are map 1.
         let dump = "x INSERT INTO `playercreateinfo` VALUES \
             (1,1,0,12,-8949.95,-132.493,83.5312,0),\
             (2,1,1,14,-618.518,-4251.67,38.718,0),\
@@ -6365,16 +5184,12 @@ mod tests {
 
     #[test]
     fn sql_text_collapses_null_token_to_empty() {
-        assert_eq!(sql_text("NULL"), "''"); // cmangos `NULL` subname → empty, not the text "NULL"
+        assert_eq!(sql_text("NULL"), "''");
         assert_eq!(sql_text("Weaponsmith"), "'Weaponsmith'");
     }
 
     #[test]
     fn build_graveyard_zone_sql_parses_id_ghost_zone_and_faction() {
-        // Cmangos game_graveyard_zone columns are (id, ghost_zone, faction), id is
-        // the world_safe_locs/game_graveyard id (safe_loc_id here), ghost_zone the zone it serves,
-        // faction 0 = both / else a team-faction id. Northshire+Goldshire+Eastvale serve zone 12
-        // (Alliance-only, 469); Sentinel Hill serves zone 40 (also 469).
         let dump =
             "x INSERT INTO `game_graveyard_zone` VALUES (105,12,469),(106,12,469),(80,40,469); y";
         let stmts = build_graveyard_zone_sql(dump);
@@ -6386,8 +5201,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_graveyard_zone "))
             .unwrap();
-        // row_id,safe_loc_id,zone_id,faction — row_id assigned sequentially (1-based), not the
-        // cmangos id (which collides across factions/zones for the SAME graveyard in a real dump).
         assert!(insert.contains("(1,105,12,469)"), "{insert}");
         assert!(insert.contains("(2,106,12,469)"), "{insert}");
         assert!(insert.contains("(3,80,40,469)"), "{insert}");
@@ -6395,18 +5208,6 @@ mod tests {
 
     #[test]
     fn build_areatrigger_teleport_sql_maps_columns_by_tuple_position() {
-        // Cmangos areatrigger_teleport columns are (id, name, target_map,
-        // target_position_x, target_position_y, target_position_z, target_orientation) — see the `at`
-        // module's `[V]` doc comment. Two rows with DISTINCT values in every column (no accidental
-        // digit reuse across fields) so a column-index typo/transposition would fail this test, not
-        // pass it vacuously; one row's name carries an apostrophe to prove `sql_text` escaping rides
-        // through this builder too.
-        // The name's apostrophe is backslash-escaped (`\'`), the MySQL/mysqldump convention
-        // `parse_table` actually implements (see its own doc comment) — NOT the doubled-quote (`''`)
-        // ANSI-SQL convention `sql_text`'s OUTPUT side re-escapes it into for `spacetime sql`.
-        // The REAL dump-verified 13-col shape (at:: 2026-07-10): id, name, required_level,
-        // req_item, req_quest, req_?, target_map, x, y, z, o, message, ? — the old 7-col fixture
-        // pre-dated the offset fix and parsed 0 rows (fixture drift, found 2026-07-12).
         let dump = "x INSERT INTO `areatrigger_teleport` VALUES \
             (1447,'Deadmines',10,0,0,0,36,-114.8,-9.5,-9.6,3.14,'',0),\
             (1448,'Moonbrook\\'s Exit',0,0,0,0,0,-11235.7,1668.3,23.9,1.57,'',0); y";
@@ -6420,9 +5221,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_areatrigger_teleport "))
             .unwrap();
-        // trigger_id,target_map,x,y,z,o,name — NOT the dump's own (id,name,target_map,x,y,z,o) order;
-        // `name` moves to the END of our column list (module table field order), everything else keeps
-        // the dump's tuple position. A transposed x/y/z or a name landing in the wrong slot fails here.
         assert!(
             insert.contains("(1447,36,-114.8,-9.5,-9.6,3.14,'Deadmines')"),
             "{insert}"
@@ -6435,37 +5233,25 @@ mod tests {
 
     #[test]
     fn drink_discriminator_keys_on_beverage_names_within_food_and_drink() {
-        // Drinks → restore mana. In classicdb z2815 these are class 0 / subclass 0 (NOT 5), incl. the key
-        // mage drink Conjured Water — the subclass-0 path is the common case.
         assert!(is_drink_consumable(0, 0, "Conjured Water"));
-        assert!(is_drink_consumable(0, 0, "Morning Glory Dew")); // "dew"
+        assert!(is_drink_consumable(0, 0, "Morning Glory Dew"));
         assert!(is_drink_consumable(0, 0, "Ice Cold Milk"));
-        assert!(is_drink_consumable(0, 5, "Refreshing Spring Water")); // subclass 5 also valid
+        assert!(is_drink_consumable(0, 5, "Refreshing Spring Water"));
         assert!(is_drink_consumable(0, 5, "Bottle of Dalaran Red Wine"));
-        // Food (same class/subclass as drink) → NOT a drink (stays HP) — discriminated purely by name.
-        assert!(!is_drink_consumable(0, 0, "Tender Wolf Steak")); // "tea" is a substring, not a word
-        assert!(!is_drink_consumable(0, 0, "Snapvine Watermelon")); // "water" substring, not a word
-        assert!(!is_drink_consumable(0, 5, "Beer Basted Boar Ribs")); // "beer" dropped (food collision)
+        assert!(!is_drink_consumable(0, 0, "Tender Wolf Steak"));
+        assert!(!is_drink_consumable(0, 0, "Snapvine Watermelon"));
+        assert!(!is_drink_consumable(0, 5, "Beer Basted Boar Ribs"));
         assert!(!is_drink_consumable(0, 0, "Tough Jerky"));
-        // Right name, excluded class/subclass → never a drink.
-        assert!(!is_drink_consumable(2, 7, "Watery Blade")); // a weapon named "water…"
-        assert!(!is_drink_consumable(0, 1, "Healing Potion")); // potion (subclass 1) excluded
-        assert!(!is_drink_consumable(0, 2, "Elixir of Water Walking")); // elixir (subclass 2) excluded
+        assert!(!is_drink_consumable(2, 7, "Watery Blade"));
+        assert!(!is_drink_consumable(0, 1, "Healing Potion"));
+        assert!(!is_drink_consumable(0, 2, "Elixir of Water Walking"));
     }
 
-    // ---- LOOT-FAMILY COMPLETENESS ----
-
-    /// `resolve_ref_pool` flattens a 2-DEEP reference chain (pool 1 → item A direct + a `-ref` to pool 2
-    /// → item B) into ONE flat list, and a CYCLE (pool 3 → pool 4 → pool 3) terminates instead of
-    /// looping forever — the cycle guard returns an empty tail for the pool it re-enters, so pool 3's
-    /// own direct item still comes through.
     #[test]
     fn resolve_ref_pool_flattens_two_deep_and_terminates_a_cycle() {
         use std::collections::{HashMap, HashSet};
         let mut refs: HashMap<u64, Vec<(u64, f64, i64, u32)>> = HashMap::new();
-        // Pool 1: item 100 direct (30%) + a reference to pool 2 (mincountOrRef = -2).
         refs.insert(1, vec![(100, 30.0, 0, 1), (0, 0.0, -2, 1)]);
-        // Pool 2 (nested, 2 deep from pool 1): item 200 direct.
         refs.insert(2, vec![(200, 100.0, 0, 3)]);
         let mut visited = HashSet::new();
         let flat = resolve_ref_pool(1, &refs, &mut visited);
@@ -6481,11 +5267,9 @@ mod tests {
             .iter()
             .any(|&(item, chance, count)| item == 200 && chance == 100.0 && count == 3));
 
-        // Cycle: pool 3 → pool 4 → pool 3. Pool 3's OWN direct item (300) still resolves; the cyclic
-        // re-entry into pool 3 (via pool 4) returns empty instead of recursing forever.
         let mut cyc: HashMap<u64, Vec<(u64, f64, i64, u32)>> = HashMap::new();
         cyc.insert(3, vec![(300, 50.0, 0, 1), (0, 0.0, -4, 1)]);
-        cyc.insert(4, vec![(0, 0.0, -3, 1)]); // pool 4 references pool 3 right back
+        cyc.insert(4, vec![(0, 0.0, -3, 1)]);
         let mut visited2 = HashSet::new();
         let flat2 = resolve_ref_pool(3, &cyc, &mut visited2);
         assert_eq!(
@@ -6494,19 +5278,13 @@ mod tests {
             "the cycle terminates; only pool 3's own direct item survives"
         );
 
-        // An unresolvable pool id (no rows at all) is an empty flatten, never a panic.
         let mut visited3 = HashSet::new();
         assert!(resolve_ref_pool(999, &refs, &mut visited3).is_empty());
     }
 
-    /// `parse_loot_family` sign handling: a POSITIVE `ChanceOrQuestChance` is an ordinary drop
-    /// (`quest_only == false`); a NEGATIVE one is cmangos's quest-drop marker — `quest_only == true`,
-    /// with `chance_bp` taking the ABSOLUTE value (so a -25.5% quest row still emits a real 2550 bp,
-    /// not a negative/garbage chance).
     #[test]
     fn parse_loot_family_reads_the_quest_only_sign_and_abs_value() {
         use std::collections::HashMap;
-        // entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount
         let dump = "x INSERT INTO `pickpocketing_loot_template` VALUES \
             (500,1,50.0,0,0,1),\
             (500,2,-25.5,0,0,1); y";
@@ -6548,21 +5326,15 @@ mod tests {
         assert_eq!(&fields[26..28], &["8690", "0"]);
     }
 
-    /// The dropped item_template columns (resistances, extra spell slots, skill/rep
-    /// gates, maxcount/flags/page_text/startquest/bag_family) parse from their VERIFIED cmangos
-    /// column indices into the right positions of the emitted `game_item_template` row, appended
-    /// after `bonding` in struct order. Builds a synthetic 121-column row (indices 0..=120, reaching
-    /// BagFamily) via the `it` module's own constants, so this test breaks if an index constant ever
-    /// drifts from the row layout it asserts against.
     #[test]
     fn item_template_parses_the_work_item_213_columns_into_the_right_positions() {
         use std::collections::{HashMap, HashSet};
 
         let mut cols = vec!["0".to_string(); 124];
         cols[it::ENTRY] = "90001".into();
-        cols[it::CLASS] = "4".into(); // Armor — never a drink, regardless of subclass
+        cols[it::CLASS] = "4".into();
         cols[it::SUBCLASS] = "1".into();
-        cols[it::NAME] = "__NAME__".into(); // swapped for a quoted literal below
+        cols[it::NAME] = "__NAME__".into();
         cols[it::DISPLAY_ID] = "1234".into();
         cols[it::QUALITY] = "3".into();
         cols[it::FLAGS] = "512".into();
@@ -6616,19 +5388,14 @@ mod tests {
         );
     }
 
-    /// A template with no resistance/spell-3-5/skill/rep/maxcount/flags/page_text/startquest/
-    /// bag_family data at all keeps every column at 0, the additive-migration
-    /// baseline (unchanged for an ordinary existing item like the starter
-    /// Worn Shortsword). Built the same index-constant-driven way as the row above, so a real
-    /// no-frills weapon row round-trips with every new column zeroed.
     #[test]
     fn item_template_with_no_new_data_keeps_the_work_item_213_columns_zero() {
         use std::collections::{HashMap, HashSet};
 
         let mut cols = vec!["0".to_string(); 124];
         cols[it::ENTRY] = "25".into();
-        cols[it::CLASS] = "2".into(); // Weapon
-        cols[it::SUBCLASS] = "7".into(); // Sword (one-hand)
+        cols[it::CLASS] = "2".into();
+        cols[it::SUBCLASS] = "7".into();
         cols[it::NAME] = "__NAME__".into();
         cols[it::DISPLAY_ID] = "1521".into();
         cols[it::QUALITY] = "0".into();
@@ -6691,19 +5458,12 @@ mod tests {
 
     #[test]
     fn unrestricted_sentinel_expands_to_the_playable_masks() {
-        // Vanilla class ids skip 6 and 10 (Druid is 11 → bit 0x400); races 1-8 are contiguous.
-        // The client hides the tooltip "Classes:" line only when every playable bit is set.
         assert_eq!(normalize_item_mask("-1", ALL_PLAYABLE_CLASS_MASK), 0x5df);
         assert_eq!(normalize_item_mask("-1", ALL_PLAYABLE_RACE_MASK), 0xff);
     }
 
-    // --- playercreateinfo_* fixture tests ------------------------------------------
-
     #[test]
     fn build_createinfo_spell_sql_parses_race_class_spell_and_wipes_wholesale() {
-        // Human(1) Warrior(1) wildcard-style rows (race==0 class kit, class==0 racial) pass through
-        // verbatim — the importer does no wildcard interpretation itself (module reads it at grant
-        // time via createinfo_row_matches). A concrete Dwarf(3) Warrior(1) row also imports.
         let dump = "x INSERT INTO `playercreateinfo_spell` VALUES (0,1,78),(1,0,20598),(3,1,78); y";
         let stmts = build_createinfo_spell_sql(dump);
         assert_eq!(stmts[0], "DELETE FROM game_createinfo_spell WHERE id >= 0");
@@ -6728,7 +5488,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_createinfo_action "))
             .unwrap();
-        // row_id,race,class,button,action,action_type
         assert!(insert.contains("(1,1,1,0,6603,0)"), "{insert}");
         assert!(insert.contains("(2,1,1,1,78,0)"), "{insert}");
     }
@@ -6744,7 +5503,6 @@ mod tests {
 
     #[test]
     fn build_createinfo_item_sql_without_dbc_imports_every_row_undeduped() {
-        // No --dbc → no outfit set to dedup against, so every distinct (race,class,item) imports.
         let dump = "x INSERT INTO `playercreateinfo_item` VALUES (1,1,6948,1),(1,1,2092,1); y";
         let stmts = build_createinfo_item_sql(dump, None).expect("no dbc dir needed");
         assert_eq!(
@@ -6771,9 +5529,6 @@ mod tests {
 
     #[test]
     fn build_createinfo_item_sql_dedupes_within_itself_and_skips_nonpositive_items() {
-        // The dump lists the SAME (race,class,item) twice (a malformed/duplicated dump row) — only
-        // one row should import. item 0 (an empty slot sentinel, if the dump ever carries one) is
-        // skipped, not imported as a bogus item_entry.
         let dump =
             "x INSERT INTO `playercreateinfo_item` VALUES (1,1,6948,1),(1,1,6948,1),(1,1,0,1); y";
         let stmts = build_createinfo_item_sql(dump, None).expect("no dbc dir needed");
@@ -6785,12 +5540,8 @@ mod tests {
         assert!(!insert.contains(",0)"), "item 0 must not import: {insert}");
     }
 
-    // --- (reduced scope): spell_chain / spell_learn_spell fixture parse/shape ---------
-
     #[test]
     fn build_spell_chain_sql_parses_rank_chain_and_wipes_wholesale() {
-        // Fireball rank 2 (spell_id 143): prev=133 (rank 1), first=133, rank=2, no extra req_spell.
-        // Rank 1 itself (133): prev=0 (no predecessor), first=133, rank=1.
         let dump = "x INSERT INTO `spell_chain` VALUES (133,0,133,1,0),(143,133,133,2,0); y";
         let stmts = build_spell_chain_sql(dump, &[]).unwrap();
         assert_eq!(stmts[0], "DELETE FROM game_spell_chain WHERE spell_id > 0");
@@ -6798,7 +5549,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_spell_chain "))
             .unwrap();
-        // spell_id,prev_spell,first_spell,rank,req_spell
         assert!(insert.contains("(133,0,133,1,0)"), "{insert}");
         assert!(insert.contains("(143,133,133,2,0)"), "{insert}");
     }
@@ -6869,9 +5619,6 @@ mod tests {
 
     #[test]
     fn build_spell_proc_event_sql_maps_the_nine_overlay_columns_by_tuple_position() {
-        // entry,SchoolMask,SpellFamilyName,SpellFamilyMask,procFlags,procEx,ppmRate,CustomChance,Cooldown
-        // Two shapes worth pinning together: a filtered talent proc (Impact 12358 — fire school, mage
-        // family, crit-only, no rate) and a rate-plus-cooldown weapon proc.
         let dump = "x INSERT INTO `spell_proc_event` VALUES \
                     (12358,4,3,32,0,2,0,0,0),(20007,0,0,0,20,0,1.5,15,45); y";
         let stmts = build_spell_proc_event_sql(dump, None).unwrap();
@@ -6883,9 +5630,7 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_spell_proc_event "))
             .expect("two rows must produce one INSERT");
-        // spell_id,proc_flags,proc_ex,school_mask,family_name,family_flags,ppm_rate,custom_chance,icd_ms
         assert!(insert.contains("(12358,0,2,4,3,32,0,0,0)"), "{insert}");
-        // The cooldown is seconds in the dump and milliseconds on the row.
         assert!(
             insert.contains("(20007,20,0,0,0,0,1.5,15,45000)"),
             "{insert}"
@@ -6929,8 +5674,6 @@ mod tests {
 
     #[test]
     fn build_spell_proc_event_sql_empty_table_yields_delete_only_no_insert() {
-        // A dump with no `spell_proc_event` table at all: the overlay is optional per spell AND as a
-        // whole, so the clear still runs and every Proc falls back to its Spell.dbc values.
         let stmts = build_spell_proc_event_sql("x y", None).unwrap();
         assert_eq!(
             stmts,
@@ -6940,9 +5683,6 @@ mod tests {
 
     #[test]
     fn build_spell_proc_event_sql_drops_a_row_the_delete_cannot_reach_or_the_schema_moved() {
-        // A synthetic-range entry is a seeded fixture's own overlay row: the DELETE deliberately spares
-        // it, so importing one would PK-collide on the next reload. An unknown row width is dropped
-        // rather than mapping shifted columns onto the wrong fields.
         let dump = "x INSERT INTO `spell_proc_event` VALUES \
                     (50143,0,0,0,0,0,0,0,5),(133,0,0,0,0,0,0,0,0,0,0,0); y";
         let stmts = build_spell_proc_event_sql(dump, None).unwrap();
@@ -6954,8 +5694,6 @@ mod tests {
 
     #[test]
     fn build_spell_chain_sql_empty_table_yields_delete_only_no_insert() {
-        // No cmangos `spell_chain` rows at all (e.g. an un-imported dump) — the DELETE still runs
-        // (wholesale wipe), but push_insert emits no INSERT for zero rows.
         let stmts = build_spell_chain_sql("x y", &[]).unwrap();
         assert_eq!(
             stmts,
@@ -6972,7 +5710,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_spell_learn "))
             .unwrap();
-        // id,parent_spell,learn_spell — ids assigned densely from 1, dump order preserved.
         assert!(insert.contains("(1,196,197)"), "{insert}");
         assert!(
             insert.contains("(2,196,198)"),
@@ -6982,8 +5719,6 @@ mod tests {
 
     #[test]
     fn build_spell_learn_sql_empty_table_still_synthesizes_armor_proficiency_wrappers() {
-        // No cmangos spell_learn_spell rows at all — the two verified armor-proficiency wrapper→passive
-        // pairs still synthesize (cmangos ships neither; see the builder's doc).
         let stmts = build_spell_learn_sql("x y");
         assert_eq!(stmts[0], "DELETE FROM game_spell_learn WHERE id > 0");
         let insert = stmts
@@ -7003,8 +5738,6 @@ mod tests {
     #[test]
     fn build_spell_learn_sql_synthesizes_armor_proficiency_wrappers_exactly_once_alongside_real_rows(
     ) {
-        // Real spell_learn_spell rows for unrelated spells coexist with the two synthesized pairs, each
-        // appearing exactly once, with ids continuing densely past the real rows.
         let dump = "x INSERT INTO `spell_learn_spell` VALUES (196,197,1); y";
         let stmts = build_spell_learn_sql(dump);
         let insert = stmts
@@ -7020,8 +5753,6 @@ mod tests {
 
     #[test]
     fn build_spell_learn_sql_does_not_double_synthesize_if_dump_already_has_the_wrapper_row() {
-        // Defense-in-depth: if a future cmangos dump grows a real spell_learn_spell row for one of the
-        // wrapper parents, the synthesis must not add a second, colliding row for that parent.
         let dump = "x INSERT INTO `spell_learn_spell` VALUES (7109,750,1); y";
         let stmts = build_spell_learn_sql(dump);
         let insert = stmts
@@ -7033,15 +5764,11 @@ mod tests {
             1,
             "must not double-insert the plate wrapper: {insert}"
         );
-        // The mail pair still synthesizes — only the colliding parent is skipped.
         assert!(insert.contains("8738,8737"), "{insert}");
     }
 
     #[test]
     fn family_spellmeta_filter_produces_only_spellmeta_family_stmts() {
-        // `--family spellmeta` (reduced scope) mirrors the `--family` gate parity
-        // pattern: the plan must carry ONLY the three spellmeta blocks — no other family's
-        // statements — even on a dump that also carries an in-box quest fixture.
         let dump = format!(
             "{} INSERT INTO `spell_chain` VALUES (133,0,133,1,0); \
              INSERT INTO `spell_learn_spell` VALUES (196,197,1); \
@@ -7121,22 +5848,13 @@ mod tests {
                 plan.stmts
             );
         }
-        // Only the spellmeta family gets a provenance stamp (1 chain row + 1 real learn row + the 2
-        // synthesized armor-proficiency wrapper→passive rows + 1 proc-event row).
         assert_eq!(plan.stamps, vec![("spellmeta", 5u64)], "{:?}", plan.stamps);
     }
 
-    // --- gossip completeness (menu options, multi-slot npc_text, conditions) --------
-
-    /// Build a `creature_template` INSERT tuple wide enough to reach `ct::GOSSIP_MENU_ID` (col 77):
-    /// entry at col 0, gossip_menu_id at col 77, everything else `0`.
     fn creature_template_row(entry: u64, gossip_menu_id: u64) -> String {
         creature_template_row_with_faction(entry, gossip_menu_id, 0, 0, 0, 0)
     }
 
-    /// `creature_template_row` plus `TrainerType` (71) and `TrainerClass` (73). Both sit below
-    /// `ct::GOSSIP_MENU_ID`, so the row is already wide enough. The gap between them is
-    /// `TrainerSpell`, which is not ingested.
     fn creature_template_row_with_trainer(
         entry: u64,
         gossip_menu_id: u64,
@@ -7164,8 +5882,6 @@ mod tests {
         format!("({})", cols.join(","))
     }
 
-    /// A minimal `gossip_menu_option` row in the SHORT (no-condition) 7-column vintage:
-    /// `menu_id, id, option_icon, option_text, option_type, npc_option_npcflag, action_menu_id`.
     fn gossip_option_row_short(
         menu_id: u64,
         id: u64,
@@ -7173,19 +5889,11 @@ mod tests {
         text: &str,
         option_type: u64,
     ) -> String {
-        // The REAL dump-verified 15-col gossip_menu_option shape (gmo:: 2026-07-10): menu_id, id,
-        // option_icon, option_text, option_broadcast_text, option_id(TYPE), npc_option_npcflag,
-        // action_menu_id, action_poi_id, action_script_id, box_coded, box_money, box_text,
-        // box_broadcast_text, condition_id. The old 7-col fixture pre-dated the offset fix and
-        // silently parsed 0 options (fixture drift, found 2026-07-12).
         format!("({menu_id},{id},{icon},'{text}',0,{option_type},0,0,0,0,0,0,'',0,0)")
     }
 
     #[test]
     fn build_gossip_sql_orders_menu_options_by_dense_index_and_maps_actions() {
-        // An Elwynn-innkeeper-shaped NPC: 3 options (plain gossip / vendor / innkeeper) inserted in
-        // `id` order — assert the importer keeps that order (dense 0..2 option_index) and copies the
-        // cmangos action code through verbatim (see `lyracore_shared::constants::gossip_option`).
         let entry = 300u64;
         let menu_id = 900u64;
         let dump = format!(
@@ -7199,7 +5907,6 @@ mod tests {
         let entries: std::collections::HashSet<u64> = [entry].into_iter().collect();
         let etl = build_gossip_sql(&dump, &entries);
         assert_eq!(etl.option_rows.len(), 3, "{:?}", etl.option_rows);
-        // row_id,entry,option_index,icon,text,action,action_menu_id,cond_type,cond_value1,cond_value2
         assert!(
             etl.option_rows[0].contains(&format!("(1,{entry},0,0,'Lets talk.',1,0,0,0,0)")),
             "{}",
@@ -7257,22 +5964,18 @@ mod tests {
 
     #[test]
     fn build_gossip_sql_reindexes_dense_option_order_even_when_cmangos_ids_have_gaps() {
-        // cmangos option `id`s aren't guaranteed contiguous (a deleted row leaves a gap) — the importer
-        // must still emit a DENSE 0-based `option_index` (the gateway's render/select alignment depends
-        // on it), sorted by the cmangos id.
         let entry = 301u64;
         let menu_id = 901u64;
         let dump = format!(
             "x INSERT INTO `creature_template` VALUES {}; \
              INSERT INTO `gossip_menu_option` VALUES {}, {}; y",
             creature_template_row(entry, menu_id),
-            gossip_option_row_short(menu_id, 5, 0, "Second.", 1), // higher cmangos id, inserted first
+            gossip_option_row_short(menu_id, 5, 0, "Second.", 1),
             gossip_option_row_short(menu_id, 2, 0, "First.", 1),
         );
         let entries: std::collections::HashSet<u64> = [entry].into_iter().collect();
         let etl = build_gossip_sql(&dump, &entries);
         assert_eq!(etl.option_rows.len(), 2);
-        // (row_id,entry,option_index,icon,text...), option_index 0 must land on the LOWER cmangos id.
         assert!(
             etl.option_rows[0].contains(&format!("{entry},0,0,'First.'")),
             "{}",
@@ -7287,8 +5990,6 @@ mod tests {
 
     #[test]
     fn build_gossip_sql_drops_questgiver_placeholder_rows_and_keeps_the_index_dense() {
-        // An `OptionType=2` row's label is the literal string "GOSSIP_OPTION_QUESTGIVER" (13 NPCs in
-        // the dump, Innkeeper Farley among them), and its quests arrive via the quest section anyway.
         use lyracore_shared::constants::gossip_option;
         let entry = 320u64;
         let menu_id = 920u64;
@@ -7319,18 +6020,14 @@ mod tests {
             "{:?}",
             etl.option_rows
         );
-        // The surviving rows are indexed 0 and 1 — the drop must leave no gap for the menu to render.
         assert!(etl.option_rows[0].contains(&format!("{entry},0,0,'Chat.'")));
         assert!(etl.option_rows[1].contains(&format!("{entry},1,0,'Train me.'")));
     }
 
     #[test]
     fn build_gossip_sql_takes_the_unconditional_greeting_as_the_menu_title() {
-        // Several rows per entry, in no meaningful order: one unconditional greeting plus
-        // condition-gated variants. First-row-wins made a conditional greeting the permanent title.
         let entry = 321u64;
         let menu_id = 921u64;
-        // npc_text short (17-col) rows: id, prob0..7, BroadcastTextId0..7 — only slot 0 populated.
         let dump = format!(
             "x INSERT INTO `creature_template` VALUES {}; \
              INSERT INTO `gossip_menu` VALUES ({menu_id},5100,0,44),({menu_id},5101,0,0); \
@@ -7351,7 +6048,6 @@ mod tests {
 
     #[test]
     fn build_gossip_sql_hides_a_seasonal_event_option_instead_of_failing_open() {
-        // mangos type 12 = CONDITION_ACTIVE_GAME_EVENT, the one condition that fails CLOSED.
         let entry = 322u64;
         let menu_id = 922u64;
         let option =
@@ -7376,12 +6072,8 @@ mod tests {
 
     #[test]
     fn build_gossip_sql_folds_an_inline_quest_taken_condition() {
-        // The INLINE-condition dump vintage (14 cols: the 11-col FK shape + cond_type/value1/value2
-        // appended). mangos type 9 = CONDITION_QUESTTAKEN → our QUEST_TAKEN (1), value1 = the quest id.
         let entry = 302u64;
         let menu_id = 902u64;
-        // 14 cols: menu_id,id,icon,text,type,npcflag,action_menu_id,poi,box_coded,box_money,box_text,
-        // cond_type(11),cond_value1(12),cond_value2(13, unused by the current minimal condition set).
         let option =
             format!("({menu_id},0,0,'Have you started my quest?',1,0,0,0,0,0,'NULL',9,777,0)");
         let dump = format!(
@@ -7392,7 +6084,6 @@ mod tests {
         let entries: std::collections::HashSet<u64> = [entry].into_iter().collect();
         let etl = build_gossip_sql(&dump, &entries);
         assert_eq!(etl.option_rows.len(), 1);
-        // cond_type=1 (QUEST_TAKEN), cond_value1=777, cond_value2=0 — the trailing 3 fields.
         assert!(
             etl.option_rows[0].ends_with("1,777,0)"),
             "{}",
@@ -7403,10 +6094,6 @@ mod tests {
     #[test]
     fn build_gossip_sql_resolves_condition_via_the_generic_conditions_table_and_fails_open_when_unmapped(
     ) {
-        // The FK-vintage dump (11 cols, `condition_id` at col 10) joins a generic `conditions` row.
-        // mangos type 8 = CONDITION_QUESTREWARDED → our QUEST_REWARDED (2). A SECOND option references a
-        // condition type this importer doesn't map (5) — it must fail OPEN (cond_type 0, always shown),
-        // never silently hide the option.
         let entry = 303u64;
         let menu_id = 903u64;
         let dump = format!(
@@ -7424,25 +6111,21 @@ mod tests {
             etl.option_rows[0].ends_with("2,555,0)"),
             "{}",
             etl.option_rows[0]
-        ); // QUEST_REWARDED
+        );
         assert!(
             etl.option_rows[1].ends_with("0,0,0)"),
             "{}",
             etl.option_rows[1]
-        ); // fail-open
+        );
     }
 
     #[test]
     fn build_gossip_sql_resolves_broadcast_text_for_both_npc_text_and_option_labels() {
-        // The BroadcastText-era dump: npc_text is the SHORT 17-col schema (id + 8 probs + 8
-        // BroadcastTextIds) and the option's `option_text` column carries a bare broadcast_text id
-        // instead of literal text — both must resolve through `broadcast_text`.
         let entry = 304u64;
         let menu_id = 904u64;
         let text_id = 5000u64;
-        // npc_text short row: id, prob0..7, bcast0..7 — only slot 0 populated (bcast id 8001).
         let npc_text_row = format!("({text_id},1.0,0,0,0,0,0,0,0,8001,0,0,0,0,0,0,0)");
-        let option = gossip_option_row_short(menu_id, 0, 0, "9002", 1); // option_text = bcast id, quoted as a string
+        let option = gossip_option_row_short(menu_id, 0, 0, "9002", 1);
         let dump = format!(
             "x INSERT INTO `creature_template` VALUES {}; \
              INSERT INTO `gossip_menu` VALUES ({menu_id},{text_id}); \
@@ -7471,20 +6154,15 @@ mod tests {
 
     #[test]
     fn build_gossip_sql_emits_every_populated_npc_text_slot_and_skips_empty_ones() {
-        // Full 81-col npc_text row with slot 0 AND slot 3 populated (a weighted-variant greeting) —
-        // all 8 slots must be considered, not just the first, and an all-empty/zero-prob slot must not
-        // emit a row at all (the gateway reads "no rows" as the legacy single-slot fallback).
         let entry = 305u64;
         let menu_id = 905u64;
         let text_id = 5001u64;
         let mut cols = vec!["NULL".to_string(); 81];
         cols[0] = text_id.to_string();
-        // slot 0: base 1 — male/female/lang/prob
         cols[1] = "'Well met.'".into();
         cols[2] = "'Well met, traveler.'".into();
         cols[3] = "0".into();
         cols[4] = "0.6".into();
-        // slot 3: base 31
         cols[31] = "'Watch yourself.'".into();
         cols[32] = "NULL".into();
         cols[33] = "0".into();
@@ -7502,14 +6180,13 @@ mod tests {
             etl.npc_text_rows[0].contains("Well met."),
             "{:?}",
             etl.npc_text_rows
-        ); // first-nonempty
+        );
         assert_eq!(
             etl.npc_text_slot_rows.len(),
             2,
             "{:?}",
             etl.npc_text_slot_rows
         );
-        // Row shape: (id,text_id,slot_index,text_male,text_female,probability).
         let slot0 = etl
             .npc_text_slot_rows
             .iter()
@@ -7532,12 +6209,8 @@ mod tests {
         );
     }
 
-    // --- import pipeline tooling (--family, --source-sha, provenance stamps) --------
-
     #[test]
     fn sha256_hex_matches_known_test_vectors() {
-        // Well-known NIST test vectors — pins `sha256_hex`'s `sha256sum` shell-out against a value
-        // nobody can silently get wrong.
         assert_eq!(
             sha256_hex(b"abc").unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -7550,9 +6223,6 @@ mod tests {
 
     #[test]
     fn families_fixed_set_accepts_every_named_family_and_rejects_unknown() {
-        // Mirrors `parse_args`'s `--family` validation exactly (`FAMILIES.contains(&v.as_str())`) —
-        // pins the fixed set promised: covers --dump families only (terrain/dbc/spells
-        // are separate invocations, not in this list).
         for name in [
             "creatures",
             "items",
@@ -7609,9 +6279,6 @@ mod tests {
         }
     }
 
-    /// An absent `--packages` is "the operator did not say", which the spell import then warns
-    /// about. It must never read as an empty enabled set, because that would delete every row a
-    /// Package invented.
     #[test]
     fn the_enabled_packages_root_is_absent_until_the_operator_names_it() {
         let unnamed = parse_args_from(["--dbc", "/path/need-not-exist", "--spells"])
@@ -7629,8 +6296,6 @@ mod tests {
         assert_eq!(named.packages.as_deref(), Some("packages"));
     }
 
-    /// The Base Snapshot is an author-time read. Naming it beside an import would leave the operator
-    /// guessing whether anything was loaded, so the two modes stay apart.
     #[test]
     fn the_base_snapshot_mode_is_standalone() {
         let alone = parse_args_from([
@@ -7671,8 +6336,6 @@ mod tests {
         assert!(format!("{error:#}").contains("--dbc"), "{error:#}");
     }
 
-    /// `--pack-out` is an input in its own right: it writes a distributable directory out of the
-    /// repo's own client content, so it needs no dump and no client data path.
     #[test]
     fn the_client_pack_output_dir_is_an_input_on_its_own() {
         let args = parse_args_from(["--pack-out", "target/client-artifact"])
@@ -7681,8 +6344,6 @@ mod tests {
         assert_eq!(args.pack_client, None);
     }
 
-    /// `--apply` guards writes to the operator's own client. `--pack-out` never touches one, so
-    /// accepting the flag would promise a dry run that does not exist.
     #[test]
     fn the_client_pack_output_dir_refuses_apply() {
         let error = parse_args_from(["--pack-out", "target/client-artifact", "--apply"])
@@ -7694,8 +6355,6 @@ mod tests {
         );
     }
 
-    /// Dispatch runs one packer. Taking both flags would run `--pack-client` and drop the
-    /// distributable directory the caller also asked for, so the pair is refused by name.
     #[test]
     fn the_two_client_packers_refuse_to_run_together() {
         let error = parse_args_from([
@@ -7712,8 +6371,6 @@ mod tests {
         );
     }
 
-    /// Every `--dump` family has a Package Delta stage of its own, so `--packages` is valid beside
-    /// any of them and beside a full run.
     #[test]
     fn an_enabled_packages_root_with_a_package_delta_family_active_parses() {
         let mut argvs: Vec<Vec<&str>> = vec![vec![
@@ -7820,14 +6477,11 @@ mod tests {
         assert!(format!("{removed:#}").contains("scope is empty"));
     }
 
-    // ---- --include-map (the Deadmines map-36 slice) ------------------------------
-
     #[test]
     fn row_in_slice_keeps_box_geometry_for_the_primary_map_and_whole_map_for_included() {
         let mut args = test_args();
         args.bbox = Some((-9000.0, -8900.0, -200.0, -100.0));
         args.include_maps = vec![36];
-        // Primary-map spawns remain bounded by the requested box.
         assert!(
             row_in_slice(&args, 0, -8949.95, -132.493, 83.5),
             "in-box map-0 row imports"
@@ -7836,14 +6490,11 @@ mod tests {
             !row_in_slice(&args, 0, -10650.0, 1180.0, 34.0),
             "out-of-box map-0 row does not"
         );
-        // Included map: WHOLE map, no geometry — Deadmines interior coords are nowhere near the box.
         assert!(
             row_in_slice(&args, 36, -16.4, -383.07, -33.35),
             "map-36 row imports anywhere"
         );
-        // A map that is neither primary nor included never imports (Kalimdor stays out).
         assert!(!row_in_slice(&args, 1, -16.4, -383.07, -33.35));
-        // The --exclude carve still applies to the PRIMARY map only.
         args.exclude = Some((-8960.0, -8940.0, -140.0, -120.0));
         assert!(
             !row_in_slice(&args, 0, -8949.95, -132.493, 83.5),
@@ -8465,9 +7116,7 @@ mod tests {
     fn force_include_creatures_keeps_an_out_of_box_row_by_entry() {
         let mut args = test_args();
         args.bbox = Some((-9000.0, -8900.0, -200.0, -100.0));
-        // An out-of-box Westfall giver (Magistrate Solomon 344 at ~-9219,-2222) is dropped normally…
         assert!(!creature_row_kept(&args, 0, -9219.0, -2222.0, 68.0, 344));
-        // …but kept once its entry is force-included, WITHOUT changing in-box geometry.
         args.include_creatures = vec![344, 266];
         assert!(
             creature_row_kept(&args, 0, -9219.0, -2222.0, 68.0, 344),
@@ -8481,19 +7130,14 @@ mod tests {
             !creature_row_kept(&args, 0, -9219.0, -2222.0, 68.0, 999),
             "a non-listed out-of-box entry still drops"
         );
-        // A pool slot (raw_entry 0) never matches a force-listed giver — falls through to geometry.
         assert!(!creature_row_kept(&args, 0, -9219.0, -2222.0, 68.0, 0));
     }
 
     #[test]
     fn the_map_fence_drops_a_force_included_entry_that_spawns_on_a_foreign_map() {
-        // --include-creatures matches on ENTRY, so before the map fence a
-        // force-listed giver's spawn on ANOTHER map rode into the slice — i.e. a Kalimdor shard's ETL
-        // could import an Elwynn spawn (or vice versa) purely because an entry was force-listed. No
-        // flag combination may cross the map boundary; the fence is the gate, not script hygiene.
         let mut args = test_args();
-        args.map = 1; // a Kalimdor world shard
-        args.bbox = Some((-700.0, -400.0, -4300.0, -4000.0)); // Valley of Trials-ish
+        args.map = 1;
+        args.bbox = Some((-700.0, -400.0, -4300.0, -4000.0));
         args.include_creatures = vec![344];
         assert!(
             !creature_row_kept(&args, 0, -9219.0, -2222.0, 68.0, 344),
@@ -8503,38 +7147,25 @@ mod tests {
             creature_row_kept(&args, 1, -550.0, -4150.0, 39.0, 344),
             "the in-box map-1 row is kept"
         );
-        // Symmetric: on the canonical map-0 run a force-listed entry's map-1 spawn is fenced out too,
-        // while its in-corridor map-0 spawn still bypasses the box exactly as needs.
         let mut m0 = test_args();
         m0.bbox = Some((-11400.0, -8000.0, -3100.0, 2000.0));
         m0.include_creatures = vec![344];
         assert!(m0.map == 0 && creature_row_kept(&m0, 0, -9219.0, -2222.0, 68.0, 344));
         assert!(!creature_row_kept(&m0, 1, -550.0, -4150.0, 39.0, 344));
-        // --include-map still opens a whole extra map to the same force-include path (Deadmines).
         m0.include_maps = vec![36];
         assert!(creature_row_kept(&m0, 36, -16.4, -383.07, -33.35, 644));
         assert!(map_in_run(&m0, 0) && map_in_run(&m0, 36) && !map_in_run(&m0, 1));
     }
 
-    /// The trainer columns land from the indices they are actually written at, with `TrainerSpell`
-    /// skipped between them.
-    ///
-    /// This is the only automated guard on those indices. A wrong one reads a real neighbouring cell
-    /// and produces plausible data rather than an error, so the fixture gives type and class
-    /// different values and poisons every neighbour.
     #[test]
     fn trainer_type_and_class_import_from_their_own_columns() {
-        // Paladin trainer: type 0 (CLASS) / class 2. Type stays at the enum's 0, so the class cell
-        // alone carries the signal — the same shape the live gate keys on.
         let mut paladin = vec!["0".to_string(); ct::GOSSIP_MENU_ID + 1];
         paladin[ct::ENTRY] = "925".to_string();
         paladin[ct::TRAINER_TYPE] = "0".to_string();
         paladin[ct::TRAINER_CLASS] = "2".to_string();
-        // Poison every neighbour so a slipped index reads a rejected value, not a plausible 0. Note
-        // 71+1 and 73-1 are the same cell: the two ingested columns are not adjacent.
-        paladin[70] = "66".to_string(); // MovementType — one before TrainerType
-        paladin[72] = "7".to_string(); // TrainerSpell — between the two we ingest
-        paladin[74] = "9".to_string(); // TrainerRace  — one after TrainerClass
+        paladin[70] = "66".to_string();
+        paladin[72] = "7".to_string();
+        paladin[74] = "9".to_string();
         let dump = format!(
             "x INSERT INTO `creature` VALUES \
              (1,925,0,1,-8949.95,-132.493,83.5312,0,300,300,0,0),\
@@ -8542,9 +7173,7 @@ mod tests {
              (3,620,0,1,-8949.95,-132.493,83.5312,0,300,300,0,0); \
              INSERT INTO `creature_template` VALUES ({}),{},{}; y",
             paladin.join(","),
-            // Weapon master: TRADESKILLS (2) with NO class — serves everyone.
             creature_template_row_with_trainer(11867, 0, 2, 0),
-            // A plain critter: both cells 0, the overwhelming majority of the dump.
             creature_template_row_with_trainer(620, 0, 0, 0),
         );
         let args = test_args();
@@ -8554,12 +7183,10 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_creature_template"))
             .unwrap_or_else(|| panic!("template insert present: {:?}", plan.stmts));
-        // The two columns are named, and END-appended after skin_loot_id (the migration rule).
         assert!(
             insert.contains("skin_loot_id,trainer_type,trainer_class"),
             "trainer columns are named and end-appended: {insert}"
         );
-        // Every emitted tuple, keyed by entry -> its last two cells.
         let values = insert
             .split_once(" VALUES ")
             .expect("the insert names its columns then VALUES")
@@ -8592,14 +7219,8 @@ mod tests {
         );
     }
 
-    /// The verbatim `npc_trainer` → `game_trainer_spell` path (unchanged by the armor-proficiency
-    /// wrapper work) already carries `required_level` and `cost` straight through for an armor-wrapper
-    /// offering — this pins that behavior rather than re-implementing it. The gap the wrapper work
-    /// closes is `game_spell_learn` (see `build_spell_learn_sql_*` tests), not this path.
     #[test]
     fn npc_trainer_armor_wrapper_row_imports_verbatim_required_level_and_cost() {
-        // A Paladin trainer (entry 925, in-box at the test-args default center) offering the Plate
-        // Mail wrapper (7109) at req level 40 for 22000 copper — real-world ClassicDB shape.
         let dump = format!(
             "x INSERT INTO `creature` VALUES \
              (1,925,0,1,-8949.95,-132.493,83.5312,0,300,300,0,0); \
@@ -8614,7 +7235,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_trainer_spell"))
             .unwrap_or_else(|| panic!("trainer_spell insert present: {:?}", plan.stmts));
-        // id,trainer_entry,spell_id,cost,required_level,learn_skill_line,learn_skill_cap
         assert!(
             insert.contains(",925,7109,22000,40,0,75)"),
             "wrapper row keeps req level 40 and verbatim cost: {insert}"
@@ -8623,12 +7243,6 @@ mod tests {
 
     #[test]
     fn include_map_spawns_import_whole_map_with_their_own_map_and_verbatim_z() {
-        // One in-box map-0 creature, one map-36 creature far outside the box with a WMO-interior Z,
-        // one map-1 creature (NOT included — must be dropped), plus a map-36 DOOR gameobject.
-        // Pins the three invariants: (a) --include-map imports the whole extra map,
-        // (b) each packed row carries its OWN map id (not args.map), and (c) the dump Z rides
-        // through UNALTERED. There is no ground-z snap in the import path, and Map 36 does not stage
-        // single-layer terrain, so the spawn's cmangos Z remains its authored height.
         let dump = format!(
             "x INSERT INTO `creature` VALUES \
              (1,100,0,1,-8949.95,-132.493,83.5312,0,300,300,0,0),\
@@ -8646,7 +7260,6 @@ mod tests {
         let plan = build_dump_plan(&dump, &args, &None, &None).expect("build_dump_plan");
         let spawn_payload = plan.spawn_batches.join(";");
         let rows: Vec<&str> = spawn_payload.split(';').collect();
-        // (a)+(b)+(c) for creatures: the map-36 row is present, on map 36, Z byte-verbatim.
         let dm_row = rows
             .iter()
             .find(|r| r.split(',').nth(1) == Some("644"))
@@ -8660,7 +7273,6 @@ mod tests {
             f[5], "-33.35",
             "the dump Z is verbatim — no snap, no rounding: {dm_row}"
         );
-        // The primary map-0 row still imports (map field 0), and map 1 is NOT in the slice.
         assert!(
             rows.iter().any(|r| {
                 let f: Vec<&str> = r.split(',').collect();
@@ -8672,7 +7284,6 @@ mod tests {
             !rows.iter().any(|r| r.split(',').nth(1) == Some("999")),
             "a map neither primary nor included must be dropped: {spawn_payload}"
         );
-        // The map-36 gameobject rides the same rule, carrying map 36 in its packed row.
         let go_payload = plan.go_batches.join(";");
         let go_row = go_payload
             .split(';')
@@ -8712,11 +7323,6 @@ mod tests {
 
     #[test]
     fn creature_movement_template_expands_onto_waypoint_spawns_without_direct_rows() {
-        // Two waypoint-typed (MovementType=2) spawns of the same entry 644 on map 36, one direct-
-        // routed spawn of entry 645: the entry-keyed creature_movement_template path expands onto
-        // BOTH 644 spawns (each gets its own copy, keyed by its world guid), a PathId!=0 row is
-        // skipped (9-col vintage), and the direct creature_movement rows for 645 win (no template
-        // expansion for it, proven by 645 also having template rows that must NOT be emitted).
         let dump = format!(
             "x INSERT INTO `creature` VALUES \
              (10,644,36,1,-16.4,-383.07,-33.35,0,300,300,0,2),\
@@ -8741,7 +7347,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_creature_waypoint"))
             .unwrap_or_else(|| panic!("waypoint insert present: {:?}", plan.stmts));
-        // Both 644 spawns got the 2-point path — 4 template points total + 1 direct 645 point.
         assert_eq!(
             wp_insert.matches("-17,-384,-33.35").count(),
             2,
@@ -8752,7 +7357,6 @@ mod tests {
             2,
             "point 2 lands on both spawns: {wp_insert}"
         );
-        // Point order is the dump's Point column (1 before 2), not dump row order (2 listed first).
         let g10 = world_guid(644, 10).to_string();
         let p1 = wp_insert
             .find(&format!("{g10},-17,-384"))
@@ -8761,7 +7365,6 @@ mod tests {
             .find(&format!("{g10},-18,-385"))
             .expect("spawn 10 point 2");
         assert!(p1 < p2, "route order follows the Point column: {wp_insert}");
-        // PathId 1 rows are skipped; direct rows win for 645 (its template row never lands).
         assert!(
             !wp_insert.contains("-99,-99"),
             "PathId!=0 must be skipped: {wp_insert}"
@@ -8807,9 +7410,6 @@ mod tests {
         assert!(error.to_string().contains("--taxi-mounts"));
     }
 
-    /// A default `Args` for tests that need the struct but not real CLI input (mirrors `parse_args`'s
-    /// defaults where it matters for `build_dump_plan`: center/radius match the Northshire default so
-    /// a fixture creature placed exactly at the center lands in scope).
     fn test_args() -> Args {
         Args {
             dump: None,
@@ -9303,8 +7903,6 @@ mod tests {
         assert_eq!(quests.reward_spells, ["(5091041,50944)", "(5091042,50945)"]);
     }
 
-    /// A minimal `quest_template` INSERT tuple wide enough to reach `qt::REW_MONEY_MAX_LEVEL` (col 99):
-    /// entry at col 0, title at col 30, everything else `0`. Mirrors `creature_template_row`'s pattern.
     fn quest_template_row(entry: u64, title: &str) -> String {
         let mut cols = vec!["0".to_string(); qt::REW_MONEY_MAX_LEVEL + 1];
         cols[qt::ENTRY] = entry.to_string();
@@ -9335,7 +7933,6 @@ mod tests {
         format!("({})", cols.join(","))
     }
 
-    /// Source columns from the pinned ClassicDB schema, independent of the importer offsets.
     fn quest_template_row_with_reward_mail(
         entry: u64,
         title: &str,
@@ -9350,8 +7947,6 @@ mod tests {
         format!("({})", cols.join(","))
     }
 
-    /// One `dbscripts_on_quest_end` row, `command`/column positions verified against the pinned
-    /// dump's own `CREATE TABLE` (see the `dse` module).
     fn dbscripts_send_mail_row(
         quest_entry: u64,
         mail_template: u32,
@@ -9364,11 +7959,6 @@ mod tests {
         )
     }
 
-    /// The pinned dump's own three reward-mail quests — 8728 sends 1,000,000 copper from creature
-    /// 11811 after 36 hours; 5237 and 5238 send text-only letters after 24 hours. Quest 3645 (a
-    /// `quest_template.RewMailTemplateId` quest, template 99, delay 86,400) provides the OTHER
-    /// source, and its template names loot item 11423 — both real values, confirmed against the
-    /// pinned `cd0c426a…` dump rather than re-derived from this importer.
     #[test]
     fn quest_reward_mail_imports_from_quest_template_and_from_dbscripts() {
         let dump = format!(
@@ -9584,8 +8174,6 @@ mod tests {
         format!("({})", cols.join(","))
     }
 
-    /// The leading fields of ClassicDB's real quest 783 row. Keep the two adjacent zero and seven
-    /// values literal so this catches a column constant that drifts back to BreadcrumbForQuestId.
     fn classicdb_quest_783_row() -> String {
         let mut cols = vec!["0".to_string(); 123];
         for (index, value) in [
@@ -9606,10 +8194,6 @@ mod tests {
         format!("({})", cols.join(","))
     }
 
-    /// A tiny but REAL synthetic dump: one in-box creature (a quest giver) + its template + one
-    /// quest + the giver relation linking them — just enough for `build_dump_plan` to run
-    /// end-to-end (every family's prerequisite parsing touches this data) without a real cmangos
-    /// dump.
     fn tiny_quest_dump(creature_entry: u64, quest_entry: u64) -> String {
         format!(
             "x INSERT INTO `creature` VALUES (1,{creature_entry},0,1,-8949.95,-132.493,83.5312,0,300,300,0,0); \
@@ -9645,7 +8229,6 @@ mod tests {
         format!("({})", columns.join(","))
     }
 
-    /// `creature_template_row` with `UnitFlags` (col 17) set; everything else `0`.
     fn creature_template_row_with_unit_flags(entry: u64, unit_flags: u32) -> String {
         let mut cols = vec!["0".to_string(); ct::GOSSIP_MENU_ID + 1];
         cols[ct::ENTRY] = entry.to_string();
@@ -9873,7 +8456,6 @@ mod tests {
         let plan = build_dump_plan(&dump, &args, &None, &None).expect("EventAI plan");
         let definitions = plan.eventai_definition_batches.join("\n");
 
-        // Source rule 16 names spawn guid 2. Source rule 17 names entry 200.
         assert!(
             definitions
                 .lines()
@@ -10165,8 +8747,6 @@ mod tests {
         assert!(plan
             .definition_rows
             .iter()
-            // 903 is rewritten to source chat type 2 above, so it encodes as a narrative emote
-            // rather than speech.
             .any(|row| row.contains("speak:emote:self:903")));
         assert_eq!(plan.event_counts(99), (1, 0, 1, 0));
         assert_eq!(plan.action_counts(99), (3, 0, 3, 0));
@@ -10174,10 +8754,6 @@ mod tests {
 
     #[test]
     fn family_quests_filter_produces_only_quest_family_stmts() {
-        // `--family quests`: the plan must carry ONLY the quest tables' DELETE+INSERT
-        // — no creature/item/loot/gossip/gameobject/trainer/cast/globals statements — even though every
-        // family's prerequisite parsing still ran (the quest giver relation needed the creature entry
-        // to resolve, per `build_quests`' doc).
         let dump = tiny_quest_dump(100, 500);
         let mut args = test_args();
         args.family = Some("quests".to_string());
@@ -10230,13 +8806,9 @@ mod tests {
                 plan.stmts
             );
         }
-        // Only the quests family gets a provenance stamp.
         assert_eq!(plan.stamps, vec![("quests", 1u64)], "{:?}", plan.stamps);
     }
 
-    /// `next_quest_id`/`limit_time` thread through the FULL import (dump row → parsed
-    /// column → the emitted `game_quest_template` INSERT tuple), not just `build_quests`' own struct —
-    /// extends the quests-family fixture with a chained+timed quest.
     #[test]
     fn chained_and_timed_quest_columns_thread_through_the_full_import() {
         let dump = format!(
@@ -10255,13 +8827,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_quest_template") && s.contains("500"))
             .unwrap_or_else(|| panic!("quest 500 row present: {:?}", plan.stmts));
-        // Match the triple adjacent-and-in-order rather than anchored at the row's end: `reward_money_max_level`
-        // (daf083c, authentic quest XP) END-appended a THIRD column after next_quest_id/limit_time, and an
-        // end-anchored check broke on that legitimate append even though both still threaded through
-        // correctly. Pin the VALUE of all three (777 is the fixture's distinctive REW_MONEY_MAX_LEVEL, see
-        // `quest_template_row_chained_timed`) rather than just checking a comma follows — a comma-only check
-        // would pass even if reward_money_max_level silently came out wrong (e.g. always the unwrap_or(0)
-        // default). Any FURTHER end-append is still expected to land after this triple, never between them.
         assert!(insert.contains(",501,3600,777"), "next_quest_id=501, limit_time=3600, reward_money_max_level=777 must thread through, in order, as END-appended columns: {insert}");
     }
 
@@ -10292,9 +8857,6 @@ mod tests {
         );
     }
 
-    /// `qt::TYPE` (column 6) reads into `QuestTemplate.quest_type`, the last END-appended field, and
-    /// a type-62 (`QUEST_TYPE_RAID`) fixture counts toward the coverage line's raid-quest total. A
-    /// normal quest (type 0, the default) does not.
     #[test]
     fn quest_type_column_reads_into_quest_type_and_counts_raid_quests() {
         let normal_row = {
@@ -10336,11 +8898,6 @@ mod tests {
         assert_eq!(quests.raid_quest_count, 1);
     }
 
-    /// The leading fields plus `RewMailTemplateId`/`RewMailDelaySecs` of ClassicDB's real quest 3645
-    /// row (`Membership Card Renewal`, `cd0c426a…` pin). The pinned dump's own `quest_template` row
-    /// carries 130 columns; keeping 102/103 literal at that real width catches a column constant
-    /// that drifts off its real position, the same guard `classicdb_quest_783_row` gives
-    /// NextQuestInChain.
     fn classicdb_quest_3645_row() -> String {
         let mut cols = vec!["0".to_string(); 130];
         for (index, value) in [
@@ -10400,7 +8957,6 @@ mod tests {
                     "full run is missing a {family} statement: {s}"
                 );
             }
-            // Every family that ran got exactly one stamp, matching its own solo run's stamp count.
             assert_eq!(
                 plan.stamps.len(),
                 1,
@@ -10409,7 +8965,6 @@ mod tests {
             );
             assert_eq!(plan.stamps[0].0, family);
         }
-        // The full run stamps every family exactly once, in FAMILIES order.
         let stamped_families: Vec<&str> = full_plan.stamps.iter().map(|(f, _)| *f).collect();
         assert_eq!(
             stamped_families,
@@ -10418,7 +8973,6 @@ mod tests {
             full_plan.stamps
         );
 
-        // Determinism: re-running the full plan over the identical dump/args is byte-for-byte identical.
         let full_plan_again =
             build_dump_plan(&dump, &full_args, &None, &None).expect("full run again");
         assert_eq!(
@@ -10427,15 +8981,6 @@ mod tests {
         );
     }
 
-    // --- bad input / missing files / partial datasets ---------------------------------------
-    // The importer's whole job is to eat an operator-supplied file we have never seen. Every test
-    // below pins what happens when that file is WRONG — missing, truncated, corrupt, or half a
-    // schema — because the failure mode we cannot afford is a silent one: an import that "succeeds"
-    // with garbage rows poisons the live world tables, and a panic mid-run leaves the clear+reload
-    // half-applied (the DELETE ran, the INSERT never did).
-
-    /// A unique scratch file per test (std-only; no `tempfile` dep — mirrors `pack_client.rs`'s
-    /// `Scratch`). Removed on drop so a FAILING assert still cleans up after itself.
     struct ScratchFile(std::path::PathBuf);
     impl ScratchFile {
         fn new(tag: &str, bytes: &[u8]) -> Self {
@@ -10462,11 +9007,6 @@ mod tests {
 
     #[test]
     fn read_dump_on_a_missing_path_errors_and_names_the_path() {
-        // A mistyped `--dump` is the single most common operator error, and the run that follows is
-        // destructive (clear+reload). The error MUST name the path the operator actually passed —
-        // a bare "No such file or directory" leaves them guessing which of --dump/--dbc/--terrain
-        // was wrong. Both the plain and the.gz branch route through the same `read` context, so
-        // both are pinned: read_dump reads the bytes BEFORE it looks at the extension.
         for path in [
             "/nonexistent/lyracore/importer/path.sql",
             "/nonexistent/lyracore/importer/path.sql.gz",
@@ -10482,9 +9022,6 @@ mod tests {
 
     #[test]
     fn read_dump_on_a_gz_path_holding_non_gzip_bytes_errors_at_the_gunzip_step() {
-        // A half-downloaded / plain-text-renamed-to-.gz dump must fail LOUDLY at decompression, not
-        // panic and not decode to an empty string (an empty dump would make every builder emit its
-        // DELETEs with no INSERTs — i.e. it would WIPE the live tables and reload nothing).
         let f = ScratchFile::new(
             "not-really-gzip.sql.gz",
             b"INSERT INTO `spell_chain` VALUES (1);",
@@ -10499,11 +9036,6 @@ mod tests {
 
     #[test]
     fn read_dump_decodes_invalid_utf8_lossily_instead_of_failing() {
-        // DELIBERATE design decision, pinned so nobody "fixes" it into `read_to_string`: real
-        // cmangos dumps are latin1/utf8-ish and carry stray non-UTF8 bytes inside creature/item
-        // names. A strict decode would abort the WHOLE import over one bad byte in one name (and
-        // `read_to_string` cannot even be used on the.gz path). We decode lossily on both paths:
-        // the offending byte becomes U+FFFD and every valid row around it still imports.
         let f = ScratchFile::new("latin1.sql", b"INSERT INTO `t` VALUES (1,'Caf\xE9 Ale');");
         let text = read_dump(f.path()).expect("a stray non-UTF8 byte must not fail the import");
         assert!(
@@ -10514,7 +9046,6 @@ mod tests {
             text.contains('\u{FFFD}'),
             "the bad byte must become the replacement char, not be dropped: {text:?}"
         );
-        // And the lossily-decoded text is still parseable — the row is not lost.
         let rows = parse_table(&text, "t");
         assert_eq!(
             rows.len(),
@@ -10526,9 +9057,6 @@ mod tests {
 
     #[test]
     fn parse_table_returns_no_rows_for_a_table_the_dump_never_mentions() {
-        // A --family run asks for tables a partial dump may simply not contain (an operator can
-        // dump `creature` without `spell_chain`). That must be an EMPTY result, never a panic:
-        // every builder is expected to degrade to "DELETE, no INSERT" for a table it cannot find.
         let dump = "x INSERT INTO `creature_template` VALUES (1,'A',NULL,5); y";
         assert!(
             parse_table(dump, "spell_chain").is_empty(),
@@ -10540,12 +9068,6 @@ mod tests {
 
     #[test]
     fn parse_table_name_match_is_exact_not_a_prefix_of_a_longer_table() {
-        // `creature` is a PREFIX of `creature_template`, and cmangos ships both. The needle carries
-        // the closing backtick (``INSERT INTO `creature` VALUES ``), so the match is exact in BOTH
-        // directions — asking for the short name never harvests the long table's rows (which would
-        // import creature_template columns as spawn rows: total garbage), and asking for the long
-        // name never matches the short table. Pinned because the guard is a single backtick in a
-        // format! string, trivially lost in a refactor.
         let templates = "x INSERT INTO `creature_template` VALUES (1,'A',NULL,5); y";
         assert!(
             parse_table(templates, "creature").is_empty(),
@@ -10563,9 +9085,6 @@ mod tests {
 
     #[test]
     fn parse_table_keeps_complete_tuples_and_drops_an_unterminated_one() {
-        // A truncated dump (interrupted download / disk full) ends mid-statement. The good tuples
-        // ALREADY closed by a `)` are kept; the half-written tail is dropped, because a row is only
-        // committed on its closing paren. No panic, no partial row with missing columns.
         let truncated = "x INSERT INTO `spell_chain` VALUES (133,0,133,1,0),(143,133,133";
         let rows = parse_table(truncated, "spell_chain");
         assert_eq!(
@@ -10574,19 +9093,12 @@ mod tests {
             "the closed tuple survives, the truncated tail is dropped: {rows:?}"
         );
         assert_eq!(field(&rows[0], 0), "133");
-        // A missing terminating `;` alone (both tuples closed) loses nothing.
         let no_semicolon = "x INSERT INTO `spell_chain` VALUES (133,0,133,1,0),(143,133,133,2,0)";
         assert_eq!(parse_table(no_semicolon, "spell_chain").len(), 2);
     }
 
     #[test]
     fn parse_table_unterminated_quote_swallows_the_rest_of_the_dump() {
-        // HONEST PIN of the REAL behavior, which is NOT per-row skip: an unclosed `'` puts the
-        // parser in quote mode until the next `'` ANYWHERE downstream, so it eats the remainder of
-        // the file — including later, perfectly well-formed statements for the same table. Rows
-        // BEFORE the corruption still import. The consequence to know: a single unbalanced quote
-        // silently TRUNCATES an import rather than dropping one row, so a suspiciously low row
-        // count in the importer's own `eprintln!` totals is the symptom to look for.
         let dump = "x INSERT INTO `creature_template` VALUES (1,'Good'),(2,'oops); \
                     INSERT INTO `creature_template` VALUES (3,'Later'); y";
         let rows = parse_table(dump, "creature_template");
@@ -10600,10 +9112,6 @@ mod tests {
 
     #[test]
     fn build_stats_sql_drops_rows_whose_key_columns_are_missing_or_non_numeric() {
-        // Partial-dataset policy (`filter_map(...parse().ok()?)`): a row we cannot key is DROPPED,
-        // the import does NOT abort. Losing one stat row costs one class/level's base HP; aborting
-        // costs the operator the whole run. The KEY columns only are validated, so this test also
-        // documents the sharp edge below.
         let dump = "x INSERT INTO `player_classlevelstats` VALUES (1,1,20,0),\
                     ('warrior',2,29,0),(1,'two',29,0); \
                     INSERT INTO `player_levelstats` VALUES (1,1,1,23,20,22,20,21),(1,1,'x',1,1,1,1,1); y";
@@ -10634,12 +9142,6 @@ mod tests {
 
     #[test]
     fn build_stats_sql_emits_empty_tokens_for_a_row_short_of_its_value_columns() {
-        // SHARP EDGE, pinned honestly rather than wished away: only the KEY columns (class/level)
-        // are `parse()`d — `base_health`/`base_mana` are interpolated verbatim. A row truncated to
-        // its keys therefore emits `(...,,)`, which `spacetime sql` rejects at APPLY time (loud) —
-        // it does not silently insert zeroes. If this ever needs hardening, the fix is to parse the
-        // value columns too; until then this test documents that the guard is apply-time, not
-        // parse-time, so nobody assumes short rows are already filtered.
         let dump = "x INSERT INTO `player_classlevelstats` VALUES (1,1); y";
         let stmts = build_stats_sql(dump);
         let cls = stmts
@@ -10654,8 +9156,6 @@ mod tests {
 
     #[test]
     fn build_stats_sql_empty_dump_yields_deletes_only_no_insert() {
-        // An empty/absent stats section must still WIPE (clear+reload semantics) and emit no
-        // INSERT — `push_insert` must not produce a syntactically-broken `VALUES` with no tuples.
         let stmts = build_stats_sql("");
         assert_eq!(
             stmts,
@@ -10669,11 +9169,6 @@ mod tests {
 
     #[test]
     fn build_graveyard_zone_sql_drops_unparseable_rows_and_leaves_a_gap_in_row_id() {
-        // Bad rows drop (a graveyard link we cannot key would resolve corpses to the wrong zone).
-        // HONEST PIN: `enumerate()` runs BEFORE `filter_map`, so row_id is the PRE-filter index —
-        // a dropped row leaves a HOLE in the sequence (1,3 here, not 1,2). That is harmless (row_id
-        // is an opaque surrogate key and the DELETE is wholesale), but it means row_id is NOT a
-        // count of imported rows and must never be used as one.
         let dump = "x INSERT INTO `game_graveyard_zone` VALUES (105,12,469),(106,'zone',469),(80,40,469); y";
         let stmts = build_graveyard_zone_sql(dump);
         let insert = stmts
@@ -10704,10 +9199,6 @@ mod tests {
 
     #[test]
     fn build_spell_chain_sql_drops_rows_with_a_short_or_out_of_range_column() {
-        // Every one of the five columns is parsed here, so ANY malformed column drops the row —
-        // stricter than build_stats_sql above, and deliberately so: a half-parsed rank-prereq row
-        // would let a player train rank 3 without rank 2. `rank` is a u8, so a >255 rank is also
-        // rejected rather than wrapping.
         let dump = "x INSERT INTO `spell_chain` VALUES (133,0,133,1,0),(143,133),\
                     (145,133,133,300,0),(147,133,133,2,'x'),(0,0,0,1,0); y";
         let stmts = build_spell_chain_sql(dump, &[]).unwrap();
@@ -10725,10 +9216,6 @@ mod tests {
 
     #[test]
     fn build_createinfo_spell_sql_drops_bad_rows_and_leaves_a_gap_in_the_id() {
-        // A starter-kit row we cannot key would teach a spell to the wrong race/class at character
-        // creation — drop it. Same pre-filter `enumerate()` shape as the graveyard builder: the id
-        // of the surviving third row is 3, not 2. Pinned so a future "densify the ids" change is a
-        // deliberate one and not a surprise.
         let dump = "x INSERT INTO `playercreateinfo_spell` VALUES (0,1,78),(1,0),(3,1,'fireball'),(3,1,78); y";
         let stmts = build_createinfo_spell_sql(dump);
         let insert = stmts
@@ -10749,9 +9236,6 @@ mod tests {
 
     #[test]
     fn build_createinfo_spell_sql_empty_dump_yields_delete_only_no_insert() {
-        // Note the consequence this pins: with no `playercreateinfo_spell` in the dump, the import
-        // WIPES the table. That is the intended wholesale-reload semantics (see the builder's doc),
-        // but it means a --family run over a partial dump must not include this family by accident.
         let stmts = build_createinfo_spell_sql("");
         assert_eq!(
             stmts,

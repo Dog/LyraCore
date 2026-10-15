@@ -1,23 +1,11 @@
-//! Reconciling a Package's Runtime Scripts onto a Shard, and firing one on a real event.
-//!
-//! Everything here needs a live `ReducerContext`, which a native test has no way to build: the
-//! apply reducer's writes, the `game_script` rows they leave, and the Event Binding dispatch that
-//! reads them back at a hook chokepoint. The plan-level refusals and the dispatch ORDER are pure
-//! and covered where they live (`module/src/package_import/script.rs`,
-//! `module/src/script_binding.rs`); this drives the rungs those cannot reach.
-
 mod support;
 
 use support::Standalone;
 
-/// A Package's source digest. The artifact only carries it; nothing recomputes it.
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const HASH_B: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 const PLAYER: u64 = 1;
-/// The scenario fixture's own quest, which `debug_seed_scenario_fixtures` puts on the Shard. The
-/// test only needs `debug_grant_quest` to succeed so the `on_quest_accept` chokepoint fires; a
-/// bare sandbox seeds no quest template at all, so one has to be asked for.
 const QUEST: u32 = 50_900;
 
 fn script(
@@ -46,14 +34,10 @@ fn artifact(package: &str, source_hash: &str, scripts: &[String]) -> String {
     )
 }
 
-/// One reducer argument. `spacetime call` parses every argument as JSON, so a `String` parameter
-/// has to arrive as a JSON string literal — bare text is a parse error, and the packed payload
-/// carries quotes and newlines that need escaping either way.
 fn arg(value: &str) -> String {
     serde_json::to_string(value).expect("a string encodes as JSON")
 }
 
-/// The whole enabled plan, one canonical artifact per line — the payload shape the reducer reads.
 fn apply(standalone: &Standalone, artifacts: &[String]) {
     standalone.assert_call(
         "apply_package_deltas",
@@ -94,7 +78,6 @@ fn provenance(standalone: &Standalone) -> Vec<(String, u64)> {
     rows
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
@@ -103,7 +86,6 @@ fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
 
-    // --- One Package's whole set lands, disabled script included.
     apply(
         &standalone,
         &[artifact(
@@ -139,7 +121,6 @@ fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
         [("test_fixture.bolt".to_string(), 2)]
     );
 
-    // --- Re-applying the same plan is idempotent.
     let before = scripts_on_shard(&standalone);
     apply(
         &standalone,
@@ -158,7 +139,6 @@ fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
         "re-publication must not change a row"
     );
 
-    // --- A second Package joins; neither displaces the other.
     apply(
         &standalone,
         &[
@@ -206,7 +186,6 @@ fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
         ]
     );
 
-    // --- A Package leaving the enabled set takes its scripts with it.
     apply(
         &standalone,
         &[artifact(
@@ -234,14 +213,11 @@ fn a_packages_runtime_scripts_reconcile_onto_a_shard() {
         [("test_fixture.zeta".to_string(), 1)]
     );
 
-    // --- An empty plan is the honest "no Package ships a script any more".
     apply(&standalone, &[]);
     assert!(scripts_on_shard(&standalone).is_empty());
     assert!(provenance(&standalone).is_empty());
 }
 
-/// A plan two Packages disagree about must change nothing at all — not the scripts already on the
-/// Shard, and not the provenance describing them.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_conflicting_plan_leaves_the_shard_exactly_as_it_was() {
@@ -267,7 +243,6 @@ fn a_conflicting_plan_leaves_the_shard_exactly_as_it_was() {
     );
     let before = scripts_on_shard(&standalone);
 
-    // Both Packages ship script 100_002. The plan is refused whole.
     let refused = standalone.call(
         "apply_package_deltas",
         &[
@@ -317,8 +292,6 @@ fn a_conflicting_plan_leaves_the_shard_exactly_as_it_was() {
     );
 }
 
-/// A Package Event is an event the Package fires itself, so the Shard has to store the binding
-/// exactly as written — and refuse a Package reaching for an event another Package owns.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_package_binds_its_own_event_and_never_another_packages() {
@@ -351,7 +324,6 @@ fn a_package_binds_its_own_event_and_never_another_packages() {
     );
     let before = scripts_on_shard(&standalone);
 
-    // `test_fixture.bolt` reaching for `test_fixture`'s event. Refused at the parse, before any write.
     let refused = standalone.call(
         "apply_package_deltas",
         &[
@@ -383,8 +355,6 @@ fn a_package_binds_its_own_event_and_never_another_packages() {
     assert_eq!(provenance(&standalone), [("test_fixture".to_string(), 1)]);
 }
 
-/// The point of the whole feature: a script a Package shipped runs at a real core chokepoint, and
-/// one that fails does not stop the next one.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_package_script_fires_on_a_real_event_and_a_failing_one_does_not_block_the_next() {
@@ -407,8 +377,6 @@ fn a_package_script_fires_on_a_real_event_and_a_failing_one_does_not_block_the_n
     };
     let before = xp(&standalone);
 
-    // Three scripts on one event: one that fails to compile between two that work. The Host is the
-    // failure boundary, so the third still runs.
     apply(
         &standalone,
         &[artifact(
@@ -439,7 +407,6 @@ fn a_package_script_fires_on_a_real_event_and_a_failing_one_does_not_block_the_n
                     true,
                     "grant_xp(event.actor, 25)",
                 ),
-                // Disabled: shipped, on the Shard, and never invoked.
                 script(
                     100_004,
                     "bolt.off",
@@ -504,7 +471,6 @@ fn a_typed_levelup_binding_receives_each_attained_level_from_the_core_hook() {
         "debug_grant_quest",
         &[&PLAYER.to_string(), &QUEST.to_string()],
     );
-    // L1 requires 400 XP and L2 requires 900 XP. The row is persisted after both hooks fire.
     standalone.assert_call(
         "debug_turn_in_quest",
         &[&PLAYER.to_string(), &giver, &QUEST.to_string(), "0"],

@@ -1,4 +1,3 @@
-//! Real Module registration, instance lifecycle and gameplay ray queries on a private fixture.
 mod support;
 
 #[test]

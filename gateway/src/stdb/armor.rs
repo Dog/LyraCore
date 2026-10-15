@@ -1,7 +1,3 @@
-//! Character-sheet resistances from the coordinator's entity, aura, item and catalogue caches.
-//! The shared combat fold includes applied enchantments and Random Properties.
-//! Other character-sheet values come directly from the Module's derived entity fields.
-
 use super::bindings::*;
 use spacetimedb_sdk::Table;
 use std::collections::HashMap;
@@ -24,24 +20,9 @@ fn aura_values(db: &RemoteTables, guid: u64) -> Vec<AuraAmount> {
         .collect()
 }
 
-/// Everything the paperdoll shows that GEAR/AURAS move on the STR/AGI/STA/INT/SPI/AP/damage-range/crit
-/// half of the sheet, a plain row read of `module::spell::recompute_sheet`'s output,
-/// never a second fold. `strength`/`agility`/`stamina`/`intellect`/`spirit` are the BASE attributes (the
-/// white `UNIT_FIELD_STAT0..4` total); `*_bonus` is the SIGNED aura+gear(+enchant) delta the caller
-/// splits into the green/red `PLAYER_FIELD_POSSTAT`/`NEGSTAT` pair via `.max(0)`/`.min(0)` — sign
-/// arithmetic only, not aura interpretation, so no drift risk re-enters the gateway. `attack_power` is
-/// the stat-derived base (folds effective STR/AGI, so a +STR trinket already moves it) and `ap_mods` is
-/// the `A_MOD_COMBAT(ATTACK_POWER)` aura portion alone (Battle Shout) — vanilla renders those through
-/// two different wire fields. `dmg_min`/`dmg_max` are `combat::swing_range_ctx`'s own numbers (weapon +
-/// AP + disarm folded in module-side), so the sheet can never show a range the swing doesn't roll.
-/// `crit_pct` is `sheet_crit_bp`/100.0 — `combat::effective_crit_bp`'s output, the exact band the swing
-/// table rolls a crit against.
 pub(crate) fn sheet_stats(db: &RemoteTables, guid: u64) -> Option<crate::codec::SheetStatsValues> {
     let e = db.game_world_entity().guid().find(&guid)?;
-    // `e.strength`/`agility`/`stamina`/`intellect` are BASE only (unlike `e.spirit`, which
-    // `recompute_vitals` already overwrites to the effective value) — the wire field is the white
-    // EFFECTIVE total (base + bonus), matching the armor half's `total` (see module docs above), so
-    // add the signed `sheet_*_bonus` delta back in here rather than sending the base straight through.
+    // Strength, agility, stamina and intellect are base values; spirit is already effective.
     Some(crate::codec::SheetStatsValues {
         strength: (e.strength as i32 + e.sheet_str_bonus).max(0) as u32,
         agility: (e.agility as i32 + e.sheet_agi_bonus).max(0) as u32,
@@ -60,9 +41,7 @@ pub(crate) fn sheet_stats(db: &RemoteTables, guid: u64) -> Option<crate::codec::
         ranged_attack_power: e.sheet_ranged_ap,
         ranged_dmg_min: e.sheet_ranged_dmg_min,
         ranged_dmg_max: e.sheet_ranged_dmg_max,
-        // PLAYER_CRIT_PERCENTAGE wants a float percent; `sheet_crit_bp` is basis points
-        // (100 bp == 1%), so divide by 100.0 — the sheet value IS `effective_crit_bp`'s output,
-        // no second crit formula.
+        // PLAYER_CRIT_PERCENTAGE uses percent; sheet_crit_bp uses basis points.
         crit_pct: e.sheet_crit_bp as f32 / 100.0,
     })
 }
@@ -71,8 +50,7 @@ pub(crate) fn aura_armor_positive(db: &RemoteTables, guid: u64) -> u32 {
     resistance::positive_armor(aura_values(db, guid))
 }
 
-/// Effective armor followed by Holy, Fire, Nature, Frost, Shadow and Arcane resistance.
-/// The order matches `UNIT_FIELD_RESISTANCES[0..=6]`.
+/// Descriptor order is armor, Holy, Fire, Nature, Frost, Shadow, Arcane.
 pub(crate) fn effective_resistances(db: &RemoteTables, guid: u64) -> [u32; 7] {
     let base_armor = db
         .game_world_entity()
@@ -112,7 +90,6 @@ pub(crate) fn effective_resistances(db: &RemoteTables, guid: u64) -> [u32; 7] {
             })
         })
         .collect();
-    // The SDK exposes no non-unique enchantment index. Read its catalogue once per projection.
     let mut enchantments = HashMap::<u32, Vec<(u8, i32, u32)>>::new();
     for effect in db.game_item_enchantment().iter() {
         enchantments.entry(effect.enchant_id).or_default().push((

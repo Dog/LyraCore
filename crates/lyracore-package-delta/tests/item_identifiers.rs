@@ -1,7 +1,3 @@
-//! The item identifier policy: which rows a Package may claim. Mirrors `spell_identifiers.rs`,
-//! items' worked-example counterpart — items have one table, so there is no packed child key to
-//! test here.
-
 mod common;
 
 use common::{artifact, item_claim, WHOLE_ITEM_ROW};
@@ -30,7 +26,6 @@ fn a_package_may_insert_an_item_inside_the_package_range() {
 
 #[test]
 fn an_insert_outside_the_package_range_is_refused() {
-    // A real client item, the value just below the floor, and the value just above the ceiling.
     for entry in [25, PACKAGE_ITEM_ID_FLOOR - 1, PACKAGE_ITEM_ID_CEIL + 1] {
         let json = artifact("example.pkg", &item_claim(entry, "insert", WHOLE_ITEM_ROW));
 
@@ -44,7 +39,6 @@ fn an_insert_outside_the_package_range_is_refused() {
 
 #[test]
 fn an_update_may_name_a_real_client_item() {
-    // Tuning a real item is the common case, and the reason the range applies to inserts alone.
     let json = artifact("example.pkg", &item_claim(25, "update", A_BUY_PRICE));
 
     let delta = PackageDelta::parse(&json).expect("a real item is updatable");
@@ -54,8 +48,6 @@ fn an_update_may_name_a_real_client_item() {
 
 #[test]
 fn no_operation_may_claim_the_project_wide_fixture_reserved_band() {
-    // Items have no family-specific fixture cluster the way spells do — the shared band is the
-    // whole check. `5_090_050` is `FIXTURE_BLADE` (`module/src/seed/fixtures.rs`).
     for entry in [5_090_000, 5_090_050, 5_099_999] {
         let update = artifact("example.pkg", &item_claim(entry, "update", A_BUY_PRICE));
         assert_eq!(
@@ -120,7 +112,6 @@ fn an_incomplete_item_insert_is_refused() {
     match PackageDelta::parse(&json).expect_err("the insert must be refused") {
         DeltaError::IncompleteInsert { table, missing } => {
             assert_eq!(table, lyracore_package_delta::Table::Item);
-            // Every claimable column except the one the claim carried.
             assert_eq!(missing.len(), 56);
             assert!(missing.contains(&"name".to_owned()));
             assert!(!missing.contains(&"buy_price".to_owned()));

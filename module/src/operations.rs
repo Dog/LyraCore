@@ -1,5 +1,3 @@
-//! Operator reducers that every build carries, whatever its Cargo features.
-
 use spacetimedb::{log, reducer, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::spell::stacking::game_spell_group;
@@ -12,22 +10,11 @@ use crate::{
     CreatureMoveSchedule, DuelSchedule, GroundAreaSchedule, PetCareSchedule,
 };
 
-/// The post-publish repair pass. SpacetimeDB runs `init` only on a database's first publish, so
-/// every seed, fixture and schedule row `seed::init` inserts stays absent on an auto-migrated
-/// database until this pass restores it. Every step is idempotent, so it is safe to run after every
-/// publish, on every shard.
-///
-/// Gated by `require_operator`. On a database's first publish the operator is not yet claimed, so
-/// the call fails with "operator not claimed"; `init` has already seeded everything there.
-///
-/// Stamps one `game_import_meta` row (family `"debug_repair_after_publish"`) with the total row
-/// count. The name keeps its `debug_` prefix because the CLI, scripts and runbooks call it by name.
 #[reducer]
-#[allow(clippy::too_many_lines)] // One idempotent repair pass per row family.
+#[allow(clippy::too_many_lines)]
 pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
 
-    // --- seeders (each idempotent: inserts only rows that are absent) ---
     crate::talent::seed_talents(ctx);
     let talents = ctx.db.game_talent().count();
 
@@ -45,19 +32,15 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
     crate::items::seed_compatibility_enchantments(ctx);
     let spell_groups = ctx.db.game_spell_group().count();
 
-    // The live stacking-family probe needs its four family members present on an already-migrated
-    // database, where `init` never re-runs.
     crate::seed::seed_stacking_probe_fixture(ctx);
 
     crate::seed::seed_pw_shield_fixture(ctx);
-    // Weakened Soul 6788, Test PW:Shield 50072
     let pw_shield = [6788u32, 50072u32]
         .iter()
         .filter(|id| ctx.db.game_spell().spell_id().find(**id).is_some())
         .count() as u64;
 
     crate::seed::seed_fixture_catalogue(ctx);
-    // Tempered Blade 5090050 + Tough Jerky 5090052 + fixture faction 50900
     let fixture_catalogue = [crate::seed::FIXTURE_BLADE, crate::seed::FIXTURE_JERKY]
         .iter()
         .filter(|e| ctx.db.game_item_template().entry().find(**e).is_some())
@@ -93,7 +76,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
 
     crate::seed::seed_frost_armor_fixture(ctx);
     crate::seed::seed_test_proc_fixtures(ctx);
-    // Chilled 6136, Frost Armor 168, and the Proc engine's six test fixtures
     let frost_armor = [
         6136u32,
         168u32,
@@ -112,13 +94,8 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
     let demon_skin = ctx.db.game_spell().spell_id().find(696u32).is_some() as u64;
 
     crate::seed::seed_regen_fixture(ctx);
-    // Test Regeneration 50137 (the combat-regen probe's kind-169 A_COMBAT_HEALTH_REGEN_PCT source)
     let regen = ctx.db.game_spell().spell_id().find(50137u32).is_some() as u64;
 
-    // The land-mount fixture: Riding skill line 762, Test Riding Horse 50310 + its two effects, the
-    // skill-ability row that makes it trainable, and Test Dazed 50311. `seed_fixture_catalogue` above
-    // restores the reins ITEM, so without this the item would survive a republish pointing at a spell
-    // that no longer exists.
     crate::seed::seed_mount_fixture(ctx);
     let mount_fixture = [
         crate::seed::FIXTURE_MOUNT_SPELL,
@@ -128,9 +105,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
     .filter(|id| ctx.db.game_spell().spell_id().find(**id).is_some())
     .count() as u64;
 
-    // The temporary Elwynn Forest / Westfall weather climate. Only-if-empty, so an operator edit and
-    // the eventual world-data import both survive this pass. A zone with no climate row never rolls,
-    // and its sky stays fine.
     let weather_climate = crate::weather::seed_weather_weights(ctx);
 
     let aura_schedule = if ctx.db.game_aura_schedule().iter().next().is_some() {
@@ -177,10 +151,7 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         1
     };
 
-    // Ensure — never REARM — the 20 Hz movement-republish schedule. Ensure, because
-    // `scheduled_at` IS the cadence knob (`set_motion_tick_ms`), and a publish must not silently
-    // undo an operator's retune. Absent, movement stages into the private table and never relays,
-    // so this is the row whose absence is loudest.
+    // Ensure rather than rearm because scheduled_at preserves the Operator's chosen motion cadence.
     let motion_schedule = if ctx
         .db
         .game_motion_publish_schedule()
@@ -201,8 +172,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         1
     };
 
-    // Hunter care is an authoritative module timer. Ensure it after an auto-migrate publish, where
-    // `init` does not run, without disturbing an already-armed row.
     let pet_care_schedule = if ctx.db.game_pet_care_schedule().iter().next().is_some() {
         0
     } else {
@@ -215,7 +184,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         1
     };
 
-    // Restore the global tick without changing dedicated Instance tick rows.
     let move_sched = ctx.db.game_creature_move_schedule();
     let stale_move: Vec<u64> = move_sched
         .iter()
@@ -243,9 +211,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         )),
     });
 
-    // Re-arm the gateway lease reaper (bounded ghost lifetime for sessions riding
-    // the shared connection). Rearm-not-ensure is safe here — unlike the motion tick there is no
-    // operator tuning knob to preserve; the canonical interval is the only interval.
     let lease_sched = ctx.db.game_gateway_lease_reaper_schedule();
     let stale_lease: Vec<u64> = lease_sched.iter().map(|r| r.scheduled_id).collect();
     for id in stale_lease {
@@ -256,27 +221,14 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         scheduled_at: ScheduleAt::Interval(TimeDuration::from_micros(crate::gw::LEASE_REAP_MICROS)),
     });
 
-    // Re-arm the 10-minute weather roll, leaving exactly one schedule row. Rearm-not-ensure for the
-    // lease reaper's reason: there is no operator cadence knob here, so the canonical interval is the
-    // only interval. Absent, weather silently stops advancing.
     crate::weather::rearm_weather_schedule(ctx);
 
-    // Re-arm the 5 s Meeting Stone reminder tick, for the weather roll's reason. Absent, a queued
-    // Party never hears IN_PROGRESS.
     crate::meeting_stone::rearm_reminder_schedule(ctx);
 
-    // Re-tag legacy auction mail (plain English subject, Character sender) to the vanilla
-    // AuctionHouse sender and machine subject — see `auction::repair_legacy_auction_mail`, which
-    // runs at most once per database on its own marker. MUST stay ordered before any Mail Timer
-    // expiry backfill added to this reducer: a legacy "Auction won" still reads as returnable
-    // Character mail until this re-tag runs, and a backfill that reaches it first would send an
-    // already-paid seller their own item back.
     let (legacy_auction_mail, _unmapped_auction_mail) =
         crate::auction::repair_legacy_auction_mail(ctx);
 
-    // One-shot Auction expiries are created with their Auctions, not seeded globally. A publish
-    // must preserve them; if an older/broken publication left one absent, restore only that missing
-    // row at the Auction's original deadline. Never re-arm an existing row or move its deadline.
+    // Preserve one-shot Auction expiries; restore only missing schedule rows.
     let mut auction_expiries = 0u64;
     for auction in ctx.db.game_auction().iter() {
         if ctx
@@ -295,20 +247,8 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         }
     }
 
-    // Mail Timers are created with their Mail. Arm one for each Mail that has none: Mail written
-    // before the timer existed, or Mail a Transfer imported. Mail older than its life expires after
-    // this pass commits, 100 a second. A Mail that has a timer keeps it, so a second pass arms
-    // nothing.
     let mail_timers = crate::mail_timer::arm_missing(ctx);
 
-    // PROC-PROFILE BACKFILL. The proc columns are END-appended and default to 0, and 0 in `proc_flags`
-    // reads as "never procs" — so an aura row that was already on a unit when the proc columns landed
-    // is a Proc that silently stopped firing. A permanent self-buff (Frost Armor) never refreshes on
-    // its own, so nothing would ever re-freeze it. Re-freeze each such row from its spell header and
-    // the `spell_proc_event` overlay, the same profile `aura_apply` freezes — which also picks up an
-    // overlay that landed after the aura did. Charges are refilled to full and the cooldown starts ready,
-    // which is what a fresh apply would have given it. Idempotent: a row already carrying its profile
-    // is left alone, so a second repair pass touches nothing.
     let auras = ctx.db.game_aura();
     let stale_procs: Vec<crate::Aura> = auras
         .iter()
@@ -317,11 +257,11 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
     let mut proc_profiles = 0u64;
     for mut a in stale_procs {
         let Some(hdr) = ctx.db.game_spell().spell_id().find(a.spell_id) else {
-            continue; // no header to read a profile off — leave the row as it is
+            continue;
         };
         let profile = crate::spell::proc::freeze_profile(ctx, a.eff_kind, &hdr);
         if profile.flags == 0 {
-            continue; // the header carries no proc data either; nothing to backfill
+            continue;
         }
         a.proc_flags = profile.flags;
         a.proc_chance = profile.chance;
@@ -337,10 +277,6 @@ pub fn debug_repair_after_publish(ctx: &ReducerContext) -> Result<(), String> {
         proc_profiles += 1;
     }
 
-    // row_count: total rows/rearms across every family this pass touched. One provenance
-    // stamp records the whole repair pass. The trailing `+ 3` is the three schedule rows this always (re)arms
-    // unconditionally (creature tick + instance reaper + weather roll), which have no "was it
-    // already present" signal worth stamping separately.
     let total = talents
         + createinfo
         + lesser_heal_target

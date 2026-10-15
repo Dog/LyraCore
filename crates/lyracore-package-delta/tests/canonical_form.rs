@@ -1,5 +1,3 @@
-//! Canonical serialization: equivalent artifacts must produce identical bytes.
-
 mod common;
 
 use common::{
@@ -9,8 +7,6 @@ use lyracore_package_delta::{canonicalize, PackageDelta};
 
 #[test]
 fn member_order_whitespace_and_number_spelling_do_not_change_the_bytes() {
-    // The same two claims, written two ways: reordered members, different indentation, a padded
-    // unsigned 64-bit string, and a float spelled with a trailing zero.
     let spelled_one = format!(
         r#"{{
             "version": 1,
@@ -45,13 +41,6 @@ fn member_order_whitespace_and_number_spelling_do_not_change_the_bytes() {
     assert_eq!(one, two);
 }
 
-/// The bytes are frozen, not merely self-consistent.
-///
-/// A shard records `game_package_import.artifact_hash` as the BLAKE3 digest of these bytes, and a
-/// Package's Build Identity records the artifact's own hash. Both are stored on live realms, so a
-/// canonical form that moved — even in a way that still round-trips — would invalidate every stored
-/// digest and force a realm-wide reapply. This case pins one artifact that exercises every value
-/// type, both key shapes and the claim ordering, so any such move fails here first.
 #[test]
 fn a_frozen_artifact_still_canonicalizes_to_the_same_bytes() {
     let written = format!(
@@ -138,8 +127,6 @@ fn an_unsigned_64_bit_value_is_written_as_a_decimal_string() {
 
     let canonical = canonicalize(&source).expect("artifact parses");
 
-    // The largest u64 survives intact. Through a JSON number it would have come back as
-    // 18446744073709551616, with nothing to notice the change.
     assert!(
         canonical.contains(r#""family_flags":{"type":"u64","value":"18446744073709551615"}"#),
         "{canonical}"
@@ -204,10 +191,7 @@ fn claims_are_ordered_by_table_then_spell_then_effect_index() {
 
 #[test]
 fn a_string_has_one_canonical_escaping() {
-    // `bs` is a single backslash. Building the JSON this way keeps the long escapes out of the Rust
-    // literal, where they would be a second layer of escaping to reason about.
     let bs = "\\";
-    // The input spells a tab and a capital A as long escapes, next to a quote and a backslash.
     let written = format!("{bs}u0009{bs}u0041{bs}u0007{bs}\"{bs}{bs}");
     let source = one_spell_update(
         "example.pkg",
@@ -217,8 +201,6 @@ fn a_string_has_one_canonical_escaping() {
 
     let canonical = canonicalize(&source).expect("artifact parses");
 
-    // Canonical form takes the short escape where JSON has one, leaves a printable character alone,
-    // and keeps the long form only for a control character that has no short escape.
     let expected = format!("{bs}tA{bs}u0007{bs}\"{bs}{bs}");
     assert!(
         canonical.contains(&format!(
@@ -228,8 +210,6 @@ fn a_string_has_one_canonical_escaping() {
     );
 }
 
-/// The item family's key shape canonicalizes the same deliberate way the spell family's does:
-/// a fixed member, plain decimal, no whitespace.
 #[test]
 fn an_item_claim_canonicalizes_to_a_pinned_member_order() {
     let source = one_item_update(
@@ -258,7 +238,5 @@ fn a_character_json_does_not_require_escaping_stays_as_itself() {
 
     let canonical = canonicalize(&source).expect("artifact parses");
 
-    // Escaping it would be a second spelling of one artifact, which is what canonical form exists
-    // to prevent.
     assert!(canonical.contains("\"Caf\u{e9} Bolt\""), "{canonical}");
 }

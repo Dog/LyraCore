@@ -1,6 +1,3 @@
-//! Leadership and Assistants through the Realm-core party reducer, on a private Standalone: passing
-//! the lead, succession, promotion, and the invite and kick rights of an Assistant.
-
 mod support;
 
 use lyracore_shared::group::{event_kind, RaidSlot, RosterPayload};
@@ -35,7 +32,6 @@ fn group_op(node: &Standalone, op: &str, actor_guid: u64, target_guid: u64, arg_
     node.assert_call("realm_group_op", &args);
 }
 
-/// The whole error text of a refused `realm_group_op`, which carries the Refusal tag.
 fn refusal(node: &Standalone, op: &str, actor_guid: u64, target_guid: u64, arg_a: u8) -> String {
     let args = group_op_args(op, actor_guid, target_guid, arg_a);
     let args: Vec<_> = args.iter().map(String::as_str).collect();
@@ -100,7 +96,6 @@ fn members(node: &Standalone) -> Vec<u64> {
     guids
 }
 
-/// One `game_group_event` row a reducer call inserted.
 struct Event {
     id: u64,
     recipient: u64,
@@ -115,7 +110,6 @@ impl Event {
     }
 }
 
-/// Every event row the first committed transaction of `action` that inserts one carries.
 fn events_pushed_by(node: &Standalone, action: impl FnOnce()) -> Vec<Event> {
     let newest = node
         .query_rows("SELECT id FROM game_group_event")
@@ -143,7 +137,6 @@ fn events_pushed_by(node: &Standalone, action: impl FnOnce()) -> Vec<Event> {
         .collect()
 }
 
-/// The kinds `guid` received, in insertion order.
 fn kinds_for(events: &[Event], guid: u64) -> Vec<u8> {
     let mut mine: Vec<_> = events.iter().filter(|e| e.recipient == guid).collect();
     mine.sort_unstable_by_key(|e| e.id);
@@ -157,10 +150,6 @@ fn start(name: &str) -> Standalone {
     realm
 }
 
-/// AC 1 and 2: the leader passes the lead to a member. Every member hears the new leader's
-/// announcement before the list naming it. Passing the lead to yourself, as a member who does not
-/// lead, or to a Character outside the Group changes nothing. In a Raid the new leader keeps its
-/// Raid Slot.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_leader_passes_the_lead_and_every_member_hears_it_before_the_list() {
@@ -194,7 +183,6 @@ fn the_leader_passes_the_lead_and_every_member_hears_it_before_the_list() {
         }
     }
 
-    // In a Raid, the new leader keeps its Raid Slot: here an Assistant in Subgroup 1, 0x81.
     join(&realm, 2, 4);
     join(&realm, 2, 5);
     group_op(&realm, RAID_CONVERT, 2, 0, 0);
@@ -212,9 +200,6 @@ fn the_leader_passes_the_lead_and_every_member_hears_it_before_the_list() {
     );
 }
 
-/// AC 3: when a Raid leader leaves, the first Assistant in join order leads, whoever was promoted
-/// first, and the remaining members hear it before their list. Without an Assistant the first
-/// member in join order leads.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_leaving_raid_leader_passes_the_lead_to_the_first_assistant_in_join_order() {
@@ -251,9 +236,6 @@ fn a_leaving_raid_leader_passes_the_lead_to_the_first_assistant_in_join_order() 
     );
 }
 
-/// AC 4 and 9: the Raid leader promotes and demotes an Assistant. Every list shows the flags byte,
-/// and each change advances the Roster Revision. Repeating a promotion changes nothing. A Party
-/// refuses both, and only the leader may do either.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_raid_leader_promotes_and_demotes_an_assistant() {
@@ -299,9 +281,6 @@ fn the_raid_leader_promotes_and_demotes_an_assistant() {
     );
 }
 
-/// AC 5 to 8: an Assistant's invite joins the Raid, and an Assistant removes plain members and
-/// Assistants but never the leader. The leader removes a member by guid. As in cmangos, an invite
-/// joins its Group even after its sender is demoted or leaves, and ends once the Group is gone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_assistant_invites_and_removes_members_but_never_the_leader() {
@@ -375,10 +354,6 @@ fn an_assistant_invites_and_removes_members_but_never_the_leader() {
     );
 }
 
-/// A solo inviter's first accept forms its Group, and its other pending invites join that same
-/// Group. A solo inviter who joins another Group first speaks for nobody: its pending invite
-/// forms no Party and does not lead into the other Group. Nobody can invite a Character that has
-/// invited someone while it has no Group (cm:GroupHandler.cpp:105-114).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_solo_inviters_pending_invites_follow_the_group_its_first_accept_forms() {
@@ -404,9 +379,6 @@ fn a_solo_inviters_pending_invites_follow_the_group_its_first_accept_forms() {
     );
 }
 
-/// Succession feeds the Group Broadcast gate too: once the sole Assistant inherits the lead, it
-/// may start a Ready Check that reaches every remaining member, and the departed leader, no
-/// longer in any Group, may not.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_assistant_who_inherits_the_lead_can_start_a_ready_check() {
@@ -435,8 +407,6 @@ fn the_assistant_who_inherits_the_lead_can_start_a_ready_check() {
     assert_refused(&realm, READY_CHECK_START, 1, 0, 0, "group:not_in_group");
 }
 
-/// A demoted Assistant loses both rights the flag granted: it may no longer move a member to
-/// another Subgroup, nor mark a Target Icon.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_demoted_assistant_can_no_longer_move_a_member_or_mark_a_target_icon() {

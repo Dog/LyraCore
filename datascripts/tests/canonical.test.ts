@@ -1,7 +1,3 @@
-// The canonical writer has to agree with the Rust one byte for byte, and the float spelling is the
-// only part where two languages could plausibly disagree. `fixtures/f32-literals.json` pins that
-// agreement: the literals in it were produced by Rust, and both sides assert against them.
-
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

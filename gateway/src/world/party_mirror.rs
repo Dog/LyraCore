@@ -1,11 +1,3 @@
-//! The Roster Revision Relay: push a party's Realm-core roster to each World Shard whose mirror
-//! holds an older Roster Revision or none, whatever changed it. `party::run` pushes only the
-//! actor's parties, and a Stone Add changes parties the actor is not in.
-//!
-//! Row callbacks only mark a party dirty, and one worker thread drains the set, so no reducer call
-//! runs on an SDK callback thread. A push that fails every attempt is logged and dropped; the party
-//! waits for its next revision or the reconnect pass.
-
 use super::party;
 use super::WorldStore;
 use crate::world::ShardRoutingStore;
@@ -19,7 +11,6 @@ pub(crate) struct RosterRevisionRelay {
 }
 
 impl RosterRevisionRelay {
-    /// Start the worker thread. `store` is any Coordinator handle.
     pub(crate) fn spawn<St: Send + ShardRoutingStore + 'static>(
         store: St,
     ) -> std::io::Result<Arc<Self>> {
@@ -29,7 +20,6 @@ impl RosterRevisionRelay {
             .name("roster-revision-relay".into())
             .spawn(move || loop {
                 worker.wait_for_dirty();
-                // A panic in one pass must not end the relay for the life of the process.
                 let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker.push_dirty(&store);
                 }));
@@ -43,7 +33,6 @@ impl RosterRevisionRelay {
         Ok(relay)
     }
 
-    /// Safe on an SDK callback thread: one short lock, no calls.
     pub(crate) fn mark_dirty(&self, group_id: u64) {
         self.dirty
             .lock()
@@ -62,8 +51,6 @@ impl RosterRevisionRelay {
         }
     }
 
-    /// Push every dirty party to the World Shards whose mirror is stale. A party marked during the
-    /// pass waits for the next one.
     pub(crate) fn push_dirty<St: ShardRoutingStore + ?Sized>(&self, store: &St) {
         let parties =
             std::mem::take(&mut *self.dirty.lock().unwrap_or_else(PoisonError::into_inner));
@@ -107,7 +94,6 @@ fn push_party<St: ShardRoutingStore + ?Sized>(
         }
     };
     for shard in shards {
-        // A failed read cannot prove the mirror current, and a repeated push is idempotent.
         let mirrored = shard.held_roster_revision(group_id).unwrap_or(None);
         if !mirror_is_stale(realm_revision, mirrored) {
             continue;
@@ -128,8 +114,6 @@ fn push_party<St: ShardRoutingStore + ?Sized>(
     }
 }
 
-/// A newer mirrored revision means this Gateway's Realm-core cache lags, and the shard would refuse
-/// the older push anyway.
 fn mirror_is_stale(realm_revision: u64, mirrored: Option<u64>) -> bool {
     mirrored.is_none_or(|mirrored| mirrored < realm_revision)
 }

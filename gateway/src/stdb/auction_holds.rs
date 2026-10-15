@@ -1,7 +1,3 @@
-//! The auction rows of each Character, kept from the same row callbacks that fill the coordinator
-//! cache. The SDK cache indexes these tables by primary key only, and the Hold and receipt tables
-//! keep every finished row, so a per-request lookup by Character would otherwise scan them.
-
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
@@ -10,12 +6,10 @@ use spacetimedb_sdk::{Table, TableWithPrimaryKey};
 
 use super::bindings::*;
 
-/// A Hold still owes a phase: Realm-core has not decided it, or its refund waits for mail.
 pub(crate) fn hold_is_unfinished(hold: &AuctionBidHold) -> bool {
     hold.outcome == bid_outcome::PENDING || hold.deferred_refund != 0
 }
 
-/// Primary keys of one table's rows, by the Character each row belongs to.
 #[derive(Default)]
 pub(crate) struct KeysByCharacter {
     by_character: HashMap<u64, BTreeSet<u64>>,
@@ -38,8 +32,6 @@ impl KeysByCharacter {
         }
     }
 
-    /// The keys of `character_guid`'s rows, lowest first. A caller reads each row back by primary
-    /// key, so a stale key costs one missed lookup and nothing else.
     pub(crate) fn keys_of(&self, character_guid: u64) -> Vec<u64> {
         self.by_character
             .get(&character_guid)
@@ -48,17 +40,11 @@ impl KeysByCharacter {
     }
 }
 
-/// Every per-Character auction index one coordinator keeps.
 #[derive(Default)]
 pub(crate) struct AuctionIndex {
-    /// Unfinished bid and Cancellation Holds, by bidder.
     pub(crate) unfinished_bid_holds: KeysByCharacter,
-    /// Listing Holds, by seller. Settle and release delete a listing Hold, so each one is
-    /// unfinished.
     pub(crate) listing_holds: KeysByCharacter,
-    /// Listing receipts, by seller.
     pub(crate) listing_receipts: KeysByCharacter,
-    /// Auctions, by seller and by highest bidder.
     pub(crate) auctions: KeysByCharacter,
 }
 
@@ -96,8 +82,6 @@ fn locked(index: &RwLock<AuctionIndex>) -> RwLockWriteGuard<'_, AuctionIndex> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Keep an [`AuctionIndex`] current from the auction row callbacks. Initial subscription rows
-/// arrive as inserts.
 pub(crate) fn watch_auctions(conn: &DbConnection) -> Arc<RwLock<AuctionIndex>> {
     let index = Arc::new(RwLock::new(AuctionIndex::default()));
 
@@ -201,7 +185,6 @@ mod tests {
         index.add_bid_hold(&hold(9, 8, 0, 0));
         assert_eq!(index.unfinished_bid_holds.keys_of(7), vec![3, 5]);
 
-        // A decision whose refund overflowed the purse still owes the refund phases.
         let overflowed = hold(5, 7, 2, 10);
         index.remove_bid_hold(&pending);
         index.add_bid_hold(&overflowed);

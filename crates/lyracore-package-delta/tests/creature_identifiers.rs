@@ -1,9 +1,3 @@
-//! The creatures family's identifier policy and its spatial key.
-//!
-//! `game_creature_template` follows the item shape: one band, checked against the row's own entry.
-//! `game_creature_spawn` is the build's first SPATIAL table: its key names the map that routes the
-//! claim as well as the two components its durable guid is derived from.
-
 mod common;
 
 use common::{
@@ -29,8 +23,6 @@ fn a_creature_template_key_is_the_entry_itself() {
     assert_eq!(key.table(), Table::CreatureTemplate);
 }
 
-/// The guid is the importer's `world_guid`: the client's Unit tag, the template entry, the spawn
-/// identifier. Derived from the key so no artifact ever writes one.
 #[test]
 fn a_spawn_key_derives_the_importers_creature_guid() {
     let key = PrimaryKey::creature_spawn(REAL_MAP, REAL_CREATURE, REAL_CREATURE_SPAWN)
@@ -46,8 +38,6 @@ fn a_spawn_key_derives_the_importers_creature_guid() {
     );
 }
 
-/// The map is what routes a spatial claim to a Shard, and it is the only reason it is in the key.
-/// Two spawns of one template on two maps are two claims.
 #[test]
 fn a_spawn_claim_states_the_map_it_routes_by() {
     let key = PrimaryKey::creature_spawn(FOREIGN_MAP, REAL_CREATURE, REAL_CREATURE_SPAWN)
@@ -63,8 +53,6 @@ fn a_spawn_claim_states_the_map_it_routes_by() {
     );
 }
 
-/// The map does not reach the durable guid, so the same spawn on two maps is one durable row. The
-/// Module's preflight is what refuses that plan; here it is only stated.
 #[test]
 fn the_map_stays_out_of_the_derived_guid() {
     let here = PrimaryKey::creature_spawn(REAL_MAP, REAL_CREATURE, REAL_CREATURE_SPAWN)
@@ -112,8 +100,6 @@ fn an_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// One band covers both insertable tables: the template's own entry and the spawn's own spawn
-/// identifier. The template a spawn NAMES is the other side of the relation and takes no band.
 #[test]
 fn one_band_covers_the_template_and_the_spawn_identifier() {
     let out_of_band = PACKAGE_CREATURE_ID_FLOOR - 1;
@@ -188,8 +174,6 @@ fn a_fixture_reserved_creature_is_refused_under_every_operation() {
     }
 }
 
-/// The Module seeds its creature fixtures at `51xxx` and asserts against them, so a Package tuning
-/// one would turn those tests into a report about the Package.
 #[test]
 fn a_fixture_cluster_creature_template_is_refused_under_every_operation() {
     for id in [FIXTURE_CREATURE_ID_FLOOR, 51_001, FIXTURE_CREATURE_ID_CEIL] {
@@ -206,8 +190,6 @@ fn a_fixture_cluster_creature_template_is_refused_under_every_operation() {
     }
 }
 
-/// The fixture cluster names TEMPLATE entries. Real imported spawn identifiers run straight
-/// through the same numbers, so a spawn takes the project-wide band alone.
 #[test]
 fn the_fixture_creature_cluster_does_not_reach_spawn_identifiers() {
     PackageDelta::parse(&artifact(
@@ -232,8 +214,6 @@ fn the_fixture_creature_cluster_does_not_reach_spawn_identifiers() {
     );
 }
 
-/// Both halves of the guid are 24 bits wide, so a wider component would wrap into another
-/// creature's row instead of addressing its own.
 #[test]
 fn a_key_component_wider_than_the_guid_field_is_refused() {
     let too_wide = MAX_CREATURE_GUID_COMPONENT + 1;
@@ -251,7 +231,6 @@ fn a_key_component_wider_than_the_guid_field_is_refused() {
     );
 }
 
-/// The whole band has to fit both 24-bit fields, or a Package spawn could not be addressed at all.
 #[test]
 fn the_whole_package_creature_band_fits_the_guid_fields() {
     const { assert!(PACKAGE_CREATURE_ID_CEIL <= MAX_CREATURE_GUID_COMPONENT) };
@@ -261,8 +240,6 @@ fn the_whole_package_creature_band_fits_the_guid_fields() {
     assert!(!is_fixture_reserved_creature_id(PACKAGE_CREATURE_ID_FLOOR));
 }
 
-/// The key already carries the map, the template and the spawn identifier, so a claim that also
-/// set them as columns could disagree with itself.
 #[test]
 fn a_spawn_may_not_claim_its_own_key_columns() {
     for column in ["map_id", "entry", "spawn_id", "guid"] {
@@ -289,8 +266,6 @@ fn a_spawn_may_not_claim_its_own_key_columns() {
     }
 }
 
-/// A spawn's live state — when it respawns, when its corpse decays, which life is standing — is
-/// written by the running Shard, never by an artifact.
 #[test]
 fn a_spawn_may_not_claim_the_shards_live_state() {
     for column in ["respawn_at", "despawn_at", "life_seq"] {

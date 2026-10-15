@@ -1,9 +1,3 @@
-//! Instance-specific checks for WMO placements read from selected ADT tiles.
-//!
-//! The shared tile scanner and vmap packer own archive parsing, transforms, and collision output.
-//! This module keeps the Instance Pool's stricter rule: a selected WMO group may not depend on an
-//! active nested doodad until the importer can transform that doodad into the same generation.
-
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -128,8 +122,7 @@ fn selected_doodad_range(
     selected_set: u16,
     name: &str,
 ) -> Result<(u32, u32, usize)> {
-    // Some Classic roots overstate the MOHD definition count. The MODD chunk contains the
-    // definitions that can be selected; MOHD must still cover that complete parsed prefix.
+    // Classic MOHD can overstate the doodad count; it must still cover the parsed MODD prefix.
     if root.n_doodad_sets as usize != root.doodad_sets.len()
         || (root.n_doodad_defs as usize) < root.doodad_defs.len()
     {

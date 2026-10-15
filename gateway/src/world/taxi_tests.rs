@@ -1,5 +1,3 @@
-//! Taxi opcodes through their dispatcher, and taxi gossip over an encrypted World Session.
-
 use super::family::{ProtocolFamily, ProtocolSession};
 use super::handlers::InMemoryTaxiActions;
 use super::*;
@@ -21,7 +19,6 @@ fn run(actions: &InMemoryTaxiActions, msg: impl Into<ClientOpcodeMessage>) -> Ve
     try_run(actions, msg).unwrap()
 }
 
-/// The one typed packet a request answered with.
 fn only_message(mut sent: Vec<Outbound>) -> ServerOpcodeMessage {
     match (sent.pop(), sent.is_empty()) {
         (Some(Outbound::One(message)), true) => message,
@@ -122,7 +119,6 @@ fn taxi_dispatch_propagates_arming_transport_loss_after_acceptance() {
 
 #[test]
 fn taxi_status_query_returns_the_persisted_bit_without_opening() {
-    // A status answer, not a node map, shows the query did not open the taxi.
     let actions = InMemoryTaxiActions::default();
     *actions.status.lock().unwrap() = Some(codec::TaxiNodeStatusView {
         npc_guid: 90,
@@ -159,8 +155,6 @@ fn direct_taxi_query_opens_the_taxi_map() {
 
 #[test]
 fn taxi_gossip_opens_the_same_map_as_the_direct_query() {
-    // The gossip arm lives in the query handler, so this stays a socket test. It must answer
-    // with exactly the packet the direct query builds.
     use lyracore_shared::constants::gossip_option;
     let direct = only_message(run(
         &taxi_map_actions(),
@@ -192,7 +186,6 @@ fn taxi_gossip_opens_the_same_map_as_the_direct_query() {
 
 #[test]
 fn activate_taxi_gameplay_refusal_replies_and_does_not_fail_the_next_query() {
-    // The Module accepts only 255 -> 256, so the reply also shows the node ids arrived intact.
     let actions = InMemoryTaxiActions {
         route: Some((255, 256)),
         ..Default::default()
@@ -212,7 +205,6 @@ fn activate_taxi_gameplay_refusal_replies_and_does_not_fail_the_next_query() {
         other => panic!("expected SMSG_ACTIVATETAXIREPLY, got {other}"),
     }
 
-    // A gameplay refusal is a normal packet result, not a world-session failure.
     let query = CMSG_TAXINODE_STATUS_QUERY {
         guid: Guid::new(90),
     };

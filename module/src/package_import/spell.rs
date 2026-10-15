@@ -1,13 +1,3 @@
-//! The spell Import Family's half of a Package Delta apply: the setters for `game_spell` and
-//! `game_spell_effect`, where a Package spell lives, and how to find one row.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of spells.
-//!
-//! The Claim schema and these setters are one contract; the tests below fail if a claimable column
-//! has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -22,7 +12,6 @@ use super::{
     UpdateTarget,
 };
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -47,17 +36,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package spell range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs: the Package that owns it is not enabled, and the one tuning it is claiming a row that
-/// does not exist. A base spell is different — the base import puts it there.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_spell_id(row.key().spell_id())
 }
 
-/// Removes every row a Package invented. A whole-table pass over both spell tables, once per
-/// import, right after the base import rewrote them anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let effects = ctx.db.game_spell_effect();
     let stale_effects: Vec<u64> = effects
@@ -125,13 +107,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-// ===========================================================================================
-//  Row building — pure.
-// ===========================================================================================
-
-/// A Package spell before any claim has been applied to it. Every claimable column is overwritten
-/// by the insert that follows, so these values never survive; they exist because the row's shape
-/// has no `Default`.
 fn blank_spell(spell_id: u32) -> Spell {
     Spell {
         spell_id,
@@ -162,8 +137,6 @@ fn blank_spell(spell_id: u32) -> Spell {
     }
 }
 
-/// A Package spell effect before any claim has been applied to it. `id` is the derived packed key,
-/// never authored.
 fn blank_spell_effect(spell_id: u32, effect_index: u8) -> SpellEffect {
     SpellEffect {
         id: packed_spell_effect_id(spell_id, effect_index),
@@ -276,10 +249,6 @@ fn built_spell_effect(row: &TracedRow) -> Result<SpellEffect, String> {
     Ok(effect)
 }
 
-// ===========================================================================================
-//  Tests — the pure half. Row WRITING needs a live ReducerContext, which a native test has no
-//  way to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -288,8 +257,6 @@ mod tests {
     };
     use super::*;
 
-    /// The Package spell range is cleared on every apply, so tuning a Package spell nobody enables
-    /// is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_spell_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -338,8 +305,6 @@ mod tests {
         assert!(spell.is_negative);
     }
 
-    /// The packed key is derived from the spell and the effect index, never authored, so the built
-    /// row must carry the same value `game_aura.effect_id` is reproducible from.
     #[test]
     fn an_inserted_effect_derives_its_packed_key_from_the_spell_and_the_index() {
         let plan = plan(&[artifact(
@@ -358,8 +323,6 @@ mod tests {
         assert_eq!(effect.p0_kind, 255);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_spell_column_has_a_setter() {
         let mut spell = blank_spell(PACKAGE_SPELL);

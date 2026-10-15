@@ -1,5 +1,3 @@
-//! Protocol responses for services whose durable gameplay is not implemented.
-
 use super::super::*;
 
 fn word(opcode: u16, value: u32) -> Outbound {
@@ -45,7 +43,6 @@ pub(crate) fn unavailable_outbound(
     let response = match msg {
         ClientOpcodeMessage::CMSG_GMTICKET_SYSTEMSTATUS => word(0x021b, 0),
         ClientOpcodeMessage::CMSG_GMTICKET_GETTICKET => word(0x0212, 10),
-        // Deletion is idempotent when no ticket exists. Creation never claims success.
         ClientOpcodeMessage::CMSG_GMTICKET_DELETETICKET => word(0x0218, 9),
         ClientOpcodeMessage::MSG_LIST_STABLED_PETS(_)
         | ClientOpcodeMessage::CMSG_STABLE_PET(_)
@@ -144,14 +141,11 @@ fn battlefield_refusal() -> Vec<Outbound> {
     replies
 }
 
-/// Build 5875 layouts that differ from the protocol library's definitions.
 pub(crate) fn raw_unavailable_outbound(opcode: u32, body: &[u8]) -> Result<Option<Vec<Outbound>>> {
     match opcode {
         0x0205 => {
             anyhow::ensure!(body.len() >= 19, "short CMSG_GMTICKET_CREATE body");
             let tail = after_cstring(after_cstring(&body[17..])?)?;
-            // Benilla omits the optional harassment transcript. Its size headers are
-            // untrusted; an unavailable service has no reason to decompress it.
             anyhow::ensure!(
                 tail.is_empty() || (body[0] == 2 && tail.len() >= 8),
                 "invalid CMSG_GMTICKET_CREATE transcript"
@@ -232,8 +226,6 @@ fn page_unavailable(page_id: u32) -> Outbound {
     }
 }
 
-/// These receipts do not change the authoritative pose. Movement counters and cinematic
-/// cameras have no durable state yet; ordinary movement still crosses the Store Seam.
 pub(crate) fn is_control_receipt(msg: &ClientOpcodeMessage) -> bool {
     matches!(
         msg,

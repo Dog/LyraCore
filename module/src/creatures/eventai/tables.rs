@@ -2,8 +2,7 @@ use spacetimedb::table;
 
 use super::EventAiRule;
 
-/// Retained flat EventAI migration row. Runtime and importer code use
-/// [`CreatureAiDefinition`]; this schema stays unchanged for additive migration safety.
+// Retain this flat schema for additive migration; runtime uses CreatureAiDefinition.
 #[table(
     accessor = game_creature_ai_event,
     index(accessor = by_entry, btree(columns = [creature_entry])),
@@ -66,7 +65,6 @@ pub struct CreatureAiEvent {
     pub cast_options: u32,
 }
 
-/// One normalized native EventAI definition for an entry or one remapped creature guid.
 #[table(
     accessor = game_creature_ai_definition,
     index(accessor = by_entry, btree(columns = [creature_entry])),
@@ -82,7 +80,6 @@ pub struct CreatureAiDefinition {
     pub rules: Vec<EventAiRule>,
 }
 
-/// Broadcast text referenced by EventAI actions. Module only.
 #[table(accessor = game_creature_ai_broadcast_text)]
 pub struct CreatureAiBroadcastText {
     #[primary_key]
@@ -99,7 +96,6 @@ pub struct CreatureAiBroadcastText {
     pub emote_id_3: u32,
 }
 
-/// Spell metadata used only while EventAI selects an event subject.
 #[table(accessor = game_creature_ai_spell_metadata)]
 pub struct CreatureAiSpellMetadata {
     #[primary_key]
@@ -107,7 +103,6 @@ pub struct CreatureAiSpellMetadata {
     pub exclude_caster: bool,
 }
 
-/// Creature-wide EventAI state. Edge resets advance its lifecycle identities. Module only.
 #[table(
     accessor = game_creature_ai_state,
     index(accessor = by_active_object, btree(columns = [active_object]))
@@ -124,17 +119,14 @@ pub struct CreatureAiState {
     pub ranged_posture_active: bool,
     #[default(0u64)]
     pub definition_revision: u64,
-    /// Source `SetActiveObjectState`: an active creature remains in the cycle outside player cells.
     #[default(false)]
     pub active_object: bool,
-    /// Passive 0, defensive 1, aggressive 2. Fresh EventAI creatures are aggressive.
     #[default(2u8)]
     pub react_state: u8,
     #[default(true)]
     pub melee_enabled: bool,
 }
 
-/// Timing and consumption state for one creature and one effective source rule. Module only.
 #[table(
     accessor = game_creature_ai_rule_state,
     index(accessor = by_creature, btree(columns = [creature_guid]))
@@ -149,22 +141,19 @@ pub struct CreatureAiRuleState {
     pub consumed: bool,
     pub lifecycle_id: u64,
     pub engagement_id: u64,
-    /// Saved for every linked choice while an authored opportunity remains open.
     #[default(0u64)]
     pub invocation_seed: u64,
     #[default(false)]
     pub invocation_started: bool,
-    /// Prevents a synchronous spell or action hook from re-entering this rule.
+    // Prevent synchronous spell or action hooks from re-entering this rule.
     #[default(false)]
     pub executing: bool,
     #[default(0u32)]
     pub invocation_branch: u32,
-    /// When an authored phase gate stopped this rule's timer. Zero means the timer is running.
     #[default(0u64)]
     pub paused_at_ms: u64,
 }
 
-/// Imported EventAI summon placement. Module only.
 #[table(accessor = game_creature_ai_summon)]
 pub struct CreatureAiSummon {
     #[primary_key]

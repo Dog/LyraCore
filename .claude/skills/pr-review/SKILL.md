@@ -48,6 +48,8 @@ changed lines. It must assess both the Spec and repository standards, and return
 - Concrete failure cases with file locations and supporting evidence. Separate demonstrated
   defects from hypotheses that need a check.
 - The smallest checks that could settle disputed behavior or missing coverage.
+- The [comment-review result](../../../CODING_STANDARDS.md#comment-review), with its scope and file
+  locations for findings.
 - Whether it is confident the outcome is complete, what supports that judgment, and what could
   still make the solution wrong. A clean diff or passing unit suite alone does not establish this.
 

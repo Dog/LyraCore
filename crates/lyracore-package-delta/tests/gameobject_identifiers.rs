@@ -1,10 +1,3 @@
-//! The gameobjects family's identifier policy and its spatial key.
-//!
-//! One band covers three tables. The template and the trap share ONE identifier space, because a
-//! trap row describes the template of the same entry; the spawn has its own. `game_gameobject` is
-//! spatial: its key names the map that routes the claim beside the spawn identifier its durable
-//! guid derives from.
-
 mod common;
 
 use common::{
@@ -21,8 +14,6 @@ use lyracore_package_delta::{
 const A_NAME: &str = r#"{"name":{"type":"string","value":"Kindled Cache"}}"#;
 const A_POSITION: &str = r#"{"x":{"type":"f32","value":1.5}}"#;
 
-/// The guid is the importer's `go_guid`: the client's GameObject tag and the spawn identifier. No
-/// template entry rides in it, unlike a creature's.
 #[test]
 fn a_spawn_key_derives_the_importers_gameobject_guid() {
     let key = PrimaryKey::gameobject_spawn(REAL_MAP, REAL_GAMEOBJECT_SPAWN)
@@ -91,8 +82,6 @@ fn an_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// Every insertable gameobject table shares one band, so one out-of-range identifier is refused
-/// the same way whichever of them names it.
 #[test]
 fn one_band_covers_every_insertable_gameobject_table() {
     let out_of_band = PACKAGE_GAMEOBJECT_ID_FLOOR - 1;
@@ -155,8 +144,6 @@ fn the_package_gameobject_band_is_its_own() {
     assert!(!is_fixture_reserved_gameobject_id(PACKAGE_GAMEOBJECT));
 }
 
-/// The key carries the map and the spawn identifier, and the grid columns are derived from the
-/// coordinates in the same write, so neither may be claimed.
 #[test]
 fn a_gameobject_spawn_may_not_claim_a_key_or_a_derived_column() {
     for column in ["map_id", "spawn_id", "guid"] {

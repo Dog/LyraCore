@@ -1,5 +1,3 @@
-//! [`WorldFake`]: one sub-state per Store family, each in its family's file with its impl.
-
 mod auction;
 mod bank;
 mod cast;
@@ -55,19 +53,12 @@ pub(crate) use self::weather::*;
 use super::TopologyState;
 use crate::world::codec;
 
-/// The Fake behind World Session socket tests. It implements every Store family, so one handle
-/// serves a whole session, and several handles wired through `topology` model a sharded Realm.
-/// Each family keeps its state in its own field, defined beside that family's impl.
 #[derive(Default)]
 pub(crate) struct WorldFake {
     pub(crate) benilla_gameplay:
         Option<std::sync::Mutex<crate::world::tests::benilla_tests::GameplayState>>,
-    /// The Characters this Shard holds. Several families read it.
     pub(crate) characters: Vec<codec::CharacterView>,
-    /// 195: `npc_refuses_interaction` return — false (derive-Default) keeps every fixture NPC open.
     pub(crate) npc_refuses: bool,
-    /// When set, Durable Requests in several families fail with this error: a Refusal tag, or any
-    /// other text for a failure with an unknown durable result.
     pub(crate) trade_error: Option<String>,
     pub(crate) topology: TopologyState,
     pub(crate) session: SessionState,

@@ -1,21 +1,8 @@
-//! Party/group + loot-roll cache-accessor methods — pure code-motion split of the former
-//! `reads.rs`.
-
 use super::super::bindings::*;
 use super::super::connection::Coordinator;
 use lyracore_shared::group::{GroupKind, RaidSlot};
 
 impl Coordinator {
-    /// The party `character_guid` belongs to, read from THIS handle's database.
-    ///
-    /// Which database the handle points at is the whole meaning of the answer: on the **realm-core**
-    /// handle this is the AUTHORITATIVE roster, and on a world shard it is that shard's mirror of it
-    /// (`group::sync_group_mirror`). Nothing here knows or cares which — routing is the caller's job,
-    /// exactly as it is for every other read in this file.
-    ///
-    /// A cache read through the membership index, so it is cheap enough to run inside an SDK
-    /// callback (which the realm-core group relay does): no reducer call, no round trip, no table
-    /// scan.
     pub fn group_roster(&self, character_guid: u64) -> Option<crate::world::party::GroupRoster> {
         let group_id = self
             .0
@@ -27,12 +14,6 @@ impl Coordinator {
         self.group_roster_by_id(group_id)
     }
 
-    /// [`group_roster`](Self::group_roster) keyed by the group itself — the read the mirror push
-    /// needs for a party the acting character has just LEFT (their own membership row is gone, but
-    /// the remaining members' rows still have to reach every shard).
-    ///
-    /// Realm membership revisions retain join order when Transfer replaces a World mirror row.
-    /// Realm-core and unmirrored local parties use their own member-row ids.
     pub fn group_roster_by_id(&self, group_id: u64) -> Option<crate::world::party::GroupRoster> {
         let guard = self.0.coord();
         let db = &guard.conn.db;

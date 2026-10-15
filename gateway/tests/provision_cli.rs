@@ -4,7 +4,6 @@ use std::process::{Command, Output, Stdio};
 fn run_gateway(args: &[&str], stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lyracore-gateway"))
         .args(args)
-        // Isolate the child from inherited Realm topology and credentials.
         .env_remove("LYRACORE_COORDINATOR_TOKEN")
         .env_remove("LYRACORE_DATABASE")
         .env_remove("LYRACORE_SPACETIMEDB_URL")
@@ -24,7 +23,6 @@ fn run_gateway(args: &[&str], stdin: &[u8]) -> Output {
 fn run_gateway_against_unreachable_loopback(args: &[&str], stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lyracore-gateway"))
         .args(args)
-        // An unreachable loopback port keeps the connection failure independent of local nodes.
         .env("LYRACORE_COORDINATOR_TOKEN", "functional-test-token")
         .env("LYRACORE_DATABASE", "spacetime-core")
         .env("LYRACORE_SPACETIMEDB_URL", "http://127.0.0.1:0")
@@ -99,8 +97,6 @@ fn valid_password_stdin_reaches_provisioning_without_disclosing_the_password() {
     assert!(!stderr.contains("invalid password"));
 }
 
-/// The SRP6 challenge is answered from Realm-core, and characters belong to the World Shard's
-/// account row, so a provisioned account must exist on both databases.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn provision_writes_the_account_to_the_world_shard_and_realm_core() {

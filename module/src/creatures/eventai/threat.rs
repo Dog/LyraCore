@@ -1,5 +1,3 @@
-//! EventAI percent-threat instructions.
-
 use super::engine::EventAiWorld;
 use super::{
     ActionResult, CreatureInstruction, EventContext, ScaleAllThreatInstruction,

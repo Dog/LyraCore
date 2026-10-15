@@ -10,24 +10,16 @@ use lyracore_package_delta::{
 use crate::world_import_scope::WorldImportScope;
 use crate::{call_reducer_args, Args};
 
-/// Where a Package's generated Delta artifacts live, relative to the Package folder.
 const GENERATED_DIR: &str = "data/.generated";
 
-/// The reducer that applies a whole family's enabled plan in one transaction.
 const APPLY_REDUCER: &str = "apply_package_deltas";
 
-/// One artifact, and the file it came from so a refusal can name it.
 #[derive(Debug)]
 struct Artifact {
     path: PathBuf,
     delta: PackageDelta,
 }
 
-/// Read the enabled Packages' artifacts for `family`, report the plan, and apply it when the caller
-/// asked to write.
-///
-/// Refuses the whole stage on an unreadable root, an invalid artifact, or a Claim Conflict — the
-/// module would refuse the same plan, and refusing here names the file.
 pub(crate) fn reapply(args: &Args, family: &str, root: &str) -> Result<()> {
     let scope = args.world_import_scope()?;
     let for_family = artifacts_for_family(read_enabled(Path::new(root))?, family)?;
@@ -69,9 +61,6 @@ pub(crate) fn reapply(args: &Args, family: &str, root: &str) -> Result<()> {
     Ok(())
 }
 
-/// Keep only the claims owned by `family`, preserving the Package and source identities carried by
-/// the original artifact. One Package Delta may span several Import Families, but each reducer call
-/// applies exactly one family.
 fn artifacts_for_family(artifacts: Vec<Artifact>, family: &str) -> Result<Vec<Artifact>> {
     artifacts
         .into_iter()
@@ -102,13 +91,7 @@ fn artifacts_for_family(artifacts: Vec<Artifact>, family: &str) -> Result<Vec<Ar
         .collect()
 }
 
-/// Keep only the claims this Shard owns, and count the spatial ones it does not.
-///
-/// A claim with no map is a global catalogue row and always stays. A spatial claim stays exactly
-/// when the World Import Scope owns its map — `contains_map`, not `contains`: the base import's own
-/// rule for a forced creature is that a placed entry bypasses bounded geometry but never the map
-/// fence, and an authored spawn is placed the same way. A Package left with no claims at all drops
-/// out of the plan, the way it does when it claims no table of this family.
+// Forced spawns bypass slice geometry, so route Package claims by the owned map alone.
 fn routed_to_this_shard(
     scope: &WorldImportScope,
     artifacts: Vec<Artifact>,
@@ -145,11 +128,6 @@ fn routed_to_this_shard(
     Ok((kept, routed_away))
 }
 
-/// The warning a base import prints when the operator did not name an enabled Package root.
-///
-/// Silence would be the wrong answer twice over: the shard is now running base rows with no Package
-/// claims on them, and an empty enabled set is a DIFFERENT statement that would have deleted every
-/// row a Package invented. Neither may be guessed.
 pub(crate) fn warn_not_reapplied(family: &str) {
     eprintln!(
         "{family}: WARNING — enabled Package Deltas were NOT reapplied. The base rows are back \
@@ -158,11 +136,6 @@ pub(crate) fn warn_not_reapplied(family: &str) {
     );
 }
 
-/// Every enabled Package's artifacts, ordered by Package folder then by file name so the same tree
-/// always produces the same plan.
-///
-/// A missing root is an error, never an empty set: "no Package claims this family" is a statement
-/// the operator makes by pointing at a real Package Inventory that happens to hold no artifacts.
 fn read_enabled(root: &Path) -> Result<Vec<Artifact>> {
     if !root.is_dir() {
         bail!(
@@ -195,11 +168,6 @@ fn read_enabled(root: &Path) -> Result<Vec<Artifact>> {
         for path in files {
             let json =
                 fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            // One Package ships every artifact kind it has into this one directory, so the glob
-            // above finds a Script Artifact next to a Package Delta. Skipping it is not leniency:
-            // this stage is the CLAIM half of an apply, and the script family has no base import to
-            // run behind. `lyracore packages apply` applies that family separately. Anything this
-            // router cannot read at all still goes to the parser, which names what is wrong with it.
             if matches!(
                 artifact_kind(&json),
                 Some(ArtifactKind::Script | ArtifactKind::Other(_))
@@ -214,9 +182,6 @@ fn read_enabled(root: &Path) -> Result<Vec<Artifact>> {
     Ok(artifacts)
 }
 
-/// The artifacts' canonical bytes, one per line — the payload shape `apply_package_deltas` reads.
-/// Canonical rather than as-written, so the digest the module records describes what the artifact
-/// SAYS rather than how someone spelled it.
 fn pack(deltas: &[PackageDelta]) -> String {
     deltas
         .iter()
@@ -225,8 +190,6 @@ fn pack(deltas: &[PackageDelta]) -> String {
         .join("\n")
 }
 
-/// The plan, in the form a check prints and an apply announces: every Package with its file and row
-/// counts, then every claimed row, then every conflict.
 fn plan_report(
     root: &str,
     scope: &str,
@@ -289,7 +252,6 @@ mod tests {
     const PACKAGE_SPELL: u32 = 6_000_001;
     const REAL_SPELL: u32 = 133;
 
-    /// A unique scratch tree per test (std-only; no tempfile dep — mirrors `pack_client.rs`).
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(tag: &str) -> Self {
@@ -317,11 +279,8 @@ mod tests {
         )
     }
 
-    /// Eastern Kingdoms, inside the eastern profile's Elwynn slice.
     const EASTERN_MAP: u32 = 0;
-    /// Kalimdor, which the eastern profile does not touch.
     const KALIMDOR_MAP: u32 = 1;
-    /// Deadmines, the whole map the `instances` profile owns.
     const INSTANCE_MAP: u32 = 36;
     const REAL_CREATURE: u32 = 6;
     const PACKAGE_CREATURE: u32 = 15_000_001;
@@ -332,7 +291,6 @@ mod tests {
         )
     }
 
-    /// One Package placing the same creature on two maps: the shape a two-Shard realm produces.
     fn two_map_artifact() -> String {
         format!(
             r#"{{"version":1,"package":"example.placer","source_hash":"{HASH_A}","claims":[{},{}]}}"#,
@@ -354,7 +312,6 @@ mod tests {
         )
     }
 
-    /// One Package tuning an imported EventAI line and inventing a summon placement beside it.
     fn creature_ai_artifact() -> String {
         format!(
             r#"{{"version":1,"package":"example.voice","source_hash":"{HASH_A}","claims":[{{"table":"game_creature_ai_broadcast_text","key":{{"id":900}},"operation":"update","fields":{{"male_text":{{"type":"string","value":"You will burn."}}}}}},{{"table":"game_creature_ai_summon","key":{{"id":17000001}},"operation":"insert","fields":{{"x":{{"type":"f32","value":1.5}},"y":{{"type":"f32","value":2.5}},"z":{{"type":"f32","value":3.5}},"orientation":{{"type":"f32","value":0.0}},"lifetime_ms":{{"type":"u32","value":30000}}}}}}]}}"#
@@ -415,7 +372,6 @@ mod tests {
             .is_empty());
     }
 
-    /// A Package with no data half is the common case, not a problem.
     #[test]
     fn a_package_with_no_generated_artifacts_contributes_nothing() {
         let t = Scratch::new("rust-only");
@@ -427,9 +383,6 @@ mod tests {
         assert!(found.is_empty());
     }
 
-    /// A Package ships every artifact kind it has into one directory. This stage is the CLAIM half
-    /// of an apply, so a Script Artifact next to a Package Delta is not its business — and must not
-    /// abort the whole spell import the way an unreadable Package Delta would.
     #[test]
     fn a_script_artifact_beside_a_package_delta_is_skipped_rather_than_refused() {
         let t = Scratch::new("mixed-kinds");
@@ -450,8 +403,6 @@ mod tests {
         assert_eq!(found[0].delta.package().as_str(), "example.bolt");
     }
 
-    /// The router only skips what it can positively identify as another kind. A file no parser can
-    /// read is still a refusal that names it.
     #[test]
     fn a_file_no_parser_can_read_still_refuses_the_stage() {
         let t = Scratch::new("unreadable");
@@ -462,7 +413,6 @@ mod tests {
         assert!(refusal.to_string().contains("spell.json"), "{refusal}");
     }
 
-    /// Only `.generated/` counts. An author's own JSON beside their Datascript is not an artifact.
     #[test]
     fn json_outside_the_generated_directory_is_not_an_artifact() {
         let t = Scratch::new("stray-json");
@@ -478,8 +428,6 @@ mod tests {
         assert_eq!(found[0].delta.package().as_str(), "example.bolt");
     }
 
-    /// An empty Package Inventory and an absent one are different statements: the first says no
-    /// Package claims this family, the second says the operator never named one.
     #[test]
     fn an_enabled_root_holding_no_packages_is_an_empty_plan() {
         let t = Scratch::new("empty-root");
@@ -511,8 +459,6 @@ mod tests {
         );
     }
 
-    /// A creature spawn on a map the scope owns stays in the plan; the same Package's spawn on a
-    /// map it does not own is routed to the Shard that does.
     #[test]
     fn a_spatial_claim_reaches_only_the_shard_whose_scope_owns_its_map() {
         let t = Scratch::new("routing");
@@ -532,7 +478,6 @@ mod tests {
         assert_eq!(claims[0].key().map_id(), Some(EASTERN_MAP));
     }
 
-    /// A global catalogue row states no map, so every Shard loads it however its scope is drawn.
     #[test]
     fn a_global_catalogue_claim_reaches_every_shard() {
         let t = Scratch::new("routing-global");
@@ -552,9 +497,6 @@ mod tests {
         assert_eq!(kept.len(), 1, "a template is not spatial");
     }
 
-    /// The EventAI catalogue names no map, so its whole family is global: an `instances` Shard and
-    /// an open-world Shard both load every claim. The base import writes these tables the same way,
-    /// with global SQL and no map predicate.
     #[test]
     fn every_creature_ai_claim_reaches_every_shard() {
         let t = Scratch::new("routing-creature-ai");
@@ -586,8 +528,6 @@ mod tests {
         }
     }
 
-    /// A Package whose every claim routed away drops out of the plan, the way it does when it
-    /// claims no table of the family at all.
     #[test]
     fn a_package_whose_claims_all_route_away_leaves_the_plan() {
         let t = Scratch::new("routing-empty");
@@ -595,7 +535,6 @@ mod tests {
         let found = read_enabled(&t.0).expect("discovery succeeds");
         let creatures = artifacts_for_family(found, "creatures").expect("the creatures plan");
 
-        // The instances profile owns Deadmines alone, so neither open-world spawn belongs to it.
         let instances =
             WorldImportScope::canonical(WorldImportProfile::Instances).expect("instances profile");
         let (kept, routed_away) =
@@ -605,8 +544,6 @@ mod tests {
         assert!(kept.is_empty());
     }
 
-    /// A whole map in the scope owns every claim on it, with no bounded geometry to pass — the base
-    /// import's own rule for a forced creature, applied to an authored spawn.
     #[test]
     fn a_whole_map_in_the_scope_owns_every_spawn_on_it() {
         let t = Scratch::new("routing-whole-map");
@@ -702,8 +639,6 @@ mod tests {
         assert!(report.contains("example.second"), "{report}");
     }
 
-    /// The check has to be able to describe a Package that invents a spell, not only one that tunes
-    /// an existing row.
     #[test]
     fn the_report_describes_an_inserted_package_spell() {
         let whole_row = concat!(

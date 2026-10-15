@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::ShardId;
@@ -7,10 +5,6 @@ use crate::stdb::world_view::*;
 use crate::world::Outbound;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Skill pane: the shared-dispatch twin of the per-player skill relays
-/// (insert and update ran the same body there too). Audience (owner only) resolved by the
-/// owner-session lookup in `world_view::skill_changed`; the slot allocation writes the viewer's
-/// OWN `skill_slots` — the same map the per-player leg captures, seeded from the login layout.
 pub(crate) fn relay_skill(
     viewer: &Viewer,
     skill_line: u32,
@@ -34,9 +28,6 @@ pub(crate) fn relay_skill(
     Vec::new()
 }
 
-/// A skill row changed (line learned / skill-up). Self-only family, same owner-session-lookup
-/// audience as [`rest_state_appeared`] — the slot allocation runs in the job on the owner's own
-/// writer thread, against the viewer's `skill_slots` (the same map the per-player leg uses).
 pub(crate) fn skill_changed(view: &WorldView, shard: ShardId, row: &PlayerSkill) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
         return;

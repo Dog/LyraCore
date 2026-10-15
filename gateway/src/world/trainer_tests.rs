@@ -1,5 +1,3 @@
-//! Trainer and talent replies through the Character, Npc, and Trainer Stores.
-
 use super::handlers::{CharacterStore, Trainer, TrainerBuyOutcome, TrainerStore};
 use super::*;
 use crate::stdb::ReducerCallError;
@@ -8,27 +6,19 @@ use lyracore_shared::constants::armor_proficiency::{
 };
 use lyracore_shared::trainer::TrainerRefusal;
 
-/// What the Module would answer a trainer window, a buy and a talent pick, set per test.
 #[derive(Default)]
 struct TrainerFake {
     npc_refuses: bool,
     refuses_class: bool,
     spells: Vec<codec::TrainerSpellView>,
-    /// `learn_skill_line` per offering id. An offering absent here teaches an ordinary spell.
     skill_lines: std::collections::HashMap<u32, u32>,
     buy_refusal: Option<TrainerRefusal>,
-    /// A failed Durable Request on the buy.
     buy_error: Option<fn() -> anyhow::Error>,
-    /// A failed Durable Request on the talent pick.
     talent_error: Option<fn() -> anyhow::Error>,
-    /// The known previous rank a buy of a non-stacking chain replaces.
     superseded: Option<u32>,
-    /// The spellbook after the buy.
     learned_spells: Vec<u32>,
-    /// `(level, class)` of the buying Character.
     level_and_class: Option<(u8, u8)>,
     talent_grant: u32,
-    /// `(rank spell taught, rank spell it replaces, points left)`.
     talent_pane: (u32, u32, u32),
 }
 
@@ -206,7 +196,6 @@ impl TrainerStore for TrainerFake {
     }
 }
 
-/// Handle `msg` as Character 1 of Account 7 and return the replies in order.
 fn drive(
     store: &TrainerFake,
     msg: impl Into<ClientOpcodeMessage>,
@@ -268,9 +257,6 @@ fn trainer_buy_success_replies_succeeded_then_pushes_the_learned_spell() {
     assert_eq!(learned.id, 1234);
 }
 
-/// A RIDING purchase teaches a skill, not a spell. Its trainer-list id is a marker with no Spell.dbc
-/// row, so the buy confirms and stops: a learned-spell push would hand the client an id it cannot
-/// resolve. The skill pane moves from the `game_player_skill` relay.
 #[test]
 fn a_riding_buy_confirms_without_echoing_the_offering_as_a_learned_spell() {
     let store = TrainerFake {
@@ -285,8 +271,6 @@ fn a_riding_buy_confirms_without_echoing_the_offering_as_a_learned_spell() {
     );
 }
 
-/// A Warrior buying Plate Mail at 40. The book update alone leaves the client tinting every plate
-/// piece red, so the buy also refreshes the ARMOR mask from the post-buy spellbook.
 #[test]
 fn a_proficiency_buy_pushes_the_refreshed_armor_mask_after_the_learned_spell() {
     let store = TrainerFake {
@@ -316,8 +300,6 @@ fn a_proficiency_buy_pushes_the_refreshed_armor_mask_after_the_learned_spell() {
     );
 }
 
-/// An ordinary ability purchase changes nothing about what the Character may wear, so it must not
-/// resend a proficiency mask.
 #[test]
 fn an_ordinary_trainer_buy_pushes_no_proficiency_mask() {
     let sent = run(&TrainerFake::buying_as(40, 1), buy(1234));
@@ -334,9 +316,6 @@ fn an_ordinary_trainer_buy_pushes_no_proficiency_mask() {
     );
 }
 
-/// A buy whose previous rank is known sends SMSG_SUPERCEDED_SPELL, so the client replaces the old
-/// rank's book entry. The first wire slot carries the OLD rank (cmangos order), as the talent
-/// rank-upgrade path does.
 #[test]
 fn trainer_buy_rank_upgrade_supersedes_the_previous_rank_spell() {
     let store = TrainerFake {
@@ -389,8 +368,6 @@ fn every_module_refusal_has_one_client_failure_reason() {
     }
 }
 
-/// A Transport Loss leaves the durable result unknown, so it must not reach the client as a
-/// gameplay Refusal that says the purchase did not happen. The handler fails; the session ends.
 #[test]
 fn a_trainer_transport_loss_is_not_answered_as_a_refusal() {
     let store = TrainerFake {
@@ -401,8 +378,6 @@ fn a_trainer_transport_loss_is_not_answered_as_a_refusal() {
         .expect_err("a lost trainer Durable Request must end the World Session");
 }
 
-/// A refused talent pick is per-action: the client hears nothing and the session goes on. A lost
-/// transport leaves the pick's outcome unknown and ends the session.
 #[test]
 fn a_refused_talent_pick_keeps_the_session_and_a_transport_loss_ends_it() {
     let refused = TrainerFake {
@@ -421,8 +396,6 @@ fn a_refused_talent_pick_keeps_the_session_and_a_transport_loss_ends_it() {
     drive(&lost, pick_talent()).expect_err("a lost talent pick must end the World Session");
 }
 
-/// An ability talent (`grant_spell_id != 0`) pushes the granted spell so the new button works
-/// without a relog, then the points push.
 #[test]
 fn learn_talent_with_a_grant_spell_pushes_learned_spell() {
     let store = TrainerFake {
@@ -443,8 +416,6 @@ fn learn_talent_with_a_grant_spell_pushes_learned_spell() {
     );
 }
 
-/// A passive pick still refreshes the TalentFrame: SMSG_LEARNED_SPELL for the rank spell the Module
-/// taught (the pane derives shown ranks from known rank spells), then the points push.
 #[test]
 fn learn_talent_passive_pushes_rank_spell_and_points() {
     let store = TrainerFake {
@@ -465,8 +436,6 @@ fn learn_talent_passive_pushes_rank_spell_and_points() {
     );
 }
 
-/// Rank N>1 replaces the previous rank's spell in the book. SMSG_SUPERCEDED_SPELL carries the OLD
-/// rank in its first wire slot (cmangos order), as the trainer rank-upgrade path does.
 #[test]
 fn learn_talent_rank_upgrade_supersedes_the_previous_rank_spell() {
     let store = TrainerFake {
@@ -535,8 +504,6 @@ fn direct_profession_training_request_sends_the_profession_list_type() {
     assert_eq!(list.spells[0].spell, 4036);
 }
 
-/// The class gate removes the training service, not the creature: the NPC still talks, which the
-/// gossip test `gossip_hides_the_train_and_unlearn_options_for_a_class_the_trainer_does_not_serve` covers.
 #[test]
 fn trainer_list_is_silently_dropped_for_a_player_the_trainer_does_not_serve() {
     let store = TrainerFake {

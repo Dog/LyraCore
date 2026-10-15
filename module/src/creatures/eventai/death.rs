@@ -1,5 +1,3 @@
-//! EventAI requests owned by combat death authority.
-
 use super::engine::EventAiWorld;
 use super::{ActionResult, CreatureInstruction, EventContext};
 

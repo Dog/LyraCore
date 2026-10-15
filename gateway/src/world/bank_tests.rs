@@ -1,23 +1,15 @@
-//! Bank replies and durable outcomes through the Bank and Npc Stores.
-
 use super::handlers::{Bank, BankStore, NpcStore};
 use super::*;
 use crate::stdb::ReducerCallError;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-/// A bank that moves an item by its source slot: a carried slot goes into the bank, a banked slot
-/// comes back. The Module infers that direction from the slot, so the Fake does too.
 #[derive(Default)]
 struct BankFake {
     npc_refuses: bool,
-    /// Every banker the Module accepts a bag-slot purchase from.
     bankers: BTreeSet<u64>,
-    /// Refuses `auto_bank_item` with this reason, like a full bank.
     move_error: Option<String>,
-    /// Refuses `buy_bank_slot` with this reason.
     purchase_error: Option<String>,
-    /// Loses the transport on every Durable Request.
     transport_lost: bool,
     carried: Mutex<BTreeSet<u64>>,
     banked: Mutex<BTreeSet<u64>>,
@@ -85,14 +77,12 @@ impl BankStore for BankFake {
     }
 }
 
-/// Handle `msg` as Character 1 of Account 7 and return the replies in order.
 fn run(store: &BankFake, msg: impl Into<ClientOpcodeMessage>) -> Vec<ServerOpcodeMessage> {
     let mut session = ProtocolSession::in_world(7, 1);
     let reply = Bank::handle(store, &mut session, ProtocolRequest::Message(msg.into())).unwrap();
     outbound_messages(reply.outbound)
 }
 
-/// What the handler returns when the Store loses the transport.
 fn run_transport_lost(msg: impl Into<ClientOpcodeMessage>) -> Result<ProtocolReply> {
     let store = BankFake {
         transport_lost: true,
@@ -142,8 +132,6 @@ fn banker_activate_on_a_standing_refusing_banker_sends_no_reply() {
     assert!(sent.is_empty(), "got [{}]", kinds(&sent));
 }
 
-/// Right-click a bag item with the bank open: the gateway names the source slot and the Module
-/// resolves the free bank slot.
 #[test]
 fn autobank_item_from_the_main_bag_deposits_the_item() {
     let store = BankFake::carrying(23);
@@ -158,7 +146,6 @@ fn autobank_item_from_the_main_bag_deposits_the_item() {
     assert_eq!((store.carried(), store.banked()), (vec![], vec![23]));
 }
 
-/// Right-click a banked item: withdraw, through the same Store method as the deposit.
 #[test]
 fn autostore_bank_item_from_the_main_bag_withdraws_the_item() {
     let store = BankFake::banking(39);
@@ -173,8 +160,6 @@ fn autostore_bank_item_from_the_main_bag_withdraws_the_item() {
     assert_eq!((store.carried(), store.banked()), (vec![39], vec![]));
 }
 
-/// A full destination (bank or carry space) is a per-action error. The client gets the existing
-/// inventory-change failure, and the session goes on.
 #[test]
 fn autobank_item_err_sends_smsg_inventory_change_failure() {
     let store = BankFake {
@@ -199,8 +184,6 @@ fn autobank_item_err_sends_smsg_inventory_change_failure() {
     assert_eq!((store.carried(), store.banked()), (vec![23], vec![]));
 }
 
-/// Only the main pseudo-bag (255) is addressed, like the item handler. A sub-bag index is logged
-/// and ignored, never fatal.
 #[test]
 fn autobank_item_from_a_sub_bag_is_unsupported_and_moves_nothing() {
     let store = BankFake::carrying(0);
@@ -229,8 +212,6 @@ fn autostore_bank_item_from_a_sub_bag_is_unsupported_and_moves_nothing() {
     assert_eq!((store.carried(), store.banked()), (vec![], vec![0]));
 }
 
-/// The Fake accepts a purchase only from a banker it knows, so an `Ok` reply shows the wire's
-/// banker guid reached the Store.
 #[test]
 fn buy_bank_slot_success_sends_ok_and_reaches_the_named_banker() {
     let store = BankFake {
@@ -254,8 +235,6 @@ fn buy_bank_slot_success_sends_ok_and_reaches_the_named_banker() {
     assert_eq!(*store.bought_slots.lock().unwrap(), 1);
 }
 
-/// The Module tags a refusal with its `SMSG_BUY_BANK_SLOT_RESULT` code in brackets. The gateway
-/// reads the code, not the prose.
 #[test]
 fn buy_bank_slot_failure_maps_the_bracketed_code_to_the_matching_result() {
     for (err, want) in [
@@ -287,8 +266,6 @@ fn buy_bank_slot_failure_maps_the_bracketed_code_to_the_matching_result() {
     }
 }
 
-/// A Transport Loss leaves the durable outcome unknown, so it ends the World Session instead of
-/// posing as a failed bank move or a refused purchase.
 #[test]
 fn a_transport_loss_ends_the_world_session() {
     assert!(run_transport_lost(CMSG_AUTOBANK_ITEM {

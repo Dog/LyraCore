@@ -29,7 +29,6 @@ fn tame_dismiss_and_retame_preserve_one_durable_identity_and_clean_live_state() 
     shard.assert_call("claim_operator", &[]);
     shard.assert_call("install_guid_range", &["0"]);
     shard.assert_call("debug_seed_scenario_fixtures", &[]);
-    // Entry 51006 also seeds a Flight Master. This private fixture supplies the tameable template.
     shard.assert_sql("UPDATE game_creature_template SET creature_family = 5, level = 5, health = 100, npc_flags = 0 WHERE entry = 51006");
     shard.assert_sql("UPDATE game_character SET class = 3, level = 10 WHERE guid = 1");
     shard.assert_call("debug_spawn_player_entity", &[HUNTER]);

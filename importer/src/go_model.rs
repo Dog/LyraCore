@@ -1,16 +1,3 @@
-//! `--go-models <client Data/ dir>` — resolves every DOOR/BUTTON
-//! `gameobject_template.display_id` to its M2's bounding mesh and emits one `game_go_model` row
-//! per entry. Used TOGETHER with `--dump` (the template rows come from the cmangos dump; the
-//! model bytes come from the client's own MPQs).
-//!
-//! Local-space, not world-space: `nav::m2_tris` already loads the bounding mesh model-local, and
-//! the only transform applied here is the MDDF axis shuffle (the same one `vmap.rs::apply_full`
-//! pre-applies for placed doodads) — quaternion/scale/translate are per-spawn data the MODULE
-//! holds in `game_go_collider`, so baking a world transform here would break for instance copies
-//! (no source-guid backref on a `GO_COPY_BAND` row). Same licensing firewall as `--vmap`/`--dbc`:
-//! in-memory only, nothing written to disk. A display resolving to a `.wmo` is skipped with a
-//! warning — WMO door parsing is out of scope.
-
 use anyhow::{bail, Context, Result};
 use lyracore_shared::vmap::{encode, TriClass, VmapTri};
 use std::path::Path;
@@ -22,10 +9,7 @@ use wow_dbc::Indexable;
 use crate::nav::Tri;
 use crate::{field, got, parse_table, GO_BUTTON, GO_DOOR};
 
-/// MDDF axis shuffle: placement-local (Y-up) → world-axis (Z-up) orientation, applied BEFORE any
-/// rotation/scale/translate — same convention `vmap.rs::apply_full` uses for placed doodads.
-/// Pre-applying it here means the module's per-spawn transform is pure quaternion+scale+
-/// translate, with no shuffle of its own to get wrong at ray-query time.
+// Shuffle Y-up placement coordinates to Z-up world axes before rotation and scale.
 fn shuffle(v: [f32; 3]) -> [f32; 3] {
     [-v[2], -v[0], v[1]]
 }
@@ -34,9 +18,6 @@ fn shuffle_tri(t: Tri) -> Tri {
     [shuffle(t[0]), shuffle(t[1]), shuffle(t[2])]
 }
 
-/// Local bounding-sphere radius: center of the mesh's AABB, radius = farthest vertex from that
-/// center. Not minimal-enclosing, but conservative (contains every vertex) — the cheap
-/// segment-reject the ray merge needs before decoding and transforming the full triangle blob.
 fn bounding_radius(tris: &[Tri]) -> f32 {
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for t in tris {
@@ -61,14 +42,9 @@ fn bounding_radius(tris: &[Tri]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-/// Hard cap on one `game_go_model` row's packed byte size — door meshes are tens of triangles, so
-/// hitting this means something is wrong (a WMO-scale mesh slipping through, a corrupt parse), not
-/// a legitimate case to shard like `vmap.rs` does for dense terrain cells.
 const MAX_ROW_TRI_BYTES: usize = 20_000;
 
-/// Encode a model's shuffled local-space mesh, erroring (NOT sharding) past `MAX_ROW_TRI_BYTES`.
-/// `TriClass::M2` is a placeholder the codec requires — the ray merge decides participation per
-/// GO row, not per class.
+// M2 is a codec placeholder here; each GameObject row decides ray participation.
 fn encode_capped(entry: u64, model_name: &str, tris: &[Tri]) -> Result<Vec<u8>> {
     let packed: Vec<VmapTri> = tris
         .iter()
@@ -88,7 +64,6 @@ fn encode_capped(entry: u64, model_name: &str, tris: &[Tri]) -> Result<Vec<u8>> 
     Ok(blob)
 }
 
-/// One classified DOOR/BUTTON template row worth resolving a model for.
 struct DoorTemplate {
     entry: u64,
     display_id: u32,
@@ -111,7 +86,6 @@ fn door_templates(dump: &str) -> Vec<DoorTemplate> {
         .collect()
 }
 
-/// Reducer batch ceiling (bytes of packed payload) — same ballpark the other importers respect.
 const BATCH_BYTES: usize = 28_000;
 
 pub(crate) fn run(args: &crate::Args) -> Result<()> {
@@ -191,8 +165,6 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
         bail!("go-models: nothing resolved to import — check the warnings above");
     }
 
-    // Batch + apply (byte-budgeted, same convention as nav.rs/vmap.rs): first batch clears +
-    // loads, the rest append.
     let mut batches: Vec<String> = Vec::new();
     let mut current = String::new();
     for row in &rows {
@@ -228,16 +200,11 @@ mod tests {
     use super::*;
 
     fn cube(half: f32, z: f32) -> Vec<Tri> {
-        // Two triangles: enough to exercise the AABB/radius math without a real M2.
         vec![
             [[-half, -half, z], [half, -half, z], [-half, half, z]],
             [[half, -half, z], [half, half, z], [-half, half, z]],
         ]
     }
-
-    // -------------------------------------------------------------------------------------
-    //  Classification gating (only DOOR/BUTTON survive `door_templates`).
-    // -------------------------------------------------------------------------------------
 
     #[test]
     fn door_templates_keeps_only_door_and_button_rows() {
@@ -259,20 +226,13 @@ mod tests {
 
     #[test]
     fn door_templates_drops_a_row_with_no_classification() {
-        // Real cmangos type 25 (FISHINGHOLE) collides with the synthetic GATHER marker and is
-        // always dropped by `classify_go_type` — must not appear as a DOOR/BUTTON either.
         let dump =
             "INSERT INTO `gameobject_template` VALUES (5,25,50,'Fishing Hole',0,0,0,1.0,0,0);";
         assert!(door_templates(dump).is_empty());
     }
 
-    // -------------------------------------------------------------------------------------
-    //  Transform pipeline: shuffle, bounding radius, codec round trip.
-    // -------------------------------------------------------------------------------------
-
     #[test]
     fn shuffle_applies_the_mddf_axis_convention() {
-        // [-v2, -v0, v1]
         assert_eq!(shuffle([1.0, 2.0, 3.0]), [-3.0, -1.0, 2.0]);
         assert_eq!(shuffle([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
     }
@@ -281,7 +241,6 @@ mod tests {
     fn bounding_radius_covers_every_shuffled_vertex() {
         let tris: Vec<Tri> = cube(2.0, 5.0).into_iter().map(shuffle_tri).collect();
         let radius = bounding_radius(&tris);
-        // Every shuffled vertex must lie within `radius` of the reported center.
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for t in &tris {
             for v in t {
@@ -322,13 +281,8 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------------------
-    //  Byte-cap error — oversized rows fail loudly, they are never sharded.
-    // -------------------------------------------------------------------------------------
-
     #[test]
     fn encode_capped_errors_instead_of_sharding_an_oversized_mesh() {
-        // Each triangle costs lyracore_shared::vmap::TRI_BYTES; pick enough to blow the cap.
         let per_tri = lyracore_shared::vmap::TRI_BYTES;
         let n = MAX_ROW_TRI_BYTES / per_tri + 10;
         let tris: Vec<Tri> = (0..n).map(|i| cube(1.0, i as f32)[0]).collect();

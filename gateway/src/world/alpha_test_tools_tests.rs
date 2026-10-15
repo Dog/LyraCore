@@ -1,9 +1,3 @@
-//! Account-owned Alpha Test Tools through a Headless Client.
-//!
-//! The Fake models the production Store operation's two outcomes: Realm-core answers current
-//! Account authority, then the Home Shard accepts or refuses the Durable Request. Module tests
-//! own command parsing and teleport coordinates.
-
 use super::*;
 
 fn alpha_test_tools_store(
@@ -59,7 +53,6 @@ fn alpha_test_tools_dispatch_speed_and_tele_without_say_chat() {
 
     send_dot_say(&mut client, &mut encrypt, ".speed 3");
     send_dot_say(&mut client, &mut encrypt, ".tele stormwind");
-    // Neither command sends chat on success. The next response must be this unrelated reply.
     assert_quest_status_reply(&mut client, &mut encrypt, &mut decrypt);
 
     drop(client);

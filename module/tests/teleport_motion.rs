@@ -7,7 +7,6 @@ use support::{poll_until, Standalone};
 const CHARACTER_GUID: u64 = 1;
 const HEARTBEAT: u32 = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT;
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn teleport_motion_rows_follow_the_live_entity_boundary() {
@@ -38,8 +37,6 @@ fn teleport_motion_rows_follow_the_live_entity_boundary() {
         "a same-map teleport keeps the live entity's public motion row"
     );
 
-    // Stop the isolated node's publisher after it has produced the public row. The next movement
-    // therefore leaves a known pending row for the teleport boundary to clean up as well.
     standalone.assert_sql("DELETE FROM game_motion_publish_schedule");
     move_to(&standalone, 201.0, 200.0, 2);
     assert_eq!(row_count(&standalone, "game_entity_motion_pending"), 1);

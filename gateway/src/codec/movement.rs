@@ -1,8 +1,6 @@
 use super::*;
 use wow_world_messages::vanilla::SMSG_FORCE_SWIM_SPEED_CHANGE;
 
-/// The opcode of an inbound movement message, if it's one of the slice's relayed `MSG_MOVE_*`
-/// Records and relays movement under the same opcode.
 pub fn relayed_move_opcode(msg: &ClientOpcodeMessage) -> Option<u32> {
     use movement_opcodes as m;
     Some(match msg {
@@ -27,8 +25,7 @@ pub fn relayed_move_opcode(msg: &ClientOpcodeMessage) -> Option<u32> {
     })
 }
 
-/// Typed reference for movement without transport tails. Transport uses the build-5875
-/// codec and the raw relay, since the library's transport layout belongs to later clients.
+/// The typed transport layout belongs to later clients; use the build-5875 codec.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn build_movement_relay(
     opcode: u32,
@@ -126,16 +123,9 @@ pub fn build_movement_relay(
     })
 }
 
-/// The shortest legal `MovementInfo` body: `flags u32 + timestamp u32 + position 12 +
-/// orientation f32 + fall_time u32`. Every optional block (transport / pitch / jump / spline
-/// elevation) only makes it longer, so this is a floor, not an exact size — it exists so a truncated
-/// row can never be framed as a movement packet (the client would parse past the end of the body and
-/// desync its stream).
+// Fixed MovementInfo fields require 28 bytes before any optional tails.
 const MIN_MOVEMENT_INFO_LEN: usize = 4 + 4 + 12 + 4 + 4;
 
-/// Relay the stored build-5875 movement body under its original opcode, prefixed by the
-/// mover's packed guid. Each observer's writer supplies the frame header and encryption.
-/// Returns None for an unsupported opcode or a body shorter than the fixed movement fields.
 pub fn build_movement_relay_raw(
     opcode: u32,
     mover_guid: u64,
@@ -144,20 +134,13 @@ pub fn build_movement_relay_raw(
     if !movement_opcodes::is_slice_move(opcode) || info_bytes.len() < MIN_MOVEMENT_INFO_LEN {
         return None;
     }
-    // 9 = the largest packed guid (pattern byte + 8 non-zero bytes).
+    // 9 = the largest packed guid, including its mask byte.
     let mut body = Vec::with_capacity(9 + info_bytes.len());
     super::values::write_packed_guid_u64(&mut body, mover_guid);
     body.extend_from_slice(info_bytes);
-    // `MSG_MOVE_*` opcodes are bidirectional: the server re-emits under the SAME number the client
-    // sent (the `_Server` message's `OPCODE` equals the `_Client` one), so no mapping is needed.
     Some((opcode as u16, body))
 }
 
-/// Build `MSG_MOVE_TELEPORT_ACK_Server` (same-map teleport, opcode 0x00C7) moving `mover_guid` to
-/// `(x, y, z)` facing `o`. The 5875 client applies the position on receipt and echoes a CMSG
-/// `MSG_MOVE_TELEPORT_ACK` we accept-and-ignore, so `counter` (the movement counter it echoes) can be 0 —
-/// we don't gate on its reply. The `MovementInfo` carries no movement flags (a clean stand-still arrival).
-/// This is the reusable teleport leg: graveyard release, `debug_teleport`, and future `.tele`/hearthstone.
 pub fn build_teleport_ack(
     mover_guid: u64,
     counter: u32,
@@ -179,13 +162,7 @@ pub fn build_teleport_ack(
     }
 }
 
-/// Build the cross-map teleport-ARRIVAL pair: `SMSG_TRANSFER_PENDING(map)` (opcode
-/// 0x003F — starts the client's loading screen) immediately followed by `SMSG_NEW_WORLD(map, x, y, z, o)`
-/// (opcode 0x003E — the position on the new map). Sent back-to-back as ONE batch: both go out BEFORE the client even starts
-/// loading — the client only replies `MSG_MOVE_WORLDPORT_ACK` (opcode 0x00DC, empty body — [V]ed against
-/// the vendored gtker crate, `wow_world_messages` 0.3.0) once ITS OWN load completes, at which point the
-/// gateway drives the entity rebuild + full subscription reset (`world::mod.rs`'s `enter_world`).
-/// `map_id` must resolve to a client-known `Map` variant — `Err` in the pathological case (an unmapped id).
+/// Queue TRANSFER_PENDING and NEW_WORLD together to keep loading and arrival ordered.
 pub fn build_cross_map_teleport(
     map_id: u32,
     x: f32,
@@ -207,20 +184,6 @@ pub fn build_cross_map_teleport(
     ])
 }
 
-/// Build `SMSG_TRANSFER_ABORTED` (opcode 0x0040) — "the transfer you are loading for is not going to
-/// happen". The ONLY thing worse than failing a dungeon entry is not telling the client,
-/// because a client that has already been sent `SMSG_TRANSFER_PENDING` sits on its loading screen
-/// forever with no error and no way out. This is the packet vanilla servers send on exactly this
-/// path (mangos `SendTransferAborted`, e.g. "instance not found" / "instance is full"), so the
-/// client's own handler surfaces it as a dialog and stops loading.
-///
-/// `[V]`: the wire shape is pinned against the vendored gtker crate (`Map` u32 + `TransferAbortReason`
-/// u8 + a trailing `argument` u8, body 6 bytes); the client-side DIALOG has not been eyeballed on a
-/// live 1.12.1 client yet — the server-side property (the client is TOLD, and the socket is not
-/// silently dropped mid-load) is what this fixes and what the tests pin.
-///
-/// `map_id` must resolve to a client-known `Map` variant — `Err` for an unmapped id, which the
-/// caller treats as "no abort packet", never as a reason to skip the rest of its failure handling.
 pub fn build_transfer_aborted(
     map_id: u32,
     reason: TransferAbortReason,
@@ -232,11 +195,6 @@ pub fn build_transfer_aborted(
     })
 }
 
-/// Build `SMSG_FORCE_RUN_SPEED_CHANGE` (opcode 0x00E2): tell the client `guid` now runs at `speed`
-/// yards/sec. Sprint (and any future move-speed aura) pushes this so the client actually moves faster —
-/// player movement is client-authoritative, so the server-side `A_MOD_SPEED(MOVE)` aura alone never
-/// changes the client's speed. `move_event` is 0 (cmangos/vmangos convention). The client echoes
-/// `CMSG_FORCE_RUN_SPEED_CHANGE_ACK`, which we accept-and-ignore (we don't gate on its reply).
 pub fn build_force_run_speed(guid: u64, speed: f32) -> SMSG_FORCE_RUN_SPEED_CHANGE {
     SMSG_FORCE_RUN_SPEED_CHANGE {
         guid: Guid::new(guid),
@@ -245,7 +203,6 @@ pub fn build_force_run_speed(guid: u64, speed: f32) -> SMSG_FORCE_RUN_SPEED_CHAN
     }
 }
 
-/// Tell the owning client its current swimming speed in yards per second.
 pub fn build_force_swim_speed(guid: u64, speed: f32) -> SMSG_FORCE_SWIM_SPEED_CHANGE {
     SMSG_FORCE_SWIM_SPEED_CHANGE {
         guid: Guid::new(guid),
@@ -254,10 +211,6 @@ pub fn build_force_swim_speed(guid: u64, speed: f32) -> SMSG_FORCE_SWIM_SPEED_CH
     }
 }
 
-/// Build `SMSG_MONSTER_MOVE` for one server-driven creature leg: a straight walk from
-/// `start` to `dest` over `duration_ms`. EXACTLY ONE destination point — the crate writes a single
-/// spline point absolute, avoiding its multi-point packed-offset encoding (not 1.12-compatible).
-/// `spline_id` must strictly increase per creature or the client ignores the new spline.
 pub fn build_monster_move(
     mover_guid: u64,
     start: Vector3d,
@@ -271,16 +224,13 @@ pub fn build_monster_move(
         spline_point: start,
         spline_id,
         move_type: SMSG_MONSTER_MOVE_MonsterMoveType::Normal,
-        // RUN_MODE (0x100) = run animation; 0 = walk. Set from the leg's `run` flag so a RUN-speed
-        // chase/return/flee/fear leg run-animates (without it every leg walk-animated → moonwalk).
         spline_flags: SplineFlag::new(if run { 0x100 } else { 0 }),
         duration: duration_ms,
         splines: vec![dest],
     }
 }
 
-/// Vanilla linear paths put the absolute destination first, then signed destination-relative
-/// intermediate points. The typed writer uses a different multi-point representation.
+// Linear paths send the destination first, then signed destination-relative points.
 pub fn build_ground_path_raw(
     mover_guid: u64,
     start: Vector3d,
@@ -321,10 +271,7 @@ pub fn build_ground_path_raw(
     Some((0x00DD, body))
 }
 
-/// Build the dedicated multi-point passenger spline in the build-5875 Catmull-Rom form. The
-/// vendored typed writer always applies linear-path PackXYZ after the destination, even when the
-/// FLYING/Catmull-Rom flag is set. Taxi paths require full absolute points (and commonly have
-/// negative world coordinates), so this packet is intentionally encoded raw.
+/// Taxi Catmull-Rom paths need absolute points; gtker always applies linear PackXYZ.
 pub fn build_taxi_move_raw(
     passenger_guid: u64,
     start: Vector3d,
@@ -346,8 +293,8 @@ pub fn build_taxi_move_raw(
         body.extend_from_slice(&value.to_le_bytes());
     }
     body.extend_from_slice(&spline_id.to_le_bytes());
-    body.push(0); // MonsterMoveNormal
-    body.extend_from_slice(&0x0000_0300u32.to_le_bytes()); // RUN_MODE | FLYING (Catmull-Rom)
+    body.push(0);
+    body.extend_from_slice(&0x0000_0300u32.to_le_bytes());
     body.extend_from_slice(&duration_ms.to_le_bytes());
     body.extend_from_slice(&(points.len() as u32).to_le_bytes());
     for point in points {
@@ -358,13 +305,6 @@ pub fn build_taxi_move_raw(
     Some((0x00DD, body))
 }
 
-/// Build `SMSG_MONSTER_MOVE` as a FACING-ONLY packet: `mover_guid` does not move, `pos` is
-/// both the spline point and its sole (degenerate) destination, `duration` 0 — but its heading
-/// changes to `angle_rad`. This is the wire tool the issue calls out as "already exists, unwired":
-/// gtker 0.3 models 1.12's `FacingAngle` `MonsterMoveType` (`spline_point`/`splines` framing
-/// unchanged from [`build_monster_move`], only `move_type` differs), but nothing built it until a
-/// stationary stand-and-swing creature had no OTHER way to tell the client its facing changed — a
-/// `Normal`/`Stop` leg with `dest == start` carries a destination point, never a heading.
 pub fn build_monster_move_facing(
     mover_guid: u64,
     pos: Vector3d,
@@ -402,7 +342,6 @@ mod ground_path_tests {
         )
         .unwrap();
         assert_eq!(opcode, 0xdd);
-        // Packed GUID, start, id, normal, RUN_MODE, duration, count, destination, packed point.
         assert_eq!(
             body,
             vec![

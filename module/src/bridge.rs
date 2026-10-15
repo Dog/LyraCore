@@ -1,18 +1,3 @@
-//! Addon⇄server message bridge, the UI↔server RPC channel custom features ride.
-//!
-//! Client→server: the 1.12 client's `SendAddonMessage` is `CMSG_MESSAGECHAT` with language
-//! `LANG_ADDON` (0xFFFFFFFF) and text `"<prefix>\t<message>"`. The GATEWAY intercepts those frames
-//! raw (gtker's Language enum can't decode 0xFFFFFFFF), parses the `STC` envelope, and calls the
-//! [`client_command`] reducer AS the player — a command handler has exactly a reducer's authority.
-//!
-//! Server→client: [`send`] inserts a [`AddonMessage`] row; the gateway relays it (COORDINATOR
-//! connection — the delivery law: addon UI state must survive fat transactions) as an
-//! addon-language whisper the client surfaces to addons as `CHAT_MSG_ADDON`.
-//!
-//! Core owns `ping`; one installed Package may register a parser, an admitted apply operation and a
-//! reply command name with `game_client_command!`. Parsing queues only a pending intent. Gateway
-//! certifies Realm-core party authority before the target World Shard applies gameplay.
-
 use lyracore_shared::group::COMMAND_RESULT_WINDOW_MICROS;
 use spacetimedb::{reducer, table, Identity, ReducerContext, Table, Timestamp};
 
@@ -94,7 +79,6 @@ pub struct AdmittedClientCommand {
 pub struct ClientCommandHandler {
     pub parse: fn(&str, &str) -> Option<Result<ParsedClientCommand, CommandOutcome>>,
     pub apply: fn(&ReducerContext, &AdmittedClientCommand) -> CommandOutcome,
-    /// The addon command name that carries each outcome back to the issuer.
     pub reply: &'static str,
 }
 
@@ -109,7 +93,6 @@ pub enum CommandIntentState {
     index(accessor = by_pending, btree(columns = [pending])),
     index(accessor = by_result_reap, btree(columns = [result_reap_micros]))
 )]
-/// An authenticated client command awaiting Gateway party-authority admission. [entity]
 pub struct PartyCommandIntent {
     #[primary_key]
     #[auto_inc]
@@ -131,7 +114,6 @@ pub struct PartyCommandIntent {
 }
 
 #[table(accessor = game_party_command_dispatch_lane)]
-/// One durable fair queue lane for authenticated companion commands. [entity]
 pub struct PartyCommandDispatchLane {
     #[primary_key]
     pub lane: u8,
@@ -140,7 +122,6 @@ pub struct PartyCommandDispatchLane {
 }
 
 #[table(accessor = game_party_command_issuer)]
-/// The next causal Companion Order sequence minted for one authenticated issuer. [entity]
 pub struct PartyCommandIssuer {
     #[primary_key]
     pub character_guid: u64,
@@ -165,7 +146,6 @@ crate::character_owned!(transfer, fn sweep_transfer_game_party_command_issuer(ct
     index(accessor = by_bot, btree(columns = [bot_guid])),
     index(accessor = by_retention, btree(columns = [retain_until_micros]))
 )]
-/// The target Shard's idempotency result for one source Module and intent id. [entity]
 pub struct PartyCommandReceipt {
     #[primary_key]
     #[auto_inc]
@@ -179,14 +159,9 @@ pub struct PartyCommandReceipt {
     pub retain_until_micros: i64,
 }
 
-// A settled Character deletion retains receipts until their deadline, so a lost acknowledgement
-// cannot turn into a second application. Cross-Shard transfer removes the source copies through
-// `detach_command_receipts_for_transfer` before the character cascade; this registered sweep stays
-// deliberately empty so its result cannot depend on the generated cascade order.
+// Retain receipts through deletion until expiry so a lost acknowledgement cannot apply twice.
 crate::character_owned!(delete, fn sweep_delete_game_party_command_receipt(_ctx, _character_guid) {});
 
-/// Remove receipts already carried in the cross-Shard Escrow snapshot before source teardown.
-/// Same-database transfer never calls the source teardown boundary and therefore retains them.
 pub(crate) fn detach_command_receipts_for_transfer(ctx: &ReducerContext, character_guid: u64) {
     let receipts = ctx.db.game_party_command_receipt();
     for row in receipts
@@ -209,25 +184,17 @@ pub(crate) fn party_command_receipt_key(source_identity: Identity, intent_id: u6
     format!("{source_identity}:{intent_id}")
 }
 
-/// One server→client addon message: relayed by the gateway as an addon-language whisper, arriving
-/// in the recipient's addons as `CHAT_MSG_ADDON` with `prefix == "STC"`. TTL-reaped with the other
-/// event tables (same `created_at` shape). [event]
 #[table(accessor = game_addon_message, public)]
 pub struct AddonMessage {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
     pub recipient_identity: Identity,
-    /// Command name, e.g. `"pong"` or `"event.progress"` — the addon routes on it.
     pub cmd: String,
-    /// Command payload, a command-defined micro-format (no JSON — 255-byte wire budget).
     pub payload: String,
     pub created_at: Timestamp,
 }
 
-/// Queue an addon message for `character_guid`'s live session. The recipient identity comes off
-/// the durable character row (its owner binding) — a logged-out recipient's row is inserted and
-/// simply reaped unread (the 1s event TTL), which is the right semantics for UI state.
 pub(crate) fn send(ctx: &ReducerContext, character_guid: u64, cmd: &str, payload: &str) {
     let Some(c) = crate::helpers::character_by_guid(ctx, character_guid) else {
         return;
@@ -250,15 +217,11 @@ fn client_command_handler() -> Option<ClientCommandHandler> {
     crate::GAME_CLIENT_COMMAND
 }
 
-/// A debug Module with no Package handler uses [`FIXTURE_COMMAND`], so Core's durable tests drive
-/// the command transport with no Package installed.
 #[cfg(feature = "debug_reducers")]
 fn client_command_handler() -> Option<ClientCommandHandler> {
     crate::GAME_CLIENT_COMMAND.or(Some(FIXTURE_COMMAND))
 }
 
-/// Core's neutral test command: `fixture.command` with a bot guid as payload. It applies nothing,
-/// so each outcome comes from the transport's own Gates.
 #[cfg(feature = "debug_reducers")]
 const FIXTURE_COMMAND: ClientCommandHandler = ClientCommandHandler {
     parse: parse_fixture_command,
@@ -286,8 +249,6 @@ fn parse_fixture_command(
     })
 }
 
-/// The shared core behind [`client_command`] and its gateway twin `gw_client_command`:
-/// dispatch with the sender already resolved to a guid.
 pub(crate) fn apply_client_command(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -298,10 +259,8 @@ pub(crate) fn apply_client_command(
     Ok(())
 }
 
-/// Command dispatch — one arm per command, handlers live next to their features.
 fn dispatch(ctx: &ReducerContext, character_guid: u64, cmd: &str, payload: &str) {
     match cmd {
-        // The 184 acceptance round-trip: `STC ping` → `STC pong` (payload echoed).
         "ping" => send(ctx, character_guid, "pong", payload),
         other => {
             let parsed = client_command_handler().and_then(|handler| {
@@ -443,8 +402,7 @@ pub fn defer_party_command_intent(
     if lane.head_intent_id != intent.id {
         return Err("IntentNotDispatchHead".to_string());
     }
-    // Expiry permits lane rotation without stealing the worker that may still be completing its
-    // target transaction. Its lease keeps a second worker from claiming a false Expired result.
+    // Expiry rotates the lane; keep its lease while the prior target transaction may finish.
     if !foreign_live_claim {
         intent.claim_token = 0;
         intent.claim_until_micros = 0;
@@ -543,7 +501,6 @@ pub fn finish_party_command_intent(
     let reply_identity = intent.reply_identity;
     retire_party_command_intent(ctx, &intent)?;
     table.id().update(intent);
-    // An intent outlives an uninstalled Package; no addon remains to read its reply.
     if let Some(handler) = client_command_handler() {
         send_to_identity(
             ctx,
@@ -648,8 +605,6 @@ pub fn apply_admitted_party_command(
     Ok(())
 }
 
-/// Acknowledge an exact Command Receipt read. `Ok` proves absence in this transaction; a known
-/// outcome tag proves presence. Gateway treats any other reducer failure as unavailable state.
 #[reducer]
 pub fn confirm_party_command_receipt(
     ctx: &ReducerContext,
@@ -669,8 +624,6 @@ pub fn confirm_party_command_receipt(
     }
 }
 
-/// Acknowledge whether this World Shard owns the durable Character for `bot_guid`. Transfer is a
-/// nonterminal routing state. Live-body admission remains the target transaction's Group Gate.
 #[reducer]
 pub fn confirm_party_command_holder(ctx: &ReducerContext, bot_guid: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -695,8 +648,6 @@ fn fixture_command_intent(
         .ok_or_else(|| "fixture command intent missing".to_string())
 }
 
-/// Drive Realm-core admission and target application on one private unsharded fixture, stopping
-/// before source finalization so durable tests can model a Gateway loss at that boundary.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_apply(
@@ -708,8 +659,6 @@ pub fn party_command_fixture_apply(
     fixture_command_apply_after_authority(ctx, intent_id, claim_token, 0)
 }
 
-/// Change one target Gate after authority admission and before application in the same private
-/// transaction. Mode 1 removes the live body; mode 2 suppresses Sessionless Action Consent.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_apply_after_gate_change(
@@ -793,7 +742,6 @@ fn fixture_command_apply_after_authority(
     }
 }
 
-/// Finish a private fixture command from the exact target receipt without applying it again.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_finish(
@@ -813,7 +761,6 @@ pub fn party_command_fixture_finish(
     finish_party_command_intent(ctx, intent.id, claim_token, receipt.outcome)
 }
 
-/// Apply and finish one private unsharded fixture command through the production phase operations.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_drive(
@@ -836,7 +783,6 @@ pub fn party_command_fixture_drive(
     Ok(())
 }
 
-/// Release the oldest receipt owned by one private command fixture to exercise capacity recovery.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_release_receipt(
@@ -855,7 +801,6 @@ pub fn party_command_fixture_release_receipt(
     Ok(())
 }
 
-/// Expire one still-pending private fixture command without changing its target receipt.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_expire(ctx: &ReducerContext, intent_id: u64) -> Result<(), String> {
@@ -870,7 +815,6 @@ pub fn party_command_fixture_expire(ctx: &ReducerContext, intent_id: u64) -> Res
     Ok(())
 }
 
-/// Move one pending fixture intent beyond the target receipt-retention guarantee.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn party_command_fixture_expire_after_receipt_window(

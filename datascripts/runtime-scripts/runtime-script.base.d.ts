@@ -1,7 +1,4 @@
-// The Host supplies Entity Handles and gameplay operations for one Invocation.
-// Scripts do not import modules. The builder lowers a static Event Binding to one Invocation.
-
-// Entity fields are snapshots. A level-up event carries the attained level in newLevel.
+// Entity fields are snapshots; level-up events carry the attained level in newLevel.
 interface Entity {
   readonly name: string;
   readonly is_player: boolean;
@@ -31,7 +28,6 @@ interface EventBindingOptions {
   readonly enabled?: boolean;
 }
 
-// Kept for sources that declare the legacy script() entry point.
 declare const event: ScriptEvent;
 
 declare function heal(entity: Entity, amount: number): void;

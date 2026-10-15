@@ -2,8 +2,8 @@ mod support;
 
 use support::{actor, Standalone};
 
-const HUMAN: &str = "1"; // Alliance
-const ORC: &str = "2"; // Horde
+const HUMAN: &str = "1";
+const ORC: &str = "2";
 const CONTACT_ROWS: &str =
     "SELECT target_guid, is_ignore FROM game_character_contact WHERE owner_guid = 1";
 
@@ -20,9 +20,6 @@ fn refused(shard: &Standalone, reducer: &str, args: &[&str], tag: &str) {
     );
 }
 
-/// `gw_add_friend`/`gw_add_ignore` against one Standalone Shard, whose only durable Character row
-/// is the actor's own: every target guid below has no `game_character` row here at all, proving the
-/// Gateway's realm-wide name resolution is now the only existence Gate.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn gw_add_friend_needs_no_local_row_and_gates_self_enemy_duplicate_and_full() {
@@ -30,12 +27,8 @@ fn gw_add_friend_needs_no_local_row_and_gates_self_enemy_duplicate_and_full() {
     shard.publish_module();
     shard.assert_call("claim_operator", &[]);
     shard.assert_call("install_guid_range", &["0"]);
-    // The actor's own live entity carries its race (Human, Alliance) — `add_contact_core`'s Enemy
-    // Gate reads it off here, not off any durable row for the target.
     shard.assert_call("debug_spawn_player_entity", &["1"]);
 
-    // A target with no `game_character` row anywhere on this database still succeeds: the
-    // existence check moved to the Gateway's name resolution.
     shard.assert_call("gw_add_friend", &[&actor("1"), "9001", HUMAN]);
     let rows = shard.query_rows(CONTACT_ROWS);
     assert_eq!(rows.len(), 1);
@@ -60,10 +53,8 @@ fn gw_add_friend_needs_no_local_row_and_gates_self_enemy_duplicate_and_full() {
         &[&actor("1"), "9002", ORC],
         "social:enemy",
     );
-    // The Enemy Gate is friends-only: the same Orc target is a legal ignore.
     shard.assert_call("gw_add_ignore", &[&actor("1"), "9002"]);
 
-    // Fill the friend list to its cap: 9001 above plus 49 more makes 50 (`chat::MAX_FRIENDS`).
     for i in 0..49u64 {
         shard.assert_call(
             "gw_add_friend",

@@ -1,66 +1,26 @@
-//! Shared loot-roll, master-loot, and money-share wire codes.
-//! Client transitions use the per-recipient `game_group_event` relay.
-//! Realm-core owns roll votes; World Shards stage new rolls and settle the winning item.
-//! See `docs/realm-loot-routing.md` for ordering across databases.
+//! Before changing Loot Roll promotion or voting, read docs/realm-loot-routing.md.
 
-/// Kinds carried in `game_group_event.kind` for a loot-roll/master-loot/money-share notification
-/// Reserved range `4..=8`, see
-/// `crate::group::event_kind::LOOT_ROLL_RESERVED_START`.
 pub mod event_kind {
-    /// A need/greed/pass window opened for one item → `SMSG_LOOT_START_ROLL`.
     pub const ROLL_START: u8 = 4;
-    /// A member's vote landed (server already rolled 1-100 for a need/greed vote) → `SMSG_LOOT_ROLL`,
-    /// relayed to every eligible member so the live vote/roll numbers are visible party-wide.
     pub const ROLL_VOTE: u8 = 5;
-    /// The roll resolved to a winner → `SMSG_LOOT_ROLL_WON`. Never fired for an all-pass resolution
-    /// (the row just unlocks FFA-in-group; vanilla shows no "won" line when everyone passes).
     pub const ROLL_WON: u8 = 6;
-    /// The master looter's eligible-recipient list for a just-appeared above-threshold row →
-    /// `SMSG_LOOT_MASTER_LIST`. Sent to the master only.
     pub const MASTER_LIST: u8 = 7;
-    /// a grouped money-loot split resolved, this recipient's copper share →
-    /// `SMSG_LOOT_MONEY_NOTIFY(share)`. Next free kind after `MASTER_LIST`; reuses the SAME
-    /// per-recipient relay (one recipient, a kind byte, a small payload) rather than a new gateway-
-    /// subscribed table, for the identical reasons the roll/master-loot kinds above do. Pushed to
-    /// EVERY recipient of a grouped split, including the looter itself (vanilla shows the looter its
-    /// own "Your share of the loot is X" line too, not the solo "You loot X copper" line) — a SOLO
-    /// money loot never pushes this kind at all (no `game_corpse_loot_eligible` snapshot for that
-    /// corpse), so the gateway sends no notify and the client's own local "You loot" line is the only
-    /// feedback.
     pub const MONEY_SHARE: u8 = 8;
 }
 
-/// The REALM-CORE loot-roll ops: the `op` byte of the operator-gated `realm_loot_op`
-/// reducer, mirroring `crate::group::realm_op`'s one-reducer-not-several trade (see that module's
-/// doc for why: a hand-maintained gateway binding per reducer, `docs/danger-zones.md` §1.2).
-///
-/// Argument slots (`realm_loot_op(op, corpse_guid, slot, item_entry, actor_guid, vote,
-/// deadline_micros, recipients)`), per op:
-/// - [`START`] — `corpse_guid`/`slot`/`item_entry`/`deadline_micros`/`recipients` carry the roll a
-///   world shard already announced locally (`item_entry`/`deadline_micros` preserved so promotion
-///   never restarts the 60s clock); `actor_guid`/`vote` unused.
-/// - [`VOTE`] — `corpse_guid`/`slot`/`vote` as `CMSG_LOOT_ROLL` sends them; `actor_guid` is the
-///   voter (the gateway's own `InWorld::self_guid`, never a client-supplied literal); `item_entry`/
-///   `deadline_micros`/`recipients` unused.
+// START preserves the World Shard deadline so promotion does not restart the roll clock.
 pub mod loot_op {
-    /// Promote a world shard's freshly-created roll onto realm-core.
     pub const START: u8 = 0;
-    /// `CMSG_LOOT_ROLL` — `actor_guid` casts `vote` on the roll open at `(corpse_guid, slot)`.
     pub const VOTE: u8 = 1;
 }
 
-/// Vote kinds (`game_loot_roll_vote.vote`) — matches the vanilla wire `RollVote` enum EXACTLY
-/// (`Pass=0, Need=1, Greed=2`; `Disenchant=3` unused here) so a vote byte from `CMSG_LOOT_ROLL`
-/// (gateway-decoded via `RollVote::as_int()`) round-trips to the module with ZERO translation table —
-/// avoiding the silent-bug shape in this codebase: an invented enum ordering that doesn't match
-/// the wire.
+// RollVote wire values: Pass = 0, Need = 1, Greed = 2.
 pub mod vote_kind {
     pub const PASS: u8 = 0;
     pub const NEED: u8 = 1;
     pub const GREED: u8 = 2;
 }
 
-/// Encode a `ROLL_START` payload: `corpse_guid,slot,item_entry,countdown_ms`.
 pub fn encode_start(
     corpse_guid: u64,
     slot: u8,
@@ -71,7 +31,6 @@ pub fn encode_start(
     format!("{corpse_guid},{slot},{item_entry},{countdown_ms},{random_property_id}")
 }
 
-/// Decode a `ROLL_START` payload back to `(corpse_guid, slot, item_entry, countdown_ms)`.
 pub fn decode_start(payload: &str) -> Option<(u64, u8, u32, u32, u32)> {
     let mut p = payload.split(',');
     let corpse_guid: u64 = p.next()?.parse().ok()?;
@@ -80,7 +39,7 @@ pub fn decode_start(payload: &str) -> Option<(u64, u8, u32, u32, u32)> {
     let countdown_ms: u32 = p.next()?.parse().ok()?;
     let random_property_id = p.next().map(str::parse).transpose().ok()?.unwrap_or(0);
     if p.next().is_some() {
-        return None; // trailing garbage — fail closed
+        return None;
     }
     Some((
         corpse_guid,
@@ -91,9 +50,7 @@ pub fn decode_start(payload: &str) -> Option<(u64, u8, u32, u32, u32)> {
     ))
 }
 
-/// Encode a `ROLL_VOTE` payload: `corpse_guid,slot,item_entry,roll_number,vote_kind,auto_pass`.
-/// The voter's own guid rides `GroupEvent.other_guid` (already resolved/looked-up by `push_event`),
-/// not the payload — mirrors INVITE/DECLINE's convention.
+// The voter guid is GroupEvent.other_guid, outside the payload.
 pub fn encode_vote(
     corpse_guid: u64,
     slot: u8,
@@ -109,7 +66,6 @@ pub fn encode_vote(
     )
 }
 
-/// Decode a `ROLL_VOTE` payload back to `(corpse_guid, slot, item_entry, roll_number, vote_kind, auto_pass)`.
 pub fn decode_vote(payload: &str) -> Option<(u64, u8, u32, u8, u8, bool, u32)> {
     let mut p = payload.split(',');
     let corpse_guid: u64 = p.next()?.parse().ok()?;
@@ -144,7 +100,6 @@ pub fn encode_won(
     format!("{corpse_guid},{slot},{item_entry},{winning_roll},{winning_vote},{random_property_id}")
 }
 
-/// Decode a `ROLL_WON` payload back to `(corpse_guid, slot, item_entry, winning_roll, winning_vote)`.
 pub fn decode_won(payload: &str) -> Option<(u64, u8, u32, u8, u8, u32)> {
     let mut p = payload.split(',');
     let corpse_guid: u64 = p.next()?.parse().ok()?;
@@ -166,13 +121,11 @@ pub fn decode_won(payload: &str) -> Option<(u64, u8, u32, u8, u8, u32)> {
     ))
 }
 
-/// Encode a `MASTER_LIST` payload: `corpse_guid|guid,guid...` (the eligible-recipient set).
 pub fn encode_master_list(corpse_guid: u64, eligible: &[u64]) -> String {
     let guids: Vec<String> = eligible.iter().map(|g| g.to_string()).collect();
     format!("{corpse_guid}|{}", guids.join(","))
 }
 
-/// Decode a `MASTER_LIST` payload back to `(corpse_guid, [eligible guids])`.
 pub fn decode_master_list(payload: &str) -> Option<(u64, Vec<u64>)> {
     let (corpse_guid, rest) = payload.split_once('|')?;
     let corpse_guid: u64 = corpse_guid.parse().ok()?;
@@ -183,13 +136,10 @@ pub fn decode_master_list(payload: &str) -> Option<(u64, Vec<u64>)> {
     (!guids.is_empty()).then_some((corpse_guid, guids))
 }
 
-/// Encode a `MONEY_SHARE` payload: just the recipient's copper share — `SMSG_LOOT_MONEY_NOTIFY`
-/// carries no other field, unlike the roll payloads above (no corpse/slot/item to round-trip).
 pub fn encode_money_share(amount: u32) -> String {
     amount.to_string()
 }
 
-/// Decode a `MONEY_SHARE` payload back to the recipient's copper share.
 pub fn decode_money_share(payload: &str) -> Option<u32> {
     payload.parse().ok()
 }
@@ -224,8 +174,8 @@ mod tests {
     #[test]
     fn start_fails_closed_on_garbage() {
         assert!(decode_start("").is_none());
-        assert!(decode_start("1,2,3").is_none()); // missing countdown
-        assert!(decode_start("1,2,3,4,5,6").is_none()); // trailing garbage
+        assert!(decode_start("1,2,3").is_none());
+        assert!(decode_start("1,2,3,4,5,6").is_none());
         assert!(decode_start("x,2,3,4").is_none());
     }
 
@@ -245,8 +195,6 @@ mod tests {
 
     #[test]
     fn vote_kind_matches_the_real_wire_rollvote_ordering() {
-        // RollVote::Pass=0, Need=1, Greed=2 (wow_world_base) — a mismatch here would silently
-        // misclassify every vote decoded from CMSG_LOOT_ROLL.
         assert_eq!(vote_kind::PASS, 0);
         assert_eq!(vote_kind::NEED, 1);
         assert_eq!(vote_kind::GREED, 2);
@@ -270,7 +218,7 @@ mod tests {
     #[test]
     fn master_list_fails_closed_on_garbage() {
         assert!(decode_master_list("").is_none());
-        assert!(decode_master_list("555|").is_none()); // no eligible guids at all
+        assert!(decode_master_list("555|").is_none());
         assert!(decode_master_list("555|1,x,3").is_none());
     }
 
@@ -285,9 +233,6 @@ mod tests {
         assert_eq!(event_kind::MONEY_SHARE, event_kind::MASTER_LIST + 1);
     }
 
-    /// Every group-membership kind (0-3) and loot-roll/money-share kind (4-8) is pairwise distinct.
-    /// A renumber that silently collides two kinds would corrupt the relay (the gateway match would
-    /// resolve the wrong SMSG for a row).
     #[test]
     fn all_group_and_loot_event_kinds_are_distinct_0_through_8() {
         use crate::group::event_kind as g;
@@ -319,14 +264,9 @@ mod tests {
     fn money_share_fails_closed_on_garbage() {
         assert!(decode_money_share("").is_none());
         assert!(decode_money_share("12x").is_none());
-        assert!(decode_money_share("-1").is_none()); // u32, no sign
+        assert!(decode_money_share("-1").is_none());
     }
 
-    // ---- Realm-core loot-roll ops ----
-
-    /// The op byte is a WIRE value the gateway sends and the module dispatches on, deployed
-    /// separately — a renumber only one side learns about silently runs the wrong op (a VOTE
-    /// arriving as a START). Mirrors `realm_group_op_codes_are_stable_and_distinct` in `group.rs`.
     #[test]
     fn realm_loot_op_codes_are_stable_and_distinct() {
         assert_eq!(loot_op::START, 0);

@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`CombatStore`] adapter.
-
 use anyhow::Result;
 
 use crate::stdb::bindings::*;
@@ -8,8 +6,6 @@ use crate::stdb::Coordinator;
 use crate::world::{Actor, CombatStore};
 
 impl CombatStore for Coordinator {
-    /// Targets are attributed to the caller through the coordinator connection. `target_guid` 0
-    /// clears the selection.
     fn set_target(&self, actor: Actor, target_guid: u64) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(

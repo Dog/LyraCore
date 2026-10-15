@@ -1,4 +1,3 @@
-//! Table Relays for this Protocol Family.
 use lyracore_shared::spell::taxonomy::{A_MOD_RESISTANCE, A_MOD_SPEED, SPEED_SWIM};
 
 use crate::codec::entity::subscriptions::build_peer_create;
@@ -15,16 +14,9 @@ use std::sync::{Arc, Mutex};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::{SMSG_FORCE_MOVE_ROOT, SMSG_FORCE_MOVE_UNROOT};
 
-/// Stealth presence marker (taxonomy `A_STEALTH`): a unit carrying ≥1 such aura is stealthed and must
-/// be hidden from OTHER players' clients. Mirrors `module::spell::taxonomy::A_STEALTH = 0xA8`.
 pub(crate) use lyracore_shared::spell::taxonomy::A_STEALTH;
 
-/// The visibility action a single A_STEALTH aura insert/delete implies, decided from the POST-change
-/// count of A_STEALTH auras on the stealther's guid. A Stealth cast applies TWO A_STEALTH auras (and a
-/// break removes both); since the SDK applies the whole row-delta before firing callbacks, both inserts
-/// fire seeing count 2 and both deletes seeing count 0 — so we HIDE on ANY insert while stealthed
-/// (count >= 1) and REVEAL when the count reaches 0. Pure + unit-tested; the exactly-once guarantee
-/// against an already-hidden/visible peer is the per-viewer `created` set at the call site, not a boundary.
+/// SDK callbacks see the whole row delta, so multiple stealth changes share one count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StealthAction {
     Hide,
@@ -32,8 +24,6 @@ pub(crate) enum StealthAction {
     None,
 }
 
-/// Hide on a stealth insert and reveal when the last marker is removed. The aura index supplies
-/// the count after this callback's change; the viewer's `created` set makes repeated actions harmless.
 pub(crate) fn stealth_action(is_insert: bool, post_change_count: usize) -> StealthAction {
     match (is_insert, post_change_count) {
         (true, n) if n >= 1 => StealthAction::Hide,
@@ -42,8 +32,6 @@ pub(crate) fn stealth_action(is_insert: bool, post_change_count: usize) -> Steal
     }
 }
 
-/// Relay a visible melee swing or ranged launch. The Module emits ranged damage at impact
-/// through `SpellCastEvent`, which `cast_event_outbound` relays separately.
 pub(crate) fn combat_event_outbound(
     created: &Mutex<HashSet<u64>>,
     row: &CombatEvent,
@@ -52,17 +40,15 @@ pub(crate) fn combat_event_outbound(
         return Vec::new();
     }
     let mut out = Vec::new();
-    // A ranged launch uses SPELL_GO. ATTACKERSTATEUPDATE would animate a melee swing.
+    // A ranged launch uses SPELL_GO; ATTACKERSTATEUPDATE would animate a melee swing.
     if row.ranged_spell_id != 0 {
-        // Auto Shot stamps an ammo display id → the AMMO flag fires the arrow graphic (24 =
-        // INVTYPE_AMMO). Wand Shoot (ammo_display_id 0) → no flag → the bolt. Deliberate
-        // simplification: inv-type 24 is hardcoded.
+        // 24 is INVTYPE_AMMO; a zero ammo display leaves wand bolts without the AMMO flag.
         let ammo = if row.ammo_display_id != 0 {
             Some((row.ammo_display_id, 24))
         } else {
             None
         };
-        let miss = row.hit_info == 2; // module HIT_MISS
+        let miss = row.hit_info == 2;
         let go = codec::build_spell_go_outcome(
             row.attacker_guid,
             row.ranged_spell_id,
@@ -74,9 +60,6 @@ pub(crate) fn combat_event_outbound(
             go,
         ))));
     } else if !row.spell_swing {
-        // A fired on-next-swing spell (Heroic Strike/Cleave) REPLACES the white hit — the
-        // whole swing rides the spell's cast-event row (GO + yellow named damage log), so this
-        // event sends NO white ATTACKERSTATEUPDATE. killing_blow/ATTACKSTOP below still applies.
         let m = codec::build_attacker_state_update(
             row.attacker_guid,
             row.target_guid,
@@ -89,11 +72,6 @@ pub(crate) fn combat_event_outbound(
             ServerOpcodeMessage::SMSG_ATTACKERSTATEUPDATE(Box::new(m)),
         ));
     }
-    // C2: on a MELEE killing blow, tell the attacker to leave combat stance. The target itself
-    // vanishes via the game_world_entity on_delete → SMSG_DESTROY_OBJECT relay. A RANGED kill
-    // sends no ATTACKSTOP (the client was never in melee-attack state; vanilla sends none) —
-    // its stop signal is the SMSG_CANCEL_AUTO_REPEAT from the engagement-row delete relay
-    // (kill_creature's disengage frees the attacker's row).
     if row.killing_blow && row.ranged_spell_id == 0 {
         let stop = codec::build_attack_stop(row.attacker_guid, row.target_guid);
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_ATTACKSTOP(
@@ -103,10 +81,6 @@ pub(crate) fn combat_event_outbound(
     out
 }
 
-/// Combat-stance engage leg: SMSG_ATTACKSTART for a melee engagement —
-/// the one body both legs run. Ranged rows are NOT melee combat (Auto Shot: ATTACKSTART would animate a
-/// melee swing between shots); the `created` gate skips an out-of-scope attacker like the swing
-/// relay.
 pub(crate) fn melee_engage_outbound(
     created: &Mutex<HashSet<u64>>,
     row: &MeleeAttack,
@@ -123,10 +97,6 @@ pub(crate) fn melee_engage_outbound(
     ))]
 }
 
-/// Combat-stance disengage leg. A RANGED row's delete is the ONE
-/// server-initiated auto-repeat teardown choke point: the OWNING player (and only them) gets the
-/// 0-byte SMSG_CANCEL_AUTO_REPEAT so its toggle drops in lockstep (Auto Shot); a melee row's delete is
-/// SMSG_ATTACKSTOP for everyone (a non-kill disengage leaves stance too).
 pub(crate) fn melee_disengage_outbound(self_guid: u64, row: &MeleeAttack) -> Vec<Outbound> {
     if row.ranged_spell_id != 0 {
         if row.attacker_guid == self_guid {
@@ -140,26 +110,13 @@ pub(crate) fn melee_disengage_outbound(self_guid: u64, row: &MeleeAttack) -> Vec
     ))]
 }
 
-/// Spell cast visuals: the one body both paths run. It handles START and GO sequencing, interrupt
-/// teardown, pushback, Proc logs, damage and heal logs, and cooldown. Every caster-private branch
-/// keys on `self_guid`.
 pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<Outbound> {
     let mut out = Vec::new();
     let Some(kind) = SpellCastEventKind::decode(row) else {
         return out;
     };
-    // INTERRUPT signal: the victim's mid-cast timed spell was cancelled.
-    // Relay SMSG_SPELL_FAILURE{spell, Interrupted} to the caster so the client tears down its cast
-    // bar. No SMSG_SPELL_GO follows because the cast never resolved.
     if kind == SpellCastEventKind::Interrupt {
-        // SELF-ONLY for a PLAYER caster: game_spell_cast_event is a global public subscription,
-        // so this closure fires for EVERY player. SMSG_SPELL_FAILURE is a caster-private cast-bar
-        // teardown (unlike the START/GO broadcast visuals), so relay it ONLY to the caster — else
-        // bystanders get stray "Interrupted" feedback and a bystander mid-casting the same spell
-        // risks a spurious teardown.
-        // A creature or pet caster (0xF130/0xF140 high-guid) has no self — broadcast so every observer's
-        // mob cast bar tears down on a Kick/Counterspell (the packet carries the mob's guid, so
-        // a bystander's own bar is untouched; mirrors the START broadcast that drew the bar).
+        // SPELL_FAILURE must be caster-private or bystanders can lose their own cast state.
         let is_creature = matches!(row.caster_guid >> 48, 0xF130 | 0xF140);
         if is_creature || row.caster_guid == self_guid {
             let m = codec::build_spell_failure(row.caster_guid, row.spell_id);
@@ -167,12 +124,7 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
                 Box::new(m),
             )));
         }
-        // A row that names a concrete reason (an on-next-swing strike that could not pay its cost at
-        // the swing) follows the teardown with the failed cast result, in vanilla's order
-        // (SendInterrupted then SendCastResult). The client needs BOTH: the teardown closes the cast
-        // bar, the cast result releases the ability it holds as its current melee spell and prints
-        // the red "Not enough rage" line. Caster-private, like the teardown above — the raw encoder,
-        // because the typed SMSG_CAST_RESULT inverts the success/failure semantics.
+        // Teardown must precede the failed cast result to clear both cast and melee-spell state.
         if row.caster_guid == self_guid {
             if let Some(reason) = codec::cast_failure_reason_for_code(row.failure_reason) {
                 out.push(Outbound::Raw {
@@ -183,8 +135,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         }
         return out;
     }
-    // PUSHBACK signal: a direct hit moved the fire time of an in-progress timed cast. Broadcast
-    // SMSG_SPELL_DELAYED so anyone watching the caster's cast bar sees the same shift.
     if kind == SpellCastEventKind::Pushback {
         let m = codec::build_spell_delayed(row.caster_guid, row.delay_ms);
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_DELAYED(
@@ -192,7 +142,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         )));
         return out;
     }
-    // Proc and ranged-impact rows report damage without another cast animation or cooldown.
     if kind == SpellCastEventKind::ProcLog {
         if row.damage > 0 {
             let log = codec::build_spell_non_melee_damage_log(
@@ -212,8 +161,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         return out;
     }
     if kind == SpellCastEventKind::Start {
-        // Cast-START (a timed spell): SMSG_SPELL_START with the cast-bar duration so observers
-        // see the bar FILL. The GO/COOLDOWN follow on the cast-GO COMPLETION event.
         let start =
             codec::build_spell_start(row.caster_guid, row.spell_id, row.cast_time_ms, 0, None);
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(
@@ -221,26 +168,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         )));
         return out;
     }
-    // Cast-GO. Legacy rows reach this branch when cast_time_ms is zero. Sequence:
-    //   - GENUINE INSTANT (is_completion=false): START(0)+GO — SendSpellStart fires for EVERY
-    //     non-triggered cast (timer 0 for an instant) to register the pending cast, then cast() →
-    //     SendSpellGo finalizes it. START flags = 0x02, GO flags = 0x0100 (set in the builders).
-    //   - TIMED COMPLETION (is_completion=true): GO ALONE — the begin already sent START(cast_time);
-    //     a 2nd START(0) reset the bar to zero-length ("stuck on full"). The SMSG_SPELL_GO is the
-    //     client's cast finalizer (it matches by caster guid + spell id to release the pending cast).
-    // The CASTER's OWN instant cast (cast_time 0 → this GO branch, !is_completion) already got
-    // START+GO SYNCHRONOUSLY from the CMSG_CAST_SPELL handler (so they precede the aura effects the
-    // SDK's alphabetical callback order would otherwise send first). Skip the duplicate to the caster
-    // — but still relay it to OBSERVERS (caster != self) and for TIMED COMPLETIONS (is_completion,
-    // which the gateway did NOT sync-send). NOTE: a player's TRIGGERED instant cast (channel-tick
-    // missile / on-hit trigger) also matches !is_completion && caster==self and is suppressed here —
-    // it did not get a synchronous send, so it loses its caster-side visual until the client_initiated
-    // flag lands (tracked follow-up). Acceptable for the slice; observers still see it.
-    // Suppress ONLY what the CMSG handler actually sent synchronously — the row says so
-    // (client_initiated rides from the cast_spell reducer path alone). The old shape
-    // (!is_completion && self) also swallowed the caster's TRIGGERED instants — channel-tick
-    // missiles (Arcane Missiles/Drain Life), on-hit trigger_spell procs — which never had a
-    // synchronous send, so their caster saw no visual while observers did.
     let caster_synced_instant = row.client_initiated && row.caster_guid == self_guid;
     if !caster_synced_instant {
         if !row.is_completion {
@@ -249,9 +176,7 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
                 Box::new(start),
             )));
         }
-        // CAST_RESULT(OK) is caster-only: clears the pending spell state so the subsequent
-        // GO can release m_currentSpells. Only for timed completions — the instant-cast
-        // caster got it synchronously from the CMSG_CAST_SPELL handler.
+        // Timed completions need caster-only CAST_RESULT before GO; instant casts already sent it.
         if row.is_completion && row.caster_guid == self_guid {
             out.push(Outbound::Raw {
                 opcode: 0x0130,
@@ -259,11 +184,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
             });
         }
         let mut go = codec::build_spell_go(row.caster_guid, row.spell_id, row.target_guid, None);
-        // A 0-damage on-next-swing FIRE that rode a missed/dodged/parried swing reports
-        // the outcome in the GO's miss list — the client prints the yellow "Your Heroic
-        // Strike missed/was dodged/was parried" line (the white MISS was suppressed via
-        // spell_swing). swing_hit_info uses the CombatEvent codes (2 miss, 3 dodge, 4 parry);
-        // every non-swing row carries 0, keeping this branch dead for ordinary casts.
         if row.is_completion && row.damage == 0 {
             use wow_world_messages::vanilla::{SpellMiss, SpellMissInfo};
             let miss_info = match row.swing_hit_info {
@@ -300,9 +220,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
             ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(log)),
         ));
     }
-    // The green floating heal number + combat-log line — SMSG_SPELLHEALLOG whenever
-    // this cast restored health (module sums EFFECTIVE heal onto the row; overheal-only
-    // casts carry 0 and stay silent, matching the damage gate's shape).
     if row.healed > 0 {
         use wow_world_messages::vanilla::SMSG_SPELLHEALLOG;
         use wow_world_messages::Guid;
@@ -327,9 +244,6 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
     out
 }
 
-/// The full aura-array VALUES block for `target_guid`. `auras` is that unit's current aura set
-/// ([`crate::stdb::world_view::AuraIndex::on_target`]); the filter only guards a caller that
-/// hands over a wider set.
 pub(crate) fn aura_sync(
     auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
     target_guid: u64,
@@ -348,8 +262,6 @@ pub(crate) fn aura_sync(
     Outbound::Raw { opcode, body }
 }
 
-// A self resistance aura applies or expires after the entity CREATE. Recompute all seven effective
-// resistances from the coordinator's post-change cache and push the complete paperdoll group.
 pub(crate) fn armor_packet(
     coord: &Coordinator,
     changed: &Aura,
@@ -362,22 +274,15 @@ pub(crate) fn armor_packet(
     {
         return None;
     }
-    // The coordinator owns the entity, aura, item-instance and item-catalogue caches needed by this fold.
     let guard = coord.0.coord();
     let db = &guard.conn.db;
     let eff = crate::stdb::armor::effective_resistances(db, self_guid);
-    // Carry the positive AURA portion alongside the total so the paperdoll renders the
-    // green "(+N)" (Devotion Aura showed as plain white armor). Raw path — the positive
-    // field has no gtker setter. Login self-corrects through this same relay (the SDK
-    // replays aura rows after subscription-apply).
     let pos = crate::stdb::armor::aura_armor_positive(db, self_guid);
     Some(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
         Box::new(codec::build_armor_values(self_guid, eff, pos)),
     )))
 }
 
-// The Module has already persisted sheet stats in the aura transaction. Re-push that row
-// only for aura kinds that affect it; the paperdoll is private to its owner.
 pub(crate) fn sheet_packet(
     coord: &Coordinator,
     changed: &Aura,
@@ -398,8 +303,6 @@ pub(crate) fn sheet_packet(
     })
 }
 
-/// Hide a peer on stealth gain; reveal it with current equipment and auras on stealth loss.
-/// The AOI and `created` checks prevent distant or duplicate CREATEs. Self never hides from itself.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stealth_visibility(
     post_change_stealth_count: usize,
@@ -417,8 +320,6 @@ pub(crate) fn stealth_visibility(
     }
     match stealth_action(is_insert, post_change_stealth_count) {
         StealthAction::Hide => {
-            // Evict so a later REVEAL (and ordinary AOI re-entry) re-CREATEs; only DESTROY if the
-            // viewer actually had it (idempotent — a never-created peer needs no DESTROY).
             if created.lock().unwrap().remove(&changed.target_guid) {
                 vec![Outbound::One(ServerOpcodeMessage::SMSG_DESTROY_OBJECT(
                     codec::build_destroy_object(changed.target_guid),
@@ -428,9 +329,6 @@ pub(crate) fn stealth_visibility(
             }
         }
         StealthAction::Reveal => {
-            // Re-CREATE only if not currently shown (idempotent) AND the peer is in this viewer's
-            // scope (its row is in the cache). Insert into `created` BEFORE building so the dedup
-            // is consistent; if the row is gone (out of scope), undo the insert and emit nothing.
             if !created.lock().unwrap().insert(changed.target_guid) {
                 return Vec::new();
             }
@@ -454,10 +352,7 @@ pub(crate) fn stealth_visibility(
                 Some(row) => match build_peer_create(coord, view, shard, self_guid, &row) {
                     Some(out) => out,
                     None => {
-                        // Encode failure: roll the dedup entry back like `offer_peer_create`
-                        // does, else this guid is permanently suppressed (marked created with
-                        // no CREATE ever sent) — the same latent re-entry bug fixed on the
-                        // insert/update path.
+                        // Undo dedup on failure so CREATE can retry.
                         created.lock().unwrap().remove(&changed.target_guid);
                         Vec::new()
                     }
@@ -472,7 +367,6 @@ pub(crate) fn stealth_visibility(
     }
 }
 
-/// Channel timers belong to the caster, including channels whose auras sit on an enemy.
 pub(crate) fn spell_channel_outbound(
     coord: &Coordinator,
     self_guid: u64,
@@ -522,9 +416,6 @@ pub(crate) fn spell_channel_outbound(
     Some(Outbound::One(packet))
 }
 
-/// Aura insert leg: array sync, self-only duration/run-speed/armor/sheet packets, and the
-/// stealth HIDE transition. The target's current aura set comes from the gateway's aura index,
-/// post-change like the cache it mirrors; `stealth_count` was taken on the pump.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aura_insert_outbound(
     coord: &Coordinator,
@@ -538,8 +429,7 @@ pub(crate) fn aura_insert_outbound(
 ) -> Vec<Outbound> {
     let mut out = Vec::new();
     out.extend(spell_channel_outbound(coord, self_guid, row, false));
-    // A stealth-hidden peer (not in `created`) must get NO per-peer relay: a partial VALUES on
-    // a DESTROYed object is a client crash/desync vector.
+    // VALUES for a stealth-hidden, destroyed object can crash or desynchronize the client.
     let visible =
         row.target_guid == self_guid || created.lock().unwrap().contains(&row.target_guid);
     let current = visible.then(|| view.auras.on_target(shard, row.target_guid));
@@ -580,7 +470,6 @@ pub(crate) fn aura_insert_outbound(
     out
 }
 
-/// Aura update leg (no stealth transition on an update).
 pub(crate) fn aura_update_outbound(
     coord: &Coordinator,
     view: &WorldView,
@@ -597,7 +486,6 @@ pub(crate) fn aura_update_outbound(
     if let Some(current) = &current {
         out.push(aura_sync(current.iter().cloned(), row.target_guid));
     }
-    // Re-send the timer only when the duration window actually changed (a refresh).
     if expires_changed {
         if let Some(o) = aura_duration_packet(row, self_guid) {
             out.push(o);
@@ -623,8 +511,6 @@ pub(crate) fn aura_update_outbound(
     out
 }
 
-/// Aura delete leg (the REVEAL half of stealth). The aura index is post-delete, so the
-/// sync/speed folds read the remaining set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aura_delete_outbound(
     coord: &Coordinator,
@@ -673,8 +559,6 @@ pub(crate) fn aura_delete_outbound(
     out
 }
 
-/// Reconnect sends one current aura array per target and observer. Owner timers remain per aura,
-/// while speed, armor, and sheet values refresh once even when several auras changed offline.
 pub(crate) fn aura_snapshot_outbound(
     coord: &Coordinator,
     view: &WorldView,
@@ -755,11 +639,9 @@ pub(crate) fn aura_snapshot_outbound(
     out
 }
 
-/// Projectile impact: the floating damage number for a projectile that
-/// finished its travel — never a START/GO. Pure over the row; broadcast.
 pub(crate) fn impact_event_outbound(row: &SpellImpactEvent) -> Vec<Outbound> {
     if row.damage == 0 {
-        return Vec::new(); // a fully-absorbed impact (or a vanished target) logs nothing
+        return Vec::new();
     }
     let log = codec::build_spell_non_melee_damage_log(
         row.target_guid,
@@ -776,8 +658,6 @@ pub(crate) fn impact_event_outbound(row: &SpellImpactEvent) -> Vec<Outbound> {
     )]
 }
 
-/// Dynamic objects: the shared-dispatch twin of the per-player
-/// `on_dynobj_insert` relay. The instance gate already ran in `world_view::dynobj_appeared`.
 pub(crate) fn relay_dynobj_create(row: &DynamicObject) -> Vec<Outbound> {
     let m = codec::build_dynamicobject_create_object(
         row.guid,
@@ -793,19 +673,13 @@ pub(crate) fn relay_dynobj_create(row: &DynamicObject) -> Vec<Outbound> {
     ))]
 }
 
-/// A bare SMSG_DESTROY_OBJECT — the delete leg of the dynobj/corpse families, shared because the
-/// packet is nothing but the guid.
 pub(crate) fn relay_destroy_object(guid: u64) -> Vec<Outbound> {
     vec![Outbound::One(ServerOpcodeMessage::SMSG_DESTROY_OBJECT(
         codec::build_destroy_object(guid),
     ))]
 }
 
-/// SMSG_UPDATE_AURA_DURATION (buff timer): the 1.12 UpdateMask aura array carries NO duration,
-/// so without this the client shows "0 seconds"/flashing icon. Only for THIS player's own auras
-/// (the slot indexes the player's aura array) with a finite window; the duration is the full
-/// applied span (expires - applied), which is what the client shows on apply/refresh. Pure →
-/// unit-tested (hoisted verbatim out of `subscribe_player_events`, no logic change).
+/// Aura-array fields omit duration; only the owner's aura slots accept timer packets.
 pub(crate) fn aura_duration_packet(row: &Aura, self_guid: u64) -> Option<Outbound> {
     if row.target_guid != self_guid {
         return None;
@@ -827,14 +701,12 @@ pub(crate) fn aura_duration_packet(row: &Aura, self_guid: u64) -> Option<Outboun
     ))
 }
 
-/// A movement aura change refreshes the owner's speed from its current movement and mount auras.
-/// The complete fold also applies stacks and the Module's minimum movement speed.
 pub(crate) fn run_speed_packet(
     auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
     changed: &Aura,
     self_guid: u64,
 ) -> Option<Outbound> {
-    const BASE_RUN_SPEED: f32 = 7.0; // vanilla base run yd/s
+    const BASE_RUN_SPEED: f32 = 7.0; // Vanilla base run speed, yards per second.
     if changed.target_guid != self_guid
         || !lyracore_shared::aura::moves_run_speed(changed.eff_kind, changed.eff_p_0)
     {
@@ -858,9 +730,7 @@ pub(crate) fn run_speed_packet(
     ))
 }
 
-/// A root, stun or polymorph change tells the owning client whether it may still move. The client
-/// moves on its own authority, so the Module's movement gate alone leaves it running in place.
-/// Overlapping holds keep the client rooted until the last one ends.
+/// The client moves independently; overlapping holds must not send an early unroot.
 pub(crate) fn root_packet(
     mut auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
     changed: &Aura,
@@ -889,7 +759,6 @@ pub(crate) fn root_packet(
     }))
 }
 
-/// A swimming aura change refreshes the owner from the remaining aura set.
 pub(crate) fn swim_speed_packet(
     auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
     changed: &Aura,
@@ -919,10 +788,6 @@ pub(crate) fn swim_speed_packet(
     ))
 }
 
-/// A ground-area dynamic object appeared (Consecration's swirl etc.) → CREATE for every
-/// same-instance viewer on the row's shard — the same `instance_relay_gate` the per-player leg
-/// runs. Short-lived, so no login/AOI resident sweep (a mid-area login misses the visual),
-/// exactly as before.
 pub(crate) fn dynobj_appeared(view: &WorldView, shard: ShardId, row: &DynamicObject) {
     let row = Arc::new(row.clone());
     for viewer in viewers_on_shard(view, shard) {
@@ -939,9 +804,6 @@ pub(crate) fn dynobj_appeared(view: &WorldView, shard: ShardId, row: &DynamicObj
     }
 }
 
-/// A dynamic object's area ended → DESTROY to every viewer on the shard. Deliberately NOT
-/// instance-gated: the per-player delete leg never was (a DESTROY for a guid the client doesn't
-/// know is a no-op), and the A/B contract is byte-for-byte equality.
 pub(crate) fn dynobj_vanished(view: &WorldView, shard: ShardId, row: &DynamicObject) {
     let guid = row.guid;
     for viewer in viewers_on_shard(view, shard) {
@@ -965,7 +827,6 @@ pub(crate) fn combat_audience(
     )
 }
 
-/// Queue a ranged launch or melee swing for each viewer. The job checks its created set.
 pub(crate) fn combat_event_appeared(view: &WorldView, shard: ShardId, row: &CombatEvent) {
     let row = Arc::new(row.clone());
     for viewer in combat_audience(view, shard, &row) {
@@ -976,7 +837,6 @@ pub(crate) fn combat_event_appeared(view: &WorldView, shard: ShardId, row: &Comb
     }
 }
 
-/// An engagement row names no cell; the attacker's indexed cell anchors it.
 pub(crate) fn melee_audience(
     view: &WorldView,
     shard: ShardId,
@@ -993,8 +853,6 @@ pub(crate) fn melee_audience(
     )
 }
 
-/// A melee/ranged engagement began → SMSG_ATTACKSTART per viewer (`melee_engage_outbound` runs
-/// the ranged skip + created gate in the job).
 pub(crate) fn melee_engaged(view: &WorldView, shard: ShardId, row: &MeleeAttack) {
     let row = Arc::new(row.clone());
     for viewer in melee_audience(view, shard, &row) {
@@ -1006,8 +864,6 @@ pub(crate) fn melee_engaged(view: &WorldView, shard: ShardId, row: &MeleeAttack)
     }
 }
 
-/// An engagement row was removed → ATTACKSTOP / the owner-only CANCEL_AUTO_REPEAT
-/// (`melee_disengage_outbound`, keyed on each viewer's own guid).
 pub(crate) fn melee_disengaged(view: &WorldView, shard: ShardId, row: &MeleeAttack) {
     let row = Arc::new(row.clone());
     for viewer in melee_audience(view, shard, &row) {
@@ -1019,7 +875,6 @@ pub(crate) fn melee_disengaged(view: &WorldView, shard: ShardId, row: &MeleeAtta
     }
 }
 
-/// Aura descriptors follow the target's AOI; channel timers also reach the caster.
 pub(crate) fn aura_audience(view: &WorldView, shard: ShardId, row: &Aura) -> Vec<Arc<Viewer>> {
     let key = view
         .spatial
@@ -1032,8 +887,6 @@ pub(crate) fn aura_audience(view: &WorldView, shard: ShardId, row: &Aura) -> Vec
     )
 }
 
-/// An aura appeared → per viewer: array sync + self-only packets + the stealth HIDE transition
-/// (`aura_insert_outbound`, all gates inside the job against that viewer's own state).
 pub(crate) fn aura_applied(
     view: &Arc<WorldView>,
     coord: &Coordinator,
@@ -1059,7 +912,6 @@ pub(crate) fn aura_applied(
     }
 }
 
-/// An aura changed → per viewer: array sync + refresh-only duration + self-only packets.
 pub(crate) fn aura_updated(
     view: &Arc<WorldView>,
     coord: &Coordinator,
@@ -1084,8 +936,6 @@ pub(crate) fn aura_updated(
     }
 }
 
-/// An aura expired/was removed → per viewer: array sync + self-only packets + the stealth REVEAL
-/// transition.
 pub(crate) fn aura_removed(
     view: &Arc<WorldView>,
     coord: &Coordinator,
@@ -1125,8 +975,6 @@ pub(crate) fn cast_audience(
     )
 }
 
-/// A cast event landed → the full cast-lock sequence per viewer (`cast_event_outbound`: the
-/// caster-private branches key on each viewer's own guid inside the job).
 pub(crate) fn cast_event_appeared(view: &WorldView, shard: ShardId, row: &SpellCastEvent) {
     let row = Arc::new(row.clone());
     for viewer in cast_audience(view, shard, &row) {
@@ -1152,7 +1000,6 @@ pub(crate) fn impact_audience(
     )
 }
 
-/// A projectile impact landed → the floating damage number per viewer that can see the caster.
 pub(crate) fn impact_appeared(view: &WorldView, shard: ShardId, row: &SpellImpactEvent) {
     let row = Arc::new(row.clone());
     for viewer in impact_audience(view, shard, &row) {
@@ -1198,9 +1045,7 @@ pub(crate) enum SpellCastEventKind {
 }
 
 impl SpellCastEventKind {
-    /// Decode the append-only Module code. Kind zero is a row from the old schema and keeps the
-    /// former field-based order. An unknown nonzero kind is newer or damaged data, so guessing a
-    /// client packet would be unsafe.
+    // Kind zero uses the old schema's field-based ordering; unknown nonzero kinds must drop.
     pub(crate) fn decode(row: &SpellCastEvent) -> Option<Self> {
         match row.kind {
             0 if row.is_interrupted => Some(Self::Interrupt),
@@ -1230,9 +1075,6 @@ impl SpellCastEventKind {
 pub(crate) mod tests {
     use super::*;
     use lyracore_shared::spell::taxonomy::SPEED_MOVE;
-    /// A minimal `Aura` row for the packet-builder tests: `target_guid`/`eff_kind`/`eff_p_0`/`amount`
-    /// are the fields those builders branch on; `applied_at`/`expires_at` (raw micros) drive the
-    /// duration math. Everything else is a fixed, inert value.
     pub(crate) fn aura(
         target_guid: u64,
         eff_kind: u8,
@@ -1279,7 +1121,6 @@ pub(crate) mod tests {
     #[test]
     fn aura_duration_packet_pins_the_remaining_window_for_self_only() {
         let self_guid = 1u64;
-        // A 5-second remaining window on the player's OWN aura, in slot 3.
         let mine = aura(self_guid, 0xA1, 1, 10, 0, 5_000_000);
         let out = aura_duration_packet(&mine, self_guid);
         let m = match out {
@@ -1287,13 +1128,9 @@ pub(crate) mod tests {
             _ => panic!("expected Some(Outbound::One(SMSG_UPDATE_AURA_DURATION))"),
         };
         assert_eq!(m, codec::build_aura_duration(3, 5000));
-        // A peer's aura (not self) never gets a duration packet — the slot only indexes the
-        // viewer's OWN aura array.
         assert!(aura_duration_packet(&mine, self_guid + 1).is_none());
-        // The infinite-duration sentinel (a toggle aura) never gets a timer packet.
         let toggle = aura(self_guid, 0xA1, 1, 10, 0, i64::MAX);
         assert!(aura_duration_packet(&toggle, self_guid).is_none());
-        // A non-positive remaining window (expires_at <= applied_at) emits nothing.
         let expired = aura(self_guid, 0xA1, 1, 10, 5_000_000, 5_000_000);
         assert!(aura_duration_packet(&expired, self_guid).is_none());
     }
@@ -1328,7 +1165,6 @@ pub(crate) mod tests {
     #[test]
     fn run_speed_packet_uses_the_strongest_move_bonus_on_self_only() {
         let self_guid = 1u64;
-        // Ghost and Wisp Spirit coexist, but only the stronger run bonus applies.
         let a1 = aura(self_guid, 0xA4, 0, 25, 0, i64::MAX);
         let a2 = aura(self_guid, 0xA4, 0, 50, 0, i64::MAX);
         let current = vec![a1.clone(), a2.clone()];
@@ -1338,10 +1174,8 @@ pub(crate) mod tests {
             _ => panic!("expected Some(Outbound::One(SMSG_FORCE_RUN_SPEED_CHANGE))"),
         };
         assert_eq!(*m, codec::build_force_run_speed(self_guid, 10.5));
-        // A non-move-speed change on self spams nothing (ordinary buffs/debuffs don't trigger this).
         let unrelated = aura(self_guid, 0xA1, 1, 10, 0, i64::MAX);
         assert!(run_speed_packet(current.clone().into_iter(), &unrelated, self_guid).is_none());
-        // A move-speed change on a DIFFERENT guid (a peer) never triggers self's packet.
         let peer_changed = aura(self_guid + 1, 0xA4, 0, 25, 0, i64::MAX);
         assert!(run_speed_packet(current.into_iter(), &peer_changed, self_guid).is_none());
     }

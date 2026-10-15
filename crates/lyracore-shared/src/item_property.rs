@@ -1,5 +1,3 @@
-//! Append-only Stat Kind codes used by item catalogue authors and the importer.
-
 pub const UNKNOWN: u8 = 0;
 pub const STRENGTH: u8 = 1;
 pub const AGILITY: u8 = 2;
@@ -62,15 +60,10 @@ pub fn equipped_stat(items: impl IntoIterator<Item = (u8, u32, u32, i32)>) -> i3
         .fold(0i32, |sum, (_, _, _, amount)| sum.saturating_add(amount))
 }
 
-/// Authored compatibility entries as `(stored, client, kind, amount)`. Stored items and synthetic
-/// enchanting spells use the stored ID, which the build 5875 client catalogue lacks. The Gateway
-/// sends the client ID instead: the Enchanting result with the same Stat Kind and amount. Random
-/// Properties own 70 and 73, which show the same text.
+// Compatibility tuples are stored id, client id, Stat Kind, amount; build 5875 lacks stored ids.
 pub const COMPATIBILITY_ENCHANTMENTS: [(u32, u32, u8, i32); 2] =
     [(7745, 823, STRENGTH, 3), (7748, 724, STAMINA, 3)];
 
-/// The enchantment ID the client resolves for a stored enchantment ID. Every ID outside
-/// `COMPATIBILITY_ENCHANTMENTS`, including 0, passes through. Stored IDs never change.
 pub fn client_enchantment_id(stored: u32) -> u32 {
     COMPATIBILITY_ENCHANTMENTS
         .iter()

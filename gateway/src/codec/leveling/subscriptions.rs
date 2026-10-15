@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::ShardId;
@@ -9,7 +7,6 @@ use crate::world::Outbound;
 use spacetimedb_sdk::Table;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Build the XP-gain result for one identity-addressed row.
 pub(crate) fn xp_event_outbound(row: &XpEvent) -> Vec<Outbound> {
     let (opcode, body) = codec::build_log_xpgain_raw(
         row.killed_guid,
@@ -20,7 +17,6 @@ pub(crate) fn xp_event_outbound(row: &XpEvent) -> Vec<Outbound> {
     vec![Outbound::Raw { opcode, body }]
 }
 
-/// Build the level-up result for one identity-addressed row.
 pub(crate) fn levelup_event_outbound(row: &LevelupEvent) -> Vec<Outbound> {
     let message = codec::build_levelup_info(
         row.new_level,
@@ -37,15 +33,11 @@ pub(crate) fn levelup_event_outbound(row: &LevelupEvent) -> Vec<Outbound> {
     ))]
 }
 
-/// The shared-dispatch twin of the per-player
-/// `on_rest_insert` relay (rest state). Same raw PLAYER_BYTES_2 VALUES packet; the audience (owner
-/// only) was already resolved by the owner-session lookup in `world_view::rest_state_appeared`.
 pub(crate) fn relay_rest_state(self_guid: u64, player_bytes_2: u32) -> Vec<Outbound> {
     let (opcode, body) = codec::build_rest_state_values(self_guid, player_bytes_2);
     vec![Outbound::Raw { opcode, body }]
 }
 
-/// XP rows are delivered to the one viewer bound to their recipient identity.
 pub(crate) fn xp_appeared(view: &WorldView, shard: ShardId, row: &XpEvent) {
     let Some(viewer) =
         view.viewer_of_identity_on_shard(shard, BoundIdentity(row.recipient_identity))
@@ -58,7 +50,6 @@ pub(crate) fn xp_appeared(view: &WorldView, shard: ShardId, row: &XpEvent) {
     });
 }
 
-/// Level-up rows are delivered to the one viewer bound to their recipient identity.
 pub(crate) fn levelup_appeared(view: &WorldView, shard: ShardId, row: &LevelupEvent) {
     let Some(viewer) =
         view.viewer_of_identity_on_shard(shard, BoundIdentity(row.recipient_identity))
@@ -71,8 +62,6 @@ pub(crate) fn levelup_appeared(view: &WorldView, shard: ShardId, row: &LevelupEv
     });
 }
 
-/// An explored-area row restores the complete fog word first, then reports a new discovery.
-/// Cache reads and replay-state mutation stay on the addressed session's writer queue.
 pub(crate) fn exploration_appeared(
     view: &WorldView,
     coord: &Coordinator,
@@ -134,7 +123,6 @@ pub(crate) fn exploration_outbound_for_word(
     outbound
 }
 
-/// Send a rest-state change to its owner on the callback's Shard.
 pub(crate) fn rest_state_appeared(view: &WorldView, shard: ShardId, row: &RestStateEvent) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
         return;

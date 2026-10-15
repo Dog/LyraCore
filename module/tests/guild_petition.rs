@@ -5,9 +5,7 @@ use support::Standalone;
 const TEAM_ALLIANCE: u32 = 469;
 const TEAM_HORDE: u32 = 67;
 
-/// The seeded Character, in the world: the Guild Charter's buyer and owner.
 const OWNER: u64 = 1;
-/// Nine signers, each on its own Realm Account (see [`signer_actors`]).
 const SIGNERS: [u64; 9] = [
     5_090_511, 5_090_512, 5_090_513, 5_090_514, 5_090_515, 5_090_516, 5_090_517, 5_090_518,
     5_090_519,
@@ -15,21 +13,16 @@ const SIGNERS: [u64; 9] = [
 const TENTH_SIGNER: u64 = 5_090_520;
 const HORDE_SIGNER: u64 = 5_090_521;
 const GUILDED_SIGNER: u64 = 5_090_522;
-/// A second Character on the first signer's Realm Account.
 const SAME_ACCOUNT_SIGNER: u64 = 5_090_523;
 
-/// Scenario vendor 51004, spawned at the owner's feet and made a Petitioner and a Tabard Designer.
 const VENDOR_ENTRY: &str = "51004";
 const PETITIONER_AND_TABARDDESIGNER: u32 = 0x200 | 0x400;
 const GUILD_CHARTER: u32 = 5863;
 
-/// A tokenless actor: Realm-core holds no Account Claim for these guids.
 fn actor(guid: u64) -> String {
     format!(r#"{{"guid":{guid},"ownership":null}}"#)
 }
 
-/// A signer's actor with an ownership token: one Signature per Realm Account needs a known
-/// Account, and a tokenless actor has none. Provisions one Account per signer and claims it.
 fn signer_actors(shard: &Standalone, signers: &[u64]) -> Vec<String> {
     signers
         .iter()
@@ -48,7 +41,6 @@ fn signer_actors(shard: &Standalone, signers: &[u64]) -> Vec<String> {
         .collect()
 }
 
-/// Claim `account_id` for `guid` under `nonce` and answer the tokened actor.
 fn claimed_actor(shard: &Standalone, account_id: &str, guid: u64, nonce: &str) -> String {
     shard.assert_call("claim_account", &[account_id, &guid.to_string(), nonce]);
     let generation = shard.query_rows(&format!(
@@ -121,9 +113,6 @@ fn count(shard: &Standalone, table: &str) -> usize {
     shard.query_rows(&format!("SELECT * FROM {table}")).len()
 }
 
-/// The imported world has the Guild Charter template; a bare test database does not. Copy the
-/// starter item 51 into entry 5863 only when it is absent, unique and binding on pickup like the
-/// real Charter.
 fn stage_charter_template(shard: &Standalone) {
     let existing = shard.query_rows(&format!(
         "SELECT entry FROM game_item_template WHERE entry = {GUILD_CHARTER}"
@@ -156,14 +145,11 @@ fn stage_charter_template(shard: &Standalone) {
     ));
 }
 
-/// The owner in the world with `copper`, standing at a Petitioner that is also a Tabard Designer.
-/// One database plays both the Home Shard and Realm-core. Answers the NPC's guid.
 fn fixture(name: &str, copper: u32) -> (Standalone, String) {
     let mut shard = Standalone::start(name);
     shard.publish_module();
     shard.assert_call("claim_operator", &[]);
     shard.assert_call("install_guid_range", &["0"]);
-    // Guild Event rows live one second; the checks below read them back.
     shard.assert_sql("DELETE FROM game_event_reaper_schedule");
     shard.assert_call("debug_seed_scenario_fixtures", &[]);
     stage_charter_template(&shard);
@@ -186,7 +172,6 @@ fn fixture(name: &str, copper: u32) -> (Standalone, String) {
     (shard, npc)
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_charter_with_nine_signatures_founds_the_guild() {
@@ -194,7 +179,6 @@ fn a_charter_with_nine_signatures_founds_the_guild() {
     let owner = actor(OWNER);
     let request = charter_request(&npc, "Night Watch");
 
-    // The hold takes ten silver and mints one Charter; a replay of the same hold takes nothing.
     shard.assert_call("gw_guild_fee_hold", &["5090501", &owner, &request]);
     shard.assert_call("gw_guild_fee_hold", &["5090501", &owner, &request]);
     assert_eq!(purse(&shard), 500);
@@ -223,7 +207,6 @@ fn a_charter_with_nine_signatures_founds_the_guild() {
     assert_eq!(decision["accepted"], "true");
     assert_eq!(decision["petition_id"], petition["petition_id"]);
 
-    // Refusals add no Signature.
     let own = sign(&charter, "Tester", TEAM_ALLIANCE);
     refused(
         &shard,
@@ -252,7 +235,6 @@ fn a_charter_with_nine_signatures_founds_the_guild() {
         &[&actor(GUILDED_SIGNER), &guilded],
         "guild:already_in_guild",
     );
-    // A Character whose Realm Account is unknown could sign without limit.
     let unknown = sign(&charter, "Unknown", TEAM_ALLIANCE);
     refused(
         &shard,
@@ -267,7 +249,6 @@ fn a_charter_with_nine_signatures_founds_the_guild() {
         let request = sign(&charter, &format!("Signer{n}"), TEAM_ALLIANCE);
         shard.assert_call("realm_guild_op", &[signer, &request]);
     }
-    // A second Character of the first signer's Realm Account adds no Signature.
     let first_account = shard.query_rows(&format!(
         "SELECT account_id FROM game_account_claim WHERE character_guid = {}",
         SIGNERS[0]
@@ -333,14 +314,11 @@ fn a_charter_with_nine_signatures_founds_the_guild() {
     let founders = shard.query_rows("SELECT * FROM game_guild_event WHERE kind = 116");
     assert_eq!(founders.len(), 9, "each signer hears FOUNDER");
 
-    // The Charter is destroyed on the Home Shard after the founding; a retry finds it gone.
     shard.assert_call("gw_destroy_guild_charter", &[&owner, &charter]);
     shard.assert_call("gw_destroy_guild_charter", &[&owner, &charter]);
     assert!(charters(&shard).is_empty());
 }
 
-/// A refused Charter is destroyed and its copper returned; a signer who joins another Guild takes
-/// its Signature away and the owner gets a fresh petition query.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
@@ -357,7 +335,6 @@ fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
     assert_eq!((purse(&shard), charters(&shard).len()), (999, 0));
     shard.assert_call("debug_set_money", &[&OWNER.to_string(), "1500"]);
 
-    // A Guild takes the name between the hold and the decision: the Charter goes back.
     shard.assert_call("gw_guild_fee_hold", &["5090532", &owner, &request]);
     shard.assert_call(
         "realm_guild_op",
@@ -376,7 +353,6 @@ fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
     assert_eq!((purse(&shard), charters(&shard).len()), (1_500, 0));
     assert_eq!(count(&shard, "game_guild_petition"), 0);
 
-    // A second name opens a Petition. One of its two signers joins another Guild.
     let owner_request = charter_request(&npc, "Day Watch");
     shard.assert_call("gw_guild_fee_hold", &["5090533", &owner, &owner_request]);
     let [charter] = <[String; 1]>::try_from(charters(&shard)).expect("one Guild Charter");
@@ -403,8 +379,6 @@ fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
     assert_eq!(changed[0]["subject_guid"], SIGNERS[0].to_string());
     assert_eq!(changed[0]["other_guid"], charter);
 
-    // The Charter is lost while its Petition stays open. Realm-core refuses a second Petition, so
-    // the new Charter goes back with its copper. The Gateway closes the stranded Petition first.
     shard.assert_sql(&format!(
         "DELETE FROM game_item_instance WHERE guid = {charter}"
     ));
@@ -419,8 +393,6 @@ fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
     assert_eq!(count(&shard, "game_guild_petition"), 0);
     assert_eq!(count(&shard, "game_guild_petition_signature"), 0);
 
-    // The owner joins a Guild with a Charter in its bags: the Petition closes, the Charter stays.
-    // After it leaves, the unique Charter refuses a second one before any copper moves.
     let sun_watch = charter_request(&npc, "Sun Watch");
     shard.assert_call("gw_guild_fee_hold", &["5090535", &owner, &sun_watch]);
     let [charter] = <[String; 1]>::try_from(charters(&shard)).expect("one Guild Charter");
@@ -441,7 +413,6 @@ fn a_refused_charter_is_refunded_and_a_joining_signer_loses_its_signature() {
     assert_eq!(count(&shard, "game_guild_fee_hold"), 0);
 }
 
-/// Buy "Night Watch" while a Petition is still open. Answers the decision's refusal.
 fn buy_attempt_refused(shard: &Standalone, npc: &str) -> String {
     let owner = actor(OWNER);
     let request = charter_request(npc, "Night Watch");

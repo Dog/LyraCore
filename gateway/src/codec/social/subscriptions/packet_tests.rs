@@ -39,8 +39,6 @@ fn chat_event_target_reaches_every_addressable_creature_packet() {
             | wow_world_messages::vanilla::SMSG_MESSAGECHAT_ChatType::MonsterYell {
                 target, ..
             } => assert_eq!(target.guid(), 77),
-            // `MonsterEmote` has no addressee field on the wire; its single guid names the
-            // speaker, so the addressed target is legitimately absent here.
             wow_world_messages::vanilla::SMSG_MESSAGECHAT_ChatType::MonsterEmote {
                 monster,
                 ..
@@ -70,8 +68,6 @@ fn system_message_outbound_reuses_the_existing_system_chat_builder() {
     );
 }
 
-/// cm:Player.cpp:16571-16599: a player's say, yell and `/e` carry `GetChatTag()`, AFK 1 and
-/// DND 2. A creature's line carries none, whatever its flags word holds.
 #[test]
 fn a_nearby_line_carries_the_player_speakers_away_tag() {
     let mut speaker = player_entity();
@@ -85,22 +81,15 @@ fn a_nearby_line_carries_the_player_speakers_away_tag() {
     assert_eq!(nearby_chat_tag(None), 0, "a speaker already gone");
 }
 
-// ---- the SAY/YELL range math -----------------------------------------------------------------
-
 #[test]
 fn chat_in_range_gates_by_distance() {
-    // `chat_in_range` only ever sees plain map/x/y — distance in WORLD SPACE.
-    let range_sq = 25.0f32 * 25.0; // SAY_RANGE_SQ, spelled out so the test pins the shape not the const
-                                   // 10 yards apart -> in range.
+    let range_sq = 25.0f32 * 25.0;
     assert!(chat_in_range(
         0, 0, 100.0, 100.0, 0, 0, 105.0, 108.0, range_sq
     ));
-    // Exactly on the boundary (25yd) -> in range (inclusive, `<=`).
     assert!(chat_in_range(
         0, 0, 100.0, 100.0, 0, 0, 125.0, 100.0, range_sq
     ));
-    // Just past the boundary -> out of range: this is the assertion the wire script's "beyond
-    // /say range but within view -> NO chat delivery" case pins end-to-end.
     assert!(!chat_in_range(
         0, 0, 100.0, 100.0, 0, 0, 125.01, 100.0, range_sq
     ));
@@ -108,14 +97,9 @@ fn chat_in_range_gates_by_distance() {
 
 #[test]
 fn chat_in_range_never_crosses_a_map_or_instance_boundary_regardless_of_distance() {
-    // Same coordinates, different map -> never in range (also guards the arithmetic: comparing
-    // x/y across two unrelated maps would otherwise produce a meaningless "distance").
     assert!(!chat_in_range(
         0, 0, 100.0, 100.0, 1, 0, 100.0, 100.0, 90_000.0
     ));
-    // Same map, different instance (e.g. an open-world speaker vs. a dungeon-instance listener
-    // whose rows happen to share a database) -> never in range either (mirrors `peer_create_gate`'s
-    // instance isolation).
     assert!(!chat_in_range(
         0, 0, 100.0, 100.0, 0, 1, 100.0, 100.0, 90_000.0
     ));
@@ -123,8 +107,6 @@ fn chat_in_range_never_crosses_a_map_or_instance_boundary_regardless_of_distance
 
 #[test]
 fn chat_in_range_yell_reaches_further_than_say_at_the_same_distance() {
-    // A speaker 200yd away: outside SAY range, inside YELL range — yell's wider radius must
-    // not be silently clipped to say range.
     assert!(!chat_in_range(
         0,
         0,
@@ -149,8 +131,6 @@ fn chat_in_range_yell_reaches_further_than_say_at_the_same_distance() {
     ));
 }
 
-/// The text-emote range shares SAY's 25yd radius (`ListenRange.TextEmote` = `ListenRange.Say`
-/// = 25 in cm:mangosd.conf.dist.in:1092): the same boundary math, over the shared constant.
 #[test]
 fn chat_in_range_gates_a_text_emote_at_the_same_25yd_boundary_as_say() {
     let range_sq = lyracore_shared::chat::broadcast_chat::TEXT_EMOTE_RANGE_YD

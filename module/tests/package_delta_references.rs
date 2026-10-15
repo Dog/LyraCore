@@ -1,18 +1,16 @@
-//! Package Delta reference preflight against a real Shard.
-
 mod support;
 
 use support::Standalone;
 
 const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const FIXTURE_QUEST: u32 = 50_900;
-const FIXTURE_CREATURE: u32 = 51_000; // Test Wolf.
-const FIXTURE_TRAINER: u32 = 51_001; // Profession Trainer.
-const IMPORTED_CREATURE: u32 = 620; // Chicken, a real catalogue creature seeded at init.
+const FIXTURE_CREATURE: u32 = 51_000;
+const FIXTURE_TRAINER: u32 = 51_001;
+const IMPORTED_CREATURE: u32 = 620;
 const REAL_ITEM: u32 = 25;
 const MISSING_ITEM: u32 = 4_000_000;
 const PACKAGE_LOOT: u64 = 9_000_001;
-const REAL_SPELL: u32 = 50_310; // Test Riding Horse, seeded by the land-mount fixture.
+const REAL_SPELL: u32 = 50_310;
 const MISSING_SPELL: u32 = 4_000_000;
 const MISSING_CREATURE: u32 = 4_000_000;
 const PACKAGE_CREATURE_SPELL: u64 = 10_000_001;
@@ -24,11 +22,9 @@ const PACKAGE_GOSSIP_OPTION: u64 = 12_000_003;
 const MISSING_NPC_TEXT: u32 = 4_000_000;
 const PACKAGE_GRAVEYARD_ZONE: u64 = 13_000_001;
 const PACKAGE_CREATEINFO_SPELL: u64 = 13_000_002;
-const REAL_GRAVEYARD: u32 = 105; // Northshire Abbey, seeded by `init`.
+const REAL_GRAVEYARD: u32 = 105;
 const MISSING_GRAVEYARD: u32 = 4_000_000;
 const PACKAGE_SPELL_LEARN: u64 = 14_000_001;
-/// Inside the Package spell band, and no `game_spell` row: what a rank link keyed on a spell that
-/// was never inserted looks like.
 const PACKAGE_SPELL: u32 = 6_000_001;
 
 fn arg(value: &str) -> String {
@@ -129,8 +125,6 @@ fn createinfo_spell_insert(spell_id: u32) -> String {
     )
 }
 
-/// An insert on an update-only table. The key names a real class and level, so only the operation
-/// is wrong.
 fn class_level_stats_insert() -> String {
     artifact(
         "example.globals.curve",
@@ -312,10 +306,6 @@ fn creature_spell_updates_cannot_hide_their_fixture_creature_target() {
     assert_eq!(spell[0]["priority"], "10");
 }
 
-/// `game_trainer_spell.spell_id` is checked against `game_spell` only when the row's final
-/// `learn_skill_line` is 0. A profession offering's `spell_id` is a synthetic marker
-/// (`module/src/skill.rs`'s `LEARN_COOKING_SPELL_ID` and siblings) that never resolves to a
-/// `game_spell` row, so an unconditional check would refuse a legitimate claim.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_profession_offerings_marker_spell_is_exempt_but_a_class_offerings_is_not() {
@@ -325,7 +315,6 @@ fn a_profession_offerings_marker_spell_is_exempt_but_a_class_offerings_is_not() 
     standalone.assert_call("install_guid_range", &["0"]);
     standalone.assert_call("debug_seed_scenario_fixtures", &[]);
 
-    // A class offering (`learn_skill_line` 0) names a real spell.
     let accepted_class = apply(
         &standalone,
         "trainers",
@@ -337,7 +326,6 @@ fn a_profession_offerings_marker_spell_is_exempt_but_a_class_offerings_is_not() 
         refusal_text(&accepted_class)
     );
 
-    // A class offering naming no real spell is refused.
     let refused_class = apply(
         &standalone,
         "trainers",
@@ -350,8 +338,6 @@ fn a_profession_offerings_marker_spell_is_exempt_but_a_class_offerings_is_not() 
         refusal_text(&refused_class)
     );
 
-    // A profession offering (`learn_skill_line` 185, Cooking) carries a marker `spell_id` that is
-    // never a `game_spell` row. The claim still succeeds because the gate exempts it.
     const COOKING: u32 = 185;
     const MARKER_SPELL_ID: u32 = 50_080;
     let accepted_profession = apply(
@@ -371,9 +357,6 @@ fn a_profession_offerings_marker_spell_is_exempt_but_a_class_offerings_is_not() 
     assert_eq!(trainer[0]["spell_id"], MARKER_SPELL_ID.to_string());
 }
 
-/// A gossip slot points at a greeting body, and a gossip option points at a creature template the
-/// creatures family owns. Both are checked against the Shard, and a Package-band body is satisfied
-/// by an insert in the same plan.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn gossip_claims_refuse_missing_cross_table_references() {
@@ -425,8 +408,6 @@ fn gossip_claims_refuse_missing_cross_table_references() {
     assert_eq!(option[0]["entry"], FIXTURE_CREATURE.to_string());
 }
 
-/// A graveyard-zone link points at a `game_graveyard` row and a createinfo grant points at a
-/// `game_spell` row. `game_class_level_stats` permits no insert at all, whatever the key.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn globals_claims_refuse_missing_references_and_every_insert_on_a_fixed_key_table() {
@@ -485,8 +466,6 @@ fn globals_claims_refuse_missing_references_and_every_insert_on_a_fixed_key_tabl
     assert_eq!(grant[0]["spell_id"], REAL_SPELL.to_string());
 }
 
-/// Spell metadata describes a spell, so both the columns and the KEY are checked against
-/// `game_spell`: a rank link for a spell no Shard holds is a row nothing will ever read.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn spell_metadata_claims_refuse_a_missing_spell_in_the_key_and_in_a_column() {
@@ -520,25 +499,18 @@ fn spell_metadata_claims_refuse_a_missing_spell_in_the_key_and_in_a_column() {
     assert_eq!(learn[0]["learn_spell"], REAL_SPELL.to_string());
 }
 
-// ---- the two spatial families ----
-
-/// Eastern Kingdoms. Every in-box World Import Scope but `instances` owns some of it, and the
-/// Module never asks which — routing is the importer's, so a live apply takes the map as given.
 const REAL_MAP: u32 = 0;
 const PACKAGE_CREATURE_SPAWN: u32 = 15_000_001;
 const PACKAGE_CREATURE_TEMPLATE: u32 = 15_000_002;
 const PACKAGE_GAMEOBJECT_TEMPLATE: u32 = 16_000_001;
 const PACKAGE_GAMEOBJECT_SPAWN: u32 = 16_000_002;
 const MISSING_GAMEOBJECT: u32 = 4_000_000;
-const SEEDED_GAMEOBJECT: u32 = 50_100; // Battered Chest, seeded by `init`.
+const SEEDED_GAMEOBJECT: u32 = 50_100;
 
-/// The importer's `world_guid`, restated so the assertion derives the key the same way the artifact
-/// does not: the test names the components, the Module packs them.
 fn creature_guid(entry: u32, spawn_id: u32) -> u64 {
     (0xF130u64 << 48) | (u64::from(entry) << 24) | u64::from(spawn_id)
 }
 
-/// The importer's `go_guid`.
 fn gameobject_guid(spawn_id: u32) -> u64 {
     (0xF110u64 << 48) | u64::from(spawn_id)
 }
@@ -552,7 +524,6 @@ fn creature_spawn_insert(map_id: u32, entry: u32, spawn_id: u32) -> String {
     )
 }
 
-/// A whole Package creature, template and spawn together — the plan an author writes to add an NPC.
 fn creature_template_and_spawn() -> String {
     let template = artifact(
         "example.creatures.invent",
@@ -584,10 +555,6 @@ fn gameobject_template_insert() -> String {
     )
 }
 
-/// A creature spawn is spatial and its guid is derived, so the preflight has two jobs: the template
-/// it places must exist after the plan lands, and no two claims may resolve to one durable
-/// creature. The second is what an invalid map-ownership statement looks like from inside a
-/// Shard, which never decides which maps it owns.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn creature_spawn_claims_refuse_a_missing_template_and_one_row_claimed_on_two_maps() {
@@ -636,8 +603,6 @@ fn creature_spawn_claims_refuse_a_missing_template_and_one_row_claimed_on_two_ma
     assert_eq!(spawn[0]["entry"], FIXTURE_CREATURE.to_string());
     assert_eq!(spawn[0]["map_id"], REAL_MAP.to_string());
 
-    // A Package that leaves the enabled set takes its invented rows with it: the same family
-    // applied with an empty plan clears the whole band.
     let cleared = apply(&standalone, "creatures", "");
     assert!(cleared.status.success(), "{}", refusal_text(&cleared));
     assert!(standalone
@@ -646,7 +611,6 @@ fn creature_spawn_claims_refuse_a_missing_template_and_one_row_claimed_on_two_ma
         ))
         .is_empty());
 
-    // A Package may also invent the creature it places, in one plan.
     let invented = apply(&standalone, "creatures", &creature_template_and_spawn());
     assert!(invented.status.success(), "{}", refusal_text(&invented));
     let template = standalone.query_rows(&format!(
@@ -661,8 +625,6 @@ fn creature_spawn_claims_refuse_a_missing_template_and_one_row_claimed_on_two_ma
         .is_empty());
 }
 
-/// A gameobject spawn names its template in a COLUMN rather than in the key, so the preflight has
-/// to judge the row it will hold after the plan lands, not the column alone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn gameobject_claims_refuse_a_missing_template_and_place_an_invented_one() {
@@ -699,8 +661,6 @@ fn gameobject_claims_refuse_a_missing_template_and_place_an_invented_one() {
         "the AOI cell is derived from the claimed position, not left at cell (0, 0)"
     );
 
-    // The template and its spawn in one plan: the Package-band template is satisfied by the insert
-    // beside it, not by anything already on the Shard.
     let plan = format!(
         "{}\n{}",
         gameobject_template_insert(),
@@ -726,18 +686,12 @@ fn gameobject_claims_refuse_a_missing_template_and_place_an_invented_one() {
         .is_empty());
 }
 
-// ---- the creature-ai family ----
-
-/// Blackfathom Deeps' Kelris. His EventAI notifies an Encounter Binding, so an encounter Package
-/// owns his fight.
 const KELRIS: u32 = 4_832;
-/// A broadcast text Kelris speaks, and one nothing encounter-owned names.
 const KELRIS_TEXT: u32 = 900;
 const ORDINARY_TEXT: u32 = 901;
 const PACKAGE_QUEST_EVENT_REQUIREMENT: u64 = 17_000_001;
 const MISSING_QUEST: u32 = 4_000_000;
 
-/// Two imported broadcast texts, in the shape the `creature-ai` base import loads them.
 fn seed_broadcast_texts(standalone: &Standalone) {
     for (id, line) in [
         (KELRIS_TEXT, "Ah, sweet innocence."),
@@ -752,8 +706,6 @@ fn seed_broadcast_texts(standalone: &Standalone) {
     }
 }
 
-/// Kelris's loaded definition: one rule that speaks [`KELRIS_TEXT`] and notifies the encounter.
-/// That notification IS the Encounter Binding, so the text it speaks is encounter-owned.
 fn kelris_definition() -> String {
     let subject = format!("entry:{KELRIS}");
     let rules = format!(
@@ -789,10 +741,6 @@ fn broadcast_text_update(id: u32) -> String {
     )
 }
 
-/// The creature-ai family has two preflight jobs the whole plan answers. A quest event requirement
-/// names a quest another family owns, and a catalogue row may already belong to an encounter whose
-/// Package owns that creature's fight. The last apply also proves the base-family replay: a Package
-/// that leaves the enabled set takes its invented rows with it.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn creature_ai_claims_are_checked_against_quests_and_encounter_ownership() {
@@ -843,7 +791,6 @@ fn creature_ai_claims_are_checked_against_quests_and_encounter_ownership() {
         refusal_text(&refused)
     );
 
-    // A line no encounter-owned definition speaks is the ordinary case, and tuning it is the point.
     let accepted = apply(
         &standalone,
         "creature-ai",
@@ -855,8 +802,6 @@ fn creature_ai_claims_are_checked_against_quests_and_encounter_ownership() {
     ));
     assert_eq!(text[0]["male_text"], "You will burn.");
 
-    // That plan carries no quest event requirement, so the Package that invented one is gone from
-    // the enabled set and its row went with it.
     assert!(standalone
         .query_rows(&format!(
             "SELECT * FROM game_quest_event_requirement WHERE id = {PACKAGE_QUEST_EVENT_REQUIREMENT}"

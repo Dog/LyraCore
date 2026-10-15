@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`ChatActionStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::chat::ChatRefusal;
 
@@ -9,9 +7,6 @@ use crate::stdb::Coordinator;
 use crate::world::{whisper, Actor, ChatActionStore, ChatOutcome};
 
 impl ChatActionStore for Coordinator {
-    /// The Speaker Facts for `speaker_guid` on this Home Shard: race from `UNIT_FIELD_BYTES_0`
-    /// byte 0 and the chat tag from `PLAYER_FLAGS`, both off the live entity, plus the Character's
-    /// name. `None` when the speaker has no live entity here.
     fn speaker_facts(&self, speaker_guid: u64) -> Result<Option<crate::world::SpeakerFacts>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -31,8 +26,6 @@ impl ChatActionStore for Coordinator {
         }))
     }
 
-    /// `realm_chat`: commit one Realm Chat Line on Realm-core, or on the one database of an
-    /// unsharded Realm. The Module applies every chat Gate. The speaker's name stays here.
     fn realm_chat(
         &self,
         actor: Actor,
@@ -57,8 +50,6 @@ impl ChatActionStore for Coordinator {
         ))
     }
 
-    /// `gw_set_away`: one `/afk` or `/dnd` on the Character's Home Shard, where its live entity
-    /// and Auto-Reply live.
     fn set_away(&self, actor: Actor, kind: u8, message: String) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -75,8 +66,6 @@ impl ChatActionStore for Coordinator {
         whisper::target_facts(self, speaker_guid, typed_name)
     }
 
-    /// `realm_whisper`: commit one whisper's lines on Realm-core, or on the one database of an
-    /// unsharded Realm. The Module applies every whisper Gate. The speaker's name stays here.
     fn realm_whisper(
         &self,
         actor: Actor,
@@ -112,8 +101,6 @@ impl ChatActionStore for Coordinator {
     }
 }
 
-/// The Module's typed chat Refusal. Only a reducer the Module rejected carries a tag; a timeout,
-/// transport, or SDK failure stays an error with an unknown outcome.
 pub(super) fn chat_outcome(result: Result<()>) -> Result<ChatOutcome> {
     match result {
         Ok(()) => Ok(ChatOutcome::Delivered),

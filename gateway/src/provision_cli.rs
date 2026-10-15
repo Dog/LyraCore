@@ -6,7 +6,6 @@ use zeroize::Zeroizing;
 
 pub(crate) const PROVISION_USAGE: &str = "usage: gateway provision <USERNAME> --password-stdin";
 const MAX_PASSWORD_BYTES: usize = MAXIMUM_STRING_LENGTH_IN_BYTES as usize;
-// A valid password plus CRLF. The reader stops at LF and never allocates beyond this bound.
 const MAX_PASSWORD_STDIN_BYTES: usize = MAX_PASSWORD_BYTES + 2;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,19 +27,15 @@ pub(crate) fn parse_gateway_mode(mut args: impl Iterator<Item = String>) -> Resu
         bail!("{PROVISION_USAGE}");
     };
     if args.next().as_deref() != Some("--password-stdin") || args.next().is_some() {
-        // Do not include the rejected argument: in the legacy invocation it is the plaintext
-        // password that this interface exists to keep out of argv and diagnostics.
+        // This argument may be a legacy plaintext password; never include it in diagnostics.
         bail!("{PROVISION_USAGE}");
     }
 
     Ok(GatewayMode::Provision { username })
 }
 
-/// Read exactly one bounded password line. LF and the CR in a CRLF terminator are removed; no
-/// other byte is trimmed or rewritten. The returned allocation is wiped when it leaves scope.
 pub(crate) fn read_password_line(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>> {
-    // Reserve the full bound up front: growing a Vec could free its old allocation before
-    // `Zeroizing` gets a chance to wipe it.
+    // Reserve before reading secrets; Vec growth can free an allocation before Zeroizing wipes it.
     let mut password = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_STDIN_BYTES));
     let mut byte = Zeroizing::new([0_u8; 1]);
     let mut bytes_read = 0;
@@ -69,7 +64,7 @@ pub(crate) fn read_password_line(reader: &mut impl Read) -> Result<Zeroizing<Vec
     }
 
     if ended_with_lf && password.last() == Some(&b'\r') {
-        // `Vec::pop` shortens the initialized slice that `Zeroizing` wipes, so clear the CR first.
+        // Clear CR before pop; Zeroizing wipes only the initialized slice.
         *password.last_mut().expect("last byte was just checked") = 0;
         password.pop();
     }
@@ -179,15 +174,8 @@ mod tests {
         assert_eq!(password.as_ref(), "PASS WORD");
     }
 
-    /// A `Read` that returns `Interrupted` (EINTR) before yielding data. Stdin is a real fd
-    /// and a signal during `read(2)` is ordinary, not exotic: any signal the process takes while an
-    /// operator is still typing lands here. The reader retries rather than failing, and the retry
-    /// must not consume, duplicate or drop a byte.
-    ///
-    /// Untested until now, and invisible to any test using a `Cursor` — `Cursor` never interrupts.
     #[test]
     fn an_interrupted_read_is_retried_without_losing_or_duplicating_a_byte() {
-        /// Interrupts before every byte, so the retry path runs once per byte rather than once.
         struct Flaky {
             remaining: Vec<u8>,
             interrupt_next: bool,
@@ -220,9 +208,6 @@ mod tests {
         );
     }
 
-    /// A read error that is NOT `Interrupted` must fail, not spin. The retry loop has no iteration
-    /// bound, so treating every error as retryable would hang the provisioning command forever on a
-    /// closed or broken stdin.
     #[test]
     fn a_real_read_error_fails_instead_of_retrying_forever() {
         struct Broken;
@@ -238,20 +223,10 @@ mod tests {
         );
     }
 
-    /// PROPERTY: whatever bytes arrive on stdin, `read_password_line` returns — never panics,
-    /// and never yields more than the bound it advertises. It runs before any validation, on input
-    /// nobody has checked, and it does its own manual buffer arithmetic (a hand-rolled byte loop
-    /// with a capacity reservation and a CR fixup), which is exactly the shape that hides an
-    /// off-by-one.
-    ///
-    /// Deterministic: a fixed seed, replayed identically every run (see
-    /// `codec::property_tests::Rng` for why this is not `proptest`).
     #[test]
     fn any_stdin_byte_stream_is_read_within_the_advertised_bound() {
         let mut rng = crate::codec::property_tests::Rng::new(0x5354_4449_4E00);
         for _ in 0..2_000 {
-            // Bias toward lengths straddling the 16-byte limit and its CRLF allowance, and inject
-            // newlines often enough that the terminator branches are reached.
             let len = rng.below(40);
             let mut input: Vec<u8> = rng.bytes(len);
             for byte in input.iter_mut() {
@@ -279,10 +254,6 @@ mod tests {
         }
     }
 
-    /// The companion property for the validator the reader hands off to: for ANY byte string,
-    /// `normalize_provision_credentials` returns a `Result`, and every accepted password is
-    /// something `wow_srp` can actually build a verifier from. Anything it accepts is written into
-    /// an account row that the logon tier must be able to authenticate forever after.
     #[test]
     fn any_password_bytes_are_normalized_or_rejected_but_never_panic() {
         let mut rng = crate::codec::property_tests::Rng::new(0x4E4F_524D);
@@ -291,8 +262,6 @@ mod tests {
             let password = rng.bytes(len);
             if let Ok((username, normalized)) = normalize_provision_credentials("TEST", &password) {
                 assert_eq!(username.as_ref(), "TEST");
-                // An accepted password must survive the derivation the provisioning path performs
-                // next; a value that normalizes but cannot be hashed would panic in production.
                 let _ =
                     wow_srp::server::SrpVerifier::from_username_and_password(username, normalized);
             }

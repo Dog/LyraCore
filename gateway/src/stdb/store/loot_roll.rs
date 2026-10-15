@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`LootRollStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::loot::LootRefusal;
 use spacetimedb_sdk::Table;
@@ -11,10 +9,6 @@ use crate::world::loot::{LootRollStore, PendingLootRoll};
 use crate::world::{Actor, LootActionStatus};
 
 impl LootRollStore for Coordinator {
-    /// Promotes a world shard's staging roll onto the database THIS handle points at (Realm-core).
-    /// Through the coordinator connection, not a player's: the reducer is operator-gated because
-    /// Realm-core has no live entity to derive an Actor from. `recipients` are the spatial snapshot
-    /// a world shard computed at kill time.
     #[allow(clippy::too_many_arguments)]
     fn realm_loot_start(
         &self,
@@ -72,13 +66,6 @@ impl LootRollStore for Coordinator {
         ))
     }
 
-    /// Every UNRESOLVED `game_loot_roll` row on THIS handle's database, joined with its votes.
-    ///
-    /// A cache read, like [`group_roster`](Self::group_roster) — this table is now part of the
-    /// coordinator subscription list, so no reducer call is
-    /// needed. Meaningful only on a WORLD SHARD in a sharded deployment: realm-core never has a row
-    /// here that a world shard wrote (only its own `realm_loot_op` START arm inserts there), and on
-    /// an unsharded gateway the relay that calls this never runs at all (`realm_store()` is `Ok(None)`).
     fn pending_local_rolls(&self) -> Result<Vec<PendingLootRoll>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -107,9 +94,6 @@ impl LootRollStore for Coordinator {
             .collect())
     }
 
-    /// Operator-gated, coordinator connection; the loot-roll relay calls it on every connected
-    /// world shard after observing realm-core's `ROLL_WON` event — the module's own `withheld`
-    /// guard makes a wrong-shard call a harmless no-op.
     fn settle_loot_roll(&self, corpse_guid: u64, slot: u8, winner_guid: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -126,15 +110,6 @@ impl LootRollStore for Coordinator {
         )
     }
 
-    /// Reads every `ROLL_WON` `game_group_event` row on THIS handle's database with `id >
-    /// after_id`, decoded to `(corpse_guid, slot, winner_guid)`, plus the new high-water mark (the
-    /// max id seen, or `after_id` unchanged if none). Meaningful on the **realm-core** handle: that
-    /// is the only database `resolve_roll`/`force_resolve_rolls_for_disband` push a `ROLL_WON`
-    /// event on in a sharded deployment (voting is routed there exclusively — `world::loot::run_vote`).
-    ///
-    /// An unparseable payload is skipped + logged rather than failing the whole scan — the module
-    /// writes this grammar, so a decode failure here means the two crates' `lyracore_shared::loot_roll`
-    /// copies have drifted, not that this event is meaningless.
     fn loot_won_since(&self, after_id: u64) -> Result<(u64, Vec<(u64, u8, u64)>)> {
         use lyracore_shared::loot_roll::event_kind as roll_kind;
         let guard = self.0.coord();
@@ -158,8 +133,6 @@ impl LootRollStore for Coordinator {
         Ok((watermark, wins))
     }
 
-    /// Records the caller's need/greed/pass vote on a live roll. Live votes and roll numbers relay
-    /// to every eligible member via the `game_group_event` roll-kind rows (`stdb/subscriptions.rs`).
     fn loot_roll(
         &self,
         actor: Actor,
@@ -196,8 +169,6 @@ impl LootRollStore for Coordinator {
     }
 }
 
-/// The typed answer for Loot Roll and master-loot requests. A Refusal with an unknown tag or a
-/// Transport Loss stays an error with an unknown durable result.
 fn loot_action_status(result: Result<()>) -> Result<LootActionStatus> {
     match result {
         Ok(()) => Ok(LootActionStatus::Applied),

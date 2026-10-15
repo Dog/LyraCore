@@ -1,7 +1,3 @@
-//! Preserve rows in Transfer Escrow written before a transported table grew columns: plain items
-//! from before Random Property fields or before Item Text, mail from before the mail header or the
-//! attached letter's text id, and mail Escrow from before that text id.
-
 use std::collections::BTreeSet;
 
 use spacetimedb::{Identity, SpacetimeType, Timestamp};
@@ -21,16 +17,11 @@ const FORMATS: &[(&str, &str)] = &[
     ("game_mail_escrow", "game_mail_escrow@letter-text-1"),
     ("game_auction_hold", "game_auction_hold@letter-text-1"),
 ];
-/// The tag the previous Module wrote on `game_item_instance` rows, which carry Random Property but
-/// not `item_text_id`.
 const RANDOM_PROPERTY_ITEM_INSTANCE: &str = "game_item_instance@random-property-1";
-/// The tag the previous Module wrote on `game_mail` rows, which lack the mail header columns.
 const RANDOM_PROPERTY_MAIL: &str = "game_mail@random-property-1";
-/// The tag the previous Module wrote on `game_mail` rows, which have the mail header but not the
-/// attached letter's `item_text_id`.
 const MAIL_HEADER_MAIL: &str = "game_mail@mail-header-1";
 
-/// Older Modules require canonical payload names and refuse these tags before applying rows.
+// Older Modules refuse these payload tags before applying rows.
 pub(super) fn mark_current(payload: &mut [TableRows]) {
     for entry in payload {
         if let Some((_, tagged)) = FORMATS.iter().find(|(table, _)| *table == entry.table) {
@@ -39,8 +30,7 @@ pub(super) fn mark_current(payload: &mut [TableRows]) {
     }
 }
 
-/// Defaults migrate table rows, but do not rewrite the opaque bytes in existing Transfer Escrow.
-/// Decode each untagged item table with its old shape; never guess its format from a decode error.
+// Table defaults do not rewrite Escrow bytes; choose the old codec by tag, never by decode failure.
 pub(super) fn prepare(payload: &[TableRows]) -> Result<Vec<TableRows>, String> {
     let mut seen = BTreeSet::new();
     let mut prepared = Vec::with_capacity(payload.len());
@@ -99,7 +89,7 @@ where
         .map_err(|error| format!("cannot encode upgraded item rows: {error}"))
 }
 
-// These exact row shapes are the compatibility boundary for already persisted Escrow bytes.
+// These exact row shapes decode already persisted Escrow bytes.
 #[derive(SpacetimeType)]
 struct LegacyItemInstance {
     guid: u64,
@@ -133,7 +123,6 @@ impl From<LegacyItemInstance> for ItemInstance {
     }
 }
 
-/// `game_item_instance` after Random Property but before `item_text_id`.
 #[derive(SpacetimeType)]
 struct RandomPropertyItemInstance {
     guid: u64,
@@ -233,7 +222,6 @@ impl From<LegacyMail> for Mail {
     }
 }
 
-/// `game_mail` before the mail header columns: a Character mail, visible since creation.
 #[derive(SpacetimeType)]
 struct RandomPropertyMail {
     id: u64,
@@ -281,7 +269,6 @@ impl From<RandomPropertyMail> for Mail {
     }
 }
 
-/// `game_mail` with the mail header, before the attached letter's `item_text_id`.
 #[derive(SpacetimeType)]
 struct MailHeaderMail {
     id: u64,
@@ -334,8 +321,6 @@ impl From<MailHeaderMail> for Mail {
     }
 }
 
-/// `game_mail_escrow` as it first travelled, with the Reward Letter header and before the attached
-/// letter's `item_text_id`. Those rows were written untagged.
 #[derive(SpacetimeType)]
 struct RewardHeaderMailEscrow {
     escrow_id: u64,

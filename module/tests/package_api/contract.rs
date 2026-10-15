@@ -1,5 +1,3 @@
-//! Package API version 4: the crate-root paths a Package may name.
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -7,18 +5,13 @@ use std::path::Path;
 use super::paths::{tokens, tree_leaves, RootedPath};
 use super::source::{strip_source, DEBUG_REDUCERS_FILE_CFG, TEST_FILE_CFG};
 
-/// The Package API roots. A gated `package` child requires its whole-file gate.
 pub const ROOTS: &[&str] = &["actor", "hooks", "package", "tables", "script_binding"];
 
-/// `package` children that exist only in a build with their whole-file gate. Core compiles each
-/// only under that cfg, so naming one from any other file breaks a build without it.
 const GATED_PACKAGE_CHILDREN: &[(&str, &str)] = &[
     ("fixture", DEBUG_REDUCERS_FILE_CFG),
     ("test", TEST_FILE_CFG),
 ];
 
-/// Crate-root names that are neither a root nor a table: the marker macros and the generated
-/// character-owned table manifest.
 const ROOT_ITEMS: &[&str] = &[
     "CHARACTER_OWNED_TABLES",
     "character_owned",
@@ -39,25 +32,20 @@ pub enum Verdict {
         child: &'static str,
         gate: &'static str,
     },
-    /// The `package` module itself, whose import would carry its gated children past their gate.
     PackageModule,
 }
 
-/// The Package API roots and items, with the table catalog for migration diagnostics.
 pub struct Contract {
     catalog: BTreeSet<String>,
 }
 
 impl Contract {
-    /// The contract for the catalog in `tables_rs`, Core's `module/src/tables.rs`.
     pub fn read(tables_rs: &Path) -> Self {
         let source = fs::read_to_string(tables_rs)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", tables_rs.display()));
         Self::from_catalog(&source)
     }
 
-    /// Every name the catalog's `use crate::<family>::{..};` lines bind. The crate root
-    /// re-exports the catalog, so each is also a crate-root name.
     pub fn from_catalog(source: &str) -> Self {
         let code = strip_source(source).code;
         let tokens = tokens(&code);
@@ -85,8 +73,6 @@ impl Contract {
         self.catalog.contains(name)
     }
 
-    /// Whether a Package file whose whole-file gate is `file_gate` may name the crate-root path
-    /// `segments`.
     pub fn verdict(&self, segments: &[String], file_gate: Option<&str>) -> Verdict {
         let root = segments.first().map_or("", String::as_str);
         if root == "package" {
@@ -117,7 +103,6 @@ impl Contract {
     }
 }
 
-/// The Version 3 path for the longest Version 2 prefix of `segments`, if one is documented.
 fn replacement(segments: &[String]) -> Option<&'static str> {
     (1..=segments.len()).rev().find_map(|len| {
         let written = segments[..len].join("::");
@@ -128,8 +113,6 @@ fn replacement(segments: &[String]) -> Option<&'static str> {
     })
 }
 
-/// Version 2 crate-root paths an official Package named, and their Version 3 path. Paths that
-/// did not change are absent.
 #[rustfmt::skip]
 const VERSION_2_REPLACEMENTS: &[(&str, &str)] = &[
     ("SessionActor", "crate::package::fixture::SessionActor"),

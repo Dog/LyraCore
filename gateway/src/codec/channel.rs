@@ -1,8 +1,4 @@
-//! Chat Channel packets: every Channel Notice (`SMSG_CHANNEL_NOTIFY`) and the member list
-//! (`SMSG_CHANNEL_LIST`).
-//!
-//! Channel Notices are hand-encoded, because gtker 0.3's `SMSG_CHANNEL_NOTIFY` carries only the
-//! notice and the channel name, never the payload that follows (cm:Channel.cpp:748-946).
+//! gtker 0.3 omits Channel Notice payloads after the name, so encode them here.
 
 use lyracore_shared::channel::notice;
 use wow_world_messages::vanilla::{
@@ -10,11 +6,8 @@ use wow_world_messages::vanilla::{
 };
 use wow_world_messages::Guid;
 
-/// `SMSG_CHANNEL_NOTIFY` (vanilla 5875).
 pub const SMSG_CHANNEL_NOTIFY_OPCODE: u16 = 0x0099;
 
-/// One Channel Notice: a Module row, or a Refusal the Gateway answers. Which fields a notice reads
-/// is [`notify`]'s business; the others stay zero.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChannelNoticeView {
     pub notice: u8,
@@ -27,17 +20,6 @@ pub struct ChannelNoticeView {
     pub text: String,
 }
 
-/// Encode one Channel Notice. The body is the notice byte and the channel name as a CString, then
-/// the notice's payload (all little-endian, guids as the full u64):
-/// - one guid: `subject_guid` for JOINED, LEFT, OWNER_CHANGED, PLAYER_ALREADY_MEMBER and INVITE;
-///   `actor_guid` for PASSWORD_CHANGED and the announcement and moderation toggles;
-/// - YOU_JOINED: the channel flags u32, then a channel index u32 that is always 0;
-/// - MODE_CHANGE: `subject_guid`, old flags u8, new flags u8;
-/// - PLAYER_KICKED, PLAYER_BANNED, PLAYER_UNBANNED: `subject_guid` (the target) then
-///   `actor_guid` (the source);
-/// - a CString `text` for PLAYER_NOT_FOUND, CHANNEL_OWNER, PLAYER_NOT_BANNED, PLAYER_INVITED and
-///   PLAYER_INVITE_BANNED;
-/// - nothing for the rest.
 pub fn notify(view: &ChannelNoticeView) -> (u16, Vec<u8>) {
     let mut body = Vec::with_capacity(2 + view.channel_name.len() + 18);
     body.push(view.notice);
@@ -76,9 +58,7 @@ pub fn notify(view: &ChannelNoticeView) -> (u16, Vec<u8>) {
     (SMSG_CHANNEL_NOTIFY_OPCODE, body)
 }
 
-/// `SMSG_CHANNEL_LIST` (cm:Channel.cpp:479-521): the stored name, the wire channel flags, and each
-/// member's guid with its raw member flags. gtker's `ChannelMemberFlags` constants use other bit
-/// names than the cores, so the flags pass through as raw bits.
+/// gtker's member-flag names differ from the client flags; preserve the raw bits.
 pub fn build_channel_list(
     channel_name: String,
     channel_flags: u8,
@@ -157,7 +137,6 @@ mod tests {
         }
     }
 
-    /// cm:Channel.cpp:767-772: the flags, then a channel index of 0.
     #[test]
     fn you_joined_carries_the_channel_flags_and_a_zero_index() {
         assert_eq!(body(0x02), [0x02, b'T', b'x', 0, 0x3C, 0, 0, 0, 0, 0, 0, 0]);
@@ -199,7 +178,6 @@ mod tests {
         }
     }
 
-    /// cm:Channel.cpp:490-515: name, flags u8, count u32, then guid u64 and flags u8 per member.
     #[test]
     fn the_channel_list_writes_raw_member_flags() {
         let message = ServerOpcodeMessage::SMSG_CHANNEL_LIST(Box::new(build_channel_list(

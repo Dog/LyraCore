@@ -1,7 +1,3 @@
-//! Core's fixture command crosses World Shards with no Package installed. Realm-core certifies the
-//! party, an issuer's sequence survives its Transfer, a Command Receipt travels with its Character,
-//! and a command that waits too long finishes as Expired or OutcomeUnknown without a second apply.
-
 use super::{party_command_intent, Coordinator, DURABLE_TOPOLOGY_ENV_LOCK};
 use crate::accept::BlockingTaskCapacity;
 use crate::config::GatewayConfig;
@@ -16,7 +12,6 @@ use std::ffi::OsString;
 use std::sync::MutexGuard;
 use std::time::Duration;
 
-/// The Module's debug fixture command, active while no Package registers a handler.
 const COMMAND: &str = "fixture.command";
 const REPLY: &str = "fixture.command.result";
 const GROUP: u64 = 5_098_000;
@@ -67,7 +62,6 @@ impl Drop for TopologyEnv {
     }
 }
 
-/// Three session-less Characters with live bodies, the targets of every command.
 struct CommandTopology {
     node: Standalone,
     target: String,
@@ -101,7 +95,6 @@ impl CommandTopology {
             node.assert_call_database(database, "install_guid_range", &[guid_base]);
         }
         node.assert_call_database(&realm, "claim_operator", &[]);
-        // The seeded Account owns the companions. Each has no Account Claim, so it acts session-less.
         let companions =
             ["Cmdone", "Cmdtwo", "Cmdthree"].map(|name| stage_character(&node, &target, "1", name));
         let (leader_one, actor_one) = stage_leader(&node, &source, "Cmdleadone", USERNAME_ONE);
@@ -155,8 +148,6 @@ impl CommandTopology {
         (runtime, coordinator)
     }
 
-    /// Write one Party mirror, led by `leader`, onto each of `databases` at the next Roster
-    /// Revision. Membership revisions come from Realm-core, so a retained member keeps its own.
     fn mirror_party(&self, databases: &[&str], leader: u64, companions: &[u64]) {
         let retained = rows(
             &self.node,
@@ -222,7 +213,6 @@ impl CommandTopology {
             serde_json::json!({"guid": leader, "ownership": {"none": []}}).to_string(),
             serde_json::to_string(&partitions).unwrap(),
             revision.to_string(),
-            // A Party, every member in Subgroup 0.
             "0".to_string(),
             serde_json::to_string(&vec![0u8; members.len()]).unwrap(),
         ];
@@ -233,7 +223,6 @@ impl CommandTopology {
         }
     }
 
-    /// Record every party member's current partition in Realm-core's character-to-shard index.
     fn publish_locators(&self, coordinator: &Coordinator) {
         let realm = coordinator.realm_core().unwrap();
         let members = self
@@ -273,7 +262,6 @@ impl CommandTopology {
         }));
     }
 
-    /// Queue the fixture command for `bot` through the authenticated client path; returns its id.
     fn queue(&self, source: &str, actor: &str, bot: u64) -> u64 {
         let ids = || {
             rows(
@@ -296,7 +284,6 @@ impl CommandTopology {
             .expect("authenticated command did not queue")
     }
 
-    /// The fixture replies `source` holds for one intent.
     fn replies(&self, source: &str, intent_id: u64) -> Vec<String> {
         rows(
             &self.node,
@@ -357,7 +344,6 @@ fn row(node: &Standalone, database: &str, query: &str) -> Row {
     rows.into_iter().next().unwrap()
 }
 
-/// Create a Human Warrior on `account` with a live body at the race's start; returns its guid.
 fn stage_character(node: &Standalone, database: &str, account: &str, name: &str) -> u64 {
     node.assert_call_database(
         database,
@@ -385,8 +371,6 @@ fn stage_character(node: &Standalone, database: &str, account: &str, name: &str)
     guid.parse().unwrap()
 }
 
-/// A human leader with its own Account and a live Account Claim. Returns its guid and the Session
-/// Actor its commands carry.
 fn stage_leader(node: &Standalone, database: &str, name: &str, username: &str) -> (u64, String) {
     node.assert_call_database(
         database,
@@ -442,7 +426,6 @@ fn cached_intent_when(
     found.unwrap()
 }
 
-/// The command as Realm-core certified it for `leader`'s current party.
 fn admitted(
     source: &Coordinator,
     intent: &party::PartyCommandIntent,
@@ -475,8 +458,6 @@ fn applied(receipts: &[Row]) -> bool {
             .contains("applied")
 }
 
-/// Sign the Character's Account in on Realm-core and on `shard`, then enter the world there.
-/// Returns the Session Actor its commands carry.
 fn enter_transferred_actor(
     topology: &CommandTopology,
     runtime: &tokio::runtime::Runtime,
@@ -545,7 +526,7 @@ fn enter_transferred_actor(
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
-#[allow(clippy::too_many_lines)] // One durable step per crash, Transfer, and replay boundary.
+#[allow(clippy::too_many_lines)]
 fn command_receipts_recover_both_gateway_crash_boundaries() {
     let topology = CommandTopology::new("party-command-crash-recovery");
     let bot = topology.companions[0];
@@ -561,7 +542,6 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
     let target = source.shard_handle(&topology.target).unwrap();
     topology.publish_locators(&source);
 
-    // A worker claims and stops. Once the lease ends, another worker applies and replies once.
     let claimed = topology.queue(topology.source(), &topology.actor_one, bot);
     let claimed_intent = cached_intent(&source, claimed);
     source.claim_party_command_intent(claimed, 101).unwrap();
@@ -576,7 +556,6 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
         vec![format!("{claimed}|Applied")]
     );
 
-    // The target applies and the source never hears of it.
     let target_applied = topology.queue(topology.source(), &topology.actor_one, bot);
     let target_intent = cached_intent(&source, target_applied);
     source
@@ -594,7 +573,6 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
         .replies(topology.source(), target_applied)
         .is_empty());
 
-    // A second source Module mints the same intent id. Its receipt stays distinct.
     topology.mirror_party(
         &[&topology.realm, &topology.target],
         topology.leader_two,
@@ -617,8 +595,6 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
         CompanionCommandOutcome::Applied
     );
 
-    // The bot leaves for the source's map. No holder applies a command while it is in transit or
-    // after it has gone.
     topology.transfer(
         &topology.target,
         bot,
@@ -659,7 +635,6 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
         .receipts(&topology.target, delayed.intent_id)
         .is_empty());
 
-    // The source finishes from the receipt that travelled, and a replayed apply finds it too.
     assert_eq!(
         party::run_party_command_intent(&source, &target_intent, 201).unwrap(),
         CompanionCommandOutcome::Applied
@@ -685,7 +660,7 @@ fn command_receipts_recover_both_gateway_crash_boundaries() {
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
-#[allow(clippy::too_many_lines)] // One durable step per issuer Transfer boundary.
+#[allow(clippy::too_many_lines)]
 fn command_issuer_sequence_continues_after_the_issuer_transfers() {
     let topology = CommandTopology::new("party-command-issuer-sequence-transfer");
     let bot = topology.companions[0];
@@ -699,7 +674,6 @@ fn command_issuer_sequence_continues_after_the_issuer_transfers() {
     let older = cached_intent(&source, older_id);
     assert_eq!(older.issuer_sequence, 1);
 
-    // The leader logs out and crosses to the target with its Account.
     target.provision_account(USERNAME_ONE, &[], &[]).unwrap();
     let actor: serde_json::Value = serde_json::from_str(&topology.actor_one).unwrap();
     let ownership = serde_json::to_string(&actor["ownership"]["some"]).unwrap();
@@ -743,7 +717,6 @@ fn command_issuer_sequence_continues_after_the_issuer_transfers() {
     assert!(issuer(topology.source()).is_empty());
     assert_eq!(issuer(&topology.target)[0]["last_sequence"], "1");
 
-    // The next command, from the new Shard, continues the issuer's sequence.
     let moved_actor = enter_transferred_actor(&topology, &runtime, &target, topology.leader_one);
     let newer_id = topology.queue(&topology.target, &moved_actor, bot);
     let newer = cached_intent(&target, newer_id);
@@ -755,8 +728,6 @@ fn command_issuer_sequence_continues_after_the_issuer_transfers() {
         CompanionCommandOutcome::Applied
     );
 
-    // The older command still finishes and replies on its own source. Whether a newer sequence
-    // supersedes it is the handler's decision; the fixture handler applies both.
     assert_eq!(
         party::run_party_command_intent(&source, &older, 702).unwrap(),
         CompanionCommandOutcome::Applied
@@ -871,7 +842,6 @@ fn command_realm_admission_rejects_a_changed_unrelated_member() {
     let intent_id = topology.queue(topology.source(), &topology.actor_one, bot);
     let intent = cached_intent(&source, intent_id);
     let authority = realm.group_roster(topology.leader_one).unwrap();
-    // Another companion leaves on Realm-core after the Gateway read the roster.
     topology.mirror_party(
         &[&topology.realm],
         topology.leader_one,
@@ -893,7 +863,7 @@ fn command_realm_admission_rejects_a_changed_unrelated_member() {
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
-#[allow(clippy::too_many_lines)] // One durable step per capacity, lane, and expiry boundary.
+#[allow(clippy::too_many_lines)]
 fn command_capacity_waits_without_ack_then_recovers_or_expires() {
     let topology = CommandTopology::new("party-command-capacity");
     let bot = topology.companions[0];
@@ -909,7 +879,6 @@ fn command_capacity_waits_without_ack_then_recovers_or_expires() {
         )
     };
 
-    // Fill the bot's receipt capacity.
     for token in 1..=32 {
         let intent = cached_intent(&source, queue());
         assert_eq!(
@@ -932,7 +901,6 @@ fn command_capacity_waits_without_ack_then_recovers_or_expires() {
         .defer_party_command_intent(waiting_id, 2_001)
         .unwrap();
 
-    // A full lane does not hold back a command for a bot in another lane.
     let blocked: Vec<u64> = (0..16).map(|_| queue()).collect();
     let lane_count = u64::from(lyracore_shared::group::COMMAND_DISPATCH_LANES);
     let bot_lane = bot % lane_count;
@@ -950,7 +918,6 @@ fn command_capacity_waits_without_ack_then_recovers_or_expires() {
         .iter()
         .all(|id| intent_row(*id)["pending"] == "true"));
 
-    // Deferring every blocked command rotates the waiting command back to the lane head.
     for (offset, intent_id) in blocked.iter().enumerate() {
         let claim_token = 4_000 + offset as u64;
         source
@@ -969,7 +936,6 @@ fn command_capacity_waits_without_ack_then_recovers_or_expires() {
     );
     assert_eq!(retry_head["head_intent_id"], waiting_id.to_string());
 
-    // A released receipt lets the waiting command apply.
     topology.node.assert_call_database(
         &topology.target,
         "party_command_fixture_release_receipt",
@@ -984,7 +950,6 @@ fn command_capacity_waits_without_ack_then_recovers_or_expires() {
         vec![format!("{waiting_id}|Applied")]
     );
 
-    // A command that waits past its deadline expires once, under its own claim.
     let expiry_id = blocked[0];
     let expiry = cached_intent(&source, expiry_id);
     assert_eq!(

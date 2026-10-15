@@ -1,25 +1,13 @@
-//! Manual-completion routes: enchant, disenchant, fishing and lock opening. Their durable
-//! operations emit no cast event, so this module sends the client's completion sequence itself.
-//! The four routes share one shape — decode a target, request a durable operation, then either the
-//! shared success sequence or the shared simple failure — and differ only in which target they
-//! decode and which operation they call.
-
 use super::*;
 use wow_world_messages::vanilla::SpellCastTargets_SpellCastTargetFlags_Gameobject as GoTarget;
 use wow_world_messages::vanilla::SpellCastTargets_SpellCastTargetFlags_Item as ItemTarget;
 
-/// Which manual-completion operation a cast requests, decided once in `route_for` from the spell's
-/// effect metadata.
 pub(crate) enum ManualRoute {
-    /// Enchant or disenchant an item; the target is an item-instance GUID.
     Enchant(EnchantRoute),
-    /// Fishing; needs no target.
     Fish,
-    /// Pick Lock; the target is a GameObject GUID.
     OpenLock,
 }
 
-/// The item-instance GUID off an ITEM-target cast, or 0 if the cast carries none.
 fn item_target(c: &CMSG_CAST_SPELL) -> u64 {
     match c.targets.target_flags.get_item() {
         Some(ItemTarget::Item { item }) => item.guid(),
@@ -27,8 +15,6 @@ fn item_target(c: &CMSG_CAST_SPELL) -> u64 {
     }
 }
 
-/// The GameObject GUID off a cast, accepting both target-flag shapes the vanilla client sends for
-/// Pick Lock, or 0 if the cast carries neither.
 fn gameobject_target(c: &CMSG_CAST_SPELL) -> u64 {
     match c.targets.target_flags.get_gameobject() {
         Some(GoTarget::Gameobject { gameobject }) => gameobject.guid(),
@@ -37,9 +23,6 @@ fn gameobject_target(c: &CMSG_CAST_SPELL) -> u64 {
     }
 }
 
-/// Enchant, disenchant, fishing and lock opening: decode the route's target, request the durable
-/// operation, then send the shared completion sequence on success or the shared simple failure on
-/// refusal. None of these reducers emit a cast event, so the gateway is the only sender either way.
 pub(super) fn manual_completion_cast<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -47,8 +30,6 @@ pub(super) fn manual_completion_cast<St: CastStore + ?Sized>(
     route: ManualRoute,
 ) -> Result<ProtocolReply> {
     let spell = c.spell;
-    // `Err` carries the reason the request ended in a Refusal: the Module's, or the Gateway's own
-    // when the cast names no usable target.
     let completed: std::result::Result<Actor, String> = 'request: {
         let Some(actor) = session.actor() else {
             break 'request Err(NO_ACTOR.to_string());

@@ -1,9 +1,3 @@
-// The authoring surface, tested against a SYNTHETIC Base Snapshot.
-//
-// `fixtures/base-snapshot.json` is hand-written and every value in it is invented. It carries the
-// same column names and the same canonical spellings a real snapshot would, and no client-derived
-// value at all, so these tests never touch the operator's game data.
-
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -62,7 +56,7 @@ test("a clone carries the whole row and every effect the source has", () => {
 
   const emitted = claims.claims();
 
-  expect(emitted).toHaveLength(3); // the header plus the source's two effects
+  expect(emitted).toHaveLength(3);
   const header = emitted.find((c) => c.key.kind === "spell")!;
   expect(header.operation).toBe("insert");
   expect([...header.fields.keys()].sort()).toEqual(
@@ -190,8 +184,6 @@ test("an update that states no change is refused", () => {
   ).toBe("EmptyUpdate");
 });
 
-/// The AC in one test: a Package cannot see what another Package invents, because the only rows a
-/// Datascript can read are the base ones, and a Package spell is never in the base data.
 test("a spell another Package would have invented is not readable", () => {
   expect(() => registry().spell(PACKAGE_SPELL)).toThrow(BaseDataError);
 });

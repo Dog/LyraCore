@@ -1,11 +1,3 @@
-// The Runtime Script build, end to end: sources under a Package's `scripts/`, one Script Artifact
-// out, and the same bytes every time.
-//
-// The committed `runtime-scripts/fuel-workload.lua` is where this suite meets the Module:
-// `module/src/runtime_script.rs` runs those exact bytes on the Runtime Script Host and sizes the
-// Fuel Budget against them. So the first test recompiles the workload and refuses a stale copy —
-// otherwise the Module would be measuring Lua the toolchain no longer emits.
-
 import { expect, test } from "bun:test";
 import {
   chmodSync,
@@ -30,10 +22,6 @@ interface Built {
   readonly scripts: Array<{ script_id: number; name: string; event: string; source: string }>;
 }
 
-/// Build a scratch Package holding `files`, and return its artifact.
-///
-/// A scratch root rather than `packages/`: the artifact is what is under test, and a build that
-/// wrote into the checkout would make one test's output another test's input.
 async function build(
   files: Record<string, string>,
   events?: string[],
@@ -64,12 +52,9 @@ async function build(
   }
 }
 
-/// The two required directives, for the tests that are about something else.
 function directives(event = EVENT, id = 100_200): string {
   return `// @event ${event}\n// @id ${id}\n`;
 }
-
-// ---- the workload the Module's Fuel Budget is sized against ----
 
 test("the committed fuel workload Lua is what the pinned toolchain emits today", async () => {
   const source = readFileSync(join(TOOLCHAIN, "fuel-workload.ts"), "utf8");
@@ -79,8 +64,6 @@ test("the committed fuel workload Lua is what the pinned toolchain emits today",
 
   expect(built.scripts[0]?.source).toBe(committed);
 });
-
-// ---- determinism ----
 
 test("two builds of one source tree write the same bytes", async () => {
   const files = { "greet.ts": `${directives()}function script(): number { return 7; }\n` };
@@ -115,11 +98,8 @@ test("the scripts are ordered by identifier, whatever order the files sort in", 
   expect(built.scripts.map((s) => s.name)).toEqual([`${PACKAGE}.zeta`, `${PACKAGE}.alpha`]);
 });
 
-// ---- the piccolo call shape ----
-
 test("a table constructor passed to a call is hoisted through the guard", async () => {
-  // piccolo 0.3.3 leaks a trailing constructor's element count as an extra argument. The Module
-  // pins both that fault and this fix; here we prove the emitter applies it.
+  // Piccolo 0.3.3 leaks a trailing constructor's element count as an extra argument.
   const built = await build({
     "guard.ts":
       `${directives()}function take(o: { a: number }): number { return o.a; }\n` +
@@ -139,8 +119,6 @@ test("every emitted file ends by calling its entry point, so the chunk returns t
   expect(built.scripts[0]?.source.trimEnd().endsWith("return script()")).toBe(true);
 });
 
-// ---- hand-written Lua ----
-
 test("a hand-written .lua script ships unchanged", async () => {
   const lua = "-- @event on_login\n-- @id 100400\ngrant_xp(event.actor, 5)\n";
 
@@ -149,8 +127,6 @@ test("a hand-written .lua script ships unchanged", async () => {
   expect(built.scripts[0]?.source).toBe(lua);
   expect(built.scripts[0]?.name).toBe(`${PACKAGE}.bonus`);
 });
-
-// ---- refusals, each naming the file ----
 
 test("a script declaring no entry point is refused", async () => {
   expect(build({ "bare.ts": `${directives()}const x = 1;\n` })).rejects.toThrow(

@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::ShardId;
@@ -9,8 +7,6 @@ use crate::world::Outbound;
 use spacetimedb_sdk::Table;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Build the full quest-log update from the coordinator cache. The empty mask deliberately clears
-/// every quest-log field when the final quest leaves the log.
 pub(crate) fn quest_log_outbound(
     db: &crate::stdb::bindings::RemoteTables,
     self_guid: u64,
@@ -25,7 +21,6 @@ pub(crate) fn quest_log_outbound(
     Some(Outbound::Raw { opcode, body })
 }
 
-/// Build all packets for one quest update, in the order the client expects.
 pub(crate) fn quest_update_outbound(
     db: &crate::stdb::bindings::RemoteTables,
     self_guid: u64,
@@ -48,7 +43,6 @@ pub(crate) fn quest_update_outbound(
     quest_update_packets(old, row, &objectives, quest_log_outbound(db, self_guid))
 }
 
-/// Build the feedback that precedes a full quest-log sync for one update.
 pub(crate) fn quest_update_feedback(
     old: &CharacterQuest,
     row: &CharacterQuest,
@@ -73,7 +67,6 @@ pub(crate) fn quest_update_feedback(
     outbound
 }
 
-/// Append a post-update full-log sync after kill and timer feedback.
 pub(crate) fn quest_update_packets(
     old: &CharacterQuest,
     row: &CharacterQuest,
@@ -87,7 +80,6 @@ pub(crate) fn quest_update_packets(
     outbound
 }
 
-/// A quest-log insert names one owner. The full log is read after the delta on that owner's writer.
 pub(crate) fn quest_inserted(
     view: &WorldView,
     coord: &Coordinator,
@@ -106,7 +98,6 @@ pub(crate) fn quest_inserted(
     });
 }
 
-/// A quest update keeps kill feedback, timer failure, then the full quest-log sync in one writer job.
 pub(crate) fn quest_updated(
     view: &WorldView,
     coord: &Coordinator,
@@ -129,7 +120,6 @@ pub(crate) fn quest_updated(
     });
 }
 
-/// A quest deletion re-sends the full log, including the all-zero final-log clear.
 pub(crate) fn quest_deleted(
     view: &WorldView,
     coord: &Coordinator,

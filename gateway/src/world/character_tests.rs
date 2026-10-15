@@ -1,19 +1,16 @@
-//! Character select over an encrypted World Session: enumerate, create and delete.
-
 use super::*;
 
 #[test]
 fn char_enum_returns_the_seeded_character() {
-    // The pre-seeded Human Warrior "Tester" must appear on the character-select screen.
     let tester = codec::CharacterView {
         guid: 1,
         name: "Tester".into(),
-        race: 1,   // Human
-        class: 1,  // Warrior
-        gender: 0, // Male
+        race: 1,
+        class: 1,
+        gender: 0,
         level: 1,
-        map_id: 0,   // Eastern Kingdoms
-        zone_id: 12, // Elwynn Forest
+        map_id: 0,
+        zone_id: 12,
         x: -8949.95,
         y: -132.493,
         z: 83.5312,
@@ -34,7 +31,6 @@ fn char_enum_returns_the_seeded_character() {
         run_world_session(server_end, server_store.clone()).unwrap();
     });
 
-    // Full handshake, then request the character list over the encrypted channel.
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
@@ -60,7 +56,6 @@ fn char_enum_returns_the_seeded_character() {
 
 #[test]
 fn char_create_replies_success_then_name_in_use() {
-    // The fake store reports a name already among its characters as in-use, else success.
     let tester = codec::CharacterView {
         guid: 1,
         name: "Tester".into(),
@@ -95,7 +90,6 @@ fn char_create_replies_success_then_name_in_use() {
         facial_hair: 0,
     };
 
-    // A fresh name → CharCreateSuccess.
     mk("Newbie")
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -106,7 +100,6 @@ fn char_create_replies_success_then_name_in_use() {
         other => panic!("expected SMSG_CHAR_CREATE, got {other}"),
     }
 
-    // An existing name → CharCreateNameInUse, and the session stays alive.
     mk("Tester")
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -191,7 +184,6 @@ fn char_delete_failure_replies_failed_and_keeps_session_alive() {
         other => panic!("expected SMSG_CHAR_DELETE, got {other}"),
     }
 
-    // Session should still be alive: CMSG_CHAR_ENUM gets a normal reply, not a dropped socket.
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();

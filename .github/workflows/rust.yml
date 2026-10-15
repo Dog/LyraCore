@@ -1,12 +1,5 @@
 name: Rust
 
-# The Rust gates from docs/danger-zones.md, verbatim, plus the wasm compile that only the
-# deploy-time preflight covered before. Nothing here needs a SpacetimeDB node: the module tests that
-# do are integration tests, and `--lib` leaves them out.
-#
-# rustup reads rust-toolchain.toml and installs the pinned toolchain, rustfmt, clippy and the
-# wasm32-unknown-unknown target on the first cargo call, so nothing here repeats the version.
-
 on:
   pull_request:
   push:
@@ -27,8 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check formatting
         run: cargo fmt --all -- --check
-      # The SpacetimeDB build aborts on a print-family macro anywhere in Module source, even in a
-      # comment or a test. Use `writeln!(std::io::stderr(), ...)` for a test diagnostic.
+      # SpacetimeDB scans comments and test code for forbidden print macros.
       - name: Check for print macros in Module source
         run: |
           roots=(module/src)
@@ -58,7 +50,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: ./.github/actions/setup-spacetime
       - run: ./lyracore bindings
-      # Share compiled dependencies while keeping each crate's result separate.
       - run: cargo test -p lyracore-importer
       - run: cargo test -p lyracore-module --lib --features=debug_reducers
       - run: cargo test -p lyracore-module --test build_script
@@ -74,16 +65,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # `lyracore publish` builds this feature set. A default-feature check would omit published reducers.
       - run: cargo check --target wasm32-unknown-unknown -p lyracore-module --features=debug_reducers
 
-  # A Core change that breaks an official Package fails here, before the Package's next publish.
   official-packages:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # A paired packages PR uses the same branch name; build against it when it exists.
       - id: packages-ref
         timeout-minutes: 2
         env:

@@ -1,5 +1,3 @@
-//! Released ghost state and its racial aura effects.
-
 use spacetimedb::ReducerContext;
 
 use crate::{game_aura, game_corpse, game_world_entity};
@@ -12,7 +10,6 @@ pub(crate) fn is_ghost_spell(spell_id: u32) -> bool {
     matches!(spell_id, GHOST | WISP_SPIRIT)
 }
 
-/// Reapply the released Character's effects after release, login or Transfer.
 pub(crate) fn restore(ctx: &ReducerContext, guid: u64) {
     let Some(character) = ctx.db.game_world_entity().guid().find(guid) else {
         return;
@@ -27,7 +24,6 @@ pub(crate) fn restore(ctx: &ReducerContext, guid: u64) {
     crate::spell::recompute_display(ctx, guid);
 }
 
-/// Complete every resurrection after its caller restores health and power.
 pub(crate) fn finish_resurrection(ctx: &ReducerContext, guid: u64) {
     if let Some(mut character) = ctx.db.game_world_entity().guid().find(guid) {
         character.dead = false;

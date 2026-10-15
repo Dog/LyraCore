@@ -1,10 +1,5 @@
-//! Pieces the handler-level family tests share: a session connection to run a handler against, and
-//! typed reply flattening. A family test owns its Fake and its `run` helper.
-
 use super::*;
 
-/// A connection for `account_id` in the world as `self_guid`. The session's routed Store is
-/// never read here: every handler under test takes its family Fake as an argument.
 pub(crate) fn in_world_conn(account_id: u64, self_guid: u64) -> WorldConn {
     let username = NormalizedString::new("TESTER").unwrap();
     let server_seed = ProofSeed::new();
@@ -30,7 +25,6 @@ pub(crate) fn in_world_conn(account_id: u64, self_guid: u64) -> WorldConn {
     }
 }
 
-/// Flatten typed replies while preserving their protocol order.
 pub(crate) fn outbound_messages(outbound: Vec<Outbound>) -> Vec<ServerOpcodeMessage> {
     let mut sent = Vec::new();
     for out in outbound {
@@ -44,8 +38,6 @@ pub(crate) fn outbound_messages(outbound: Vec<Outbound>) -> Vec<ServerOpcodeMess
     sent
 }
 
-/// `NpcStore` for a Fake that only needs the Npc to refuse or accept an interaction. Every other
-/// method panics, so a handler that starts to read more fails the test loudly.
 macro_rules! npc_store_refusing_by {
     ($fake:ty, $refuses:ident) => {
         impl NpcStore for $fake {

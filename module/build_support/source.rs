@@ -1,26 +1,14 @@
-//! Lexical source operations shared by `module/build.rs` and the Package API lint test target.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The whole-file gate of a source file compiled only with `debug_reducers`.
 pub const DEBUG_REDUCERS_FILE_CFG: &str = "#![cfg(feature = \"debug_reducers\")]";
-/// The whole-file gate of a source file compiled only in a test build.
 pub const TEST_FILE_CFG: &str = "#![cfg(test)]";
 
 pub struct StrippedSource {
-    /// The source with comments and literals blanked, keeping every line break.
     pub code: String,
-    /// Every line comment, as (1-based line, comment text from `//`).
     pub line_comments: Vec<(usize, String)>,
 }
 
-/// Blank out comments (line + nested block), string literals (plain, byte, C, raw), and char
-/// literals, keeping line breaks for diagnostics. Lifetimes (`'a`) stay intact; only a quoted
-/// character is blanked. This makes a commented-out marker or path
-/// inert and lets doc comments show real syntax.
-///
-/// Line comments are returned beside the code, so text inside a string can never pose as one.
 pub fn strip_source(src: &str) -> StrippedSource {
     let b: Vec<char> = src.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(b.len());
@@ -33,7 +21,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
         line += b[counted_until..i].iter().filter(|c| **c == '\n').count();
         counted_until = i;
         let c = b[i];
-        // Line comment (also covers /// and //!): blank to end of line.
         if c == '/' && b.get(i + 1) == Some(&'/') {
             let comment_start = i;
             while i < b.len() && b[i] != '\n' {
@@ -43,7 +30,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
             line_comments.push((line, b[comment_start..i].iter().collect()));
             continue;
         }
-        // Block comment, nested per Rust.
         if c == '/' && b.get(i + 1) == Some(&'*') {
             let mut depth = 0usize;
             while i < b.len() {
@@ -67,8 +53,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
             }
             continue;
         }
-        // Raw strings, only when the r/b/c starts a token (previous
-        // char is not part of an identifier), so `for` / `attr` never false-trigger.
         let prev_is_ident = i > 0 && (b[i - 1].is_alphanumeric() || b[i - 1] == '_');
         if !prev_is_ident && (c == 'r' || (matches!(c, 'b' | 'c') && b.get(i + 1) == Some(&'r'))) {
             let r_at = if c == 'r' { i } else { i + 1 };
@@ -78,7 +62,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
             }
             if b.get(j) == Some(&'"') {
                 let hashes = j - (r_at + 1);
-                // Emit the opener as blanks, then scan for `"` + hashes.
                 for c in &b[i..=j] {
                     out.push(blank(*c));
                 }
@@ -102,15 +85,13 @@ pub fn strip_source(src: &str) -> StrippedSource {
                 }
                 continue;
             }
-            // not a raw string: fall through to emit `c` normally below
         }
-        // Plain / byte / C string literal with escapes.
         if c == '"' || (!prev_is_ident && matches!(c, 'b' | 'c') && b.get(i + 1) == Some(&'"')) {
             if c != '"' {
                 out.push(' ');
                 i += 1;
             }
-            out.push(' '); // the opening quote
+            out.push(' ');
             i += 1;
             while i < b.len() {
                 if b[i] == '\\' {
@@ -131,7 +112,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
             }
             continue;
         }
-        // Char literal vs lifetime: a char literal is `'` + (escape | one char) + `'`.
         if c == '\'' {
             let is_char_lit = match b.get(i + 1) {
                 Some('\\') => true,
@@ -142,9 +122,7 @@ pub fn strip_source(src: &str) -> StrippedSource {
                 out.push(' ');
                 i += 1;
                 if b.get(i) == Some(&'\\') {
-                    // Consume the backslash AND its escaped char first: for '\'' the escaped char
-                    // IS a quote, and a terminator scan alone would stop on it one char early. The
-                    // tail loop then covers multi-char escapes ('\u{...}').
+                    // Consume escaped quotes before looking for the character literal's terminator.
                     out.push(' ');
                     i += 1;
                     if i < b.len() {
@@ -165,7 +143,6 @@ pub fn strip_source(src: &str) -> StrippedSource {
                 }
                 continue;
             }
-            // lifetime: keep the quote so positions stay aligned
         }
         out.push(c);
         i += 1;
@@ -176,15 +153,10 @@ pub fn strip_source(src: &str) -> StrippedSource {
     }
 }
 
-/// The file's first non-blank line, trimmed: the whole-file gate when it is one.
-///
-/// Both consumers read one exact leading inner attribute instead of interpreting general `cfg`
-/// expressions, so they decide a file's gate without reconstructing the module tree.
 pub fn file_gate(source: &str) -> Option<&str> {
     source.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
-/// Every `.rs` file beneath `dir`, in no particular order.
 pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries =
         fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read dir {}: {e}", dir.display()));

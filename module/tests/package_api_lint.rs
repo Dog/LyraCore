@@ -1,7 +1,3 @@
-//! The Package API lint, an Architecture Test: every installed Package names only Package API
-//! version 4. Core CI runs it with no Package installed; the official Packages job runs it with
-//! the collection installed.
-
 mod package_api;
 
 use std::path::{Path, PathBuf};
@@ -146,7 +142,6 @@ fn diagnostics_at(relative_path: &str, source: &str) -> Vec<Diagnostic> {
     check_source(&contract(), "sample", Path::new(relative_path), source)
 }
 
-/// Each finding as `line:path`, the path as written.
 fn reported_at(relative_path: &str, source: &str) -> Vec<String> {
     diagnostics_at(relative_path, source)
         .into_iter()
@@ -323,7 +318,6 @@ fn an_invented_game_operation_is_outside_the_package_api() {
 
 #[test]
 fn a_gated_child_is_refused_from_an_ordinary_file() {
-    // An ordinary build compiles these files; an item gate does not change what the lint sees.
     let debug_item = "#[cfg(feature = \"debug_reducers\")]\nfn f() {\n    crate::package::fixture::apply_damage();\n}\n";
     let test_module = "#[cfg(test)]\nmod tests {\n    use crate::package::test::shape_of;\n}\n";
     assert_eq!(

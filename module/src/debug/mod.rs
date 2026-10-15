@@ -1,29 +1,3 @@
-//! Reducers that stage deterministic scenarios for client automation and operator diagnostics.
-//! Teleport, health, spawn, cast, and inventory operations accept explicit Character guids.
-//!
-//! # Feature gate
-//! `lib.rs` declares `mod debug;` behind `#[cfg(feature = "debug_reducers")]`. A default build
-//! compiles this directory out. Every `lyracore publish`, production included, builds with the
-//! feature on, so these reducers exist on every published database:
-//!
-//! ```text
-//! spacetime publish -s local --build-options='--features=debug_reducers' lyracore
-//! ```
-//!
-//! `docs/danger-zones.md` is authoritative on that posture. The post-publish repair pass lives in
-//! the ungated `operations` module.
-//!
-//! # Caller identity
-//! A `spacetime call` runs as the **CLI identity**, which is NOT a player's bound identity. So every
-//! reducer here takes an **explicit `character_guid`/`guid`** and operates on that row directly — it
-//! MUST NOT use `entity_by_owner(ctx, ctx.sender())` (that only resolves the gateway's per-player
-//! connection identity). This is the single most important difference from the player reducers.
-//!
-//! # Layout
-//! This file holds the world, combat and item levers and the shared `equip_into` helper. `readout` is
-//! the `DebugReadout` table and its writers, `audit` the class-kit and quest-chain content audits,
-//! `encounter` and `instance` the operator levers, and `fingerprint` the catalogue-parity hash.
-
 mod audit;
 mod auth;
 mod encounter;
@@ -54,10 +28,6 @@ use crate::{
     CreatureMoveSchedule, CreatureSpawn, GroundArea, ItemInstance, ServerConfig,
 };
 
-/// Teleport `character_guid` to `(map_id, x, y, z, o)` via the shared `world::teleport_player` core: it
-/// updates the LIVE entity (position + grid cell) AND the durable `game_character` AND emits the
-/// `game_teleport_event` that makes the gateway send `MSG_MOVE_TELEPORT_ACK` so the player's camera
-/// actually follows. Keyed off the explicit guid (the CLI identity owns no entity). Errors if not in world.
 #[reducer]
 pub fn debug_teleport(
     ctx: &ReducerContext,
@@ -81,16 +51,6 @@ pub fn debug_teleport(
     Ok(())
 }
 
-/// Record a Transfer Intent for `character_guid`: the session-less Shard crossing a Package's
-/// bot decides for itself, driven by hand.
-///
-/// The lever exists because the acceptance test for that crossing must NOT need a Package installed.
-/// It calls the same `transfer::emit_bot_transfer_intent` the Package calls, so what it exercises is
-/// the real contract — the placement and the intent row in one transaction, then the Gateway's
-/// durable Transfer dispatcher, and never a second way to ask for a crossing.
-///
-/// The shared writer applies the ordinary session-less ownership Gate, so a Character with a live
-/// Session is refused before placement or intent creation.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn debug_bot_transfer(
@@ -135,23 +95,11 @@ pub fn debug_bot_transfer(
     Ok(())
 }
 
-/// Deal `amount` DIRECT damage to a live entity through the REAL shared damage pipeline — the same
-/// `fold_incoming_damage` → `final_damage` → `apply_hit` every swing and spell routes through, as a
-/// MAIN-HAND hit. So a debug poke drives everything a real melee swing drives: the attacker's rage
-/// and weapon skill-up, absorb, the defender's rage and defense skill-up, break-on-damage, cast pushback, threat,
-/// Retaliation and the proc pass. That last one is why it routes here rather than writing health: a
-/// scripted 100-hit run against a Proc finishes in seconds instead of waiting on swing timers.
-/// Unlike `debug_set_health` (a raw field write, NO side effects), this behaves like being hit. Never
-/// lethal: the damage is capped at `health - 1` BEFORE the pipeline, so the kill fork is unreachable
-/// from here (use `debug_kill_nearest` for that).
 #[reducer]
 pub fn debug_apply_damage(
     ctx: &ReducerContext,
     target_guid: u64,
     amount: u32,
-    // The attributed attacker (0 = anonymous): threads through to `on_damage_taken` so
-    // attacker-reactive systems (a Package defend hook, Retaliation, the proc pass) see a real
-    // source.
     attacker_guid: u64,
 ) -> Result<(), String> {
     let e = ctx
@@ -163,8 +111,6 @@ pub fn debug_apply_damage(
     if e.dead {
         return Err("target is dead".to_string());
     }
-    // Clamp at 1 HP up front: the pipeline's own lethal fork must never be reachable from a debug poke,
-    // and a clamp applied afterwards could not un-kill anything.
     let capped = amount.min(e.health.saturating_sub(1));
     let (dmg, _absorbed) =
         crate::combat::fold_incoming_damage(ctx, attacker_guid, target_guid, capped);
@@ -179,11 +125,6 @@ pub fn debug_apply_damage(
     Ok(())
 }
 
-/// Set `guid`'s live health (clamped to `max_health`). `health == 0` drives the SAME death path the
-/// combat killing blow uses (`combat::tick_melee`): a PLAYER enters the release/ghost path
-/// (`health = 0` + `dead = true`, then the client shows Release Spirit — vanilla 1.12 has no death
-/// opcode, `UNIT_FIELD_HEALTH == 0` is the sole signal); a CREATURE becomes a corpse (`dead = true`,
-/// disengaged, decay timer armed, loot rolled onto the corpse).
 #[reducer]
 pub fn debug_set_health(ctx: &ReducerContext, guid: u64, health: u32) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();
@@ -203,53 +144,32 @@ pub fn debug_set_health(ctx: &ReducerContext, guid: u64, health: u32) -> Result<
         return Ok(());
     }
 
-    // health == 0 → death. Branch exactly like the combat killing blow (combat::tick_melee).
     if e.is_player() {
-        // PLAYER death through the SHARED kill path (combat::kill_player) so a debug kill is
-        // byte-identical to a real killing blow, including channel teardown and combat-deadline
-        // zeroing. No killer on this path.
         crate::combat::kill_player(ctx, guid, 0);
         log::info!("debug_set_health: player {guid} killed (dead, awaiting release)");
         return Ok(());
     }
 
-    // CREATURE death: route through the SHARED kill path so a debug kill produces the exact same
-    // corpse + money/item loot + decay as a real killing blow (no drift between the paths). No XP
-    // credit — there's no player killer here (`award_xp` needs an attacker).
     crate::combat::kill_creature(ctx, guid, None);
     log::info!("debug_set_health: creature {guid} killed (corpse via kill_creature)");
     Ok(())
 }
 
-/// Drive Release Spirit by explicit guid (the `CMSG_REPOP_REQUEST` / `repop` path) — the CLI identity
-/// owns no entity, so this calls the shared `world::do_repop` against the row directly. Leaves a corpse,
-/// becomes a ghost (health 1, GHOST flags), and teleports to the Northshire graveyard, exactly like a
-/// real Release click. Lets the parent drive die → release → spirit-heal headless. Errors if not dead.
 #[reducer]
 pub fn debug_repop(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::actor::repop(ctx, character_guid)
 }
 
-/// Spirit-Healer resurrect by explicit guid (the `CMSG_SPIRIT_HEALER_ACTIVATE` / `spirit_healer_res`
-/// path) — drives the new graveyard-res reducer's body against the row directly (the CLI identity owns
-/// no entity), so the parent can verify the feature without the mouse-only spirit-healer dialog. Gates
-/// on the entity being a ghost; res's in place at 50% health + 50% mana and lands Resurrection Sickness.
 #[reducer]
 pub fn debug_spirit_healer_res(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::actor::spirit_res(ctx, character_guid)
 }
 
-/// Use the Self-Resurrection Option by explicit guid (the `CMSG_SELF_RES` path). Errors if the
-/// Character is alive or holds no option.
 #[reducer]
 pub fn debug_self_resurrect(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::actor::self_resurrect(ctx, character_guid)
 }
 
-/// Answer a pending resurrect offer by explicit guid (`CMSG_RESURRECT_RESPONSE` / `resurrect_response`
-/// path) — drives the shared `do_resurrect_response` core against the row directly (the CLI
-/// identity owns no entity), so the parent can verify the accept-prompt handshake headlessly. Errors if
-/// `character_guid` has no pending offer.
 #[reducer]
 pub fn debug_resurrect_response(
     ctx: &ReducerContext,
@@ -259,12 +179,6 @@ pub fn debug_resurrect_response(
     crate::spell::do_resurrect_response(ctx, character_guid, accept)
 }
 
-/// Spawn a creature of `creature_entry` at the player's feet (`player.x + offset`, same y/z/map) so a
-/// combat test doesn't have to walk to a mob. Reads the player's live entity, looks up the template,
-/// builds the live `game_world_entity` via the shared `build_creature_entity` (same construction
-/// `seed` and the creature-respawn pass use) with a fresh unique guid, and inserts a matching `game_creature_spawn` so the normal
-/// decay/respawn lifecycle owns it. The reducer can't return a value to the CLI, so the new guid is
-/// logged (`grep` the module log, or read it back from `game_world_entity` by entry).
 #[reducer]
 pub fn debug_spawn_at_feet(
     ctx: &ReducerContext,
@@ -284,14 +198,8 @@ pub fn debug_spawn_at_feet(
         .find(creature_entry)
         .ok_or_else(|| format!("no creature template for entry {creature_entry}"))?;
 
-    // A unique creature guid carrying HIGHGUID_UNIT (0xF130) + the entry in bits 24..47 (like the
-    // seed's chicken), with a low part one past the current max so it never collides with an existing
-    // spawn of the same entry.
     const HIGHGUID_UNIT: u64 = 0xF130;
     let entry_hi = (creature_entry as u64) << 24;
-    // Max over BOTH the spawn rows AND the live entities of this entry: an operator can delete a
-    // spawn row (test cleanup) while its entity still lingers (corpse decay), and a spawn-rows-only
-    // scan then re-allocates that entity's guid → duplicate-unique-column PANIC (live find 2026-07-10).
     let spawn_max = ctx
         .db
         .game_creature_spawn()
@@ -311,13 +219,6 @@ pub fn debug_spawn_at_feet(
     let next_low = spawn_max.max(entity_max) + 1;
     let new_guid = (HIGHGUID_UNIT << 48) | entry_hi | next_low;
 
-    // Place the creature `offset` yards in the player's FACING direction (not a
-    // fixed +X). The harness drives targeting via the client's TargetNearestEnemy /
-    // Tab / `/target`, which are FACING-CONE limited — a creature spawned behind the
-    // player is unselectable, so a fixed +X offset made combat tests flaky. Spawning
-    // along the player's orientation puts it directly in front (client facing == this
-    // server orientation once the player has turned), so the harness can reliably
-    // select + melee it. WoW orientation 0 = +X, so (cos, sin) is the facing vector.
     let (sin_o, cos_o) = player.orientation.sin_cos();
     let spawn = CreatureSpawn {
         guid: new_guid,
@@ -327,21 +228,14 @@ pub fn debug_spawn_at_feet(
         y: player.y + offset * sin_o,
         z: player.z,
         orientation: player.orientation,
-        // NOT-ARMED (`creatures::timer_never`): the live entity is inserted immediately below, so a
-        // past stamp would only keep this row in every due-time range scan forever.
         respawn_at: crate::creatures::timer_never(ctx),
         despawn_at: crate::creatures::timer_never(ctx),
-        // IDLE so a debug test creature holds where it's spawned (predictable for combat readback; the
-        // wander pass interfered with verification — see the harness memory).
         movement_type: crate::creatures::MOVEMENT_IDLE,
-        respawn_secs: 0, // not imported — falls back to the flat legacy respawn timer (a debug spawn's death is a one-off harness action)
+        respawn_secs: 0,
         life_seq: 0,
         source_guid: 0,
         instance_id: player.instance_id,
     };
-    // Build the live entity from a reference (fixed roll 0 → deterministic min level/health) BEFORE
-    // moving the spawn into its table, so we never depend on the row type deriving Clone. The
-    // entity insert fires the gateway's on_insert → CREATE_OBJECT so the creature appears at feet.
     let entity = build_creature_entity(&spawn, &tmpl, 0, player.instance_id);
     ctx.db.game_creature_spawn().insert(spawn);
     crate::creatures::insert_creature_entity(ctx, entity);
@@ -351,49 +245,20 @@ pub fn debug_spawn_at_feet(
     Ok(())
 }
 
-/// Materialize a PLAYER's live `game_world_entity` from its durable `game_character` row — SERVER-SIDE,
-/// with no game client. This is the harness keystone for the items/equipment/progression chain: a
-/// schema-changing `publish` tears down the in-world player entity (the live `game_world_entity`), and
-/// the client can't be driven headless to log back in, so reducers that require a live entity
-/// (`debug_compute_swing`, `debug_equip_weapon`, the item/XP/durability paths) have nothing to act on.
-/// This rebuilds that entity from the persisted character so those reducers are testable again.
-///
-/// Idempotent: if a live entity for the guid already exists it's left untouched and we return Ok (a
-/// real session may own it — we never clobber a live player). Otherwise we build + insert the entity
-/// through the SAME shared `build_player_entity` `world::player_login` uses (the player counterpart to
-/// `build_creature_entity`), so the stat curve, packing, and display/faction resolution are identical
-/// by construction. Position/level/appearance/xp/money come from the character row; vitals are filled
-/// to the new max.
-///
-/// CLI-identity caveat (file header §): a `spacetime call` runs as the CLI identity, which owns no
-/// player binding, so we key off the explicit `character_guid` and stamp the entity's `owner_identity`
-/// to the character's persisted `owner_identity` (NOT `ctx.sender()`) — the per-owner RLS that scopes
-/// items to a connection then matches what a real login would have set.
 #[reducer]
 pub fn debug_spawn_player_entity(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();
-    // Idempotent: a live entity already exists (a real session, or a prior call) — never clobber it.
     if entities.guid().find(character_guid).is_some() {
         log::info!("debug_spawn_player_entity: guid {character_guid} already live (no-op)");
         return Ok(());
     }
 
-    // REFUSE verdict. This is `player_login`'s RE-MATERIALISATION path wearing a harness
-    // hat: it builds a live entity straight off the durable row, so without the fence it is a second
-    // way to put a live copy back on a shard the character has left — the dual-liveness dupe the
-    // escrow exists to prevent. `player_login` fences it; so must this.
     let character = crate::helpers::require_character(ctx, character_guid)
         .map_err(|_| format!("no such character: {character_guid}"))?;
 
-    // Build the live entity from the durable character row — the SAME construction
-    // `world::player_login` runs, factored into the shared `build_player_entity`. The ONLY difference:
-    // `owner_identity` is the character's PERSISTED binding (NOT `ctx.sender()` — a `spacetime call`
-    // runs as the CLI identity, which owns no player binding), so per-owner RLS matches a real login.
     let entity = crate::creatures::build_player_entity(ctx, &character, character.owner_identity);
     let (level, max_health) = (entity.level, entity.max_health);
     entities.insert(entity);
-    // Same rebuild contract as `player_login`: a land mount lives in the aura set, so a materialize
-    // must re-derive the display and mounted speed rather than resurrect the rider on foot.
     crate::mount::restore_mount_on_rebuild(ctx, character_guid);
     log::info!(
         "debug_spawn_player_entity: materialized player guid {character_guid} (lvl {level}, hp {max_health})"
@@ -401,12 +266,6 @@ pub fn debug_spawn_player_entity(ctx: &ReducerContext, character_guid: u64) -> R
     Ok(())
 }
 
-/// Force-apply the tracer aura on `character_guid` (the ⭐ aura wire-check without needing rage / the
-/// spellbook UI). Reuses `spell::apply_tracer_aura` — the exact aura-upsert + `SpellCastEvent` that
-/// `cast_spell` runs — keyed off the explicit guid instead of `ctx.sender()`. Accepts ANY `spell_id`
-/// (a debug actuator; the player-facing `cast_spell` still gates on the one tracer spell). The client
-/// renders whatever icon its `Spell.dbc` has for the id, so passing several distinct ids stacks
-/// several auras in distinct slots — the multi-aura wire test for the raw-send path.
 #[reducer]
 pub fn debug_force_cast(
     ctx: &ReducerContext,
@@ -414,8 +273,6 @@ pub fn debug_force_cast(
     spell_id: u32,
 ) -> Result<(), String> {
     let e = crate::helpers::live_entity(ctx, character_guid)?;
-    // Route through the SAME resolved-cast path the player reducer uses, so the debug cast enforces
-    // the spell's mana cost and runs its effect dispatch (self-aura vs heal-self) — not just the aura.
     crate::spell::resolve_cast(ctx, character_guid, spell_id, e.level as u8)
 }
 
@@ -426,8 +283,6 @@ fn resolve_debug_cast_at(
     target_guid: u64,
 ) -> Result<(), String> {
     let caster = crate::helpers::live_entity(ctx, caster_guid)?;
-    // Fixture spells can be staged without being learned. Keep that debug-only bypass while using
-    // the owning synchronous resolver for costs, targets, effects, and other cast Gates.
     crate::spell::resolve_cast_at(
         ctx,
         caster_guid,
@@ -450,32 +305,16 @@ pub fn debug_force_cast_at(
     resolve_debug_cast_at(ctx, caster_guid, spell_id, target_guid)
 }
 
-/// Set `character_guid`'s level and recompute `max_health`/`max_power` from the real stat curve
-/// (`stats::max_health_for`/`max_power_for`, the SAME helpers `player_login` uses — not reimplemented).
-/// Health/power are refilled to the new max for the test. Also recomputes the five base attributes so
-/// the character sheet stays consistent with the new level. Thin wrapper over the shared
-/// `stats::set_character_level` core, which `gm::gm_command`'s `.level` also uses, so both run the
-/// SAME recompute (see that fn's doc).
 #[reducer]
 pub fn debug_set_level(
     ctx: &ReducerContext,
     character_guid: u64,
     level: u32,
 ) -> Result<(), String> {
-    // REFUSE verdict — the `debug_set_money` sibling. `set_character_level` writes
-    // `Character.level` (an `ExportBlob` field) and `Character.xp` on the DURABLE row and needs no
-    // live entity to do it (it errors only when neither an entity nor a character row exists), so
-    // by-guid it reaches an escrowed character. Fenced here, not in `stats`: `gm_command`'s caller
-    // resolves through `entity_by_owner` already, and the core also serves guids with no character
-    // row at all.
     crate::helpers::require_character(ctx, character_guid)?;
     crate::stats::set_character_level(ctx, character_guid, level)
 }
 
-/// Delete every CREATURE-type live `game_world_entity` on `map_id` (clean slate before a combat test).
-/// Never touches a PLAYER (the PLAYER bit gates it), mirroring `import_creature_spawns`' reset pass.
-/// The persistent `game_creature_spawn` rows are left intact, so the normal respawn pass will re-create
-/// seeded creatures later — this clears the live roster, it doesn't unseed the world.
 #[reducer]
 pub fn debug_clear_creatures(ctx: &ReducerContext, map_id: u32) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();
@@ -486,7 +325,6 @@ pub fn debug_clear_creatures(ctx: &ReducerContext, map_id: u32) -> Result<(), St
         .collect();
     let n = guids.len();
     for g in &guids {
-        // Free any combat the creature was in so no orphan engagement lingers, then delete it.
         crate::combat::disengage(ctx, *g);
         entities.guid().delete(g);
     }
@@ -494,10 +332,6 @@ pub fn debug_clear_creatures(ctx: &ReducerContext, map_id: u32) -> Result<(), St
     Ok(())
 }
 
-/// Stamp a `game_ground_area` at `caster_guid`'s position from `spell_id`'s area effect (test hook):
-/// looks up the spell header + its periodic-area effect (the one with a radius + period) and inserts the
-/// zone, exactly as an `E_PERSISTENT_AREA` cast would — so the tick engine can be verified server-side
-/// without a live client cast. `tick_ground_areas` then damages hostiles inside for `duration_ms`.
 #[reducer]
 pub fn debug_spawn_ground_area(
     ctx: &ReducerContext,
@@ -524,7 +358,6 @@ pub fn debug_spawn_ground_area(
             (hdr.duration_ms.max(1) as i64) * 1000,
         ))
         .ok_or("duration overflow")?;
-    // Perf catalog 1.20: the tick schedule is demand-armed (it disarms when the area table drains).
     crate::spell::arm_ground_area_tick(ctx);
     ctx.db.game_ground_area().insert(GroundArea {
         id: 0,
@@ -554,17 +387,11 @@ pub fn debug_spawn_ground_area(
     Ok(())
 }
 
-/// Use (consume) the item in `character_guid`'s inventory `slot` — drives the player `use_item` path
-/// by explicit guid (the CLI identity owns no entity), so consumable effects are machine-verifiable
-/// without the mouse-only inventory UI. Delegates to the SAME `apply_item_use` the player reducer uses.
 #[reducer]
 pub fn debug_use_item(ctx: &ReducerContext, character_guid: u64, slot: u8) -> Result<(), String> {
     crate::actor::use_item(ctx, character_guid, slot).map_err(crate::items::refused)
 }
 
-/// Grant `count`x item `entry` into `character_guid`'s bags — the test lever for item-dependent flows
-/// (cooking reagents etc.) that the mouse-only loot/vendor UI and a SQL insert (game_item_instance has a
-/// `created_at` Timestamp) can't drive. Delegates to the SAME `items::grant_item` the loot/quest paths use.
 #[reducer]
 pub fn debug_grant_item(
     ctx: &ReducerContext,
@@ -575,25 +402,18 @@ pub fn debug_grant_item(
     crate::items::grant_item(ctx, character_guid, entry, count)
 }
 
-/// Bind `character_guid`'s hearthstone home to its current position — drives the player `bind_home`
-/// (innkeeper gossip) by explicit guid for the harness, via the shared `world::set_home`.
 #[reducer]
 pub fn debug_bind_home(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::world::set_home(ctx, character_guid);
     Ok(())
 }
 
-/// Recall `character_guid` to its hearthstone home — drives the hearthstone-use path by explicit guid
-/// for the harness, via the shared `world::recall_to_home`. A live Character gets a
-/// game_teleport_event to home; an offline one has its durable row moved home.
 #[reducer]
 pub fn debug_use_hearthstone(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::world::recall_to_home(ctx, character_guid);
     Ok(())
 }
 
-/// Move/swap `character_guid`'s item from `from_slot` to `to_slot` — drives the player `move_item`
-/// path by explicit guid (the mouse-only drag-drop is undrivable), via the shared `apply_item_move`.
 #[reducer]
 pub fn debug_move_item(
     ctx: &ReducerContext,
@@ -605,10 +425,6 @@ pub fn debug_move_item(
         .map_err(crate::items::refused)
 }
 
-/// Equip `character_guid`'s item in inventory `from_slot` into its matching `EQUIPMENT_SLOT_*` (auto-
-/// resolved from the item's `inventory_type`, including the first-free of a finger/trinket pair) —
-/// drives the player `equip_item` path by explicit guid (the mouse-only right-click-equip is
-/// undrivable), via the shared `apply_equip_item`. Rejects a non-equippable item (e.g. food/junk).
 #[reducer]
 pub fn debug_equip_item(
     ctx: &ReducerContext,
@@ -618,8 +434,6 @@ pub fn debug_equip_item(
     crate::actor::equip_item(ctx, character_guid, from_slot).map_err(crate::items::refused)
 }
 
-/// Unequip `character_guid`'s item in equipment `from_slot` (0..=18) into the first free backpack slot —
-/// drives the player `unequip_item` path by explicit guid, via the shared `apply_unequip_item`.
 #[reducer]
 pub fn debug_unequip_item(
     ctx: &ReducerContext,
@@ -629,9 +443,6 @@ pub fn debug_unequip_item(
     crate::items::apply_unequip_item(ctx, character_guid, from_slot).map_err(crate::items::refused)
 }
 
-/// Auto-bank/auto-store-bank `character_guid`'s item in `slot` — drives the right-click-to-bank and
-/// right-click-to-withdraw paths by explicit guid, via the shared `apply_auto_bank_item` (the
-/// direction is inferred from `slot`).
 #[reducer]
 pub fn debug_auto_bank_item(
     ctx: &ReducerContext,
@@ -641,8 +452,6 @@ pub fn debug_auto_bank_item(
     crate::items::apply_auto_bank_item(ctx, character_guid, slot)
 }
 
-/// Repair `character_guid`'s item in `slot` to full durability — drives the shared `apply_repair_item`
-/// (the future vendor/player repair) by explicit guid, so durability wear/break/repair is verifiable.
 #[reducer]
 pub fn debug_repair_item(
     ctx: &ReducerContext,
@@ -652,9 +461,6 @@ pub fn debug_repair_item(
     crate::items::apply_repair_item(ctx, character_guid, slot)
 }
 
-/// Sell `character_guid`'s item in `slot` (whole stack) to `vendor_guid` — drives the player `sell_item`
-/// path by explicit guid, via the shared `apply_item_sell` (now vendor-gated like buy: credits money,
-/// removes the item, requires standing at a real vendor).
 #[reducer]
 pub fn debug_sell_item(
     ctx: &ReducerContext,
@@ -665,11 +471,6 @@ pub fn debug_sell_item(
     crate::actor::sell_item(ctx, character_guid, vendor_guid, slot)
 }
 
-/// Enter AreaTrigger `trigger_id` as `character_guid` — drives `enter_areatrigger`'s shared core
-/// (`apply_enter_areatrigger`) by explicit guid for the harness: credits any "explore" quest tied to
-/// the trigger, AND routes through a cross-map teleport if `trigger_id` is an imported
-/// `game_areatrigger_teleport` row — the same live runbook this debug twin drives for 224 exercises the
-/// Deadmines portal end-to-end without a physical CMSG_AREATRIGGER from the client.
 #[reducer]
 pub fn debug_enter_areatrigger(
     ctx: &ReducerContext,
@@ -680,9 +481,8 @@ pub fn debug_enter_areatrigger(
     Ok(())
 }
 
-/// Replay the Package's session-less AreaTrigger operation through its ordinary Core Gate.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // The expected crossing is the fixture assertion.
+#[allow(clippy::too_many_arguments)]
 pub fn debug_replay_sessionless_areatrigger(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -710,8 +510,6 @@ pub fn debug_replay_sessionless_areatrigger(
     Ok(())
 }
 
-/// Use the gameobject `go_guid` as `character_guid` — drives `use_gameobject` by explicit guid for the
-/// harness (CHEST rolls its loot, GOOBER grants quest credit), via the shared `apply_use_gameobject`.
 #[reducer]
 pub fn debug_use_gameobject(
     ctx: &ReducerContext,
@@ -721,9 +519,6 @@ pub fn debug_use_gameobject(
     crate::actor::use_gameobject(ctx, character_guid, go_guid)
 }
 
-/// Use the FIRST spawned gameobject of template `go_entry` as `character_guid` — same as
-/// `debug_use_gameobject` but resolves by template entry, so `spacetime call` can drive it with SMALL
-/// args (it mangles guids > 2^53). The parent uses this to server-verify the seeded chest/goober.
 #[reducer]
 pub fn debug_use_gameobject_entry(
     ctx: &ReducerContext,
@@ -739,19 +534,7 @@ pub fn debug_use_gameobject_entry(
     crate::actor::use_gameobject(ctx, character_guid, go.guid)
 }
 
-// `#[reducer]`: SpacetimeDB reducers take their arguments FLAT off the wire (`spacetime call`), so a parameter struct is not available.
 #[allow(clippy::too_many_arguments)]
-/// Spawn a gameobject (creating its template if absent) for harness verification — the seed only runs
-/// on `init`, so a re-published DB has no seed GOs, and `game_gameobject`'s Timestamp column blocks a
-/// SQL insert. Idempotent (deletes any prior GO at the derived HIGHGUID_GAMEOBJECT guid first).
-///
-/// `data1` (required skill level) + `gather_skill_line` (MINING 186 / HERBALISM 182) + `respawn_secs`
-/// (per-node respawn window in seconds, 0 ⇒ 3-min fallback) + `gather_gray` (skill-up gray ceiling, 0 ⇒
-/// the always-skill sentinel) are END-APPENDED args (the gateway tolerates extra END-appended reducer
-/// args, per the marathon note) so the ONE spawn lever can mint a GATHER node (`type_id` 25) as well as a
-/// CHEST/GOOBER — no dup lever. For a non-gather GO pass `... data1 0 gather_skill_line 0 respawn_secs 0
-/// gather_gray 0`; for a 30s-respawn Copper Vein pass `... data0 2770 data1 1 skill 186 respawn_secs 30
-/// gather_gray 0` (2770 = the real imported Copper Ore the vein grants).
 #[reducer]
 pub fn debug_spawn_gameobject(
     ctx: &ReducerContext,
@@ -765,8 +548,8 @@ pub fn debug_spawn_gameobject(
     z: f32,
     data1: u32,
     gather_skill_line: u32,
-    respawn_secs: u32, // END-appended (respawn-variance slice): 0 ⇒ the 3-min fallback; else the node's own window
-    gather_gray: u32,  // END-appended (skill-up-difficulty slice): 0 ⇒ the always-skill sentinel
+    respawn_secs: u32,
+    gather_gray: u32,
 ) -> Result<(), String> {
     if ctx
         .db
@@ -788,13 +571,11 @@ pub fn debug_spawn_gameobject(
                 respawn_secs,
                 gather_gray,
                 lock_id: 0,
-                size: 0.0, // no dump size, the gateway renders this at 1.0
+                size: 0.0,
             });
     }
     let guid = (0xF110u64 << 48) | template_entry as u64;
     ctx.db.game_gameobject().guid().delete(guid);
-    // Clear any prior Pick-Lock unlock for this DERIVED guid so a re-spawn of a locked
-    // template is deterministically LOCKED again (the verify's negative case relies on this).
     ctx.db.game_gameobject_unlocked().go_guid().delete(guid);
     let go = ctx
         .db
@@ -809,15 +590,11 @@ pub fn debug_spawn_gameobject(
             orientation: 0.0,
             state: 0,
             created_at: ctx.timestamp,
-            respawn_at_micros: 0, // a freshly-spawned node is ready (no pending respawn)
-            instance_id: 0,       // debug spawns land in the open world
+            respawn_at_micros: 0,
+            instance_id: 0,
             grid_x: lyracore_shared::spatial::grid_cell(x, y).0,
             grid_y: lyracore_shared::spatial::grid_cell(x, y).1,
             cell: lyracore_shared::spatial::cell_id_at(x, y),
-            // All-zero: the debug spawn lever doesn't carry a spawn quaternion this
-            // slice — the codec's yaw-only derive-from-orientation fallback covers it (orientation
-            // is also 0.0 here, so the derived quaternion is the identity rotation, byte-consistent
-            // with a hand-seeded fixture that never set these).
             rotation_0: 0.0,
             rotation_1: 0.0,
             rotation_2: 0.0,
@@ -827,11 +604,6 @@ pub fn debug_spawn_gameobject(
     Ok(())
 }
 
-/// Force the FIRST depleted gameobject of template `go_entry` to respawn NOW — flips it state 0 +
-/// clears its `respawn_at_micros` INLINE so the verify is deterministic with no wait for the ~4s sense
-/// tick (`pass_gameobject_respawn` would do the same flip once the armed time elapses). Resolves by
-/// template entry so `spacetime call` can drive it with SMALL args (it mangles guids > 2^53), mirroring
-/// `debug_use_gameobject_entry`. The professions verify lever.
 #[reducer]
 pub fn debug_force_gameobject_respawn(ctx: &ReducerContext, go_entry: u32) -> Result<(), String> {
     let gos = ctx.db.game_gameobject();
@@ -845,32 +617,6 @@ pub fn debug_force_gameobject_respawn(ctx: &ReducerContext, go_entry: u32) -> Re
     Ok(())
 }
 
-/// Stand up a TEST gathering POOL with no re-import (the POOL-model verify lever). Ensures each member's
-/// GATHER template exists, (re)creates the pool header + member point rows, then ARMS the pool to exactly
-/// `max_active` weighted-distinct active rows — so init already shows the rotation property and the
-/// MAX_ACTIVE invariant. Idempotent on `pool_id` (clears that pool's prior members + their live rows
-/// first). Args packed as a STRING (the `spacetime call` u64-mangling + the existing packed-import
-/// convention): `members` is `;`-separated points, each
-/// `template_entry,display_id,data0,data1,gather_skill_line,respawn_secs,map,x,y,z,o,weight` (12 fields).
-/// A higher-tier member is just a row with a different `template_entry` + a small `weight`.
-///
-/// `in_place` sets the pool's KIND (the tier-variety column): false = a ROAMING pool (gather → instant
-/// reroll, the node WANDERS — the importer's single-tier spatial pools); true = an IN-PLACE TIER point
-/// (`max_active` 1, members CO-LOCATED at one coord but of differing tiers — gather flips+arms the timer
-/// and the respawn pass weighted-RE-ROLLS the tier in place, so the point mostly re-presents the common
-/// tier and occasionally a rarer one, NO wander). Existing callers pass false (unchanged behavior).
-///
-/// Example A — a ROAMING pool (in_place false; pool 1, max 2, five Copper at weight 20 + one Tin at weight
-/// 2, 5s respawn, by the spawn; data0 2770 = the real imported Copper Ore the vein grants):
-///   spacetime call <db> debug_setup_gather_pool 1 2 false \
-///     '9999,259,2770,1,186,5,0,-100,-100,0,0,20;9999,259,2770,1,186,5,0,-110,-100,0,0,20;\
-///      9999,259,2770,1,186,5,0,-120,-100,0,0,20;9999,259,2770,1,186,5,0,-130,-100,0,0,20;\
-///      9999,259,2770,1,186,5,0,-140,-100,0,0,20;9998,259,2770,1,186,5,0,-150,-100,0,0,2'
-/// Example B — the IN-PLACE TIER demonstrator (in_place true; pool 2, max 1, Copper 1731 w85 + Tin 1732
-/// w15 CO-LOCATED at the real Goldshire coord — both members share x,y,z so the rolled tier never wanders):
-///   spacetime call <db> debug_setup_gather_pool 2 1 true \
-///     '1731,259,2770,1,186,300,0,-9620.11,-46.3336,47.3641,2.04204,85;\
-///      1732,259,2771,65,186,300,0,-9620.11,-46.3336,47.3641,2.04204,15'
 #[reducer]
 pub fn debug_setup_gather_pool(
     ctx: &ReducerContext,
@@ -885,8 +631,6 @@ pub fn debug_setup_gather_pool(
     let tmpl_tbl = ctx.db.game_gameobject_template();
     let gos = ctx.db.game_gameobject();
 
-    // CLEAR this pool's prior member rows + any live row at their derived guids (idempotent re-setup —
-    // mirrors the import's clear-then-load, but scoped to THIS pool so it never touches others).
     let prior: Vec<crate::gameobject::GameObjectPoolMember> =
         member_tbl.iter().filter(|m| m.pool_id == pool_id).collect();
     for m in &prior {
@@ -895,7 +639,6 @@ pub fn debug_setup_gather_pool(
         member_tbl.point_id().delete(m.point_id);
     }
 
-    // POOL header (upsert). `in_place` carries the pool's KIND through to the deplete/respawn branch.
     pool_tbl.pool_id().delete(pool_id);
     pool_tbl.insert(crate::gameobject::GameObjectPool {
         pool_id,
@@ -903,7 +646,6 @@ pub fn debug_setup_gather_pool(
         in_place,
     });
 
-    // MEMBER points: parse + ensure each GATHER template exists + insert the point row (auto_inc point_id).
     let pu32 = |s: &str| s.trim().parse::<u32>().map_err(|_| format!("bad u32: {s}"));
     let pf32 = |s: &str| s.trim().parse::<f32>().map_err(|_| format!("bad f32: {s}"));
     let mut count = 0u32;
@@ -924,7 +666,6 @@ pub fn debug_setup_gather_pool(
         let map_id = pu32(f[6])?;
         let (x, y, z, o) = (pf32(f[7])?, pf32(f[8])?, pf32(f[9])?, pf32(f[10])?);
         let weight = pu32(f[11])?;
-        // Ensure the GATHER template (type 25) — so a brand-new test entry needs no separate spawn call.
         if tmpl_tbl.entry().find(template_entry).is_none() {
             tmpl_tbl.insert(crate::gameobject::GameObjectTemplate {
                 entry: template_entry,
@@ -937,11 +678,11 @@ pub fn debug_setup_gather_pool(
                 respawn_secs,
                 gather_gray: 0,
                 lock_id: 0,
-                size: 0.0, // no dump size, the gateway renders this at 1.0
+                size: 0.0,
             });
         }
         member_tbl.insert(crate::gameobject::GameObjectPoolMember {
-            point_id: 0, // auto_inc
+            point_id: 0,
             pool_id,
             template_entry,
             map_id,
@@ -956,16 +697,10 @@ pub fn debug_setup_gather_pool(
     if count == 0 {
         return Err("pool setup had no members".to_string());
     }
-    // ARM: insert exactly max_active weighted-distinct live rows (the only place the active count is SET).
     crate::gameobject::arm_pool(ctx, pool_id);
     Ok(())
 }
 
-/// Force a pool RE-ROLL NOW for a deterministic no-wait verify (the ~4s sense tick would do the same on
-/// the armed timer). Deactivates `gathered_guid` and activates a different inactive weighted-chosen
-/// point — the active count stays `max_active`. `gathered_guid` is the live guid of the point to roll;
-/// resolve it from the SQL `SELECT guid FROM game_gameobject WHERE ...` (it's < 2^53 only for small
-/// point_ids — pass it after a `--` if negative-looking, though GO guids are large/unsigned).
 #[reducer]
 pub fn debug_force_pool_reroll(
     ctx: &ReducerContext,
@@ -985,8 +720,6 @@ pub fn debug_force_pool_reroll(
     Ok(())
 }
 
-/// Buy `count`× `item_entry` for `character_guid` — drives the player `buy_item` path by explicit
-/// guid, via the shared `apply_buy_item` (debits money, grants the item in a free backpack slot).
 #[reducer]
 pub fn debug_buy_item(
     ctx: &ReducerContext,
@@ -998,9 +731,6 @@ pub fn debug_buy_item(
     crate::actor::buy_item(ctx, character_guid, vendor_guid, item_entry, count)
 }
 
-/// Buy the next bank bag slot for `character_guid` at `banker_guid` — drives the purchase by explicit
-/// guid, via the shared `apply_buy_bank_slot`. Refusals carry the same `[N]` wire code the gateway
-/// reducer returns.
 #[reducer]
 pub fn debug_buy_bank_slot(
     ctx: &ReducerContext,
@@ -1014,8 +744,6 @@ pub fn debug_buy_bank_slot(
     ))
 }
 
-/// Split `count` units off `character_guid`'s stack in `slot` into the empty `to_slot` — drives the
-/// player `split_item` path by explicit guid, via the shared `apply_item_split`.
 #[reducer]
 pub fn debug_split_item(
     ctx: &ReducerContext,
@@ -1028,10 +756,6 @@ pub fn debug_split_item(
         .map_err(crate::items::refused)
 }
 
-/// Arm a melee engagement `attacker_guid` → `target_guid` directly (insert/retarget a `game_melee_attack`
-/// row) — the machine-test counterpart to the player `start_attack` (which is `ctx.sender`-bound and so
-/// undrivable from the CLI identity). Lets a test put a CREATURE into combat so the threat-retarget pass
-/// considers it, without a live client swing. No validation (dev only): the caller picks valid guids.
 #[reducer]
 pub fn debug_engage(
     ctx: &ReducerContext,
@@ -1055,8 +779,6 @@ pub fn debug_engage(
     } else {
         melee.insert(row);
     }
-    // Point the entity at its target too (real aggro arming sets `target_guid`; mirror it so the live
-    // row and the melee row agree before any retarget pass runs).
     let entities = ctx.db.game_world_entity();
     if let Some(mut e) = entities.guid().find(attacker_guid) {
         e.target_guid = target_guid;
@@ -1065,9 +787,6 @@ pub fn debug_engage(
     Ok(())
 }
 
-/// Cast `spell_id` from `caster_guid` AT `target_guid` — drives the target-aware `resolve_cast_at`
-/// (the player `cast_spell` resolves the target from the client; here it's explicit) so a direct-damage
-/// spell is machine-verifiable. Sources the caster level from its entity, like `debug_force_cast`.
 #[reducer]
 pub fn debug_cast_at(
     ctx: &ReducerContext,
@@ -1075,14 +794,9 @@ pub fn debug_cast_at(
     spell_id: u32,
     target_guid: u64,
 ) -> Result<(), String> {
-    // Debug direct cast resolves synchronously — not a timed-cast completion (instant packet
-    // sequence). It bypasses player spellbook admission so fixtures can cast rows they just staged.
     resolve_debug_cast_at(ctx, caster_guid, spell_id, target_guid)
 }
 
-/// Begin a (possibly cast-timed) cast from `caster_guid` AT `target_guid` — drives `begin_cast` so a
-/// spell with `cast_time_ms > 0` schedules a `PendingCast` that resolves when the cast finishes (the
-/// effect lands AFTER the bar, not instantly). Sources the caster level from its entity.
 #[reducer]
 pub fn debug_begin_cast(
     ctx: &ReducerContext,
@@ -1102,9 +816,6 @@ pub fn debug_begin_cast(
     )
 }
 
-/// Cast a GROUND-TARGETED spell at an explicit world point by caster guid — server-side proof of the
-/// ground-target dest plumbing (the CLI owns no entity, so it can't drive the real `cast_spell_at`). Drives the
-/// full `begin_cast(Some(dest))` path, so a TIMED ground spell also exercises the PendingCast dest carry.
 #[reducer]
 pub fn debug_cast_spell_at(
     ctx: &ReducerContext,
@@ -1132,15 +843,6 @@ pub fn debug_cast_spell_at(
     )
 }
 
-/// Seed `count` SYNTHETIC filler auras directly into `target_guid`'s buff (`debuff=false`) or debuff
-/// (`debuff=true`) `UNIT_FIELD_AURA` range, at slots `[0, count)` / `[BUFF_SLOT_COUNT, BUFF_SLOT_COUNT +
-/// count)` — the harness lever for proving the 32-buff/16-debuff cap end to end without
-/// hunting down that many distinct real spells. This is SETUP: it writes `game_aura` rows directly and
-/// skips `apply_group_conflict`/`pick_aura_slot` entirely, on purpose — the probe's own cast (a real
-/// `debug_cast_at`/player cast against the now-full range) is what exercises the policy boundary under
-/// test. Synthetic ids (`9_000_000 + slot`) so a real spell used by the probe cast can never collide
-/// with a filler row. Errors if `count` exceeds the range's real slot count (32 buff / 16 debuff) — the
-/// same geometry `pick_aura_slot` enforces, not an arbitrary harness limit.
 #[reducer]
 pub fn debug_fill_aura_slots(
     ctx: &ReducerContext,
@@ -1168,7 +870,7 @@ pub fn debug_fill_aura_slots(
     let auras = ctx.db.game_aura();
     let now = ctx.timestamp;
     let expires = now
-        .checked_add(TimeDuration::from_micros(3_600_000_000)) // 1h — outlives any probe session
+        .checked_add(TimeDuration::from_micros(3_600_000_000))
         .unwrap_or(now);
     for i in 0..count {
         let slot = base_slot + i;
@@ -1198,7 +900,7 @@ pub fn debug_fill_aura_slots(
             next_tick_micros: 0,
             channel_target: 0,
             enters_combat: false,
-            proc_flags: 0, // a filler aura is not a Proc
+            proc_flags: 0,
             proc_chance: 0,
             proc_ppm: 0.0,
             proc_ex: 0,
@@ -1213,9 +915,6 @@ pub fn debug_fill_aura_slots(
     Ok(())
 }
 
-/// Log the reputation vendor discount `player_guid` gets at a creature whose FactionTemplate is
-/// `faction_template_id` — runs the real `vendor_discount_pct` resolution against live data (server-side
-/// proof without needing to drive a full buy, whose vendor guid >2^53 mangles through `spacetime call`).
 #[reducer]
 pub fn debug_log_vendor_discount(
     ctx: &ReducerContext,
@@ -1227,7 +926,6 @@ pub fn debug_log_vendor_discount(
     Ok(())
 }
 
-// `#[reducer]`: SpacetimeDB reducers take their arguments FLAT off the wire (`spacetime call`), so a parameter struct is not available.
 #[allow(clippy::too_many_arguments)]
 #[reducer]
 pub fn debug_score_movement(
@@ -1247,7 +945,7 @@ pub fn debug_score_movement(
         &crate::world::MovementDelta {
             old_x,
             old_y,
-            old_z: 0.0, // unused here: `score_and_log_movement` reads only x/y; `.moved()` is movement_update-only
+            old_z: 0.0,
             x,
             y,
             z,
@@ -1258,9 +956,6 @@ pub fn debug_score_movement(
     Ok(())
 }
 
-/// Take the item in `corpse_guid`'s loot slot `loot_slot` into `character_guid`'s bags — drives the
-/// player `take_loot` path by explicit guid (the mouse-only loot window is undrivable), via the shared
-/// `apply_take_loot`.
 #[reducer]
 pub fn debug_take_loot(
     ctx: &ReducerContext,
@@ -1271,12 +966,6 @@ pub fn debug_take_loot(
     crate::actor::take_loot(ctx, character_guid, corpse_guid, loot_slot)
 }
 
-/// Equip (or swap) `character_guid`'s main-hand weapon to `item_entry` — drives the weapon-damage-in
-/// -swing test without the mouse-only equip UI (the same DirectInput wall as loot/equip clicks).
-/// Upserts the owned item instance in the main-hand slot (15) to the given template entry, stamping
-/// the live entity's owner identity so the per-owner RLS filter still shows it. The swing-damage
-/// lookup joins `game_item_template`, so a stronger seeded weapon immediately feeds `roll_swing` /
-/// `debug_compute_swing`. Durability seeds from the template (0 if the template isn't loaded). [entity]
 #[reducer]
 pub fn debug_equip_weapon(
     ctx: &ReducerContext,
@@ -1291,10 +980,6 @@ pub fn debug_equip_weapon(
     )
 }
 
-/// Equip (or swap) `character_guid`'s OFF-HAND to `item_entry` — the off-hand twin of
-/// [`debug_equip_weapon`], for shield-block testing without the mouse-only equip UI. Equip a shield
-/// (e.g. seed entry 53 "Battered Buckler") here and `effective_block_value`/`effective_block_bp` arm the
-/// block band, verifiable via `debug_compute_swing` or a live fight with no client interaction. [entity]
 #[reducer]
 pub fn debug_equip_offhand(
     ctx: &ReducerContext,
@@ -1309,10 +994,6 @@ pub fn debug_equip_offhand(
     )
 }
 
-/// Shared core of the `debug_equip_*` reducers: upsert `character_guid`'s owned item instance in `slot`
-/// to `item_entry`, stamping the live entity's owner identity (so the per-owner RLS filter still shows
-/// it) and seeding durability from the template. Find existing gear by slot, since moving it
-/// preserves its GUID.
 fn equip_into(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -1327,8 +1008,6 @@ fn equip_into(
         .transpose()?
         .unwrap_or(0);
     let durability = tmpl.as_ref().map(|t| t.max_durability).unwrap_or(0);
-    // This helper places the item DIRECTLY on the body (bypassing the pickup->equip two-step apply_item_move
-    // drives), so either a BoP or a BoE template binds immediately here — mirroring "the item is now worn".
     let soulbound = tmpl
         .as_ref()
         .map(|t| crate::items::binds_on_grant(t.bonding) || crate::items::binds_on_equip(t.bonding))
@@ -1353,7 +1032,7 @@ fn equip_into(
             stack_count: 1,
             durability,
             created_at: ctx.timestamp,
-            enchant_id: 0, // debug-granted item — unenchanted
+            enchant_id: 0,
             soulbound,
             random_property_id,
             item_text_id: 0,
@@ -1362,9 +1041,6 @@ fn equip_into(
     Ok(())
 }
 
-/// Accept quest `quest_entry` from giver `giver_guid` for `character_guid` — drives the player
-/// `accept_quest` path by explicit guid (the gossip/quest UI is mouse-only / not yet wired), via the
-/// shared `apply_accept_quest`. The harness positions the player in range of the giver first.
 #[reducer]
 pub fn debug_accept_quest(
     ctx: &ReducerContext,
@@ -1375,10 +1051,6 @@ pub fn debug_accept_quest(
     crate::actor::accept_quest(ctx, character_guid, giver_guid, quest_entry)
 }
 
-/// Relay-stress: ONE transaction — the relay-carried rows (a quest
-/// kill credit for `victim_entry` and an item grant). The wire test asserts the client still
-/// receives SMSG_QUESTUPDATE_ADD_KILL and SMSG_ITEM_PUSH_RESULT out of this fat transaction — the
-/// delivery guarantee the coordinator relay migration exists to provide.
 #[reducer]
 pub fn debug_stress_relay(
     ctx: &ReducerContext,
@@ -1398,10 +1070,6 @@ pub fn debug_stress_relay(
     Ok(())
 }
 
-/// Grant quest `quest_entry` to `character_guid` with NO giver — stages a quest in the log for live
-/// testing (verifying the quest-log and kill-feedback paths). Bypasses the giver validation that the
-/// player/`debug_accept_quest` path needs, because the giver's creature guid is a u64 > 2^53 that the CLI
-/// `spacetime call` mangles via JSON f64. Same insert as a real accept, minus the gates.
 #[reducer]
 pub fn debug_grant_quest(
     ctx: &ReducerContext,
@@ -1411,24 +1079,16 @@ pub fn debug_grant_quest(
     crate::actor::stage_quest(ctx, character_guid, quest_entry)
 }
 
-/// Force-expire `character_guid`'s `quest_entry`, the harness twin of the timed-quest
-/// tick (`quest::quest_timer_pass`), for the runbook: verify `SMSG_QUESTUPDATE_FAILEDTIMER` fires on
-/// the wire and the quest is re-acceptable, without waiting out `limit_time` seconds live.
 #[reducer]
 pub fn debug_expire_quest(
     ctx: &ReducerContext,
     character_guid: u64,
     quest_entry: u32,
 ) -> Result<(), String> {
-    // REFUSE verdict: the write lands in `game_character_quest`, a MANIFEST table — the
-    // export blob's own enumeration — so post-begin it is a lost write cross-database.
     crate::helpers::require_character(ctx, character_guid)?;
     crate::quest::debug_force_expire(ctx, character_guid, quest_entry)
 }
 
-/// Share `quest_entry` from `character_guid` to its party, drives
-/// `push_quest_to_party` by explicit guid (the CLI identity owns no entity to resolve via
-/// `ctx.sender()`).
 #[reducer]
 pub fn debug_push_quest(
     ctx: &ReducerContext,
@@ -1438,9 +1098,6 @@ pub fn debug_push_quest(
     crate::quest::apply_push_quest_to_party(ctx, character_guid, quest_entry)
 }
 
-/// Fire the `on_gossip_select` notify-hook by explicit guid — the harness twin of
-/// the player `gossip_select` reducer (the CLI identity owns no entity, and a real gossip click is
-/// mouse-only). Pure notification, no gossip behavior.
 #[reducer]
 pub fn debug_gossip_select(
     ctx: &ReducerContext,
@@ -1461,9 +1118,6 @@ pub fn debug_gossip_select(
     Ok(())
 }
 
-/// Turn quest `quest_entry` in to giver `giver_guid` for `character_guid` — drives the player
-/// `turn_in_quest` path by explicit guid, via the shared `apply_turn_in_quest` (grants money/XP/items).
-/// `reward_index` picks the choice reward (pick-1-of-N); pass 0 for a quest with no choice rewards.
 #[reducer]
 pub fn debug_turn_in_quest(
     ctx: &ReducerContext,
@@ -1475,8 +1129,6 @@ pub fn debug_turn_in_quest(
     crate::actor::turn_in_quest(ctx, character_guid, giver_guid, quest_entry, reward_index)
 }
 
-/// Start or renew a one-waypoint Route Path for `guid` to (`x`, `y`, `z`) through
-/// `creatures::tick::emit_creature_path`, the call a Package runner makes.
 #[reducer]
 pub fn debug_creature_path(
     ctx: &ReducerContext,
@@ -1492,11 +1144,6 @@ pub fn debug_creature_path(
     Ok(())
 }
 
-/// Kill creature `target_guid` crediting player `killer_guid` — drives the SHARED killing-blow path
-/// (`combat::kill_creature` with a killer), so it produces the exact same corpse + loot AND the XP +
-/// quest-objective credit a real player kill does. The machine-test counterpart to fighting a mob to
-/// death: lets a test advance a kill quest deterministically without the combat tick. Errors only if
-/// nothing was killed (missing guid / a player / an already-dead unit).
 #[reducer]
 pub fn debug_kill_creature(
     ctx: &ReducerContext,
@@ -1518,8 +1165,6 @@ pub fn debug_kill_nearest(
 ) -> Result<(), String> {
     let killer = crate::helpers::live_entity(ctx, killer_guid)
         .map_err(|_| format!("killer {killer_guid} not in world"))?;
-    // Same-partition scan (crate::helpers::nearest_entity) — a raw squared distance across
-    // maps/instances is meaningless, "nearest" could otherwise resolve to another continent.
     let target_guid = crate::helpers::nearest_entity(ctx, &killer, |e| {
         e.entry == creature_entry && e.guid != killer_guid && !e.dead
     })
@@ -1532,20 +1177,10 @@ pub fn debug_kill_nearest(
     }
 }
 
-/// SKIN the NEAREST skinnable BEAST CORPSE to `character_guid` (Skinning, professions) — the
-/// small-arg test lever (a creature corpse's own guid is a u64 > 2^53 the CLI `spacetime call` mangles, so
-/// the big corpse guid is resolved SERVER-SIDE here, mirroring `debug_kill_nearest`'s nearest-search). It
-/// finds the closest dead non-player creature whose template `creature_type == BEAST_TYPE` and isn't yet
-/// `skinned`, then funnels through the shared `loot::skin_corpse` core (auto-learn → grant leather →
-/// climb Skinning → mark skinned). A future `CMSG`-routed skin over the open corpse will share that core.
 #[reducer]
 pub fn debug_skin_nearest(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     let looter = crate::helpers::live_entity(ctx, character_guid)
         .map_err(|_| format!("skinner {character_guid} not in world"))?;
-    // A skinnable target: a dead non-player BEAST corpse not yet skinned, in the looter's OWN
-    // (map, instance) partition (mirrors `loot::can_skin`'s live gate, so the
-    // debug lever can never find a corpse the real skin path would refuse). Same-partition scan
-    // via `crate::helpers::nearest_entity`.
     let corpse_guid = crate::helpers::nearest_entity(ctx, &looter, |e| {
         e.dead && !e.is_player() && !e.skinned && crate::loot::entry_is_beast(ctx, e.entry)
     })
@@ -1554,29 +1189,16 @@ pub fn debug_skin_nearest(ctx: &ReducerContext, character_guid: u64) -> Result<(
     crate::loot::skin_corpse(ctx, character_guid, corpse_guid)
 }
 
-/// FISH at `character_guid`'s spot (FISHING, completing the 13) — the small-arg test twin of the `fish`
-/// player reducer (the CLI identity owns no entity, so the guid is explicit). Drives the shared
-/// `loot::apply_fish` core (auto-learn → grant a random fish from the pool → climb Fishing). Verify: a fish
-/// item (6291/6303/6289) appears in the backpack + the Fishing skill row climbs.
 #[reducer]
 pub fn debug_fish(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     crate::loot::apply_fish(ctx, character_guid)
 }
 
-/// DISENCHANT the item in equipment `slot` for `character_guid` (ENCHANTING, completing the 13) — the
-/// small-arg test twin of the `disenchant` player reducer. Drives `loot::apply_disenchant` (consume the
-/// item → grant Strange Dust 10940 → climb Enchanting). Verify: the item row is DELETED, mats granted,
-/// Enchanting +1.
 #[reducer]
 pub fn debug_disenchant(ctx: &ReducerContext, character_guid: u64, slot: u8) -> Result<(), String> {
     crate::loot::apply_disenchant(ctx, character_guid, slot)
 }
 
-/// ENCHANT the item in `target_slot` for `character_guid` with `enchant_id` (ENCHANTING, completing the
-/// 13) — the small-arg test twin of the `enchant_item` player reducer. Drives `loot::apply_enchant_item`
-/// (validate id → consume mats → stamp the per-instance overlay → climb Enchanting). Verify:
-/// `item_instance.enchant_id == enchant_id`, then `debug_compute_swing` shows the swing/strength readout
-/// rose by the enchant's +stat (server-real); a Stamina enchant moves max-HP via recompute_vitals.
 #[reducer]
 pub fn debug_enchant_item(
     ctx: &ReducerContext,
@@ -1587,10 +1209,6 @@ pub fn debug_enchant_item(
     crate::loot::apply_enchant_item(ctx, character_guid, target_slot, enchant_id)
 }
 
-/// Start `attacker_guid`'s RANGED auto-attack on the NEAREST live creature, with `spell_id`
-/// (75 Auto Shot / 5019 wand Shoot) — the small-arg test hook (a creature's own guid is a u64 > 2^53 the
-/// CLI `spacetime call` mangles). Requires a ranged weapon equipped (the shared gate enforces it). Mirrors
-/// `debug_kill_nearest`'s nearest-search, then arms the engagement via `apply_start_ranged_attack`.
 #[reducer]
 pub fn debug_ranged_attack_nearest(
     ctx: &ReducerContext,
@@ -1599,7 +1217,6 @@ pub fn debug_ranged_attack_nearest(
 ) -> Result<(), String> {
     let attacker = crate::helpers::live_entity(ctx, attacker_guid)
         .map_err(|_| format!("attacker {attacker_guid} not in world"))?;
-    // Same-partition scan (crate::helpers::nearest_entity) — see debug_kill_nearest.
     let target_guid = crate::helpers::nearest_entity(ctx, &attacker, |e| {
         e.guid != attacker_guid && !e.dead && !e.is_player()
     })
@@ -1608,10 +1225,6 @@ pub fn debug_ranged_attack_nearest(
     crate::actor::ranged_attack(ctx, attacker_guid, target_guid, spell_id)
 }
 
-/// Teach `character_guid` the spell `spell_id` (test hook — e.g. Auto Shot 75 on a non-Hunter so the
-/// client's spellbook gets it and `CastSpellByName("Auto Shot")` works). Drives the shared
-/// `spell::learn_spell` by explicit guid (the player path is `ctx.sender`-bound). Needs a relog for the
-/// learned spell to reach the client spellbook (sent in SMSG_INITIAL_SPELLS at login).
 #[reducer]
 pub fn debug_learn_spell(
     ctx: &ReducerContext,
@@ -1623,8 +1236,6 @@ pub fn debug_learn_spell(
     Ok(())
 }
 
-/// Set the realm XP-rate (`game_config` singleton) for testing — upserts row 0 (the seed default may be
-/// absent on a re-published DB). Negative clamps to 0. Production realms can also `UPDATE game_config`.
 #[reducer]
 pub fn debug_set_xp_rate(ctx: &ReducerContext, rate: f32) -> Result<(), String> {
     let rate = rate.max(0.0);
@@ -1649,22 +1260,6 @@ pub fn debug_set_xp_rate(ctx: &ReducerContext, rate: f32) -> Result<(), String> 
     Ok(())
 }
 
-/// The REQUIRED post-publish step for the `cell` column migration.
-///
-/// `cell` was END-appended to the four AOI-scoped tables with `#[default(0i64)]`, and 0 is not a
-/// sentinel: it is the legitimate id of cell (0, 0). So on the first publish EVERY
-/// pre-existing row claims to live in that one cell, and the AOI subscription — which now probes
-/// `cell` by equality — finds nothing where those rows actually are. Moving entities self-heal on
-/// their next heartbeat or spline leg (sub-second), but **gameobjects are static and never re-stamp
-/// themselves**: without this sweep, every imported GO in the world stays invisible forever.
-///
-/// Run once per shard immediately after publishing, on all five databases:
-/// `spacetime call <db> debug_backfill_cell_ids`
-///
-/// Idempotent and safe to re-run: it recomputes `cell` from each row's own already-correct
-/// `grid_x`/`grid_y` (NOT from `x`/`y` — re-deriving the grid here would silently double as a
-/// re-grid, which is `debug_regrid`'s job and a different decision) and writes only rows that differ.
-/// Collect-then-update so the table is not mutated mid-iteration.
 #[reducer]
 pub fn debug_backfill_cell_ids(ctx: &ReducerContext) -> Result<(), String> {
     let mut totals: Vec<(&str, usize)> = Vec::new();
@@ -1731,10 +1326,6 @@ pub fn debug_backfill_cell_ids(ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Re-stamp `grid_x`/`grid_y` on every `game_world_entity` from its live `(x, y)` with the CURRENT
-/// `GRID_CELL_SIZE`. Run after changing the AOI cell size: the columns are baked, so a constant change
-/// alone leaves stationary entities at stale cells (moving ones self-correct on their next move).
-/// Collect-then-update so we don't mutate the table mid-iteration. Idempotent full sweep.
 #[reducer]
 pub fn debug_regrid(ctx: &ReducerContext) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();
@@ -1742,8 +1333,6 @@ pub fn debug_regrid(ctx: &ReducerContext) -> Result<(), String> {
         .iter()
         .filter_map(|e| {
             let (gx, gy) = spatial::grid_cell(e.x, e.y);
-            // `cell` too — a migrated row has the RIGHT grid_x/grid_y and a stale cell of 0,
-            // so comparing only the grid columns would skip every row this sweep exists to fix.
             (e.grid_x != gx || e.grid_y != gy || e.cell != spatial::grid_cell_id(gx, gy))
                 .then_some((e.guid, gx, gy))
         })
@@ -1761,10 +1350,6 @@ pub fn debug_regrid(ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Grant `amount` reputation for `character_guid` with `faction_id` (server-verify hook — quest-rep is
-/// the only live caller, and the player turn-in path is `ctx.sender`-bound). Drives `reputation::grant_reputation`
-/// directly; no-ops if the faction has no rep bar / is unknown. Verify via `SELECT * FROM game_player_reputation`
-/// and the relayed `SMSG_SET_FACTION_STANDING`. Faction ids are small (< 2^53) so `spacetime call` carries them fine.
 #[reducer]
 pub fn debug_grant_reputation(
     ctx: &ReducerContext,
@@ -1772,19 +1357,11 @@ pub fn debug_grant_reputation(
     faction_id: u32,
     amount: i32,
 ) -> Result<(), String> {
-    // REFUSE verdict: `game_player_reputation` is a MANIFEST table — see
-    // `debug_expire_quest` for the same reasoning.
     crate::helpers::require_character(ctx, character_guid)?;
     crate::reputation::grant_reputation(ctx, character_guid, faction_id, amount);
     Ok(())
 }
 
-/// Buy spell `spell_id` from the trainer whose creature-template `trainer_entry` is spawned in-world, for
-/// `character_guid` — drives the validated `trainer::buy_trainer_spell` by explicit small args (the player
-/// path is `ctx.sender`-bound, and a trainer GUID is > 2^53 so `spacetime call` would mangle it; the
-/// template entry is small). Resolves the FIRST spawned non-player entity of that entry, then runs the
-/// SAME buy logic (range/flag/level/cost/known gates → charge + learn_spell). Verify via
-/// `SELECT * FROM game_player_spell` (row appears) + the caster's `money` dropping.
 #[reducer]
 pub fn debug_buy_trainer_spell(
     ctx: &ReducerContext,
@@ -1801,10 +1378,6 @@ pub fn debug_buy_trainer_spell(
     crate::actor::trainer_buy(ctx, character_guid, trainer.guid, spell_id)
 }
 
-/// Learn a talent for `character_guid` (drives the validated `talent::do_learn_talent` by explicit guid —
-/// the player `learn_talent` is `ctx.sender`-bound and undrivable from the CLI identity). Applies the
-/// talent's passive aura at the new rank immediately (no relog) so the combat effect is verifiable via
-/// `debug_compute_swing`. Errors on the same gates as the player path (no points / max rank / tier / prereq).
 #[reducer]
 pub fn debug_learn_talent(
     ctx: &ReducerContext,
@@ -1815,11 +1388,6 @@ pub fn debug_learn_talent(
     crate::talent::do_learn_talent(ctx, character_guid, e.owner_identity, talent_id).map(|_| ())
 }
 
-/// Reset every learned talent for `character_guid` at `trainer_guid` (drives the validated
-/// `talent::do_reset_talents` by explicit guid — the player `reset_talents` is `ctx.sender`-bound and
-/// undrivable from the CLI identity). Same trainer/range gates + escalating gold cost as the player
-/// path. Verify via `SELECT * FROM game_character_talent` (rows gone), `game_aura` (passive auras gone),
-/// `game_player_spell` (taught abilities gone), and `game_character.money`/`respec_count`.
 #[reducer]
 pub fn debug_reset_talents(
     ctx: &ReducerContext,
@@ -1829,27 +1397,10 @@ pub fn debug_reset_talents(
     crate::talent::do_reset_talents(ctx, character_guid, trainer_guid).map(|_| ())
 }
 
-/// Floor for a dedicated per-instance tick interval. Every firing is a transaction on the ONE
-/// serialized commit stream: 10 instances at 100ms is already 100 extra transactions/sec preempting
-/// player actions. Anything tighter than 50ms has no gameplay payoff at 1.12 animation cadences.
 const INSTANCE_TICK_MS_FLOOR: u64 = 50;
 
-/// Ceiling for `debug_arm_instance_tick`: bounds `tick_ms` so `tick_ms * 1000` never overflows into
-/// a negative interval, which would refire continuously.
 const INSTANCE_TICK_MS_CEIL: u64 = 600_000;
 
-/// Arm (or re-arm) a DEDICATED creature-tick row for `instance_id` at `tick_ms`: that
-/// instance's creature passes then fire on THIS row at its own cadence, and the catch-all row skips
-/// the instance (coverage is a partition — see `TickScope` in creatures/ai.rs). The global due-time
-/// passes (decay/respawn/regen/combat-drop) STAY on the catch-all row for all instances, so this knob
-/// only smooths movement/AI latency. It buys NO parallel throughput, and
-/// each firing taxes the shared serialized commit stream; use tight cadences sparingly and read the
-/// once-a-minute "pass rows-visited" log line to see what each row actually scans.
-///
-/// `instance::create_instance` inserts exactly this row shape (500ms default) and
-/// `instance::teardown_instance` deletes it, as `debug_disarm_instance_tick` does. This reducer is
-/// the operator RETUNE lever for a live instance's cadence.
-/// Idempotent per instance (replaces any existing dedicated row).
 #[reducer]
 pub fn debug_arm_instance_tick(
     ctx: &ReducerContext,
@@ -1868,7 +1419,6 @@ pub fn debug_arm_instance_tick(
         return Err(format!("tick_ms {tick_ms} above the {INSTANCE_TICK_MS_CEIL}ms ceiling (overflow guard — see the const's doc)"));
     }
     let sched = ctx.db.game_creature_move_schedule();
-    // Replace any existing dedicated row for this instance (re-arm = retune the cadence).
     let stale: Vec<u64> = sched
         .iter()
         .filter(|r| r.instance_id == instance_id)
@@ -1885,10 +1435,6 @@ pub fn debug_arm_instance_tick(
     Ok(())
 }
 
-/// Remove the dedicated creature-tick row for `instance_id`, coverage of that
-/// instance returns to the catch-all row on its next firing (the `TickScope` rebuild is per firing),
-/// so its creatures keep ticking at the global 0.5s cadence; nothing is ever stranded. This is also
-/// the future instance-reap's tick-row cleanup.
 #[reducer]
 pub fn debug_disarm_instance_tick(ctx: &ReducerContext, instance_id: u64) -> Result<(), String> {
     if instance_id == crate::creatures::GLOBAL_TICK_INSTANCE {
@@ -1909,22 +1455,6 @@ pub fn debug_disarm_instance_tick(ctx: &ReducerContext, instance_id: u64) -> Res
     Ok(())
 }
 
-/// Server-side integration probe for the `A_COMBAT_HEALTH_REGEN_PCT` aura (combat health regen
-/// in combat). Reads the LIVE `game_aura` table for `character_guid`, sums every active
-/// `A_COMBAT_HEALTH_REGEN_PCT` aura effect (exactly as the cycle's regeneration phase does), then
-/// computes the
-/// expected per-tick delta using the same `regen_health_in_combat` path. Logs the result at INFO.
-///
-/// Returns `Ok` when the pct sum AND the tick delta are both non-zero (the aura is present AND is
-/// large enough to move health by at least 1 HP per tick). Returns `Err` with a diagnostic otherwise
-/// so the caller can distinguish "no aura" from "aura too small for the entity's stats".
-///
-/// **Usage** (verify a Human has the regen passive and will tick in combat):
-/// ```text
-/// spacetime call debug_verify_combat_regen '[<guid>]'
-/// spacetime logs | grep verify_combat_regen
-/// ```
-/// The logs show: `pct=10 full_tick=71 partial=7 health=950 max=1000 → would_heal=957`
 #[reducer]
 pub fn debug_verify_combat_regen(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     let e = crate::helpers::live_entity(ctx, character_guid)?;
@@ -1951,10 +1481,6 @@ pub fn debug_verify_combat_regen(ctx: &ReducerContext, character_guid: u64) -> R
     Ok(())
 }
 
-/// Cast `spell_id` as `character_guid` THROUGH the spellbook gate (`knows_spell`) — the by-guid mirror of
-/// the sender-bound `cast_spell`, so a test can verify the learnable-spell gate: the cast is
-/// rejected until the spell is in the baseline kit OR learned (e.g. via an ability talent), then accepted.
-/// Unlike `debug_cast_at` (which drives `resolve_cast_at` and BYPASSES the gate), this exercises the gate.
 #[reducer]
 pub fn debug_cast_spell(
     ctx: &ReducerContext,
@@ -1982,11 +1508,6 @@ pub fn debug_cast_spell(
     )
 }
 
-/// Read back the two `build.rs`-generated character-owned-sweep registries
-/// LIVE, inside the actual wasm runtime (not just `cargo test`, which never proved the build.rs codegen
-/// survives the `wasm32-unknown-unknown` compile + the SpacetimeDB module-init path). Logs both slice
-/// lengths and errors out if either is unexpectedly empty — a silently-empty registry (the wasm-ld/
-/// codegen regression this whole mechanism has to guard against) must be LOUD, not a no-op sweep.
 #[reducer]
 pub fn debug_sweep_slice_lens(_ctx: &ReducerContext) -> Result<(), String> {
     let delete_len = crate::CHARACTER_OWNED_DELETE_SWEEPS.len();
@@ -2003,24 +1524,12 @@ pub fn debug_sweep_slice_lens(_ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
-/// (Re)seed the scenario-runner fixtures: quest 50900 + questgiver 51003 + vendor
-/// 51004 + faction 79 rep bar + a Lesser Heal trainer offering on 51001. Idempotent
-/// (`seed::seed_scenario_fixtures` inserts only if absent); same precedent as
-/// `debug_seed_pw_shield_fixture`. The scenario orchestrators call this before every run.
 #[reducer]
 pub fn debug_seed_scenario_fixtures(ctx: &ReducerContext) {
     crate::seed::seed_scenario_fixtures(ctx);
-    // Post-ETL one-call restore (2026-07-16): the spell-fixture seeders ride along so a single
-    // reducer re-arms EVERY suite fixture after an import pass (Test Regeneration 50137 and
-    // Test PW:Shield 50072 were found missing live — only the scenario NPC/quest slice was being
-    // reseeded, and the suite's combat-regen probe hard-failed on "unknown spell 50137").
     crate::seed::seed_regen_fixture(ctx);
     crate::seed::seed_pw_shield_fixture(ctx);
     crate::seed::seed_stacking_probe_fixture(ctx);
-    // row_count: quest 50900 (1) + how many of the 3 scenario NPC templates (questgiver 51003,
-    // vendor 51004, weapon master 51005) are present after this call — an anchor-row proxy for the
-    // fixture's full spread across quest/text/objective/reward/vendor/trainer tables, not an exact
-    // total.
     let quest = ctx
         .db
         .game_quest_template()
@@ -2034,8 +1543,6 @@ pub fn debug_seed_scenario_fixtures(ctx: &ReducerContext) {
     crate::import_meta::stamp(ctx, "debug_seed_scenario_fixtures", "", "", quest + npcs);
 }
 
-/// Set a character's purse to an EXACT copper amount (live entity + persisted row) so scenario money
-/// assertions are deterministic run-over-run — idempotent by design.
 #[reducer]
 pub fn debug_set_money(
     ctx: &ReducerContext,
@@ -2043,7 +1550,6 @@ pub fn debug_set_money(
     copper: u32,
 ) -> Result<(), String> {
     let chars = ctx.db.game_character();
-    // REFUSE verdict — harness writers get the same fence as production ones.
     let mut c = crate::helpers::require_character(ctx, character_guid)?;
     c.money = copper;
     chars.guid().update(c);
@@ -2055,10 +1561,6 @@ pub fn debug_set_money(
     Ok(())
 }
 
-/// Set a live entity's power (mana/rage/energy) for scenario staging, lifting `max_power` when
-/// needed — a no-import sandbox has no mana curve (`game_level_stats` empty), so a wire-created
-/// caster logs in with 0/0 mana and every costed cast would fail its power gate. Mirrors
-/// `debug_set_health`'s live-entity contract.
 #[reducer]
 pub fn debug_set_power(ctx: &ReducerContext, guid: u64, power: u32) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();

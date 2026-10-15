@@ -1,14 +1,3 @@
-// Reading the Base Snapshot: the derived `game_spell` / `game_spell_effect` rows the importer wrote
-// with `--spell-snapshot`, which are the only base data a Datascript can see.
-//
-// The snapshot is READ-ONLY in the strong sense: this module returns copies, and nothing in the
-// library writes to it. It is also the ONLY source of rows a Datascript can read. A Package's
-// generated artifacts are never opened here, so one Package cannot observe another's Delta — not by
-// policy, but because there is no code path that would.
-//
-// Column names in the snapshot are the DURABLE ones, the same names the artifact carries. The
-// generated names an author writes are resolved to them by the catalogue in `schema.ts`.
-
 import { MAX_SPELL_EFFECT_INDEX } from "./ids.ts";
 import { BaseDataError } from "./refusals.ts";
 import {
@@ -18,16 +7,12 @@ import {
 } from "./schema.ts";
 import type { FieldValue } from "./canonical.ts";
 
-/// The snapshot format this library reads.
 const SNAPSHOT_VERSION = 1;
 
-/// One base row: every claimable column, by its durable name.
 export type BaseRow = ReadonlyMap<string, FieldValue>;
 
-/// The base data one Datascript run reads.
 export class BaseSnapshot {
   private readonly spells: Map<number, BaseRow>;
-  /// Keyed by spell, then by effect index, so a clone can copy exactly the slots the base fills.
   private readonly effects: Map<number, Map<number, BaseRow>>;
 
   private constructor(
@@ -38,8 +23,6 @@ export class BaseSnapshot {
     this.effects = effects;
   }
 
-  /// Parse a snapshot. Refuses an unknown version and a row that does not carry every column,
-  /// because a partial base row would silently become a partial clone.
   static parse(json: string, origin: string): BaseSnapshot {
     let root: unknown;
     try {
@@ -68,8 +51,6 @@ export class BaseSnapshot {
     for (const raw of expectArray(record.game_spell_effect, origin, "game_spell_effect")) {
       const spellId = expectNumber(raw, "spell_id", origin);
       const effectIndex = expectNumber(raw, "effect_index", origin);
-      // A row outside the three real effect slots is one no Package could ever claim, so the
-      // snapshot and the claim rules would disagree about what exists. Say so rather than hide it.
       if (effectIndex < 0 || effectIndex > MAX_SPELL_EFFECT_INDEX) {
         throw new BaseDataError(
           `${origin}: spell ${spellId} carries an effect at index ${effectIndex}; a spell has ` +
@@ -87,8 +68,6 @@ export class BaseSnapshot {
     return new BaseSnapshot(spells, effects);
   }
 
-  /// The base header row, or a refusal naming the spell. A Datascript may only build on base data it
-  /// can actually see.
   spell(spellId: number): BaseRow {
     const row = this.spells.get(spellId);
     if (!row) {
@@ -100,12 +79,10 @@ export class BaseSnapshot {
     return row;
   }
 
-  /// The base effect rows of a spell, by effect index. Empty when the spell has none.
   effectsOf(spellId: number): ReadonlyMap<number, BaseRow> {
     return this.effects.get(spellId) ?? new Map();
   }
 
-  /// How many rows the snapshot holds, for a build to report.
   get size(): { spells: number; effects: number } {
     let effects = 0;
     for (const slots of this.effects.values()) effects += slots.size;
@@ -136,9 +113,6 @@ function expectNumber(
   return value;
 }
 
-/// One row's claimable columns, narrowed to the types the catalogue declares. The snapshot writer is
-/// the Package Delta canonical writer, so an unsigned 64-bit value arrives as a decimal string here
-/// exactly as it would inside a claim.
 function readRow(
   raw: Record<string, unknown>,
   columns: Record<string, Column>,

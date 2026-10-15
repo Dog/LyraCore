@@ -1,5 +1,3 @@
-//! Pinned CMaNGOS presentation-action mapping.
-
 use std::collections::HashSet;
 
 use super::eventai::{Dependency, MappingFailure, SourceNormalization};

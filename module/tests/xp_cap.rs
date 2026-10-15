@@ -1,10 +1,7 @@
-//! Character XP awards through the Runtime Script Host and creature death.
-
 mod support;
 
 use support::Standalone;
 
-/// Builds and publishes only to the test's private Standalone process.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_level_cap_discards_excess_xp_and_preserves_rested_xp_on_later_kills() {
@@ -34,7 +31,6 @@ fn the_level_cap_discards_excess_xp_and_preserves_rested_xp_on_later_kills() {
     );
 
     standalone.assert_sql("UPDATE game_character SET rested_xp = 1000 WHERE guid = 1");
-    // SQL row order does not identify the nearest creature. Keep this kill target unique.
     standalone.assert_sql("DELETE FROM game_creature_spawn WHERE entry = 51000");
     standalone.assert_sql("DELETE FROM game_world_entity WHERE entry = 51000");
     standalone.assert_call("debug_spawn_at_feet", &["1", "51000", "1.0"]);

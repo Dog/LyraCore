@@ -1,48 +1,11 @@
-//! The creature lifecycle passes (split of tick.rs): the canonical despawn checklist
-//! (every teardown path in the crate routes through `despawn_creature_entity`), then
-//! decay/respawn/GO-respawn — the due-time passes that run on schedule regardless of proximity. See
-//! `tick/mod.rs`'s module doc for the pipeline's load-bearing pass ORDER; this split does not change
-//! it (every pass here keeps its original name and signature, called by bare name via `tick/mod.rs`'s
-//! `use lifecycle::*;`).
-
 use spacetimedb::{ReducerContext, TimeDuration};
 
 use crate::{game_corpse_loot, game_gameobject, game_gameobject_pool_member, game_loot_roll};
 
 use super::*;
 
-// ===========================================================================================
-//  The canonical creature-despawn checklist
-// ===========================================================================================
-
-/// Delete a live creature entity AND every satellite row keyed on its guid. **This is the one
-/// checklist** — every teardown path routes through it: `instance::teardown_instance_inner` (step 1,
-/// the instance reap), `encounter::despawn_tracked` (wave adds on an encounter reset/wipe) and
-/// [`pass_decay`] (corpse decay). Each caller adds only its OWN extras on top — the persistent
-/// `game_creature_spawn` row and the encounter tracking/equip rows for the first two, the respawn-timer
-/// re-arm for the third — and none of them re-implements the list below.
-///
-/// Those three had each grown a private copy and DIVERGED. `despawn_tracked` deleted
-/// `game_corpse_loot` by corpse guid with no `!withheld` filter — the exact delete the fix removed
-/// from the other two — so a mid-roll wipe on a sharded realm silently ate the winner's item (the roll
-/// is authoritative on realm-core and invisible here; `settle_loot_roll`'s grant then finds no row and
-/// no-ops). It also skipped the rest of the loot family and the taunt lock. Adding a satellite table
-/// now means editing this fn, not three-and-hope.
-///
-/// NOT on the list: `game_creature_move_event`. Two of the three copies scanned that whole table for
-/// the mover's pending legs; nothing has written it since perf 2.3 moved legs onto the per-creature
-/// `game_creature_spline` row (retired the last writers, and the tripwire below forbids new
-/// ones — `gc.rs` stopped reaping it on the same grounds). A full-table scan per despawned creature,
-/// to delete from a provably empty table, teaches the next reader that the table is live.
-///
-/// The order is the safe one: free the engagement first (`disengage` also clears threat BOTH ways via
-/// `threat::clear_for_unit`, retargets the attackers and drops their combat), then the per-guid rows,
-/// then the entity itself last — its `on_delete` relay is what fires `SMSG_DESTROY_OBJECT`. Idempotent:
-/// every step is a keyed delete or an indexed collect-then-delete, so calling it on an already-gone
-/// guid is a no-op (`pass_decay` reaching a creature `kill_creature` already disengaged is normal).
-/// [entity]
 pub(crate) fn despawn_creature_entity(ctx: &ReducerContext, guid: u64) {
-    crate::combat::disengage(ctx, guid); // melee rows + threat (clear_for_unit) + stale selections
+    crate::combat::disengage(ctx, guid);
     crate::threat::clear_taunt_lock(ctx, guid);
     crate::combat::clear_lethal_damage_floor(ctx, guid);
     crate::creatures::cancel_relay_runs_for_source(ctx, guid);
@@ -50,36 +13,20 @@ pub(crate) fn despawn_creature_entity(ctx: &ReducerContext, guid: u64) {
     crate::creatures::drop_summon_expiry(ctx, guid);
     let _ = crate::creatures::set_creature_gossip_menu(ctx, guid, None);
     crate::loot::tag::clear(ctx, guid);
-    ctx.db.game_creature_spline().guid().delete(guid); // the LIVE leg row (perf 2.3)
-    crate::motion::drop_pending(ctx, guid); // The staged, not-yet-republished payload too
-    ctx.db.game_entity_motion().guid().delete(guid); // motion row dies with the entity (perf 2.1)
-    crate::loot::reap_corpse_loot_family(ctx, guid); // item rows (withheld-safe) + eligibility + rolls + votes
-    ctx.db.game_world_entity().guid().delete(guid); // last — the on_delete relay destroys the object
+    ctx.db.game_creature_spline().guid().delete(guid);
+    crate::motion::drop_pending(ctx, guid);
+    ctx.db.game_entity_motion().guid().delete(guid);
+    crate::loot::reap_corpse_loot_family(ctx, guid);
+    // Delete last; its Relay destroys the client object.
+    ctx.db.game_world_entity().guid().delete(guid);
 }
 
-/// Pass 3 — decay (runs before respawn): a corpse whose decay window elapsed is DESTROYed and its
-/// respawn timer armed to a FUTURE time (so respawn does NOT re-create it the same tick). Reaps the
-/// corpse's item-loot rows.
-///
-/// Stays GLOBAL: `despawn_at` is a due-time, not a proximity concern, and a
-/// corpse must decay on schedule whether or not a player is anywhere near it. Runs on the
-/// catch-all firing only, which covers ALL instances (see
-/// `TickScope::runs_global_passes`). Returns spawn rows scanned.
 pub(crate) fn pass_decay(ctx: &ReducerContext) -> usize {
     let now_ts = ctx.timestamp;
     let entities = ctx.db.game_world_entity();
     let spawns = ctx.db.game_creature_spawn();
 
-    // Decay pass: a corpse whose decay window elapsed is DESTROYed (the on_delete relay
-    // fires SMSG_DESTROY_OBJECT, so it vanishes) and its respawn timer armed; the respawn pass below
-    // then re-creates it. Gated on the live entity being `dead` so a freshly-spawned creature (whose
-    // stale despawn_at is in the past) is never decayed.
     let mut visited = 0usize;
-    // RANGE SCAN, not a table scan: `by_despawn_at` walks the index from its low end and stops at
-    // `now`, so it visits only corpses whose decay window has actually elapsed — normally none.
-    // This works only because `despawn_at` is parked in the far future while a creature is NOT a
-    // corpse (`creatures::timer_never`); when every row carried a past stamp, `<= now` matched the
-    // entire table and the index would have narrowed nothing.
     let decaying: Vec<u64> = spawns
         .by_despawn_at()
         .filter(..=now_ts)
@@ -98,19 +45,6 @@ pub(crate) fn pass_decay(ctx: &ReducerContext) -> usize {
         crate::loot::sweep_loot_rolls(ctx);
     }
     for guid in decaying {
-        // Belt over the sweep's braces: if a roll on this corpse is somehow STILL unresolved (a
-        // future constant change could put deadlines past decay), keep the corpse one more tick
-        // rather than discard a live roll — the sweep resolves it next pass.
-        //
-        // Fix: `sweep_loot_rolls` and the `game_loot_roll` check above only see rolls
-        // whose STATE lives on THIS database. In a sharded deployment a roll promoted to realm-core
-        // clears its local staging row within ~200ms of kill-time, so neither of the above can see
-        // it anymore even though it is still open there — decay would otherwise reap this corpse's
-        // `game_corpse_loot` row (below) before `settle_loot_roll` ever runs, silently losing the
-        // winner's item (the relay's grant no-ops when it finds no row left to grant against). The
-        // corpse's OWN `withheld` bit is a plane-agnostic signal for "a roll still owns this row" —
-        // it is set at roll start and cleared only by a grant or an all-pass unlock, on whichever
-        // database resolves the roll — so gate on it too, unconditionally, local table or not.
         if ctx
             .db
             .game_loot_roll()
@@ -129,12 +63,6 @@ pub(crate) fn pass_decay(ctx: &ReducerContext) -> usize {
 
         crate::creatures::despawn_creature_entity(ctx, guid);
         if let Some(mut spawn) = spawns.guid().find(guid) {
-            // Honor the per-spawn cmangos respawn timer (respawn_secs, seconds from DEATH) over the
-            // flat RESPAWN_MICROS default. `respawn_secs == 0` means "not imported" and falls back to
-            // the flat timer (byte-identical for every un-imported spawn). The creature's death time is
-            // recovered as `despawn_at - CORPSE_DECAY_MICROS` (kill_creature arms
-            // `despawn_at = death + CORPSE_DECAY_MICROS`), so a real `respawn_secs` is measured from
-            // DEATH, matching cmangos, not from decay.
             spawn.respawn_at = if spawn.respawn_secs == 0 {
                 now_ts
                     .checked_add(TimeDuration::from_micros(crate::combat::RESPAWN_MICROS))
@@ -151,18 +79,13 @@ pub(crate) fn pass_decay(ctx: &ReducerContext) -> usize {
                         spawn.respawn_secs as i64 * 1_000_000,
                     ))
                     .unwrap_or(now_ts);
-                // Never arm a respawn in the past (a respawn_secs shorter than the corpse-decay window
-                // would otherwise instant-respawn the same tick the corpse decays) — clamp to now.
+                // Arm respawn in the future so decay cannot respawn the creature in this firing.
                 if armed > now_ts {
                     armed
                 } else {
                     now_ts
                 }
             };
-            // DISARM the corpse timer — read AFTER `death_ts` above, which needs the armed value.
-            // The corpse is gone; leaving `despawn_at` in the past would keep this row in every
-            // future decay range scan forever, which is exactly the cost this pass just stopped
-            // paying.
             spawn.despawn_at = crate::creatures::timer_never(ctx);
             spawns.guid().update(spawn);
         }
@@ -170,13 +93,6 @@ pub(crate) fn pass_decay(ctx: &ReducerContext) -> usize {
     visited
 }
 
-/// Pass 2 — respawn: re-create any creature whose live entity is gone and whose `respawn_at`
-/// elapsed, from its persistent spawn record + template. Runs AFTER decay (decay arms a future
-/// `respawn_at`, so a just-decayed creature isn't re-spawned this tick).
-///
-/// Stays GLOBAL: `respawn_at` is a due-time, and a spawn point must
-/// repopulate on schedule whether or not a player is nearby to see it happen. Runs on the
-/// catch-all firing only, which covers ALL instances. Returns spawn rows scanned.
 pub(crate) fn pass_respawn(ctx: &ReducerContext) -> usize {
     let now_ts = ctx.timestamp;
     let entities = ctx.db.game_world_entity();
@@ -184,8 +100,6 @@ pub(crate) fn pass_respawn(ctx: &ReducerContext) -> usize {
     let templates = ctx.db.game_creature_template();
 
     let mut visited = 0usize;
-    // RANGE SCAN (see `pass_decay`): only spawns whose timer has actually fired. A live creature's
-    // `respawn_at` sits in the far future (`creatures::timer_never`), so it is not visited at all.
     const MAX_RESPAWNS_PER_TICK: usize = 256;
     let due: Vec<CreatureSpawn> = spawns
         .by_respawn_at()
@@ -196,7 +110,6 @@ pub(crate) fn pass_respawn(ctx: &ReducerContext) -> usize {
     let mut next_waypoint_id = None;
     for mut spawn in due {
         let guid = spawn.guid;
-        // Disarm legacy source timers too, so they leave the due-time index after one visit.
         if (spawn.instance_id == 0
             && lyracore_shared::instance::has_instance_population(spawn.map_id))
             || entities.guid().find(guid).is_some()
@@ -229,14 +142,8 @@ pub(crate) fn pass_respawn(ctx: &ReducerContext) -> usize {
         }
         let guid = spawn.guid;
         crate::combat::clear_lethal_damage_floor(ctx, guid);
-        // The new life reuses this guid, so nothing an earlier life scheduled may reach it.
         crate::creatures::cancel_relay_runs_for_new_life(ctx, guid);
-        // ADVANCE + DISARM, before the entity exists, so every reader this tick already sees the new
-        // life. The advance is what lets a durable row keyed on this guid tell the life that made it
-        // from the one standing here now. The disarm is what keeps the range-scan index useful — a
-        // fired-but-still-past timer would put the row back in every subsequent scan, and it is also
-        // how a freshly IMPORTED spawn (which arms `respawn_at = now` deliberately, so it
-        // materialises on the first tick) leaves the scan after that first tick.
+        // Advance and disarm the spawn before the new entity exposes this life.
         if let Some(mut s) = spawns.guid().find(guid) {
             s.respawn_at = crate::creatures::timer_never(ctx);
             s.life_seq = s.life_seq.saturating_add(1);
@@ -252,32 +159,10 @@ pub(crate) fn pass_respawn(ctx: &ReducerContext) -> usize {
     visited
 }
 
-/// GATHER-node respawn (the POOL model): for every DEPLETED node (state==1)
-/// whose armed respawn time has elapsed, EITHER re-roll its pool (a POOLED point — the node ROAMS to a
-/// different inactive point, holding MAX_ACTIVE) OR flip it state 1→0 in place (a STANDALONE node, the
-/// pool_id==0 path). Runs on each catch-all firing through the due-time index.
-/// `respawn_at_micros` is a defaulted u64 (NOT a Timestamp — that table
-/// is live/populated, so a Timestamp column would abort the publish; teleport-core lesson). The due
-/// decision is the unit-tested `gameobject::respawn_due` predicate. Filters to depleted-only inline;
-/// collect-then-mutate so we never write `game_gameobject` while iterating it.
-/// Perf catalog 1.21 (was: "deliberate simplification: full-table `iter()` every sense tick,
-/// defer it"): the scan is now a `by_respawn_at` range probe over armed-and-elapsed rows only. A
-/// `by_state` index would still have visited every depleted node every tick; the due-time range
-/// visits only the ones actually due.
-///
-/// Stays GLOBAL: `respawn_at_micros` is a due-time (like creature
-/// respawn/decay), not proximity, and GAMEOBJECTS are outside the creature-ticking scope. Runs on the
-/// catch-all firing only, which covers ALL instances. Returns GO rows scanned.
 pub(crate) fn pass_gameobject_respawn(ctx: &ReducerContext) -> usize {
     let now = ctx.timestamp.to_micros_since_unix_epoch() as u64;
     let gos = ctx.db.game_gameobject();
     let members = ctx.db.game_gameobject_pool_member();
-    // Collect the due guids FIRST (collect-then-mutate) so a reroll's delete/insert never writes
-    // game_gameobject while we iterate it, and two due rerolls can't race the same pool slot.
-    // Perf catalog 1.21: `by_respawn_at` range-scans ARMED-and-elapsed rows only (`0` = not armed, so
-    // the `1..=now` range skips every ready node and every non-gather GO for free). `respawn_due` stays
-    // as the post-filter, so the predicate — and the result set — are unchanged. `visited` now counts
-    // the index candidates rather than the whole table; that IS the evidence number.
     let mut visited = 0usize;
     let due: Vec<u64> = gos
         .by_respawn_at()
@@ -287,11 +172,6 @@ pub(crate) fn pass_gameobject_respawn(ctx: &ReducerContext) -> usize {
         .map(|g| g.guid)
         .collect();
     for guid in due {
-        // POOLED point? A guid TAGGED as a pool point (structural test, collision-proof — NOT a bare
-        // low-48 lookup, which collided with standalone GO guids) → re-roll the pool (deactivate this
-        // point, activate a different inactive one) so the active set ROTATES across the zone. A
-        // STANDALONE node (tag bit clear → never queries the member table) falls through to the EXISTING
-        // in-place state 1→0 flip — byte-identical, no regression.
         match crate::gameobject::pool_point_id_of(guid).and_then(|pid| members.point_id().find(pid))
         {
             Some(member) => crate::gameobject::reroll_pool(ctx, member.pool_id, guid),

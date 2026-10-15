@@ -1,7 +1,3 @@
-//! Guild cache reads. The guild tables are read on the Realm-core handle; Character facts are read
-//! across every World Shard. A Fee Hold and a Guild Charter item are read on the payer's Home
-//! Shard.
-
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -12,14 +8,10 @@ use super::super::bindings::*;
 use super::super::connection::Coordinator;
 use crate::world::CharacterFacts;
 
-/// The Guild Ranks and members of each Guild, and the Characters that Petitions and Signatures
-/// name, kept from the row callbacks. The SDK cache has no index on these columns, so a guild read
-/// finds its rows here by key instead of scanning the tables.
 #[derive(Default)]
 pub(crate) struct GuildIndex {
     rank_ids: HashMap<u32, BTreeSet<u64>>,
     member_guids: HashMap<u32, BTreeSet<u64>>,
-    /// Petition owner or signer guid to the number of Petition and Signature rows naming it.
     pub(in crate::stdb) petition_characters: HashMap<u64, usize>,
 }
 
@@ -53,7 +45,6 @@ impl GuildIndex {
             .unwrap_or_default()
     }
 
-    /// The members of `guild_id`, lowest guid first.
     pub(in crate::stdb) fn member_guids(&self, guild_id: u32) -> Vec<u64> {
         self.member_guids
             .get(&guild_id)
@@ -74,7 +65,6 @@ impl GuildIndex {
         }
     }
 
-    /// Every member of every Guild, every Petition owner and every signer.
     pub(in crate::stdb) fn named_characters(&self) -> BTreeSet<u64> {
         self.member_guids
             .values()
@@ -94,8 +84,6 @@ fn remove_key(index: &mut HashMap<u32, BTreeSet<u64>>, guild_id: u32, key: u64) 
     }
 }
 
-/// Keep a [`GuildIndex`] current from the Guild Rank and member row callbacks. Register it before
-/// the subscription applies: the initial rows arrive as inserts.
 pub(crate) fn watch_guilds(conn: &DbConnection) -> Arc<RwLock<GuildIndex>> {
     let index = Arc::new(RwLock::new(GuildIndex::default()));
     let inserted = index.clone();
@@ -179,7 +167,6 @@ pub(crate) fn watch_guilds(conn: &DbConnection) -> Arc<RwLock<GuildIndex>> {
     index
 }
 
-/// A Petition with its signers, found by key: the SDK cache has no index on the Petition column.
 pub(in crate::stdb) fn petition_view(
     db: &RemoteTables,
     row: GuildPetition,
@@ -203,8 +190,6 @@ pub(in crate::stdb) fn petition_view(
 }
 
 impl Coordinator {
-    /// The Guild Projection `(guild_id, rank_id)` of `character_guid` in THIS handle's cache.
-    /// `(0, 0)` outside a Guild. Cheap enough for a relay job.
     pub(crate) fn guild_projection(&self, character_guid: u64) -> (u32, u32) {
         self.0
             .coord()
@@ -216,10 +201,6 @@ impl Coordinator {
             .map_or((0, 0), |member| (member.guild_id, member.rank_id))
     }
 
-    /// Facts for one Character: the last logout and Realm Account from whichever World Shard holds
-    /// its row, and its Realm Presence. `None` when no World Shard holds a Character row, so a
-    /// creature's live entity never passes for a Character. `Err` when the World Shards cannot
-    /// vouch for an absence.
     pub(crate) fn guild_character_facts(
         &self,
         character_guid: u64,
@@ -241,8 +222,6 @@ impl Coordinator {
         crate::world::character_facts(durable, || crate::world::presence::of(self, character_guid))
     }
 
-    /// The GM level on THIS handle's own Character row, 0 when it holds none. The guild Gates call
-    /// it on the actor's Home Shard, so a copy an interrupted Transfer left elsewhere never counts.
     pub(crate) fn home_gm_level(&self, character_guid: u64) -> u8 {
         self.0
             .coord()
@@ -254,8 +233,6 @@ impl Coordinator {
             .map_or(0, |character| character.gm_level)
     }
 
-    /// The open Petition of the Guild Charter `charter_item_guid` in THIS handle's cache. Call it
-    /// on the Realm-core handle.
     pub(crate) fn guild_petition_of_charter(
         &self,
         charter_item_guid: u64,
@@ -269,8 +246,6 @@ impl Coordinator {
         Some(petition_view(db, row))
     }
 
-    /// The Petition id of the Guild Charter `charter_item_guid` in THIS handle's cache. Call it on
-    /// the Realm-core handle.
     pub(crate) fn charter_petition_id(&self, charter_item_guid: u64) -> Option<u32> {
         self.0
             .coord()
@@ -282,9 +257,6 @@ impl Coordinator {
             .map(|petition| petition.petition_id)
     }
 
-    /// Fill each Guild Charter's ITEM_FIELD_ENCHANTMENT with its Petition id from the Realm-core
-    /// cache. Call it on the owner's Home Shard, with no cache guard held. A Charter whose
-    /// Petition is unreadable shows 0; the client then asks about no Petition.
     pub(crate) fn project_charter_petitions(&self, items: &mut [crate::codec::ItemInstanceView]) {
         use lyracore_shared::guild::GUILD_CHARTER_ENTRY;
         if !items.iter().any(|item| item.entry == GUILD_CHARTER_ENTRY) {

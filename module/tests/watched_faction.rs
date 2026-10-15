@@ -1,5 +1,3 @@
-//! Watched reputation selection through the durable Gateway Verb.
-
 mod support;
 
 use std::process::Output;

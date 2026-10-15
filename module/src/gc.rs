@@ -1,11 +1,5 @@
-//! Scheduled garbage collection: the event reaper that GCs short-lived broadcast/relay event rows
-//! (movement relays + creature-move legs) once their TTL elapses. [server]
-
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table};
 
-// `breath_relay`, `channel`, `guild`, `mail_timer`, `realm_chat` and `rest` are not glob
-// re-exported at crate scope, so their accessors need their own imports. Every other event table's
-// accessor trait rides a glob.
 use crate::breath_relay::game_breath_relay_event;
 use crate::channel::game_chat_channel_notice_event;
 use crate::guild::game_guild_event;
@@ -21,10 +15,7 @@ use crate::{
     game_trade_session, game_whisper_event, game_xp_event, EVENT_TTL_MICROS, INVITE_TTL_MICROS,
 };
 use crate::{game_party_command_intent, game_party_command_receipt};
-// `game_movement_event` / `game_creature_move_event` are deliberately NOT imported: nothing writes
-// either table any more, so the reaper no longer touches them (see the notes in `reap_events`).
 
-/// Drives the movement-event GC tick. [server]
 #[table(accessor = game_event_reaper_schedule, scheduled(reap_movement_events))]
 pub struct EventReaperSchedule {
     #[primary_key]
@@ -33,28 +24,13 @@ pub struct EventReaperSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-// NO per-firing delete cap here — perf catalog 1.5 tier 1 is PARKED, not landed. A flat cap
-// (a `.take(N)` on the stale list) bounds the transaction but SILENTLY DROPS the reaper's drain
-// guarantee: the reaper fires 1×/s over a 1s TTL, so it drains only while production ≤ N rows/s
-// per table. The catalog's own arithmetic puts movement-event production at ~20k rows/s at C≈100 —
-// four times a 5k cap — i.e. the cap starts leaking at exactly the crowd size the rest of this
-// catalog exists to reach, and `game_movement_event` (public, per-player subscribed) then grows
-// without bound. Bounding the stall needs a mechanism that still drains (catch-up firings, or the
-// tier-3 restructure that stops modeling movement as insert+delete rows); a bare cap is a
-// behaviour change dressed as a perf win.
-
 #[reducer]
 pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule) {
-    // Only the scheduler should invoke this.
     if ctx.sender() != ctx.database_identity() {
         return;
     }
     let cutoff = ctx.timestamp.to_micros_since_unix_epoch() - EVENT_TTL_MICROS;
 
-    // All three event tables share the same shape (`id: u64` PK + `created_at: Timestamp`) and TTL,
-    // so one macro reaps each: collect stale ids (created_at < cutoff), then delete by id. A generic
-    // `fn` is awkward here — each table's `.id()` is a distinct generated accessor type — so a local
-    // macro keyed on the table accessor is the direct fit.
     macro_rules! reap {
         ($accessor:ident) => {{
             let t = ctx.db.$accessor();
@@ -68,46 +44,30 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
             }
         }};
     }
-    // `game_movement_event` is not reaped: peer movement rides the per-mover `game_entity_motion`
-    // row, which is updated in place and needs no reaping.
-    // `game_creature_move_event` is not reaped because nothing writes it. Creature legs ride the
-    // per-creature `game_creature_spline` row, which is updated in place. The table stays in the
-    // schema (dropping one is a separate destructive migration) and stays empty.
-    reap!(game_combat_event); // melee swing logs
-    reap!(game_xp_event); // per-kill XP awards
-    reap!(game_levelup_event); // level-up dings
-    reap!(game_spell_cast_event); // spell-cast visuals (aura tracer)
-    reap!(game_spell_impact_event); // deferred projectile-impact damage logs
-    reap!(game_chat_event); // say/yell broadcast lines
-    reap!(game_emote_event); // emote broadcast (text + animation)
-                             // Nothing writes whisper rows any more. The reap stays for the build that retires them, so
-                             // rows still inside the TTL at publish are deleted. It can go in the next build.
+    reap!(game_combat_event);
+    reap!(game_xp_event);
+    reap!(game_levelup_event);
+    reap!(game_spell_cast_event);
+    reap!(game_spell_impact_event);
+    reap!(game_chat_event);
+    reap!(game_emote_event);
     reap!(game_whisper_event);
-    reap!(game_realm_chat_event); // Realm Chat Lines
-    reap!(game_chat_channel_notice_event); // Channel Notices
-    reap!(game_system_message_event); // private Package-originated System Messages
-    reap!(game_addon_message); // addon-bridge UI messages (RLS-scoped)
-    reap!(game_roll_event); // unwritten since /roll became a Group Broadcast
-    reap!(game_group_event); // group invite/roster notifications (RLS-scoped)
-    reap!(game_trade_event); // trade-status relay rows (RLS-scoped)
-    reap!(game_duel_event); // Duel lifecycle relay rows (RLS-scoped)
-    reap!(game_bot_invite_intent); // bot-decided invites awaiting gateway pickup
-    reap!(game_auction_notice); // live outbid/won/sold/expired/new-bid notices to an online seller or bidder
-    reap!(game_movement_violation); // recent anti-cheat diagnostics
-                                    // Rest-area zzz/blue-bar relay rows. Caught missing by the gc_reap_tripwire: this
-                                    // table carries the same `id: u64` + `created_at: Timestamp` TTL shape as every table above but
-                                    // had no reap line — every inn threshold crossing for the lifetime of a character left one more
-                                    // row behind. The durable rest state (`Character.resting`/`rested_xp`) lives elsewhere; this row
-                                    // is only the one-shot PLAYER_BYTES_2 relay.
+    reap!(game_realm_chat_event);
+    reap!(game_chat_channel_notice_event);
+    reap!(game_system_message_event);
+    reap!(game_addon_message);
+    reap!(game_roll_event);
+    reap!(game_group_event);
+    reap!(game_trade_event);
+    reap!(game_duel_event);
+    reap!(game_bot_invite_intent);
+    reap!(game_auction_notice);
+    reap!(game_movement_violation);
     reap!(game_rest_state_event);
-    reap!(game_breath_relay_event); // breath timer edges + drowning damage relay
-    reap!(game_guild_event); // Guild Events (sign-on, MOTD, membership)
-    reap!(game_mail_arrival); // Mail Arrivals, relayed on insert
+    reap!(game_breath_relay_event);
+    reap!(game_guild_event);
+    reap!(game_mail_arrival);
 
-    // Never-answered pending invites. Same id+created_at shape as the event tables, but on
-    // the longer INVITE_TTL (a human is looking at the invite dialog). After that the row is dead
-    // weight: accepting a reaped invite fails as "no pending invite", exactly like accepting one
-    // that was never sent.
     {
         let t = ctx.db.game_group_invite();
         let invite_cutoff = ctx.timestamp.to_micros_since_unix_epoch() - INVITE_TTL_MICROS;
@@ -121,9 +81,6 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
         }
     }
 
-    // Never-answered pending Guild Invites, same TTL and shape as `game_group_invite` above, but
-    // keyed on the target's own guid (`target_guid` is the primary key: at most one invite per
-    // target).
     {
         let t = ctx.db.game_guild_invite();
         let invite_cutoff = ctx.timestamp.to_micros_since_unix_epoch() - INVITE_TTL_MICROS;
@@ -137,10 +94,6 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
         }
     }
 
-    // Idle Trade Sessions: `created_at` is bumped by every trade action, so the pure
-    // policy (`trade::session_is_stale`) measures idleness — a live negotiation is never reaped.
-    // Torn down THROUGH `cancel_trade_for`, never a bare delete, so both clients hear
-    // `TradeCanceled` instead of keeping stale windows open.
     {
         let sessions = ctx.db.game_trade_session();
         let now = ctx.timestamp.to_micros_since_unix_epoch();
@@ -156,16 +109,10 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
         }
     }
 
-    // CC diminishing-returns windows: rows whose 15s post-removal window has
-    // elapsed are dead state — the next same-category CC starts fresh at level 1 anyway.
     crate::spell::stacking::sweep_dr_state(ctx);
 
-    // Need/greed roll deadlines: resolves any roll whose 60s window lapsed with
-    // votes outstanding (absent members auto-pass) — the deadline half of resolve-exactly-once.
     crate::loot::sweep_loot_rolls(ctx);
 
-    // Teleport handshake relays. Same TTL, but the time column is a defaulted u64 (`created_micros`,
-    // not a `Timestamp` — so the column-add auto-migrated), so it can't use the `reap!` macro.
     {
         let t = ctx.db.game_teleport_event();
         let stale: Vec<u64> = t
@@ -178,9 +125,7 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
         }
     }
 
-    // Gateway reconciles an expired pending command against every target receipt before recording
-    // its result. Pending rows keep result_reap_micros at i64::MAX; finish sets the finite deadline,
-    // so the bounded index prefix below contains only terminal rows under Core's write contract.
+    // Pending commands retain i64::MAX; only terminal results enter this bounded expiry prefix.
     const COMMAND_REAP_LIMIT: usize = 64;
     let now = ctx.timestamp.to_micros_since_unix_epoch();
     let intents = ctx.db.game_party_command_intent();
@@ -204,7 +149,5 @@ pub fn reap_movement_events(ctx: &ReducerContext, _schedule: EventReaperSchedule
         receipts.id().delete(receipt.id);
     }
 
-    // Player corpses: unreclaimed body → bones → despawn, on its own decay policy (own the bones,
-    // not this reaper). See `corpse::sweep_corpse_decay`'s doc for the timers and the relay shape.
     crate::corpse::sweep_corpse_decay(ctx);
 }

@@ -1,8 +1,3 @@
-//! Connection tier: the `Coordinator` facade + its inner shared state, the live privileged
-//! connection (with the reconnect watchdog), the per-account player connections, the
-//! `call_reducer!` macro, and the connection lifecycle constructors. Reads/reducers/subscriptions
-//! live in sibling modules as additional `impl Coordinator` blocks.
-
 use crate::config::{GatewayConfig, ShardMap};
 use anyhow::{anyhow, Context, Result};
 use spacetimedb_sdk::{DbContext, SubscriptionHandle as _, Table, TableWithPrimaryKey};
@@ -24,15 +19,6 @@ pub(crate) struct CharacterPresenceSnapshot {
     pub(crate) present: bool,
 }
 
-/// Shared handle to the privileged coordination connection **of one shard**.
-///
-/// Field 0 is the shard this handle talks to — every read, every reducer call, and every
-/// subscription in the `reads`/`reducers`/`subscriptions` sibling modules goes through it, so
-/// "which database does this call hit" is decided entirely by which handle you hold. Field 1 is
-/// the shared, shard-independent routing table + connection set: `shard_for` mints the
-/// handle for another shard, and `Coordinator::connect` hands back the DEFAULT shard's handle.
-/// With a single-entry shard map the set has exactly one entry and `shard_for` always resolves
-/// back to `self` — byte-identical to the pre-sharding gateway.
 #[derive(Clone)]
 pub struct Coordinator(
     pub(crate) Arc<CoordinatorInner>,
@@ -40,36 +26,20 @@ pub struct Coordinator(
     pub(crate) Option<Arc<SessionOwnership>>,
 );
 
-/// The Gateway's configured Shards and shared Relay view.
 pub(crate) struct ShardSet {
     map: ShardMap,
-    /// db name → that database's coordinator connection. Always contains the default database;
-    /// an extra shard that failed to connect is ABSENT (routing then degrades to the default).
     conns: HashMap<String, Arc<CoordinatorInner>>,
-    /// Realm-wide delivery bookkeeping. Globally allocated guids let one viewer index span
-    /// all configured Shards; durable Account Claims own World Session authority.
     world: Arc<super::world_view::WorldView>,
-    /// Coalesce row-delete and reconnect requests behind one off-pump reconciliation worker.
     pub(crate) deleted_character_reconciliation_requested: AtomicBool,
     pub(crate) deleted_character_reconciliation_running: AtomicBool,
-    /// The guild cleanup the reconciliation worker still owes.
     pub(crate) guild_cleanup: std::sync::Mutex<crate::world::GuildCleanup>,
 }
 
-/// One live SDK connection generation and the handles that keep its pump and subscription alive.
-/// Coordinator generations own the shard cache; call-pipe generations carry only the reducer
-/// liveness subscription. Recovery replaces either role as one unit.
 pub(crate) struct LiveConn {
-    /// Privileged owner connection. Coordinators use its subscription cache for reads; call pipes
-    /// use it only for the module's operator-gated reducer surface.
     pub(crate) conn: Arc<DbConnection>,
-    /// Completes reducer waits as soon as this connection's transport dies. It belongs to the
-    /// connection generation, so a watchdog replacement cannot fail calls on the fresh socket.
     pub(crate) reducer_completion: Arc<ReducerCompletion>,
-    /// Keeps the SDK message-pump thread alive for the connection's lifetime.
     _pump: Option<std::thread::JoinHandle<()>>,
     pump_commands: tokio::sync::mpsc::UnboundedSender<PumpCommand>,
-    /// Identity of this cache plus the Character-presence revision maintained by row callbacks.
     cache_generation: u64,
     character_revision: Arc<AtomicU64>,
     pub(crate) party_memberships: Arc<RwLock<PartyMembershipIndex>>,
@@ -79,11 +49,9 @@ pub(crate) struct LiveConn {
     pub(crate) guilds: Arc<RwLock<super::reads::GuildIndex>>,
     pub(crate) contacts: Arc<RwLock<super::reads::ContactIndex>>,
     pub(crate) character_names: Arc<RwLock<super::reads::CharacterNameIndex>>,
-    /// Keeps this role's subscription active for the connection's lifetime.
     _sub: SubscriptionHandle,
 }
 
-/// A group id and its members as `(member_row_id, guid)`, in join order.
 pub(crate) type GroupMemberRows = (u64, Vec<(u64, u64)>);
 
 #[derive(Default)]
@@ -119,7 +87,6 @@ impl PartyMembershipIndex {
         }
     }
 
-    /// The group of `character_guid`'s oldest membership row, if it has one.
     pub(crate) fn group_of(&self, character_guid: u64) -> Option<u64> {
         self.by_character
             .get(&character_guid)?
@@ -128,7 +95,6 @@ impl PartyMembershipIndex {
             .copied()
     }
 
-    /// Every member row id of `group_id`, in join order.
     pub(crate) fn member_row_ids(&self, group_id: u64) -> Vec<u64> {
         self.by_group
             .get(&group_id)
@@ -136,9 +102,6 @@ impl PartyMembershipIndex {
             .unwrap_or_default()
     }
 
-    /// `character_guid`'s group and its members in join order as `(member_row_id, guid)`. The row
-    /// id lets a caller read the member row itself. More than `member_limit` members, or more than
-    /// one membership, is a damaged cache and fails.
     pub(crate) fn bounded_member_rows(
         &self,
         character_guid: u64,
@@ -203,7 +166,6 @@ mod party_membership_index_tests {
         );
     }
 
-    /// The roster reads find a member's group and the group's rows without scanning the cache.
     #[test]
     fn a_members_group_and_the_groups_rows_are_indexed_in_join_order() {
         let mut index = PartyMembershipIndex::default();
@@ -227,8 +189,6 @@ enum PumpCommand<C = DbConnection> {
     Stop,
 }
 
-/// Run setup and SDK advancement on the same thread. SDK advancement is the external edge;
-/// its cache update and row callbacks complete in one poll after the incoming message arrives.
 async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result<(), E>>>(
     conn: &C,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<PumpCommand<C>>,
@@ -253,9 +213,7 @@ async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result
     }
 }
 
-/// Setup runs between complete SDK messages. The SDK consumes pending callback registrations
-/// before its next incoming message, so registration and snapshot collection have no delta gap.
-/// This relies on `spacetimedb-sdk` 2.7.1 `get_message` draining pending mutations first.
+// SDK 2.7.1 drains pending registrations before the next message, preventing a snapshot gap.
 fn start_pump(
     conn: &Arc<DbConnection>,
     role: &str,
@@ -285,20 +243,12 @@ fn start_pump(
 }
 
 impl LiveConn {
-    /// A connection needs its transport, subscription, and pump. A Module republish can
-    /// invalidate the subscription while the socket remains connected.
     pub(super) fn is_healthy(&self) -> bool {
         self.conn.is_active()
             && self._sub.is_active()
             && self._pump.as_ref().is_some_and(|pump| !pump.is_finished())
     }
 
-    /// Ask the server for a fresh, filtered subscription before sampling Character presence.
-    ///
-    /// The ordinary subscription can lag a commit made through another Gateway. `on_applied`
-    /// runs after the server's snapshot has updated this connection's cache, so the returned sample
-    /// is current through a server-acknowledged boundary. The main subscription continues to own
-    /// every Character row after this temporary query is removed.
     pub(super) fn durable_character_presence_snapshot(
         &self,
         guid: u64,
@@ -314,6 +264,7 @@ impl LiveConn {
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<_, String>>();
         let tx_error = tx.clone();
         let query = format!("SELECT * FROM game_character WHERE guid = {guid}");
+        // on_applied gives a fresh snapshot; the cache can lag another Gateway's commit.
         let subscription = self
             .conn
             .subscription_builder()
@@ -356,8 +307,6 @@ impl LiveConn {
     }
 }
 
-/// Retire callbacks before publishing a fresh resource, then run setup and release the old resource.
-/// This external connection seam exposes publication order without constructing SDK types.
 fn replace_slot_ordered<T>(
     slot: &RwLock<T>,
     fresh: T,
@@ -378,7 +327,7 @@ fn replace_slot_ordered<T>(
     teardown(old);
 }
 
-/// An unwinding hook must stop the fresh pump before partially installed Relays can run.
+// An unwinding hook must stop the fresh pump before partially installed Relays can run.
 fn finish_relay_setup<C>(
     commands: &tokio::sync::mpsc::UnboundedSender<PumpCommand<C>>,
     setup: impl FnOnce(),
@@ -405,9 +354,7 @@ fn finish_relay_setup<C>(
     completion.complete = true;
 }
 
-/// Drain the old pump before exposing the fresh cache. A fresh source cache can advance a
-/// Transfer to its destination, so no old source callback may update the shared indexes afterward.
-/// The slot lock is released before disconnect or join; callbacks can finish their cache reads.
+// Drain the old pump before publishing the fresh cache; release the slot lock before joining.
 fn replace_live_conn(
     slot: &RwLock<LiveConn>,
     fresh: LiveConn,
@@ -450,17 +397,12 @@ fn replace_live_conn(
     );
 }
 
-/// One replaceable reducer-only connection. Reconnection happens off the watchdog thread; this
-/// flag prevents a slow or unavailable node from spawning another repair attempt every poll.
 struct CallPipe {
     live: RwLock<LiveConn>,
     reconnecting: AtomicBool,
 }
 
-/// One-shot completion registry for calls sent through one SDK connection.
-///
-/// A reducer callback and the SDK disconnect callback may race. Removing the sender while
-/// holding this lock makes whichever signal arrives first the caller-visible outcome.
+// Remove completion senders under the lock so result and Transport Loss choose one outcome.
 pub(crate) struct ReducerCompletion {
     next_id: AtomicU64,
     state: Mutex<ReducerCompletionState>,
@@ -479,7 +421,6 @@ pub(crate) enum ReducerCompletionFailure {
     TransportDisconnected,
 }
 
-/// Typed provenance for a reducer call after it leaves the completion channel.
 #[derive(Debug)]
 pub(crate) enum ReducerCallError {
     Rejected {
@@ -523,13 +464,11 @@ impl ReducerCallError {
         Self::Fatal(message)
     }
 
-    /// A Module Gate refusing `operation` with `reason`, as a Fake reports it.
     #[cfg(test)]
     pub(crate) fn refused(operation: &str, reason: &str) -> Self {
         Self::rejected(operation, reason.to_string())
     }
 
-    /// The transport dropping `operation` mid-call, as a Fake reports it.
     #[cfg(test)]
     pub(crate) fn transport_lost(operation: &str) -> Self {
         Self::fatal(format!(
@@ -563,18 +502,12 @@ impl std::error::Error for ReducerCallError {
     }
 }
 
-/// How a failed Durable Read or Durable Request ended, as the World Session must treat it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DurableFailure<'e> {
-    /// A Module Gate refused. `reason` is the Module's stable tag. Durable state is unchanged.
     Refusal { reason: &'e str },
-    /// The outcome is unknown: transport lost, timeout, SDK send or internal failure.
-    /// Ends the World Session.
     TransportLoss,
 }
 
-/// Fails closed: only a reducer the Module rejected is a Refusal. Any other error, typed or not,
-/// leaves the durable outcome unknown.
 pub(crate) fn classify(error: &anyhow::Error) -> DurableFailure<'_> {
     match reducer_refusal_reason(error) {
         Some(reason) => DurableFailure::Refusal { reason },
@@ -582,7 +515,6 @@ pub(crate) fn classify(error: &anyhow::Error) -> DurableFailure<'_> {
     }
 }
 
-/// The Module's unwrapped refusal reason, preserving its stable gameplay prefix.
 pub(crate) fn reducer_refusal_reason(error: &anyhow::Error) -> Option<&str> {
     error.chain().find_map(|cause| {
         let ReducerCallError::Rejected { reason, .. } = cause.downcast_ref::<ReducerCallError>()?
@@ -654,49 +586,20 @@ impl ReducerCompletion {
 }
 
 pub(crate) struct CoordinatorInner {
-    /// The live coordinator connection, swappable so the watchdog can reconnect in place. Reads take a
-    /// (near-always-uncontended) read lock for the duration of one query/call; the watchdog takes the
-    /// write lock only for the instant swap — so the steady-state (no-drop) read path is unchanged.
     live: RwLock<LiveConn>,
-    /// Connect params kept so the watchdog can rebuild the connection.
     token: Option<String>,
-    /// Connection params for opening per-account player connections lazily.
     uri: String,
     db_name: String,
-    /// Whether this connection subscribes the multi-database tables (realm-core's `game_character_shard`)
-    /// — kept so the watchdog rebuilds with the SAME subscription set it was created with. See
-    /// [`coordinator_queries`].
     sharded_tables: bool,
-    /// The CALL-PIPE POOL — extra connections to the same database used exclusively for
-    /// reducer calls, round-robined by `call_pipe()`, so seated players' call traffic and login
-    /// calls stop serializing on one websocket (measured wall: ~1000 seats/pipe). Each pipe
-    /// carries one tiny liveness subscription (`game_config`, 1 row), never the coordinator set.
-    /// Empty when `LYRACORE_CALL_PIPES` <= 1 — calls then ride `coord()` exactly as before.
-    /// Dead pipes are skipped immediately and rebuilt in the background. Until their replacement
-    /// lands, calls use another healthy pipe or the watchdogged coordinator connection.
     call_pipes: Vec<CallPipe>,
     call_pipe_next: std::sync::atomic::AtomicUsize,
-    /// Edge-triggered diagnosis for a persistent Module/Gateway dispatch-lane mismatch.
     pub(crate) party_command_lane_overflow: AtomicBool,
-    /// Edge-triggered diagnosis for a populated Transfer Intent set beyond the current writer Gate.
     pub(crate) bot_transfer_pending_overflow: AtomicBool,
-    /// The per-shard movement batch — the hot path pushes one `GwMove` per inbound
-    /// heartbeat and the 40ms flush task sends the whole tick as ONE `gw_movement_batch`
-    /// transaction (was: one transaction per heartbeat — ~10k tx/s of per-transaction machinery
-    /// at 2000 players, the measured 92%-writer wall).
     pub(crate) motion_batch: MovementBatch,
-    /// Re-arm hooks for connection-scoped coordinator relays with no per-login recovery point.
-    /// The list is empty until those relays register at startup. After each successful coordinator
-    /// replacement, the watchdog clones the list and invokes every hook against the fresh
-    /// generation without holding this mutex or the live-slot lock.
     pub(crate) on_reconnect: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl CoordinatorInner {
-    /// The live coordinator connection (read-locked for the call). A reconnect swaps the inner connection
-    /// under the write lock, so callers transparently pick up the fresh connection on their NEXT access.
-    /// Recovers a poisoned lock (matches the file's `.lock().unwrap()` discipline) — a stale read beats
-    /// poisoning every future request.
     pub(crate) fn coord(&self) -> std::sync::RwLockReadGuard<'_, LiveConn> {
         self.live.read().unwrap_or_else(|p| {
             log::error!(
@@ -706,7 +609,6 @@ impl CoordinatorInner {
         })
     }
 
-    /// Complete Relay setup on the current connection's pump, without retaining its slot lock.
     pub(crate) fn on_pump(&self, work: impl FnOnce(&DbConnection) + Send + 'static) -> Result<()> {
         let pump = self.coord().pump_commands.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -720,9 +622,6 @@ impl CoordinatorInner {
             .map_err(|error| anyhow!("{} {error}", self.db_name))
     }
 
-    /// The connection for the NEXT reducer call: round-robin over the call-pipe pool,
-    /// skipping dead pipes; no pool (or every pipe dead) falls back to the watchdogged
-    /// coordinator connection, which is exactly the behavior before the pool existed.
     pub(crate) fn call_pipe(&self) -> std::sync::RwLockReadGuard<'_, LiveConn> {
         let n = self.call_pipes.len();
         if n > 0 {
@@ -748,22 +647,12 @@ impl CoordinatorInner {
         self.coord()
     }
 
-    /// The subscribed connection for a reducer whose successful return authorizes presentation of
-    /// its committed rows. SpacetimeDB's SDK applies a reducer result to this connection's cache and
-    /// runs its row callbacks before the reducer callback. Waiting for that callback is therefore a
-    /// deterministic visibility receipt: relays for the transaction are queued before the caller
-    /// can enqueue success presentation. Reducer-only call pipes cannot provide that ordering
-    /// because they do not subscribe the relayed tables. Every Realm-core party op that changes a
-    /// roster rides this pipe, so the Group mirror push after it reads the committed roster. It
-    /// blocks on the pump, so a pump callback must never call it.
+    /// Row Relays queue before success presentation; waiting here on the pump would deadlock.
     pub(crate) fn visibility_pipe(&self) -> std::sync::RwLockReadGuard<'_, LiveConn> {
         self.coord()
     }
 }
 
-/// Return the round-robin pipe that is currently usable, or let the caller use its coordinator
-/// fallback when there is none. Kept independent of the SDK connection so recovery routing has a
-/// deterministic unit-test seam.
 fn select_active_call_pipe(
     pipe_count: usize,
     start: usize,
@@ -788,8 +677,6 @@ fn call_pipe_role_label(db_name: &str, index: usize) -> String {
     format!("shard {db_name} call pipe {index}")
 }
 
-/// Build one SDK connection generation, start its pump, and wait for the caller's exact
-/// subscription policy to apply. Reconnect Coordinators park at apply until their Relays are armed.
 fn connect_subscribed(
     uri: String,
     db_name: String,
@@ -877,7 +764,7 @@ fn connect_subscribed(
     };
     if let Err(error) = applied {
         let _ = conn.disconnect();
-        // A late apply can race this timeout and park the unpublished pump. Stop works in either state.
+        // A late apply can park the unpublished pump after timeout; Stop must handle either state.
         let _ = pump_commands.send(PumpCommand::Stop);
         if let Err(panic) = pump.join() {
             log::warn!("{role_label} failed subscription pump panicked: {panic:?}");
@@ -904,8 +791,6 @@ fn connect_subscribed(
     })
 }
 
-/// Keep a [`super::reads::ChannelIndex`] current from the channel and member callbacks. Initial
-/// subscription rows arrive as inserts.
 fn watch_chat_channels(conn: &DbConnection) -> Arc<RwLock<super::reads::ChannelIndex>> {
     let index = Arc::new(RwLock::new(super::reads::ChannelIndex::default()));
     let inserted = index.clone();
@@ -947,7 +832,6 @@ fn watch_chat_channels(conn: &DbConnection) -> Arc<RwLock<super::reads::ChannelI
     index
 }
 
-/// Build one reducer-only pipe. Its one-row subscription is a liveness signal, not a cache.
 fn connect_call_pipe(
     uri: String,
     db_name: String,
@@ -966,10 +850,6 @@ fn connect_call_pipe(
     )
 }
 
-/// Start at most one reconnect for each failed call pipe. The coordinator watchdog owns this
-/// because it is already the one place that observes transport/subscription liveness for this
-/// shard. Building happens on a detached OS thread so a down node never stalls the watchdog's
-/// coordinator recovery or live callers.
 fn repair_dead_call_pipes(inner: &Arc<CoordinatorInner>) {
     for (index, pipe) in inner.call_pipes.iter().enumerate() {
         let is_healthy = pipe
@@ -1014,26 +894,10 @@ fn repair_dead_call_pipes(inner: &Arc<CoordinatorInner>) {
     }
 }
 
-/// A repair is started exactly once for a failed pipe. This is separate from selection because a
-/// healthy coordinator remains available for reducer calls while the repair is in flight.
 fn call_pipe_needs_repair(is_healthy: bool, already_reconnecting: bool) -> bool {
     !is_healthy && !already_reconnecting
 }
 
-/// The coordinator subscription set, as a pure function of ONE flag — so the property that
-/// matters can be asserted without a node (see the tests at the bottom of this file).
-///
-/// `sharded_tables` adds the tables that only mean something on a MULTI-DATABASE deployment:
-/// realm-core's `game_character_shard`. It is OFF
-/// for a single-database gateway, and that is load-bearing rather than an optimization: **a
-/// subscription to a table the deployed module does not have FAILS TO APPLY**, which fails
-/// `connect_blocking`, which — for the default database — fails `Coordinator::connect` and the
-/// whole gateway. Subscribing them unconditionally would therefore mean a gateway restarted
-/// before the module was republished never comes back, in a configuration (`LYRACORE_SHARD_MAP` and
-/// `LYRACORE_REALM_CORE` both unset) that multi-shard routing and realm-core both promise costs
-/// nothing. Nothing reads
-/// any of them on a single-database gateway anyway — `settle_home_shard` short-circuits on
-/// `is_sharded()` before it looks at the index.
 fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
     let mut queries = crate::stdb::relays::queries();
     queries.extend([
@@ -1132,15 +996,7 @@ fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
     queries
 }
 
-/// Build + connect the privileged SDK connection on a dedicated OS thread.
-///
-/// `DbConnection::build()` creates/uses a tokio runtime via `block_in_place`; calling it from a
-/// tokio worker or a `spawn_blocking` thread panics. A plain `std::thread` has no ambient runtime,
-/// so the SDK builds and owns its own — the supported pattern for a native client.
-///
-/// `sharded_tables` adds the MULTI-DATABASE tables (realm-core's `game_character_shard`) to the
-/// subscription set — see [`coordinator_queries`] for why that flag exists and must stay off by
-/// default.
+/// Build SDK connections on an OS thread outside Tokio to avoid blocking-pool starvation.
 fn connect_blocking(
     uri: String,
     db_name: String,
@@ -1161,13 +1017,8 @@ fn connect_blocking(
     )
 }
 
-/// How often the coordinator watchdog polls connection liveness.
 const COORDINATOR_WATCHDOG_POLL: Duration = Duration::from_secs(3);
 
-/// Rebuild a Coordinator when its transport, subscription, or pump stops. A Module migration
-/// can invalidate the subscription while the socket remains connected.
-/// Subscribe and park off-lock, drain the old pump, then publish, arm, and resume the fresh connection.
-/// Readers retain the old cache during recovery; failed connections retry on the next poll.
 fn spawn_coordinator_watchdog(inner: Arc<CoordinatorInner>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
 .name("stdb-coordinator-watchdog".into())
@@ -1200,18 +1051,13 @@ fn spawn_coordinator_watchdog(inner: Arc<CoordinatorInner>) -> std::thread::Join
                     previous = current;
                     sampled_at = std::time::Instant::now();
                 }
-                // Pipe repair is independent of coordinator recovery: a healthy coordinator is the
-                // fallback while a failed reducer-only pipe reconnects, and must not prevent that
-                // pipe returning to the round-robin pool.
                 repair_dead_call_pipes(&inner);
                 {
-                    // One guard covers the whole health decision. Healthy means the transport and
-                    // subscription belong to the same generation and are both active.
                     let live = inner.coord();
                     if live.is_healthy() {
                         continue;
                     }
-                } // drop the read guard BEFORE the (blocking) rebuild
+                } // Drop the read guard before the blocking rebuild.
                 let role_label = coordinator_role_label(&inner.db_name);
                 log::warn!("{role_label} connection/subscription down; rebuilding (gateway self-heal)");
                 match connect_blocking(
@@ -1222,10 +1068,7 @@ fn spawn_coordinator_watchdog(inner: Arc<CoordinatorInner>) -> std::thread::Join
                     true,
                 ) {
                     Ok(fresh) => {
-                        // Re-arm any relay with no per-login point to self-heal through — MUST run
-                        // after the install: each hook re-reads `inner.coord()` and must see fresh.
-                        // The old pump has finished before publication. Hooks read the fresh cache
-                        // without holding the slot write lock.
+                        // Publish before re-arming; hooks read fresh cache without the slot lock.
                         replace_live_conn(&inner.live, fresh, &role_label, || {
                             let hooks = inner.on_reconnect.lock().unwrap().clone();
                             for hook in hooks {
@@ -1242,15 +1085,8 @@ fn spawn_coordinator_watchdog(inner: Arc<CoordinatorInner>) -> std::thread::Join
 .expect("spawn coordinator watchdog")
 }
 
-/// How often the loot-roll relay promotes staging rolls and settles resolved winners. Short
-/// relative to the 60s roll window: it bounds promotion and settlement latency only. A vote cast
-/// before the next tick flushes the pending promotion itself (`world::loot::run_vote`).
 const LOOT_ROLL_RELAY_POLL: Duration = Duration::from_millis(200);
 
-/// Background loop driving `world::loot::relay_tick`: promotes each world shard's freshly
-/// staged loot rolls onto realm-core, and settles resolved winners back down. A no-op on an unsharded
-/// gateway — `relay_tick` returns immediately when `Coordinator::realm_store()` answers `Ok(None)` — so
-/// this thread costs a single-database deployment nothing but its own idle wakeups.
 fn spawn_loot_roll_relay(coordinator: Coordinator) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("stdb-loot-roll-relay".into())
@@ -1264,13 +1100,6 @@ fn spawn_loot_roll_relay(coordinator: Coordinator) -> std::thread::JoinHandle<()
         .expect("spawn loot-roll relay")
 }
 
-/// Background loop driving `load_sample::sample_and_record`: every `LYRACORE_LOAD_SAMPLE_SECS`
-/// (default 30s), scrape the node's `/v1/metrics` for each configured shard's writer occupancy,
-/// read this gateway's own session counts, and record all of it onto
-/// realm-core — then log one SHARDLOAD line per shard, the same "visible without SQL" convention
-/// QUEUESTAT/AOISTAT use (`world/mod.rs`). Costs an unconfigured single-database gateway nothing
-/// but its own idle wakeups and one metrics scrape (occupancy still measurable there — realm-core
-/// unconfigured just means `record_shard_load` runs against this same database).
 fn spawn_load_sampler(
     coordinator: Coordinator,
     stdb_uri: String,
@@ -1278,9 +1107,6 @@ fn spawn_load_sampler(
 ) -> std::thread::JoinHandle<()> {
     let sampler = crate::load_sample::OccupancySampler::from_env(&stdb_uri);
     let interval = crate::load_sample::sample_interval();
-    // Hashed once at startup: `game_shard_load.gateway_key` is what keys this
-    // process's samples apart from every OTHER gateway process's, so N gateways sampling the same
-    // shard sum to a realm-wide total instead of the last writer clobbering the rest.
     let this_gateway_key = crate::load_sample::gateway_key(&gateway_id);
     std::thread::Builder::new()
         .name("stdb-load-sampler".into())
@@ -1296,35 +1122,13 @@ fn spawn_load_sampler(
         .expect("spawn load sampler")
 }
 
-/// **Every world shard holds a guid range before it can mint a character.**
-///
-/// Runs once per gateway start, right where `check_instance_hosting` enforces the other
-/// cross-database invariant: this is the only place that knows both realm-core and the shard set,
-/// and it is the courier between them — a module cannot read another database, so the claim can
-/// only be driven from here.
-///
-/// Per world shard: read the high-water it is already minting from, ask realm-core to assign it a
-/// range (idempotent — a shard keeps the one it holds), then install that range on the shard. The
-/// mark is what makes the four live databases land on the floors they were given by hand, in any
-/// order (`realm_core::assign_slot`).
-///
-/// **Never fatal.** The guarantee is enforced module-side, in `create_character`, which refuses
-/// outright without a range; a shard that fails to claim here simply cannot create characters, and
-/// says so at the point of creation. Aborting the gateway would take down a whole realm's *play*
-/// over a *creation* problem. Realm-core is skipped: it holds accounts, not characters, and never
-/// mints a character guid.
 fn ensure_guid_ranges(conns: &HashMap<String, Arc<CoordinatorInner>>, map: &ShardMap) {
-    // `call_reducer!` expands to a `?`, so each call needs a Result-returning home.
     fn claim(rc: &Arc<CoordinatorInner>, shard: &str, mark: u64) -> Result<Option<u64>> {
         call_reducer!(
             rc.coord().conn.reducers,
             "claim_guid_range",
             claim_guid_range_then(shard.to_string(), mark)
         )?;
-        // The claim committed on THIS connection, so its row normally rides in with the reducer
-        // callback — but the cache update is a separate delivery, and losing this read would leave
-        // the shard unlicensed (creation refused) until someone restarted the gateway. Same bounded
-        // poll `player_login` uses for the same reason, one connection over.
         for _ in 0..100 {
             if let Some(row) = rc
                 .coord()
@@ -1356,7 +1160,7 @@ fn ensure_guid_ranges(conns: &HashMap<String, Arc<CoordinatorInner>>, map: &Shar
         }
         let Some(inner) = conns.get(&shard) else {
             continue;
-        }; // unreachable shard: already logged
+        };
         let mark = inner
             .coord()
             .conn
@@ -1383,11 +1187,6 @@ fn ensure_guid_ranges(conns: &HashMap<String, Arc<CoordinatorInner>>, map: &Shar
                     continue;
                 }
             },
-            // No realm-core: there is no registry to arbitrate, so there is also only one authority
-            // deciding anything — this gateway. Slot 0 keeps a single-database realm (and every dev
-            // run) minting exactly as it did before ranges existed. A SECOND world shard in this
-            // state is the colliding-guid hazard itself (two shards minting the same character
-            // guids), so it is called out rather than quietly assigned.
             None => {
                 if map.shards().len() > 1 {
                     log::error!(
@@ -1412,22 +1211,13 @@ fn ensure_guid_ranges(conns: &HashMap<String, Arc<CoordinatorInner>>, map: &Shar
     }
 }
 
-/// Claim this gateway's mail-escrow id range once and resume after the largest durable fence or
-/// receipt in it. We deliberately share realm-core's existing range registry: it already provides
-/// idempotent ownership plus a unique slot constraint. Escrow ids remain a separate keyspace
-/// because they are used only as keys in the mail ledgers, never as game GUIDs.
-///
-/// Failure is fail-closed. Installing the old process-time allocator would reintroduce the very
-/// collision this claim removes, so sharded sends refuse until a range can be claimed.
 fn ensure_mail_escrow_range(
     conns: &HashMap<String, Arc<CoordinatorInner>>,
     map: &ShardMap,
     gateway_id: &str,
 ) {
     let Some(rc_name) = map.realm_core_db() else {
-        // The Gateway must not mint escrow ids on the single-database plane. There a Reward
-        // Letter's id comes from the database's own GUID Range, and any local Gateway range would
-        // overlap it. No range is installed, so a mint here refuses.
+        // Single-shard Escrow ids belong to the Module's GUID Range; a Gateway range would overlap.
         return;
     };
     let Some(rc) = conns.get(rc_name) else { return };
@@ -1506,7 +1296,6 @@ mod mail_escrow_claimant_tests {
     }
 }
 
-/// Block on a reducer-completion channel, mapping the outcome to `anyhow`.
 pub(crate) fn recv_reducer(
     rx: std::sync::mpsc::Receiver<std::result::Result<(), ReducerCompletionFailure>>,
     what: &str,
@@ -1567,26 +1356,13 @@ mod coordinator_query_tests {
         }
     }
 
-    /// Every table that only exists on a MULTI-DATABASE deployment. A subscription to one of these
-    /// against a module that predates it FAILS TO APPLY and takes the whole gateway down on
-    /// restart (`coordinator_queries`' doc comment) — so an unconfigured gateway must ask for none.
     const MULTI_DB_TABLES: &[&str] = &[
         "SELECT * FROM game_character_shard",
-        // The party STATE table. `game_group_event` and `game_group_member`
-        // moved OUT of this list to the base set when the shared dispatch landed — both predate sharding, so the
-        // restart hazard this list exists for cannot bite them, and the shared dispatch needs
-        // them on every coordinator (a cache-only subscription with the flag off: the realm
-        // relay registers only on multi-database gateways, so there is no double delivery).
         "SELECT * FROM game_group",
         "SELECT * FROM game_group_roster_revision",
         "SELECT * FROM game_group_member_partition",
-        // The loot-roll pair: both PRIVATE, no per-player subscriber to duplicate — the restart hazard alone is why
-        // they belong on this list (a module published before they exist refuses the subscription).
         "SELECT * FROM game_loot_roll",
         "SELECT * FROM game_loot_roll_vote",
-        // Realm-core's guid-range registry. The per-shard `game_guid_range`/
-        // `game_guid_allocator` pair is deliberately NOT here — a database that holds no range
-        // cannot create characters at all, so every deployment needs those two, sharded or not.
         "SELECT * FROM game_guid_range_registry",
     ];
 
@@ -1621,8 +1397,6 @@ mod coordinator_query_tests {
 
     #[test]
     fn the_multi_database_flag_adds_exactly_those_tables_and_changes_nothing_else() {
-        // The no-op guarantee, stated as set arithmetic: turning the flag on is PURELY additive,
-        // and turning it off leaves the pre-sharding subscription list untouched, in order.
         let single = coordinator_queries(false);
         let sharded = coordinator_queries(true);
         assert_eq!(
@@ -1641,8 +1415,6 @@ mod coordinator_query_tests {
                 "{table} must be subscribed when sharded"
             );
         }
-        // No duplicates in either shape (a duplicate query is a wasted subscription, and a sign
-        // someone re-added a table already in the base list).
         let mut sorted = sharded.clone();
         sorted.sort_unstable();
         let before = sorted.len();
@@ -1867,7 +1639,6 @@ mod pump_tests {
                 .unwrap();
 
             let result = pump_messages(&cache, work, || async {
-                // SDK 2.7.1 applies queued registrations before any waiting remote delta.
                 if cache.pending_registration.swap(false, Ordering::Relaxed) {
                     cache.registered.store(true, Ordering::Relaxed);
                     return Ok(());
@@ -2098,9 +1869,6 @@ mod recv_reducer_tests {
 
     #[test]
     fn a_failed_reducer_is_prefixed_with_the_call_label() {
-        // The `what` label prefixes the module's raw Err string so a log line attributes the
-        // failure to the reducer that ran ("<what> reducer failed: <module error>"). The timeout
-        // arm is not driven here (it would block the suite for its full 10s).
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Err(ReducerCompletionFailure::Rejected(
             "not enough copper".to_string(),
@@ -2229,12 +1997,6 @@ mod call_pipe_routing_tests {
     }
 }
 
-/// Fire a reducer over `$reducers` and block (≤10s) on its completion, mapping the outcome to
-/// `anyhow` (evaluates to `Result<()>`). Collapses the channel + status-flatten callback +
-/// `recv_reducer` that every reducer wrapper otherwise repeats verbatim; the trailing completion
-/// callback is appended after the reducer's own positional args. `$what` (a literal) labels the
-/// send-error and timeout messages. The double `Result` is classified here so module refusals and
-/// SDK failures retain distinct typed provenance.
 macro_rules! call_reducer {
     ($live:ident . conn . reducers, $what:literal, $method:ident ( $($arg:expr),* $(,)? )) => {{
         call_reducer!(@call $live, $what, $method($($arg),*))
@@ -2304,9 +2066,6 @@ impl Coordinator {
 }
 
 impl Coordinator {
-    /// Connect ONE database and wrap it in a watchdogged `CoordinatorInner`. `sharded_tables` — see
-    /// [`connect_blocking`]; a single-database gateway passes `false` and subscribes exactly the
-    /// tables it subscribed before realm-core existed.
     async fn connect_shard(
         cfg: &GatewayConfig,
         db_name: &str,
@@ -2317,7 +2076,6 @@ impl Coordinator {
         let token = cfg.coordinator_token.clone();
         let role_label = coordinator_role_label(db_name);
         let join_role_label = role_label.clone();
-        // Build on a dedicated OS thread (no tokio context), join it off the reactor.
         let build_thread = std::thread::Builder::new()
             .name("stdb-coordinator-connect".into())
             .spawn(move || connect_blocking(uri, db, token, sharded_tables, false))
@@ -2329,9 +2087,6 @@ impl Coordinator {
         })
         .await
         .context("join coordinator connect task")??;
-        // The call-pipe pool. Total pipes = LYRACORE_CALL_PIPES (default 4); <=1 keeps
-        // the single-connection call path. A pipe that fails to build is logged and
-        // skipped — the pool degrades toward `coord()`, never fails the gateway.
         let want_pipes = crate::config::call_pipes();
         let mut call_pipes = Vec::new();
         if want_pipes > 1 {
@@ -2381,10 +2136,6 @@ impl Coordinator {
             on_reconnect: Mutex::new(Vec::new()),
         });
         spawn_coordinator_watchdog(inner.clone());
-        // The movement batch flusher — one gw_movement_batch transaction per 40ms tick
-        // (25/s, the same cadence philosophy as publish_motion's write batching). Fire-and-forget
-        // per flush; a failed send logs and drops that tick's moves (the next heartbeat
-        // supersedes them anyway — movement is idempotent positional state).
         {
             let inner = inner.clone();
             tokio::spawn(async move {
@@ -2393,10 +2144,6 @@ impl Coordinator {
                 let mut ticks_until_metrics = 250u16;
                 loop {
                     tick.tick().await;
-                    // Batch shape: cap each call at 128 moves and spread the chunks across
-                    // the pipe pool — a single ~400-move transaction head-of-line-blocked login
-                    // calls for its whole execution (the measured 1970→1071 seat regression);
-                    // several ~5ms transactions interleave with them instead.
                     let failures = inner.motion_batch.drain(|chunk| {
                         let entries = chunk.len();
                         let pipe = inner.call_pipe();
@@ -2428,14 +2175,6 @@ impl Coordinator {
         Ok(inner)
     }
 
-    /// Connect the coordinator set: one privileged connection per database in the shard map,
-    /// and return the handle for the DEFAULT (realm/home) database — the one the logon + world
-    /// listeners are handed, exactly as before. With no `LYRACORE_SHARD_MAP` this is one connection and
-    /// nothing else changes.
-    ///
-    /// An EXTRA shard that fails to connect is logged and left out of the set rather than failing
-    /// the gateway: routing to a missing shard degrades to the default database, i.e. to today's
-    /// behavior. The default database's own failure is still fatal (it always was).
     pub async fn connect(cfg: &GatewayConfig) -> Result<Self> {
         if cfg.coordinator_token.is_none() {
             log::warn!(
@@ -2444,10 +2183,6 @@ impl Coordinator {
             );
         }
         let map = ShardMap::from_env(&cfg.module_name);
-        // The character→shard index only exists to answer "which of several databases owns
-        // this". One database ⇒ nothing to answer, nothing subscribes it, and the subscription set
-        // is exactly the pre-sharding one — which is what makes "the env vars unset ⇒ today's
-        // gateway" true of the wire, not just of the routing logic.
         let sharded_tables = map.databases().len() > 1;
         let mut conns: HashMap<String, Arc<CoordinatorInner>> = HashMap::new();
         for db in map.databases() {
@@ -2456,11 +2191,7 @@ impl Coordinator {
                     log::info!("coordinator connected to shard {db}");
                     conns.insert(db, inner);
                 }
-                // The default database is listed FIRST, so its failure aborts before any other.
                 Err(e) if db == map.default_db() => return Err(e),
-                // Realm-core down is NOT a routing degradation — it is an auth outage. Nobody can
-                // log in until it is back (`realm_core()` fails closed), but the world sessions
-                // already in progress keep playing, so this is a warning, not a fatal.
                 Err(e) if Some(db.as_str()) == map.realm_core_db() => log::error!(
                     "realm-core database {db} unreachable ({e:#}) — LOGONS WILL BE REFUSED until it \
                      is reachable (the gateway will NOT fall back to the world DB's auth cache); \
@@ -2490,13 +2221,6 @@ impl Coordinator {
                 map.databases()
             );
         }
-        // The ROUTING is ours and `game_config.hosts_instances` is each database's, and
-        // this is the only place both are known. Reads the flag out of each coordinator's just-
-        // applied subscription cache (`connect_blocking` blocks until it is applied, so the row is
-        // there); a database with no row reads `None` ⇒ "hosts", the module's own default. Silent
-        // when correctly configured — including the ordinary single-database realm — a WARNING when
-        // the world shard spawns populations it will not run, and FATAL when nothing anywhere
-        // will spawn them (every dungeon then gets created with 0 entities).
         let hosts_instances = |db: &str| -> Option<bool> {
             conns
                 .get(db)
@@ -2538,22 +2262,9 @@ impl Coordinator {
             }),
             None,
         );
-        // Arm the shared spatial, broadcast, private, and owner dispatch — one callback set per
-        // shard instead of one set per player. Must run before any session can log in, and be re-armed
-        // after a coordinator reconnect (the watchdog treats a module republish as one), which is
-        // what the `on_reconnect` hook below is for: the callbacks are bound to a `LiveConn` that
-        // the swap replaces.
         coordinator.arm_shared_world_view()?;
-        // The loot-roll relay: promotes each world shard's staging loot rolls onto realm-core and settles
-        // resolved winners back down. A no-op loop on an unsharded gateway (`relay_tick` returns
-        // immediately when `realm_store()` is `Ok(None)`), so this costs a single-database deployment
-        // nothing but one idle thread.
         spawn_loot_roll_relay(coordinator.clone());
-        // Member Stats for every group mate outside a viewer's AOI, on its own 5 s thread.
         super::member_stats_relay::spawn_member_stats_relay(coordinator.clone());
-        // The load sampler: per-shard writer occupancy + session counts, sampled on a timer and recorded
-        // onto realm-core so an operator can answer "which shard is hot" with `spacetime sql`
-        // alone.
         spawn_load_sampler(
             coordinator.clone(),
             cfg.stdb_uri.clone(),
@@ -2562,18 +2273,11 @@ impl Coordinator {
         Ok(coordinator)
     }
 
-    /// The gateway-wide shared area-of-interest view — the cell index + viewer registry the
-    /// coordinator dispatch routes through. Shard-independent: every handle answers the same one.
     pub(crate) fn world_view(&self) -> Arc<super::world_view::WorldView> {
         self.1.world.clone()
     }
 
-    /// Register the shared relays on every shard coordinator and install their reconnect hooks.
-    ///
-    /// The shard ORDER fixes the `ShardId`s the index stores, so this runs once, before any session
-    /// exists, and the vector is never reordered afterwards. The re-arm re-registers on the fresh
-    /// `LiveConn`. Reconciliation replaces only that Shard's rows and keeps viewer registrations.
-    /// It removes missing rows because initial subscription apply does not replay their deletes.
+    /// Register before any World Session; shard-vector order fixes stable ShardIds.
     fn arm_shared_world_view(&self) -> Result<()> {
         let view = self.world_view();
         let shards = self.all_shards();
@@ -2590,9 +2294,6 @@ impl Coordinator {
                 }
             }));
         }
-        // The cross-shard group and chat twins ride realm-core's connection, armed only
-        // when realm-core is a DISTINCT database (a world shard's own `arm_shard` above already
-        // watches these tables, and a second registration would deliver every packet twice).
         if let Ok(realm) = self.realm_core() {
             if !shards.iter().any(|s| s.shard_name() == realm.shard_name()) {
                 let world = self.clone();
@@ -2610,42 +2311,22 @@ impl Coordinator {
         Ok(())
     }
 
-    /// The database name this handle targets — the routing identity of every call made through it.
     pub fn shard_name(&self) -> &str {
         &self.0.db_name
     }
 
-    /// Is the gateway actually running against more than one database? `false` is the unconfigured
-    /// default and lets the routing paths short-circuit to exactly the pre-sharding behavior — no
-    /// location read, no handle clone, no pin.
     pub(crate) fn is_sharded(&self) -> bool {
         self.1.conns.len() > 1
     }
 
-    /// The handle for the shard that owns `(map_id, instance_id)`, or `None` when that is already
-    /// THIS handle's shard (the single-shard default: nothing to swap).
-    ///
-    /// An owner that is named by the map but failed to connect degrades to the DEFAULT database —
-    /// never to whatever handle happened to ask. Degrading to the asker looks the same from the
-    /// default handle but is wrong from any other: a session already pinned to shard B that ports
-    /// to a map owned by an unreachable shard C would KEEP its B pin and be served by a database
-    /// that owns neither its old location nor its new one. Collapsing to the default is the
-    /// documented safety property — a bad shard map can only ever fall back to today's behavior.
     pub fn shard_for(&self, map_id: u32, instance_id: u64) -> Option<Coordinator> {
         let db = self
             .1
             .map
             .resolve_connected(map_id, instance_id, |d| self.1.conns.contains_key(d));
-        // Always present: `resolve_connected` only ever answers a connected database or the
-        // default, and `connect` proves the default is in the set.
         self.shard_handle(db)
     }
 
-    /// [`shard_for`](Self::shard_for) for an INSTANCE, given the database that currently holds the
-    /// character. Same contract — `None` means "already this handle's shard" — with the one
-    /// extra rule that keeps a live dungeon run on its pool member when the operator re-points that
-    /// bucket to a newly added instances database. The decision is the pure, unit-tested
-    /// [`crate::config::ShardMap::instance_owner`]; this only supplies it with the connected set.
     pub(crate) fn instance_shard_for(
         &self,
         map_id: u32,
@@ -2658,17 +2339,6 @@ impl Coordinator {
         self.shard_handle(db)
     }
 
-    /// The handle for `db`, or `None` when `db` is already THIS handle's shard ("nothing to swap",
-    /// the answer every routing path gives when the session is where it belongs). One place, so a
-    /// second routing overlay cannot grow a second opinion about what "stay put" means.
-    ///
-    /// `None` therefore means one of TWO different things, and a caller that treats it as a single
-    /// failure signal cannot tell them apart (a live bug read exactly this way: a database
-    /// that was trivially connected produced a "not connected" warning because the caller asked for
-    /// its OWN shard — the fix is to never call this with `db == self.shard_name()` in the first
-    /// place, not to guess here after the fact). The warning below only fires for the SECOND case —
-    /// `db` genuinely absent from the connected set — so it stays silent on every "already home"
-    /// call, which is the common case for `shard_for`/`instance_shard_for`/`settle_home_shard`.
     pub(crate) fn shard_handle(&self, db: &str) -> Option<Coordinator> {
         if db == self.shard_name() {
             return None;
@@ -2684,21 +2354,6 @@ impl Coordinator {
         Some(Coordinator(inner?.clone(), self.1.clone(), self.2.clone()))
     }
 
-    /// Every connected shard's handle, DEFAULT FIRST. Two callers: the character-select list
-    /// (a character parked inside an instance lives on the instance shard, and the player must
-    /// still see it) and the party mirror fan-out (`world_stores`).
-    ///
-    /// ⚠ This is exactly `world_shards()` with the names dropped — REALM-CORE IS NOT IN
-    /// IT. It was originally written over `conns`, which was the same set only while the default
-    /// database was also the auth database; once realm-core is a third connection, probing it for characters
-    /// asks a database that owns none and (worse) could answer with the shadow account rows the
-    /// transfer's `import_character_blob` writes there. `ShardMap::shards()` excludes it by
-    /// construction, so the probe set is the right one for both topologies.
-    ///
-    /// Deliberate simplification: O(shards) per login for a caller that needs every handle. The
-    /// holder LOOKUP no longer pays this unconditionally — `realm_core::locate_home_shard`
-    /// tries the realm-core `character_shard` hint first and only falls back to scanning
-    /// `world_shards()` (this method's underlying set) on a miss.
     pub(crate) fn all_shards(&self) -> Vec<Coordinator> {
         self.world_shards()
             .into_iter()
@@ -2706,8 +2361,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// Check current subscription health before returning Realm-core authority.
-    /// The configured connection map survives disconnection and may retain stale rows.
     pub(crate) fn realm_core(&self) -> Result<Coordinator> {
         let db = self
             .1
@@ -2729,9 +2382,6 @@ impl Coordinator {
         Ok(Coordinator(inner.clone(), self.1.clone(), self.2.clone()))
     }
 
-    /// The connected WORLD SHARDS, default first — the probe order for the character→shard fallback
-    /// when the realm-core index has no hint. Realm-core is excluded by `ShardMap::shards`: it
-    /// holds no characters.
     pub(crate) fn world_shards(&self) -> Vec<(String, Coordinator)> {
         self.1
             .map
@@ -2744,7 +2394,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// Every configured World Shard, only while each Coordinator subscription is healthy.
     pub(crate) fn world_shards_for_absence(&self) -> Result<Vec<(String, Coordinator)>> {
         self.1
             .map
@@ -2764,13 +2413,10 @@ impl Coordinator {
             .collect()
     }
 
-    /// The routing table this handle resolves through (read-only; the pure resolvers in
-    /// `crate::config` take it by reference).
     pub(crate) fn shard_map(&self) -> &ShardMap {
         &self.1.map
     }
 
-    /// Account admission requires every configured World Shard, including an unavailable one.
     pub(crate) fn configured_world_shards(&self) -> Result<Vec<Coordinator>> {
         self.1
             .map
@@ -2791,16 +2437,6 @@ impl Coordinator {
     }
 }
 
-/// Why the SDK connection builds (`connect_blocking`, the call pipes) run on threads the
-/// runtime does NOT own.
-///
-/// The gateway spends one tokio blocking-pool thread per world session and per logon handshake, for
-/// that session's whole life (`world::run`, `logon::run`). `block_in_place` on a runtime worker gives
-/// the worker's core away and asks that same pool to run it (tokio `multi_thread/worker.rs`), so once
-/// the pool is full the core is never picked up — the runtime shrinks by one core per in-flight
-/// connection build, and every SDK message pump on it stalls with it. These tests pin the difference
-/// between the two shapes with no node and no network; they are the offline half of the evidence
-/// for that diagnosis (the live half was a ~535-seat ceiling with bimodal connect timeouts).
 #[cfg(test)]
 mod connect_build_shape {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2809,9 +2445,6 @@ mod connect_build_shape {
     use std::time::Duration;
     use tokio::runtime::{Builder, Handle, Runtime};
 
-    /// A runtime shaped like the gateway's: `workers` cores and a blocking pool with EVERY slot held
-    /// by a task that does not return — the session-per-`spawn_blocking` shape at its ceiling.
-    /// Flip the returned flag before dropping the runtime, or the drop waits forever.
     fn saturated(workers: usize, cap: usize) -> (Runtime, Arc<AtomicBool>) {
         let rt = Builder::new_multi_thread()
             .worker_threads(workers)
@@ -2839,10 +2472,6 @@ mod connect_build_shape {
         (rt, stop)
     }
 
-    /// The failure mode itself. Four workers, pool full, four `block_in_place` calls in flight ⇒ the
-    /// runtime has NO core left, so a plain task cannot run at all. In the gateway those tasks are
-    /// the SDK's websocket message and parse loops, which is why one slow connect shows up as every
-    /// other session's reducer timing out, and as the measured 12.6 s movement p95.
     #[test]
     fn block_in_place_on_a_worker_costs_a_core_when_the_blocking_pool_is_full() {
         let (rt, stop) = saturated(4, 4);
@@ -2868,8 +2497,6 @@ mod connect_build_shape {
         );
     }
 
-    /// The shape `player_conn` uses instead: a thread the runtime does not own, with an `enter()`
-    /// guard. Same saturated runtime as the test above, and it does not care.
     #[test]
     fn connect_build_does_not_starve_on_a_full_blocking_pool() {
         let (rt, stop) = saturated(4, 4);
@@ -2877,9 +2504,6 @@ mod connect_build_shape {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _guard = handle.enter();
-            // Stands in for `DbConnection::build()`, which ends in
-            // `block_in_place(|| handle.block_on(WsConnection::connect(..)))` — i.e. it awaits
-            // something only this runtime's driver can complete.
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2897,9 +2521,7 @@ mod connect_build_shape {
         );
     }
 
-    /// The other half of the same line: the `enter()` guard is what keeps the SDK on the SHARED runtime.
-    /// Without it `Handle::try_current()` fails and `enter_or_create_runtime()` builds a private
-    /// 1-worker runtime per connection — ~1-2 OS threads per account, never released.
+    // enter() shares the runtime; without it the SDK creates a private runtime per connection.
     #[test]
     fn an_enter_guard_is_what_makes_the_sdk_reuse_the_shared_runtime() {
         let rt = Builder::new_multi_thread()

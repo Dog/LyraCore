@@ -1,7 +1,3 @@
-//! The trainers family's identifier policy. `game_trainer_spell` follows the loot shape (band
-//! checked against the row's own surrogate `id`), the same as `game_creature_spell` in
-//! `cast_identifiers.rs`.
-
 mod common;
 
 use common::{
@@ -139,8 +135,6 @@ fn an_incomplete_trainer_spell_insert_is_refused() {
     }
 }
 
-/// The cast and trainer bands are one decade apart (10M/11M), so an identifier that reads as a
-/// valid trainer row must not also read as a cast row.
 #[test]
 fn the_cast_and_trainer_bands_do_not_overlap() {
     use lyracore_package_delta::is_package_cast_id;

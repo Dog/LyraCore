@@ -1,7 +1,3 @@
-//! Chat lines over an encrypted World Session: Speech, the GM dot-command and the Chat Flood
-//! Limiter. Realm Chat Lines and away status are tested against `InMemoryChatActions` in
-//! `handlers/chat.rs`.
-
 use super::*;
 
 #[test]
@@ -22,7 +18,7 @@ fn messagechat_say_and_yell_route_to_chat_types_0_and_1() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    drop(client); // no reply on success — the speaker sees their line via the broadcast relay
+    drop(client);
     server.join().unwrap();
     assert_eq!(
         store.speech.chats.lock().unwrap().as_slice(),
@@ -42,7 +38,7 @@ fn messagechat_emote_routes_to_chat_type_3() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    drop(client); // no reply on success — the speaker sees their line via the broadcast relay
+    drop(client);
     server.join().unwrap();
     assert_eq!(
         store.speech.chats.lock().unwrap().as_slice(),
@@ -68,7 +64,7 @@ fn messagechat_dot_say_diverts_to_gm_command_never_touching_chat() {
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
-        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {} // nothing was sent for a successful dot-command
+        ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {}
         other => panic!("expected the sentinel (no reply on gm_command success), got {other}"),
     }
     drop(client);
@@ -86,8 +82,6 @@ fn messagechat_dot_say_diverts_to_gm_command_never_touching_chat() {
 
 #[test]
 fn messagechat_non_dot_say_is_byte_identical_to_before_223() {
-    // The 223 divert must be a no-op for ordinary chat: a Say line NOT starting with '.' still routes
-    // to send_chat exactly as before, and never touches gm_command.
     let store = std::sync::Arc::new(quest_store());
     let (mut client, mut c_enc, _c_dec, server) = enter_world(store.clone(), 1);
     CMSG_MESSAGECHAT {
@@ -111,9 +105,6 @@ fn messagechat_non_dot_say_is_byte_identical_to_before_223() {
 
 #[test]
 fn messagechat_dot_say_error_relays_a_system_chat_line_to_the_sender_only() {
-    // A rejected dot-command (bad gm_level, unknown command, bad args) is relayed back
-    // to the SENDER as a System SMSG_MESSAGECHAT carrying the module's raw message VERBATIM — no
-    // "reducer failed" wrapper prefix, no broadcast, no game_chat_event row.
     let mut s = quest_store();
     s.speech.gm_command_error = Some(|| {
         crate::stdb::ReducerCallError::refused("gw_gm_command", "permission denied").into()
@@ -178,7 +169,6 @@ fn messagechat_dot_say_transport_loss_ends_the_world_session() {
     );
 }
 
-/// Character 1 in the world, with a Character row so `sync`'s sentinel is answered.
 fn chat_store() -> WorldFake {
     let base = quest_store();
     WorldFake {
@@ -212,8 +202,6 @@ fn notification(message: ServerOpcodeMessage) -> String {
 
 #[test]
 fn a_flooding_session_is_muted_before_any_chat_durable_request() {
-    // cm:Player.cpp:16344-16377: eleven fast lines mute the speaker for ten seconds. The twelfth
-    // line and the party line after it answer the cmangos notice and reach no reducer.
     let store = std::sync::Arc::new(chat_store());
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     for n in 0..12 {
@@ -243,7 +231,6 @@ fn a_flooding_session_is_muted_before_any_chat_durable_request() {
 
 #[test]
 fn a_muted_session_still_sends_addon_lines() {
-    // cm:ChatHandler.cpp:113-119: the addon language is never flood-controlled.
     let store = std::sync::Arc::new(chat_store());
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     for n in 0..12 {
@@ -269,7 +256,6 @@ fn a_muted_session_still_sends_addon_lines() {
 
 #[test]
 fn a_game_master_is_never_muted_for_flooding() {
-    // cm:Player.cpp:16346-16348 skips the flood count for any account above SEC_PLAYER.
     let mut s = chat_store();
     s.chat.gm_level = 1;
     let store = std::sync::Arc::new(s);
@@ -288,7 +274,6 @@ fn a_game_master_is_never_muted_for_flooding() {
 
 #[test]
 fn a_say_line_in_a_language_the_speaker_does_not_know_answers_the_vanilla_notice() {
-    // cm:ChatHandler.cpp:107-110 with cm mangos.sql:4044.
     let mut s = chat_store();
     s.speech.send_chat_outcome = Some(ChatOutcome::Refused(
         lyracore_shared::chat::ChatRefusal::UnknownLanguage,

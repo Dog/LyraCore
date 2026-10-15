@@ -1,5 +1,3 @@
-//! Locked GOOBER use through the Module boundary.
-
 mod support;
 
 use support::Standalone;
@@ -116,7 +114,6 @@ fn key_count(standalone: &Standalone) -> u32 {
         .sum()
 }
 
-/// Runs only when requested because it builds and publishes the Module to a private Standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn locked_goober_use_is_atomic_until_an_opener_unlocks_it() {

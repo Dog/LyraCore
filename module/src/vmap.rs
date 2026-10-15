@@ -1,7 +1,3 @@
-//! Static collision generations and instance-aware geometry queries.
-//! The global Gate controls gameplay rays. Static hits require an active generation;
-//! closed DOOR/BUTTON hits use their own instance-scoped registration.
-
 use crate::terrain::game_terrain_chunk;
 use lyracore_shared::terrain::cell_key;
 use lyracore_shared::vmap::{decode, RayFlavor, VmapTri};
@@ -32,10 +28,7 @@ fn require_verified(state: u8) -> Result<(), String> {
         .ok_or_else(|| "only a verified vmap generation can be activated".to_string())
 }
 
-/// Hash the canonical, transport-independent stream of staged shards. The importer makes this
-/// same sequence while it drains its sorted disk spool: cell key, per-cell ordinal, blob length,
-/// then the exact packed bytes. Keeping it here makes verification reject a complete-but-wrong
-/// upload rather than trusting transport progress as data integrity.
+// Digest framing and order must match the importer's canonical spool stream.
 fn manifest_digest<'a>(chunks: impl IntoIterator<Item = (u64, u32, &'a [u8])>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(MANIFEST_DOMAIN);
@@ -48,8 +41,6 @@ fn manifest_digest<'a>(chunks: impl IntoIterator<Item = (u64, u32, &'a [u8])>) -
     *hasher.finalize().as_bytes()
 }
 
-/// Refuse a staged stream whose content is not exactly the immutable manifest accepted at stage
-/// time. This is deliberately pure so the reducer contract has a small, headless test seam.
 fn require_manifest<'a>(
     expected_bytes: u64,
     expected_digest: &[u8],
@@ -72,8 +63,6 @@ fn require_manifest<'a>(
     Ok(())
 }
 
-/// Map-scoped import lifecycle. The operator supplies `id`, making retries and importer resume
-/// deterministic without needing a reducer return value to discover an auto-incremented key.
 #[table(accessor = game_vmap_generation, public, index(accessor = by_map_state, btree(columns = [map_id, state])))]
 pub struct VmapGeneration {
     #[primary_key]
@@ -82,19 +71,13 @@ pub struct VmapGeneration {
     pub state: u8,
     pub expected_chunks: u32,
     pub accepted_chunks: u32,
-    /// Immutable byte total of all packed shard blobs in this generation's manifest.
     pub expected_bytes: u64,
-    /// Immutable 32-byte BLAKE3 digest of the canonical manifest stream.
     pub manifest_digest: Vec<u8>,
 
     pub source_identity: String,
-    /// Immutable canonical identity of the selected map/cell coverage.
     pub selection_identity: String,
 }
 
-/// Public, blob-free receipt ledger for resumable imports. Operators and the importer can read
-/// this table to skip an already accepted `(generation_id, key, shard_ordinal)` without
-/// subscribing to or re-transferring collision payloads from the private chunk store.
 #[table(
     accessor = game_vmap_generation_receipt,
     public,
@@ -110,8 +93,6 @@ pub struct VmapGenerationReceipt {
     pub key: u64,
 }
 
-/// A staged chunk belongs to exactly one generation. `shard_ordinal` is stable within one cell,
-/// so an ambiguous importer retry can be accepted idempotently instead of duplicating triangles.
 #[table(
     accessor = game_vmap_generation_chunk,
     index(accessor = by_generation, btree(columns = [generation_id])),
@@ -130,37 +111,17 @@ pub struct VmapGenerationChunk {
     pub blob: Vec<u8>,
 }
 
-/// One SHARD of a terrain cell's packed collision triangles (`lyracore_shared::vmap` codec).
-/// PRIVATE — no gateway binding needed (the headless reducer-add pattern, `docs/danger-zones.md`
-/// §1.2: "a table binding is only needed if the gateway subscribes to or reads that table", and
-/// nothing outside this module does; an operator inspects it with `spacetime sql`).
-///
-/// MULTIPLE rows can share the same `key` (unlike `game_nav_chunk`'s one-row-per-cell, this table
-/// is NOT unique on `key`): a dense cell's triangle count is unbounded, but a single
-/// `spacetime call` CLI argument is not (Linux caps one argv string around 128 KB), so the
-/// importer shards an oversized cell into several independently-decodable blobs
-/// (`importer/src/vmap.rs`'s `MAX_ROW_TRI_BYTES` split). `fetcher` below gathers every row for a
-/// cell and concatenates their decoded triangles.
 #[table(accessor = game_vmap_chunk, index(accessor = by_cell, btree(columns = [key])))]
 pub struct VmapChunk {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    /// Same `cell_key` as `game_nav_chunk`/`game_terrain_chunk`: (map << 32) | (cell_x << 16) | cell_y.
     pub key: u64,
     pub map_id: u32,
     pub cell_x: u16,
     pub cell_y: u16,
-    /// Already `lyracore_shared::vmap::encode`d by the importer — this side stores + decodes,
-    /// never re-packs. One shard's worth of triangles, not necessarily the whole cell.
     pub blob: Vec<u8>,
 }
-
-// ===========================================================================================
-//  Import reducers — same packed-string convention as `nav::import_nav_chunks`: rows `;`,
-//  fields `,`, the blob hex. Unlike nav's fixed-size fields, the blob is the LAST field and
-//  `splitn` keeps it intact even though hex never itself contains a `,`.
-// ===========================================================================================
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
@@ -199,9 +160,8 @@ fn same_stage_request(
         && row.state == STAGING
 }
 
-/// Start a generation. Repeating the exact request resumes it; a conflicting request is refused.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // A reducer's arguments are its call signature.
+#[allow(clippy::too_many_arguments)]
 pub fn stage_vmap_generation(
     ctx: &ReducerContext,
     generation_id: u64,
@@ -264,8 +224,6 @@ pub fn stage_vmap_generation(
     }
 }
 
-/// Append one packed batch to a staging generation. Each row is
-/// `shard_ordinal,map_id,cell_x,cell_y,blob_hex`.
 #[reducer]
 pub fn append_vmap_generation_chunks(
     ctx: &ReducerContext,
@@ -332,7 +290,6 @@ pub fn append_vmap_generation_chunks(
     Ok(())
 }
 
-/// Validate the complete staged generation before it can affect gameplay.
 #[reducer]
 pub fn verify_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -346,9 +303,6 @@ pub fn verify_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Resul
         .filter(&generation_id)
         .collect();
     staged.sort_unstable_by_key(|chunk| (chunk.key, chunk.shard_ordinal));
-    // The decode pass that validates every staged chunk also classifies it: a cell whose triangles
-    // include an indoor WMO group gets a marker row below (`tri_is_indoor`). Free — the blobs are
-    // decoded here exactly once either way, and nothing about the manifest or the digest changes.
     let mut indoor_cells = std::collections::BTreeSet::new();
     for chunk in &staged {
         let tris =
@@ -370,7 +324,6 @@ pub fn verify_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Resul
     Ok(())
 }
 
-/// Atomically replace the map's active generation after successful verification.
 #[reducer]
 pub fn activate_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -389,7 +342,6 @@ pub fn activate_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Res
     Ok(())
 }
 
-/// Discard incomplete or failed staging data without touching a prior active generation.
 #[reducer]
 pub fn discard_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -418,7 +370,6 @@ pub fn discard_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Resu
     for id in receipt_ids {
         receipts.id().delete(id);
     }
-    // The derived indoor markers go with the geometry they were derived from.
     let indoor_cells = ctx.db.game_vmap_indoor_cell();
     let indoor_ids: Vec<u64> = indoor_cells
         .by_generation()
@@ -428,7 +379,6 @@ pub fn discard_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Resu
     for id in indoor_ids {
         indoor_cells.id().delete(id);
     }
-    // Derived path-grid coverage is likewise scoped to the generation it came from.
     let coverage = ctx.db.game_vmap_nav_coverage();
     let coverage_ids: Vec<u64> = coverage
         .by_generation()
@@ -447,25 +397,12 @@ pub fn discard_vmap_generation(ctx: &ReducerContext, generation_id: u64) -> Resu
     Ok(())
 }
 
-// ===========================================================================================
-//  Nav coverage derivation — per-cell walk/obstruction blobs derived module-side
-//  from a generation's OWN staged `VmapGenerationChunk` rows, never a re-import and never
-//  `game_nav_chunk` (that table has no generation column and is cleared wholesale by the `--nav`
-//  import pipeline). Coverage is generation-scoped so it can never half-exist: it belongs to
-//  exactly one generation, and the manifest below only ever gets written once, fully formed.
-//  Same rasterizer as the importer's `--nav` mode (`lyracore_shared::nav::derive_cell`) — one
-//  rasterization policy, never two.
-// ===========================================================================================
-
 fn require_coverage_preparable(state: u8) -> Result<(), String> {
     matches!(state, VERIFIED | ACTIVE)
         .then_some(())
         .ok_or_else(|| "vmap nav coverage needs a verified or active generation".to_string())
 }
 
-/// Hash the canonical, cell-key-sorted stream of a generation's coverage rows: key, `base_z` (the
-/// standing-ground floor folds into the digest per the README rule), then the walk/obs blobs.
-/// Same shape as `manifest_digest` above, one level down.
 fn coverage_digest<'a>(
     cells: impl IntoIterator<Item = (u64, f32, &'a [u8], &'a [u8])>,
 ) -> [u8; 32] {
@@ -482,10 +419,6 @@ fn coverage_digest<'a>(
     *hasher.finalize().as_bytes()
 }
 
-/// One derived coverage cell. PRIVATE like `VmapGenerationChunk` — the nav read seam
-/// (`nav.rs::fetcher`) reads it module-side; nothing outside this module needs a gateway binding.
-/// A missing row means no coverage for that cell, the same "no obstacles known" contract as
-/// `game_nav_chunk`: `derive_cell` returns `None` for a fully-clear cell and no row is written.
 #[table(
     accessor = game_vmap_nav_coverage,
     index(accessor = by_generation, btree(columns = [generation_id])),
@@ -496,7 +429,6 @@ pub struct VmapNavCoverage {
     #[auto_inc]
     pub id: u64,
     pub generation_id: u64,
-    /// Same `cell_key` as `game_nav_chunk`/`game_terrain_chunk`/`game_vmap_generation_chunk`.
     pub cell_key: u64,
     pub map_id: u32,
     pub cell_x: u16,
@@ -506,9 +438,6 @@ pub struct VmapNavCoverage {
     pub obs: Vec<u8>,
 }
 
-/// Public, blob-free per-generation summary. `complete` is set exactly once, inside
-/// `finalize_vmap_nav_coverage`'s single insert-or-update — there is no persisted half-finished
-/// manifest, so its mere existence already means "finalized."
 #[table(accessor = game_vmap_nav_coverage_manifest, public)]
 pub struct VmapNavCoverageManifest {
     #[primary_key]
@@ -519,20 +448,13 @@ pub struct VmapNavCoverageManifest {
     pub complete: bool,
 }
 
-/// One cell to prepare in [`prepare_vmap_nav_coverage`]'s batch. Cell coordinates only — the
-/// storage key is always rebuilt server-side from the generation's own `map_id`, the same trust
-/// boundary `append_vmap_generation_chunks` already applies to its cell key.
 #[derive(spacetimedb::SpacetimeType)]
 pub struct VmapNavCoverageCell {
     pub cell_x: u16,
     pub cell_y: u16,
 }
 
-/// Every triangle from `(cell_x, cell_y)` plus its 8 neighbours, gathered from this generation's
-/// OWN staged chunks (never the live `game_vmap_chunk` table). Nav derivation needs geometry
-/// within `nav::WALK_MARGIN` of the cell — wider than the vmap importer's exact-AABB-touch
-/// binning — so the neighbours cover that gap; `derive_cell` clamps everything back to the
-/// requested cell, so the extra triangles are free and correct, never a border seam.
+// Derive from this generation's staged neighbourhood, never the currently active geometry.
 fn coverage_neighborhood_tris(
     ctx: &ReducerContext,
     generation_id: u64,
@@ -561,12 +483,6 @@ fn coverage_neighborhood_tris(
     tris
 }
 
-/// Derive and store coverage for a batch of cells, decoding one cell's neighbourhood at a time so
-/// memory stays bounded by the batch, not the map. Idempotent per cell: a key that already has a
-/// row — from an earlier call, including a retried one — is skipped outright, so re-submitting
-/// the same batch (or an overlapping one) never duplicates a row or perturbs the eventual digest.
-/// Allowed for a verified or active generation (the active map can be retrofitted); refused for
-/// staging or discarded data.
 #[reducer]
 pub fn prepare_vmap_nav_coverage(
     ctx: &ReducerContext,
@@ -628,10 +544,6 @@ pub fn prepare_vmap_nav_coverage(
     Ok(())
 }
 
-/// Lock in whatever coverage is currently prepared as this generation's manifest: cell count +
-/// digest over every stored row, sorted by cell key for a canonical stream. Safe to call again
-/// after preparing more cells, or with nothing new — the digest just reproduces. Same
-/// verified-or-active gate as preparation.
 #[reducer]
 pub fn finalize_vmap_nav_coverage(ctx: &ReducerContext, generation_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -675,11 +587,6 @@ pub fn finalize_vmap_nav_coverage(ctx: &ReducerContext, generation_id: u64) -> R
     Ok(())
 }
 
-/// This map's active generation's coverage manifest, but only once it is finalized (`complete`).
-/// Coverage is optional: a verified-but-not-yet-finalized, or deliberately uncovered, active
-/// generation selects none, and `nav.rs::fetcher` degrades to terrain-only exactly as if coverage
-/// had never been prepared. Re-evaluated on every call rather than snapshotted at activation time,
-/// because preparation can retrofit an already active generation.
 pub(crate) fn active_vmap_nav_coverage_manifest(
     ctx: &ReducerContext,
     map_id: u32,
@@ -711,7 +618,7 @@ fn load_vmap_batch(ctx: &ReducerContext, packed: &str) -> Result<u32, String> {
             .map_err(|_| format!("bad u16: {}", f[2]))?;
         let blob = hex_decode(f[3])?;
         chunks.insert(VmapChunk {
-            id: 0, // auto_inc
+            id: 0,
             key: cell_key(map_id, cell_x, cell_y),
             map_id,
             cell_x,
@@ -723,7 +630,6 @@ fn load_vmap_batch(ctx: &ReducerContext, packed: &str) -> Result<u32, String> {
     Ok(loaded)
 }
 
-/// Clear + load the first vmap batch (operator-only), mirroring `import_nav_chunks`.
 #[reducer]
 pub fn import_vmap_chunks(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -738,7 +644,6 @@ pub fn import_vmap_chunks(ctx: &ReducerContext, packed: String) -> Result<(), St
     Ok(())
 }
 
-/// Append a vmap batch WITHOUT the reset — a zone's cells span many `spacetime call` args.
 #[reducer]
 pub fn import_vmap_chunks_append(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -746,16 +651,8 @@ pub fn import_vmap_chunks_append(ctx: &ReducerContext, packed: String) -> Result
     Ok(())
 }
 
-// ===========================================================================================
-//  Runtime consumption — module-side wrappers over `lyracore_shared::vmap::cast_ray`,
-//  gated on `game_config.vmap_enabled`.
-// ===========================================================================================
-
 use crate::game_config;
 
-/// The map's ACTIVE generation id, or `None` when it has none. The ONE `by_map_state` scan —
-/// `vmap_enabled`, `fetcher` and the indoor-presence lookup all ask through here rather than
-/// repeating the filter, so "which generation is live" has a single answer per map.
 pub(crate) fn active_generation_id(ctx: &ReducerContext, map_id: u32) -> Option<u64> {
     ctx.db
         .game_vmap_generation()
@@ -765,13 +662,10 @@ pub(crate) fn active_generation_id(ctx: &ReducerContext, map_id: u32) -> Option<
         .map(|generation| generation.id)
 }
 
-/// Static geometry consumes only with the global Gate and a complete active generation.
-/// This decides whether navigation still needs its coarse grid fallback.
 pub(crate) fn vmap_enabled(ctx: &ReducerContext, map_id: u32) -> bool {
     rays_enabled(ctx) && active_generation_id(ctx, map_id).is_some()
 }
 
-/// Global collision Gate. Dynamic doors do not require a static generation.
 pub(crate) fn rays_enabled(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
@@ -780,11 +674,6 @@ pub(crate) fn rays_enabled(ctx: &ReducerContext) -> bool {
         .is_some_and(|c| c.vmap_enabled)
 }
 
-/// Chunk fetch closure for `cast_ray`: one indexed scan + decode per crossed cell, gathering
-/// every shard row for that cell key (a dense cell may be split across several — see
-/// `VmapChunk`'s doc comment) and concatenating their decoded triangles. A shard decode failure
-/// (shouldn't happen — only this module writes the table) is skipped rather than panicking a ray
-/// query. `None` only when NO row at all exists for the cell (the missing-chunk contract).
 fn fetcher(ctx: &ReducerContext, map_id: u32) -> impl FnMut(u16, u16) -> Option<Vec<VmapTri>> + '_ {
     let generation_id = active_generation_id(ctx, map_id);
     move |cx, cy| {
@@ -807,7 +696,6 @@ fn fetcher(ctx: &ReducerContext, map_id: u32) -> impl FnMut(u16, u16) -> Option<
     }
 }
 
-/// Exact sight includes WMO geometry and closed doors in the requested instance.
 pub(crate) fn los_ray(
     ctx: &ReducerContext,
     map_id: u32,
@@ -820,7 +708,6 @@ pub(crate) fn los_ray(
         .flatten()
 }
 
-/// Exact collision includes WMO, static doodads and closed doors.
 pub(crate) fn collision_ray(
     ctx: &ReducerContext,
     map_id: u32,
@@ -861,7 +748,6 @@ fn ray(
     )
 }
 
-/// Operator geometry probe, independent of the gameplay Gate.
 #[cfg(feature = "debug_reducers")]
 pub(crate) fn probe_rays(
     ctx: &ReducerContext,
@@ -877,13 +763,8 @@ pub(crate) fn probe_rays(
 }
 
 const FLOOR_PROBE_UP_YD: f32 = 2.0;
-/// How far below `probe_z` the down-ray searches — generous enough to reach the ground floor of
-/// a multi-deck WMO interior (Deadmines) from a probe standing on an upper deck.
 const FLOOR_PROBE_DOWN_YD: f32 = 200.0;
 
-/// Highest static or closed-door surface in the vertical probe segment in this partition.
-/// The segment starts slightly above `probe_z` so a point already on the surface can find it.
-/// Returns `None` when the gameplay Gate is off or no collision triangle lies in that segment.
 pub(crate) fn floor_z(
     ctx: &ReducerContext,
     map_id: u32,
@@ -897,8 +778,6 @@ pub(crate) fn floor_z(
     collision_ray(ctx, map_id, instance_id, top, bottom).map(|hit| hit[2])
 }
 
-/// Walkable model support for a movement waypoint. A steep face remains an obstacle even when
-/// a downward ray intersects it near the preceding foot height.
 pub(crate) fn walking_floor_z(
     ctx: &ReducerContext,
     map_id: u32,
@@ -920,7 +799,6 @@ pub(crate) fn walking_floor_z(
     .map(|point| point[2])
 }
 
-/// Static and closed-door floor probe, independent of the gameplay Gate.
 #[cfg(feature = "debug_reducers")]
 pub(crate) fn probe_floor_z(
     ctx: &ReducerContext,
@@ -935,20 +813,6 @@ pub(crate) fn probe_floor_z(
     ray(ctx, map_id, instance_id, top, bottom, RayFlavor::Collision).map(|hit| hit[2])
 }
 
-// ===========================================================================================
-//  Indoor/outdoor area-info — mangos parity: `VMapManager2::getAreaInfo` / the indoor
-//  half of `Player::CheckAreaExploreAndOutdoor`. Same down-ray probe shape as `floor_z`, but
-//  WMO-only (a doodad standing in an open field doesn't make the point "indoor") and reporting
-//  the containing group's id + MOGP indoor bit instead of just the hit height.
-// ===========================================================================================
-
-/// Which WMO group (if any) contains `(x, y, z)` on `map_id`, and whether it's indoor. `None`
-/// when vmap is off, unimported, or no WMO group is found in the probe range (outdoors/open
-/// world) — mirrors every other vmap query's missing-chunk-means-nothing-found contract.
-///
-/// The downward budget is `AREA_PROBE_DOWN_YD`, NOT the 200 yd `FLOOR_PROBE_DOWN_YD`: a floor
-/// probe wants the deepest deck it can reach, an area query wants only the surface this point is
-/// standing on, and the long budget reports a point in the open as inside a WMO far below it.
 pub(crate) fn area_info(
     ctx: &ReducerContext,
     map_id: u32,
@@ -964,25 +828,6 @@ pub(crate) fn area_info(
     lyracore_shared::vmap::cast_ray_area(&mut fetcher(ctx, map_id), top, bottom)
 }
 
-// ===========================================================================================
-//  Per-cell indoor presence — a derived, module-private pre-reject in front of
-//  `area_info`, so a movement heartbeat can ask "am I indoors?" every 100 ms without paying a
-//  ray cast anywhere the map has no interior geometry at all (which is nearly everywhere).
-//
-//  Kept in one region at the END of this file on purpose: the generation lifecycle above is
-//  contested ground (the coverage derivation lands there too), and everything here is
-//  additive — one table, one marker write inside `verify_vmap_generation`'s existing decode
-//  pass, one indexed find on the read path.
-// ===========================================================================================
-
-/// A cell of one generation that contains at least one INDOOR WMO triangle. Marker-only: the row's
-/// existence IS the fact, so there is no state to keep in sync. PRIVATE and derived — it carries
-/// no information the staged chunks don't already, it is rebuilt from them by verification, and it
-/// is deliberately outside the manifest/digest (hashing it would make an equivalent re-import
-/// non-reproducible for no gain).
-///
-/// A MISSING row means outdoors. That is the fail-open contract the whole indoor feature rests
-/// on: no generation, no verification, no row — no indoor dismount, ever.
 #[table(
     accessor = game_vmap_indoor_cell,
     index(accessor = by_generation, btree(columns = [generation_id])),
@@ -993,13 +838,9 @@ pub struct VmapIndoorCell {
     #[auto_inc]
     pub id: u64,
     pub generation_id: u64,
-    /// Same `cell_key` as `game_vmap_generation_chunk`: (map << 32) | (cell_x << 16) | cell_y.
     pub key: u64,
 }
 
-/// Does this triangle belong to an indoor WMO group? Doodads (M2) never do — a tent-shaped tree
-/// standing in a field is not a room. Delegates the MOGP rule to `lyracore_shared::vmap` so the
-/// pre-reject and the query it fronts can never disagree.
 fn tri_is_indoor(tri: &VmapTri) -> bool {
     match tri.class {
         lyracore_shared::vmap::TriClass::Wmo { mogp_flags, .. } => {
@@ -1009,9 +850,6 @@ fn tri_is_indoor(tri: &VmapTri) -> bool {
     }
 }
 
-/// Record the generation's indoor cells. Called once from `verify_vmap_generation` with the keys
-/// its existing decode pass already classified — there is no second decode and no second read of
-/// the staged chunks.
 fn record_indoor_cells(
     ctx: &ReducerContext,
     generation_id: u64,
@@ -1027,10 +865,6 @@ fn record_indoor_cells(
     }
 }
 
-/// Is `(x, y)` in a cell that holds any indoor geometry at all? One indexed find against the
-/// map's ACTIVE generation. `false` — no raycast, treat as outdoors — when vmap has no active
-/// generation for the map, when the position is off the map square, or when the cell has no
-/// marker row.
 fn cell_may_be_indoor(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> bool {
     let Some(generation_id) = active_generation_id(ctx, map_id) else {
         return false;
@@ -1049,13 +883,6 @@ fn cell_may_be_indoor(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> bool
         .is_some()
 }
 
-/// Is `(x, y, z)` inside a WMO interior? THE indoor question — the mount cast gate, the movement
-/// heartbeat and the teleport path all ask it here rather than reading MOGP flags themselves.
-///
-/// Two stages, and both FAIL OPEN (answer `false`, "outdoors"): the per-cell marker find, which
-/// skips the ray cast for a cell with no interior geometry, then `area_info`, which is already
-/// `None` with vmap off, with no active generation, or with nothing under the probe. So an
-/// operator running without vmap data never gets an indoor dismount, and never gets a false one.
 pub(crate) fn is_indoor(ctx: &ReducerContext, map_id: u32, x: f32, y: f32, z: f32) -> bool {
     cell_may_be_indoor(ctx, map_id, x, y)
         && area_info(ctx, map_id, x, y, z).is_some_and(|info| info.indoor)
@@ -1114,8 +941,6 @@ mod tests {
         );
     }
 
-    /// The presence table's classifier. A WMO group is indoor by the SHARED mangos rule (outdoor
-    /// only when `0x8000` is set); a doodad never is, whatever its geometry looks like.
     #[test]
     fn only_indoor_wmo_triangles_mark_a_cell() {
         use lyracore_shared::vmap::{TriClass, VmapTri, WMO_GROUP_OUTDOOR_FLAG};

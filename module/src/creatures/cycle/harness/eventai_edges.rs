@@ -1,4 +1,3 @@
-//! Spawn and death EventAI scenarios.
 use super::*;
 use crate::creatures::eventai::*;
 use crate::creatures::presentation::NpcFlagsProjection;
@@ -496,7 +495,6 @@ fn an_overlong_line_is_capped_like_any_other_chat() {
 
     edge(&mut scenario, EventKind::OnAggro, false);
 
-    // Vanilla caps client chat input around 255 characters; the stored row is bounded to match.
     assert_eq!(
         scenario
             .eventai_speech()

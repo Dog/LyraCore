@@ -6,7 +6,6 @@ use crate::world::party::PartyOutcome;
 use crate::world::{Actor, PartyStore};
 use lyracore_shared::group::realm_op;
 
-/// Holds the process-wide topology variables for the whole test, then restores them.
 pub(super) struct TopologyEnv {
     shard_map: Option<std::ffi::OsString>,
     realm_core: Option<std::ffi::OsString>,
@@ -42,8 +41,6 @@ impl Drop for TopologyEnv {
     }
 }
 
-/// Every World Shard holds Realm-core's Roster Revision for the party and, while it exists, its
-/// members.
 pub(super) fn mirrors_follow_realm_core(
     realm: &Coordinator,
     shards: &[(String, Coordinator)],
@@ -100,7 +97,6 @@ fn a_roster_change_made_only_on_realm_core_reaches_every_world_shard_mirror() {
     let shards = gateway.world_shards();
     assert_eq!(shards.len(), 2, "the default World Shard and {INSTANCES}");
 
-    // Straight to Realm-core: no `party::run`, so only the relay can update the mirrors.
     assert_eq!(
         realm
             .realm_group_op(
@@ -137,7 +133,6 @@ fn a_roster_change_made_only_on_realm_core_reaches_every_world_shard_mirror() {
             .collect::<Vec<_>>()
     );
 
-    // A party of one disbands, so the mirrors get the tombstone and forget the party.
     assert_eq!(
         realm
             .realm_group_op(realm_op::LEAVE, Actor::new(MEMBER).unwrap(), 0, 0, 0, 0)

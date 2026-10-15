@@ -1,5 +1,3 @@
-//! Auction replies through the Protocol Family and encrypted World Session.
-
 use super::handlers::{store_with, Auction, InMemoryAuctionActions};
 use super::*;
 
@@ -13,7 +11,6 @@ fn run(actions: &InMemoryAuctionActions, msg: impl Into<ClientOpcodeMessage>) ->
     .outbound
 }
 
-/// The one typed packet a request answered with.
 fn only_message(mut sent: Vec<Outbound>) -> ServerOpcodeMessage {
     match (sent.pop(), sent.is_empty()) {
         (Some(Outbound::One(message)), true) => message,
@@ -61,8 +58,6 @@ fn auction_house_round_trip_stays_typed_over_the_dispatcher() {
 
 #[test]
 fn raw_auction_browse_answers_an_empty_page_over_the_encrypted_session() {
-    // The raw CMSG_AUCTION_LIST_ITEMS path runs before typed dispatch in the session read loop,
-    // so only a socket reaches it.
     let store = std::sync::Arc::new({
         let base = quest_store();
         WorldFake {
@@ -94,8 +89,6 @@ fn raw_auction_browse_answers_an_empty_page_over_the_encrypted_session() {
 
 #[test]
 fn an_unresolved_auctioneer_gets_no_reply() {
-    // An auctioneer the Module does not resolve (no interaction) gets no reply at all: the refusal
-    // is silent and the dispatcher returns Ok, so the session keeps serving.
     let actions = store_with(None);
     let sent = run(
         &actions,
@@ -108,11 +101,6 @@ fn an_unresolved_auctioneer_gets_no_reply() {
 
 #[test]
 fn refused_auctioneer_interaction_keeps_the_encrypted_world_session_alive() {
-    // A resolvable requester with no seeded in-world Characters (`entity_in_world: false`
-    // overrides `quest_store`'s blanket flag), so the WHO answer this test cares about is the
-    // empty-but-present reply, not "no answer for an unknown requester" (a different rule, pinned
-    // in `social.rs`'s own WHO tests). It stays a socket test because the sentinel proves the
-    // session survives the silent refusal, and nothing else pins that WHO reply.
     let store = std::sync::Arc::new({
         let base = quest_store();
         WorldFake {
@@ -140,8 +128,6 @@ fn refused_auctioneer_interaction_keeps_the_encrypted_world_session_alive() {
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    // RAW-encoded (codec::build_who_response_raw); the auction refusal must be silent and leave
-    // WHO's own empty-roster reply next.
     let (opcode, body) = read_raw_frame(&mut client, &mut c_dec);
     assert_eq!(opcode, codec::social::SMSG_WHO_OPCODE);
     assert_eq!(

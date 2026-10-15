@@ -1,5 +1,3 @@
-//! EventAI edge dispatch and lifecycle resets.
-
 use std::collections::HashSet;
 
 use spacetimedb::ReducerContext;
@@ -12,14 +10,10 @@ use crate::{
     WorldEntity,
 };
 
-/// Who runs its entry's EventAI at all. A Character carries no rules, and a pet answers its
-/// owner's commands rather than the wild entry it was built from, so a tamed beast must neither
-/// evaluate its entry's rules nor keep rule state of its own.
 pub(crate) fn runs_eventai(creature: &WorldEntity) -> bool {
     !creature.is_player() && creature.owner_guid == 0
 }
 
-/// One unit whose engagement reset waits until the current creature-death hooks finish.
 #[table(accessor = game_creature_ai_reset_deferral)]
 pub struct CreatureAiResetDeferral {
     #[primary_key]
@@ -27,7 +21,6 @@ pub struct CreatureAiResetDeferral {
     pub creature_guid: u64,
 }
 
-/// A creature whose evade return has not reached its spawn post.
 #[table(accessor = game_creature_ai_returning_home)]
 pub struct CreatureAiReturningHome {
     #[primary_key]
@@ -386,11 +379,6 @@ pub(crate) fn eventai_on_summoned(
     super::evaluate_context(ctx, EventAiRequest::Edge(context));
 }
 
-/// Start the creature's next engagement: bump `engagement_id`, drop the phase and ranged posture,
-/// and clear the rule state every engagement rule earned in the fight that just ended. Once-only
-/// aggro rules re-arm and timed rules wait their initial window again on the next pull. Spawn and
-/// death rules keep their state, moved onto the new engagement, because they belong to the
-/// lifecycle instead. Called however a fight ends, so no path can leave a creature half-armed.
 pub(crate) fn reset_engagement(ctx: &ReducerContext, creature_guid: u64) {
     if ctx
         .db

@@ -5,7 +5,6 @@ use crate::stdb::world_view::WorldView;
 use crate::world::{Outbound, SessionTx};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// The owner's `PLAYER_SELF_RES_SPELL` from one queued VALUES packet.
 fn self_res_spell_of(outbound: Vec<Outbound>) -> Option<i32> {
     use wow_world_messages::vanilla::{Object, UpdateMask};
     let [Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(packet))] = outbound.as_slice()

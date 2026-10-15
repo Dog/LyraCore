@@ -23,7 +23,6 @@ pub(crate) fn viewer_with_tx(
     viewer_in_zone(session, self_guid, bound_identity, 0, tx)
 }
 
-/// A viewer already standing in `zone_id` for weather Relay tests.
 pub(crate) fn viewer_in_zone(
     session: u64,
     self_guid: u64,
@@ -75,7 +74,6 @@ pub(crate) fn teleport(mover_guid: u64) -> TeleportEvent {
     }
 }
 
-/// A registered viewer for `self_guid` on `shard`, with the receiving end of its writer queue.
 pub(crate) fn registered_viewer(
     view: &WorldView,
     shard: usize,

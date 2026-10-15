@@ -1,21 +1,5 @@
-// The tables a Package Delta may claim, their claimable columns, and the wire type each column
-// takes. Hand-written against the Rust catalogue in `crates/lyracore-package-delta/src/schema.rs`,
-// which is itself hand-written against `module/src/spell/tables.rs`.
-//
-// Two names exist for every column, and both are load-bearing:
-//
-//   * the KEY of each entry is the generated TypeScript name (`cooldownMs`), which is what an author
-//     writes and what the editor completes;
-//   * `column` is the DURABLE name (`cooldown_ms`), which is what the artifact and the Base Snapshot
-//     carry.
-//
-// The catalogue's keys are typed as exactly the generated `Spell` / `SpellEffect` columns minus the
-// primary key, so a column added, removed or renamed in the Module fails `tsc --noEmit` HERE. That
-// is the same standing check the Reference Datascript performs, applied to the authoring surface.
-
 import type { Spell, SpellEffect } from "../generated/types";
 
-/// The wire type tag a claimed value carries. Mirrors `FieldType` in the Rust catalogue.
 export type FieldType =
   | "u8"
   | "u16"
@@ -26,19 +10,14 @@ export type FieldType =
   | "bool"
   | "string";
 
-/// One claimable column: its durable name and the type a claim on it must declare.
+// Keys use generated names; column values use durable names.
 export interface Column {
   readonly column: string;
   readonly type: FieldType;
 }
 
-/// The `game_spell` columns an author may set, keyed by their generated names. `spellId` is absent:
-/// a claim carries it in the key, so naming it in `fields` would let a Package state one identifier
-/// twice and disagree with itself.
 export type SpellField = Exclude<keyof Spell, "spellId">;
 
-/// The `game_spell_effect` columns an author may set. `id` is absent for the key reason plus one
-/// more: it is derived from the spell and the effect index, never authored.
 export type SpellEffectField = Exclude<
   keyof SpellEffect,
   "id" | "spellId" | "effectIndex"
@@ -91,11 +70,8 @@ export const SPELL_EFFECT_COLUMNS: {
   entersCombat: { column: "enters_combat", type: "bool" },
 };
 
-/// The durable table names, and the values an artifact's `table` member carries.
 export const SPELL_TABLE = "game_spell";
 export const SPELL_EFFECT_TABLE = "game_spell_effect";
 
-/// The primary-key columns of each table, by their durable names. A claim never carries one in
-/// `fields`; the key already names it.
 export const SPELL_KEY_COLUMNS = ["spell_id"];
 export const SPELL_EFFECT_KEY_COLUMNS = ["id", "spell_id", "effect_index"];

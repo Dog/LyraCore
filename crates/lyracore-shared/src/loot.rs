@@ -1,26 +1,13 @@
-//! The loot tier contract shared by the Module and the Gateway.
-
-/// Why the Module refused a loot Durable Request. The tag is the whole reducer error text, so
-/// neither tier matches on human prose. The Module keeps the detail in its own log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LootRefusal {
-    /// The Actor is not in the Loot Source's Loot Tag eligibility set.
     LootTagIneligible,
-    /// The Loot Source is on another map, in another instance, or beyond loot range.
     OutOfRange,
-    /// The named Loot Source does not exist, or is not a lootable creature corpse.
     NoLootSource,
-    /// The looter is not in the world, or is dead.
     LooterUnavailable,
-    /// The Loot Source has nothing left in the requested slot or purse.
     NothingToLoot,
-    /// No open Loot Roll answers this vote, or the voter already voted.
     RollUnavailable,
-    /// The Actor does not hold the master-looter right on that row.
     NotMasterLooter,
-    /// The master-loot recipient is no longer in the world.
     RecipientUnavailable,
-    /// The master-loot recipient has no room for the item.
     RecipientInventoryFull,
 }
 
@@ -58,9 +45,6 @@ impl LootRefusal {
     }
 }
 
-/// A failure in the trusted Gateway entry before a loot core can answer the request. These tags
-/// cross the reducer boundary so legacy untagged gameplay compatibility cannot hide a broken
-/// Operator or Actor invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LootBoundaryFailure {
     OperatorRejected,
@@ -116,7 +100,6 @@ mod tests {
     }
 }
 
-/// A reservation is the grant; only an unreserved quest row requires current need.
 pub fn quest_take_allowed(reserved_for: u64, taker_guid: u64, taker_needs_item: bool) -> bool {
     reserved_for == taker_guid || (reserved_for == 0 && taker_needs_item)
 }
@@ -146,7 +129,6 @@ pub struct QuestItemObjective {
     pub required_count: u32,
 }
 
-/// Decide item need from active quests, objective kinds, quantities and Raid membership.
 pub fn needs_quest_item(
     in_raid: bool,
     active_quests: &[u32],

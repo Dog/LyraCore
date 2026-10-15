@@ -1,15 +1,5 @@
-//! XP / level-up wire mapping: the `SMSG_LOG_XPGAIN` "+N experience" text and the
-//! `SMSG_LEVELUP_INFO` ding popup (Tier 5 / XP). The matching descriptor VALUES updates
-//! (`build_player_xp_values` / `build_levelup_values`) live in `values.rs`. Pure code-motion.
-
 use super::*;
 
-/// Build `SMSG_LOG_XPGAIN` (Tier 5 / XP) — the "+N experience" combat-log text for a kill.
-/// `killed_guid` is the slain creature.
-/// SMSG_EXPLORATION_EXPERIENCE (opcode 0x01F8) — the "Discovered: <area>" popup, sent once per fresh
-/// subzone. Body is `area_id: u32 LE` + `experience: u32 LE` (8 bytes). Hand-rolled raw rather than the
-/// gtker typed message so an `Area` enum that lacks an imported area id can't reject the send (the fog +
-/// XP still ship; only the text would be skipped otherwise). Returns `(opcode, body)` for `Outbound::Raw`.
 pub const SMSG_EXPLORATION_EXPERIENCE_OPCODE: u16 = 0x01F8;
 pub fn build_exploration_experience_raw(area_id: u32, experience: u32) -> (u16, Vec<u8>) {
     let mut body = Vec::with_capacity(8);
@@ -18,8 +8,7 @@ pub fn build_exploration_experience_raw(area_id: u32, experience: u32) -> (u16, 
     (SMSG_EXPLORATION_EXPERIENCE_OPCODE, body)
 }
 
-/// Build 5875 XP feedback. Only a kill carries base XP and the group multiplier.
-/// The typed dependency attaches that tail to the opposite award type.
+/// gtker puts the base-XP and group-multiplier tail on the wrong award type.
 pub const SMSG_LOG_XPGAIN: u16 = 0x01d0;
 
 pub fn build_log_xpgain_raw(
@@ -39,9 +28,6 @@ pub fn build_log_xpgain_raw(
     (SMSG_LOG_XPGAIN, body)
 }
 
-/// Build `SMSG_LEVELUP_INFO` (Tier 5 / XP) — the "You have reached level N" ding popup, carrying the
-/// health/mana gains and the five per-stat deltas the module's ding loop computed. rage/focus/
-/// energy/happiness stay 0 — those pools never grow per level in vanilla.
 #[allow(clippy::too_many_arguments)]
 pub fn build_levelup_info(
     new_level: u32,
@@ -108,7 +94,6 @@ mod tests {
         assert_eq!(msg.stamina, 2);
         assert_eq!(msg.intellect, 0);
         assert_eq!(msg.spirit, 1);
-        // rage/focus/energy/happiness never grow per level in vanilla — always 0.
         assert_eq!(msg.rage, 0);
         assert_eq!(msg.focus, 0);
         assert_eq!(msg.energy, 0);

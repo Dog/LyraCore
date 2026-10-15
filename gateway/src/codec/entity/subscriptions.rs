@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::combat::subscriptions::aura_sync;
 use crate::codec::guild::subscriptions::guild_projection_of;
 use crate::codec::movement::subscriptions::{
@@ -21,8 +19,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Read a peer's equipment and current aura state for AOI entry or stealth reveal.
-/// An encoding failure leaves the caller responsible for removing its `created` entry.
 pub(crate) fn build_peer_create(
     coord: &Coordinator,
     world: &WorldView,
@@ -81,8 +77,6 @@ pub(crate) fn build_peer_create(
     }
 }
 
-/// The view a peer CREATE encodes: the stored row, the viewer-relative dynamic flags, and for a
-/// player the Guild Projection `guild_of` reads.
 pub(crate) fn peer_entity_view(
     row: &WorldEntity,
     dynamic_flags: u32,
@@ -96,8 +90,7 @@ pub(crate) fn peer_entity_view(
     view
 }
 
-/// A peer's current auras follow its CREATE. Their rows may have arrived before the viewer
-/// could see it, so another aura callback cannot be relied on to supply them.
+// Replay auras after CREATE; their callbacks may have fired before the entity was visible.
 pub(crate) fn peer_create_outbound(
     view: &codec::EntityView,
     inventory: &[codec::ItemInstanceView],
@@ -160,7 +153,6 @@ struct LootTagProjectionRows<'a> {
     corpse_eligible: &'a [CorpseLootEligible],
 }
 
-/// Render the stored entity flags for one viewer without changing the durable row.
 fn viewer_relative_dynamic_flags(
     viewer_guid: u64,
     entity: &WorldEntity,
@@ -244,15 +236,6 @@ pub(crate) fn projected_dynamic_flags(
     )
 }
 
-/// May an instance-tagged CORPSE/GAMEOBJECT row be CREATE-relayed to this
-/// viewer? Instance equality against a KNOWN viewer instance — `None` (viewer entity not resident,
-/// see `viewer_instance`) relays nothing: suppress-then-sweep is strictly safer than the old
-/// default-to-0 (which leaked instance-0 rows to a viewer whose real instance wasn't known yet).
-/// Kept map-agnostic deliberately: instance-0 rows keep today's relay behavior byte-identical for
-/// every resident open-world viewer, while a per-instance copy (or an in-instance corpse) reaches
-/// ONLY viewers inside that instance. DELETE relays stay ungated (the `on_melee_delete` precedent —
-/// SMSG_DESTROY_OBJECT for a never-created guid is a client no-op, and gating deletes risks
-/// leaking a stale object on an instance transition). Pure — unit-tested below.
 pub(crate) fn instance_relay_gate(row_instance_id: u64, viewer_instance_id: Option<u64>) -> bool {
     viewer_instance_id == Some(row_instance_id)
 }
@@ -266,7 +249,7 @@ pub(crate) fn peer_create_gate(
     viewer_is_ghost: bool,
     row_is_stealthed: bool,
 ) -> bool {
-    const SPIRITHEALER_NPC_FLAG: u32 = lyracore_shared::constants::npc_flags::SPIRITHEALER; // 0x20
+    const SPIRITHEALER_NPC_FLAG: u32 = lyracore_shared::constants::npc_flags::SPIRITHEALER;
     if row_guid == self_guid {
         return false;
     }
@@ -290,12 +273,11 @@ pub(crate) fn offer_peer_create_for(
     viewer: &Viewer,
     row: &WorldEntity,
 ) -> Vec<Outbound> {
-    const SPIRITHEALER_NPC_FLAG: u32 = lyracore_shared::constants::npc_flags::SPIRITHEALER; // 0x20
+    const SPIRITHEALER_NPC_FLAG: u32 = lyracore_shared::constants::npc_flags::SPIRITHEALER;
     if row.guid == viewer.self_guid || row.instance_id != viewer.instance_id {
         return Vec::new();
     }
     let viewer_is_ghost = viewer.gates.is_ghost();
-    // A spirit healer viewed by a living player is refused regardless of stealth.
     if row.npc_flags & SPIRITHEALER_NPC_FLAG != 0 && !viewer_is_ghost {
         return Vec::new();
     }
@@ -323,8 +305,6 @@ pub(crate) fn offer_peer_create_for(
     if let Some(equipment) = db.game_encounter_equip().creature_guid().find(&row.guid) {
         append_encounter_equip_after_create(&mut out, viewer, &equipment);
     }
-    // Pet action bar: this viewer's OWN summoned pet just appeared — bind it client-side
-    // (UNIT_FIELD_SUMMON + the pet action bar).
     if row.owner_guid == viewer.self_guid {
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
             Box::new(codec::build_owner_summon_values(viewer.self_guid, row.guid)),
@@ -368,8 +348,6 @@ pub(crate) fn offer_peer_create_for(
     out
 }
 
-/// Relay one durable creature virtual-item projection to a viewer that already holds the creature.
-/// A delete clears all three display slots. The raw builder is the crash-safe sparse VALUES path.
 pub(crate) fn encounter_equip_outbound(
     viewer: &Viewer,
     row: &EncounterEquip,
@@ -430,10 +408,6 @@ pub(crate) fn relay_entity_update(
                 .gates
                 .is_ghost
                 .store(is_ghost, std::sync::atomic::Ordering::Relaxed);
-            // Every spirit healer currently IN VIEW (the index answers that; before the
-            // shared-connection model this scanned the AOI-scoped connection cache, which was the
-            // same set). Idempotent through
-            // `created`, exactly like the stealth Reveal/Hide arms.
             let guard = coord.0.coord();
             let healers: Vec<WorldEntity> = guard
                 .conn
@@ -459,9 +433,6 @@ pub(crate) fn relay_entity_update(
     out
 }
 
-/// Re-send the projected flags for visible live Loot Tags after the shard membership mirror
-/// changes. Membership does not rewrite a creature's `WorldEntity`, so its normal VALUES relay has
-/// nothing to carry.
 pub(crate) fn loot_tag_flags_after_membership_change(
     coord: &Coordinator,
     viewer: &Viewer,
@@ -496,8 +467,6 @@ pub(crate) fn relay_peer_destroy(viewer: &Viewer, guid: u64, owner_guid: u64) ->
     let mut out = vec![Outbound::One(ServerOpcodeMessage::SMSG_DESTROY_OBJECT(
         codec::build_destroy_object(guid),
     ))];
-    // Pet action bar: this viewer's own pet despawned — clear UNIT_FIELD_SUMMON and send the empty
-    // SMSG_PET_SPELLS (the vanilla "remove pet bar" form).
     if owner_guid == viewer.self_guid {
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
             Box::new(codec::build_owner_summon_values(viewer.self_guid, 0)),
@@ -509,21 +478,10 @@ pub(crate) fn relay_peer_destroy(viewer: &Viewer, guid: u64, owner_guid: u64) ->
     out
 }
 
-/// The `on_update` dispatch decision: does this update need to be treated as a
-/// re-entry (offer a fresh CREATE via `offer_peer_create`) instead of a field diff? True exactly when
-/// the guid isn't self AND isn't already in the viewer's `created` set — i.e. either this is the first
-/// time this viewer has seen the row, or it left scope (evicted by `on_delete`) and is now returning as
-/// an UPDATE of the SDK's still-cached row instead of a fresh `on_insert`. Pure over the dedup-set
-/// membership so the branch is unit-testable without a live SDK connection.
 pub(crate) fn is_update_reentry(guid: u64, self_guid: u64, currently_shown: bool) -> bool {
     guid != self_guid && !currently_shown
 }
 
-/// Edge-detect for the spirit-healer reveal: did the GHOST player-flag (mask) cross 0↔1 between `old`
-/// and `new`? Returns `Some(true)` on an alive→ghost crossing (REVEAL the in-scope spirit healers),
-/// `Some(false)` on ghost→alive (DESTROY them), `None` when the bit didn't change (the common heartbeat /
-/// any other field update — no reveal work). Pure so the on_update closure stays a thin relay and this
-/// stays unit-testable (the closure itself needs a live EventContext to enumerate healers).
 pub(crate) fn ghost_transition(old_flags: u32, new_flags: u32, ghost_mask: u32) -> Option<bool> {
     let was = old_flags & ghost_mask != 0;
     let is = new_flags & ghost_mask != 0;
@@ -534,13 +492,6 @@ pub(crate) fn ghost_transition(old_flags: u32, new_flags: u32, ghost_mask: u32) 
     }
 }
 
-/// Diff an observed `game_world_entity` row (`old` → `new`) into the partial-VALUES `SMSG_UPDATE_OBJECT`
-/// packets that replicate the change to this player's client. Pure (no I/O) so it is unit-testable — the
-/// `on_update` relay callback just sends whatever this returns, in order. The level-up branch is
-/// MUTUALLY EXCLUSIVE with the individual field diffs: a ding pushes ONE combined VALUES block (level +
-/// vitals + xp together) instead of the separate health/xp packets, so the panel + bars flip in lockstep.
-/// Player-only fields (xp / coinage / ghost / power) are gated on the PLAYER bit; health and dynamic-flags
-/// apply to any unit (creatures' health bars + loot sparkle). Order is preserved from the original relay.
 #[cfg(test)]
 pub(crate) fn entity_update_to_outbound(
     old: &WorldEntity,
@@ -557,8 +508,6 @@ pub(crate) fn entity_update_to_outbound_with_dynamic_flags(
     let mut out = Vec::new();
     let is_player = new.type_mask & lyracore_shared::constants::type_mask::PLAYER_BIT != 0;
     if is_player && old.level != new.level {
-        // Level-up ding: level + maxhealth + health + xp in ONE VALUES block (the panel + health/XP bars
-        // flip together). SMSG_LEVELUP_INFO (relayed separately) is the cosmetic popup only.
         let m = codec::build_levelup_values(
             new.guid,
             new.level,
@@ -575,34 +524,22 @@ pub(crate) fn entity_update_to_outbound_with_dynamic_flags(
             let m = codec::build_health_values(new.guid, new.health);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Dynamic-flags VALUES relay: the killing blow sets UNIT_DYNFLAG_LOOTABLE (0x1) on a corpse that
-        // rolled money; the loot reducer clears it. NOTE: UNIT_DYNFLAG_DEAD (0x20) is NEVER set
-        // (it is feign-death in vanilla — see combat + lyracore-shared constants).
+        // UNIT_DYNFLAG_DEAD, 0x20, means feign death in vanilla.
         if old.dynamic_flags != new.dynamic_flags {
             let m = codec::build_dynamic_flags_values(new.guid, dynamic_flags);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Target relay (UNIT_FIELD_TARGET): observers see who this unit selected — the target ring /
-        // target-of-target / assist. Any unit (a creature's aggro target relays too), not player-gated.
         if old.target_guid != new.target_guid {
             let m = codec::build_target_values(new.guid, new.target_guid);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Max-vitals relay: a non-level-up max_health/max_power change (+Stamina/+Intellect gear or a
-        // Fortitude/Mark aura) moves the bar DENOMINATOR live for observers. Any unit.
         if old.max_health != new.max_health || old.max_power != new.max_power {
             let power_b = (new.unit_bytes_0 >> 24) as u8;
             let m =
                 codec::build_max_vitals_values(new.guid, new.max_health, power_b, new.max_power);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Taxi presentation changes mount display + the TAXI_FLIGHT unit flag in one mask (activation
-        // and landing set both atomically), so the client never sees an intermediate
-        // mounted-but-controllable or unmounted-but-in-flight state — detected by the flight bit itself
-        // toggling, not just "unit_flags changed", so an unrelated flag change alongside a land mount
-        // doesn't get mistaken for a taxi transition. A LAND mount/dismount changes `mount_display_id`
-        // ALONE (the flight bit is untouched) and relays through the standalone single-field builder
-        // instead, never alongside the coupled one for the same change.
+        // Mount display and TAXI_FLIGHT must reach the client in one mask.
         let taxi_flight_toggled = (old.unit_flags ^ new.unit_flags)
             & lyracore_shared::constants::unit_flags::TAXI_FLIGHT
             != 0;
@@ -623,27 +560,19 @@ pub(crate) fn entity_update_to_outbound_with_dynamic_flags(
                 out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
             }
         }
-        // Sheath relay: UNIT_FIELD_BYTES_2 byte 0 flipping as a unit draws or stows its weapon.
-        // Any unit, not player-gated — a creature drawing on engage is the same wire field. Without
-        // this arm the server knows the state and no observer ever hears about it.
         if old.unit_bytes_2 != new.unit_bytes_2 {
             let m = codec::build_sheath_values(new.guid, new.unit_bytes_2);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Live XP-bar update: players only (creatures never change xp; player-only fields).
         let xp_changed = old.xp != new.xp || old.next_level_xp != new.next_level_xp;
         if xp_changed && is_player {
             let m = codec::build_player_xp_values(new.guid, new.xp, new.next_level_xp);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Live purse update: PLAYER_FIELD_COINAGE on money change (looting). Players only.
         if old.money != new.money && is_player {
             let m = codec::build_coinage_values(new.guid, new.money);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Live bank bag slot count: PLAYER_BYTES_2 byte 2 on a purchase, so the bank window grows a
-        // slot without a relog. Scoped to byte 2 only — byte 3 (rest state) already relays through
-        // its own dedicated `game_rest_state_event` path and must not double-fire here.
         const BANK_SLOT_BYTE: u32 = 0x00FF_0000;
         if is_player
             && (old.player_bytes_2 & BANK_SLOT_BYTE) != (new.player_bytes_2 & BANK_SLOT_BYTE)
@@ -651,29 +580,19 @@ pub(crate) fn entity_update_to_outbound_with_dynamic_flags(
             let m = codec::build_bank_bag_slots_values(new.guid, new.player_bytes_2);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // PLAYER_FLAGS and the UNIT_FIELD_BYTES_1 vis bit: the ghost transition on Release Spirit
-        // and reclaim, and the AFK and DND bits of an Away Status. Players only.
         if is_player
             && (old.player_flags != new.player_flags || old.unit_bytes_1 != new.unit_bytes_1)
         {
             let m = codec::build_player_flags_values(new.guid, new.player_flags, new.unit_bytes_1);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // Live power update: rage/energy/mana changing in combat. The power-type byte of unit_bytes_0 picks
-        // the right UNIT_FIELD_POWER_N. Players only — else the rage bar stays at 0 and rage spells grey out.
         if is_player && old.power != new.power {
             let power_b = (new.unit_bytes_0 >> 24) as u8;
             let m = codec::build_power_values(new.guid, power_b, new.power);
             out.push(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(m)));
         }
-        // GM playtest `.speed`: a `run_speed_mult_bp` change relays
-        // SMSG_FORCE_RUN_SPEED_CHANGE — player movement is client-authoritative, so the server-side
-        // field alone never speeds the client up. Mirrors the existing `A_MOD_SPEED(MOVE)` aura relay
-        // (`run_speed_packet`, same `BASE_RUN_SPEED` constant) but keyed off THIS field, any unit (not
-        // player-gated — a GM could in principle god/speed-tag a creature down the line, and the relay
-        // is inert for anyone not watching this guid).
         if old.run_speed_mult_bp != new.run_speed_mult_bp {
-            const BASE_RUN_SPEED: f32 = 7.0; // vanilla base run yd/s — same constant as `run_speed_packet`
+            const BASE_RUN_SPEED: f32 = 7.0;
             let speed = BASE_RUN_SPEED * (new.run_speed_mult_bp as f32 / 10_000.0);
             out.push(ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(Box::new(
                 codec::build_force_run_speed(new.guid, speed),
@@ -688,17 +607,10 @@ pub(crate) fn entity_update_to_outbound_with_dynamic_flags(
     out
 }
 
-/// A row's cell, taken from the grid columns the WRITER stamped — not recomputed from `x`/`y`.
-///
-/// The subscription predicate this replaces filtered on `grid_x`/`grid_y`, so reading the same
-/// columns is what makes the index and the deleted SQL agree by construction rather than by both
-/// happening to call `grid_cell` the same way.
 pub(crate) fn entity_key(row: &WorldEntity) -> CellKey {
     CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y)
 }
 
-/// A row entered the world (or this shard). Index it, then offer a CREATE to everyone who can see
-/// its cell.
 pub(crate) fn entity_appeared(view: &Arc<WorldView>, shard: ShardId, row: &WorldEntity) {
     let key = entity_key(row);
     view.spatial.upsert_entity(
@@ -714,8 +626,6 @@ pub(crate) fn entity_appeared(view: &Arc<WorldView>, shard: ShardId, row: &World
     }
 }
 
-/// Create or update for the new cell's viewers, destroy for viewers left behind,
-/// and leave all other viewers untouched.
 pub(crate) fn entity_changed(
     view: &Arc<WorldView>,
     shard: ShardId,
@@ -748,7 +658,6 @@ pub(crate) fn entity_changed(
     }
 }
 
-/// The row is gone from the database. Everyone who could see it gets a DESTROY.
 pub(crate) fn entity_vanished(view: &WorldView, shard: ShardId, guid: u64, owner_guid: u64) {
     let Some((key, _)) = view
         .spatial
@@ -844,8 +753,6 @@ pub(crate) fn destroy_job(view: &WorldView, session: SessionId, guid: u64, owner
     });
 }
 
-/// A standing row is delivered only to its owner. The wire packet uses the Faction.dbc
-/// ReputationListID, never the game's faction id.
 pub(crate) fn reputation_appeared(view: &WorldView, shard: ShardId, row: &PlayerReputation) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
         return;
@@ -892,8 +799,6 @@ pub(crate) mod tests {
         peer_create_outbound(&entity_view(creature, 0), &[], &[], None).unwrap()
     }
 
-    /// A live-entity row with no pending change; tests clone it and mutate one field at a time.
-    /// `type_mask` carries the PLAYER bit by default (most relayed fields are player-only).
     pub(crate) fn player_entity() -> WorldEntity {
         WorldEntity {
             guid: 1,

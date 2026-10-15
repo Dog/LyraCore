@@ -1,10 +1,3 @@
-//! Meeting Stone Queue fixtures for the durable tests. Fixture ids sit in `509_6000`-`509_6099`.
-//!
-//! The levers stage the world a Meeting Stone needs: a stone and its spawned GameObject, Characters
-//! with a chosen race, class and level, each with a live entity and a live Account Claim, the same
-//! claim alone on Realm-core, and a Party or Raid led by one of them. Two more move a Seeker's or a queued party's time back, so a
-//! test never waits on the clock.
-
 use spacetimedb::{reducer, ReducerContext, Table, TimeDuration};
 
 use lyracore_shared::constants::go_type;
@@ -18,13 +11,8 @@ use crate::{
     game_group_member, game_world_entity, AccountClaim, Group, GroupMember,
 };
 
-/// How long a fixture Account Claim lives. Longer than any durable test runs.
 const FIXTURE_CLAIM_MICROS: i64 = 60 * 60 * 1_000_000;
 
-/// Stage Meeting Stone template `entry` for `area_id` and levels `min_level..=max_level`, spawned
-/// as GameObject `go_guid` at `(x, y, z)` on `map_id` in the open world. Pass a `go_guid` below
-/// 2^53: `spacetime call` reads integer arguments through a double. A second call replaces all
-/// three rows.
 #[allow(clippy::too_many_arguments)]
 #[reducer]
 pub fn debug_stage_meeting_stone(
@@ -89,10 +77,6 @@ pub fn debug_stage_meeting_stone(
     Ok(())
 }
 
-/// Stage Character `guid` with `race`, `class` and `level`, in the world at `(x, y, z)` on `map_id`,
-/// with a live Account Claim of `account_id`. Its World Session Token is
-/// `{account_id, generation: 1, request_nonce: guid}`. A second call replaces the Character, its
-/// entity and the claim, and leaves its group and queue rows alone.
 #[allow(clippy::too_many_arguments)]
 #[reducer]
 pub fn debug_stage_meeting_stone_character(
@@ -129,9 +113,6 @@ pub fn debug_stage_meeting_stone_character(
     stage_claim(ctx, guid, account_id)
 }
 
-/// Stage only the live Account Claim [`debug_stage_meeting_stone_character`] writes, with the same
-/// World Session Token. On a sharded realm the Character lives on a World Shard and its claim on
-/// Realm-core, which holds no Character rows. A second call replaces the claim.
 #[reducer]
 pub fn debug_stage_meeting_stone_claim(
     ctx: &ReducerContext,
@@ -161,9 +142,6 @@ fn stage_claim(ctx: &ReducerContext, guid: u64, account_id: u64) -> Result<(), S
     Ok(())
 }
 
-/// Stage a Party, or a Raid when `raid` is set, led by `leader_guid` with `member_guids` after the
-/// leader in join order. Writes the group rows directly, so it fires no group event. Refuses a
-/// Character already in a group.
 #[reducer]
 pub fn debug_stage_meeting_stone_group(
     ctx: &ReducerContext,
@@ -219,7 +197,6 @@ pub fn debug_stage_meeting_stone_group(
     Ok(())
 }
 
-/// Move Seeker `character_guid`'s `queued_at` back by `secs`.
 #[reducer]
 pub fn debug_backdate_meeting_stone_seeker(
     ctx: &ReducerContext,
@@ -240,8 +217,6 @@ pub fn debug_backdate_meeting_stone_seeker(
     Ok(())
 }
 
-/// Move queued party `group_id`'s `queued_at` and `next_reminder_at` back by `secs`, so it is the
-/// older party and its reminder can fall due.
 #[reducer]
 pub fn debug_backdate_meeting_stone_party(
     ctx: &ReducerContext,

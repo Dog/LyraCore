@@ -1,17 +1,4 @@
 #!/usr/bin/env bash
-# import-manifest-smoke.sh — source-smoke test for importer/scripts/import-manifest.sh.
-#
-# Run it from the checkout root, any time, with nothing set up:
-#   bash importer/scripts/import-manifest-smoke.sh     # prints "[smoke] OK" when it passes
-#
-# Offline: no live node, no dump, no built importer. Run it after editing the manifest.
-#
-# WHAT IT ASSERTS: every KEY the two real consumers read is actually DEFINED after sourcing the
-# manifest. Those consumers are importer/scripts/import-world.sh's `chk` floors, and the data-gate
-# probes of the wire test harness, which lives in its own repository and is pinned here by release.
-# The failure it exists to catch is quiet: a renamed or deleted manifest key reads as an EMPTY STRING
-# in a `chk`/gate comparison rather than as an error, so the assertion it backs stops enforcing
-# anything while the import still prints OK.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -19,7 +6,7 @@ cd "$(dirname "$0")/../.." || exit 1
 source importer/scripts/import-manifest.sh
 
 fail=0
-need() { # key-name
+need() {
   if [ -z "${!1:-}" ]; then echo "  FAIL  $1 is unset/empty"; fail=1; else echo "  ok    $1=${!1}"; fi
 }
 
@@ -49,8 +36,6 @@ for k in GATE_SPELL_PALADIN GATE_SPELL_SHADOWBOLT GATE_CREATURE_TEST GATE_HEALER
   need "$k"
 done
 
-# Cross-check: every FLOOR_/GATE_ key the manifest itself DEFINES is covered by the lists above (a new
-# key added to the manifest without updating this smoke test would otherwise go unchecked silently).
 defined_keys="$(grep -oE '^(FLOOR|GATE)_[A-Z0-9_]+=' importer/scripts/import-manifest.sh | tr -d '=')"
 checked_keys="FLOOR_CLASS_TRAINERS FLOOR_TRAINER_OFFERINGS_CLASS FLOOR_TRAINER_OFFERINGS_PROFESSION \
 FLOOR_GATHER_NODE_GO FLOOR_TERRAIN_CHUNKS FLOOR_NAV_CHUNKS FLOOR_TRAINER_COVERAGE FLOOR_VENDOR_COVERAGE FLOOR_QUESTGIVER_COVERAGE FLOOR_INNKEEPER_FARLEY FLOOR_QUEST_GIVER_RELATIONS \
@@ -96,11 +81,6 @@ for profile in full-world full-eastern full-kalimdor full-instances alliance-eas
   case " $WORLD_PROFILES " in *" $profile "*) ;; *) echo "  FAIL  missing canonical profile $profile"; fail=1 ;; esac
 done
 
-# The manifest's MAP!=0 tail re-points the BOX-DEPENDENT floors for a continent shard other
-# than map 0. Re-source it with MAP=1 in a SUBSHELL (so the map-0 values above stay intact for anything
-# sourcing this script) and assert (a) every key is still defined — an override block that typo'd a key
-# name would otherwise leave a `chk` comparing against an empty string — (b) a box-dependent floor
-# actually dropped, and (c) a map-INDEPENDENT floor did NOT move (those must match on every shard).
 echo "[smoke] MAP=1 continent-shard floor overrides:"
 map1_out="$(
   MAP=1 bash -c '
@@ -115,7 +95,7 @@ map1_out="$(
 )"
 echo "$map1_out" | grep -q '^UNSET' && { echo "$map1_out" | grep '^UNSET' | sed 's/^/  FAIL  /'; fail=1; }
 m1() { echo "$map1_out" | grep "^$1=" | cut -d= -f2; }
-chk_eq() { # label expected actual
+chk_eq() {
   if [ "$2" != "$3" ]; then echo "  FAIL  $1: got $3, want $2"; fail=1; else echo "  ok    $1: $3"; fi
 }
 chk_eq "FLOOR_TERRAIN_CHUNKS drops for a non-map-0 shard" 100 "$(m1 FLOOR_TERRAIN_CHUNKS)"
@@ -124,15 +104,9 @@ chk_eq "FLOOR_SPELL_TOTAL is map-INDEPENDENT (unchanged)" "$FLOOR_SPELL_TOTAL" "
 chk_eq "FLOOR_AREAS is map-INDEPENDENT (unchanged)"        "$FLOOR_AREAS" "$(m1 FLOOR_AREAS)"
 chk_eq "FLOOR_TAXI_NODES is map-INDEPENDENT"                "$FLOOR_TAXI_NODES" "$(m1 FLOOR_TAXI_NODES)"
 chk_eq "FLOOR_START_ITEMS_CLASSES is map-INDEPENDENT"      "$FLOOR_START_ITEMS_CLASSES" "$(m1 FLOOR_START_ITEMS_CLASSES)"
-# And the map-0 defaults are untouched when MAP is unset/0 (the byte-parity guarantee for the canonical run).
 chk_eq "MAP unset keeps the map-0 terrain floor" 2500 "$FLOOR_TERRAIN_CHUNKS"
 chk_eq "MAP unset keeps the map-0 live-creature floor" 2500 "$FLOOR_LIVE_CREATURES"
 
-# import-world.sh's `chk0`/`chk36` FENCE the assertions that name a specific map-0 or map-36 fixture.
-# Their failure mode is the dangerous direction — a wrapper that stops delegating to `chk` does not go
-# red, it silently stops enforcing Elwynn/Deadmines and the canonical run still prints "[world] OK".
-# Nothing else runs those two lines offline, so pin their semantics here by extracting the definitions
-# verbatim out of import-world.sh and exercising both arms.
 echo "[smoke] import-world.sh chk0/chk36 map fences:"
 fence_out="$(
   bash -c '
@@ -165,13 +139,6 @@ chk_eq "chk0 SKIPS Human checks for alliance-kalimdor"       no  "$(ran profile-
 chk_eq "chk36 RUNS instance checks for alliance-single"      yes "$(ran profile-single-instance)"
 chk_eq "chk36 RUNS instance checks for instances"            yes "$(ran profile-instances)"
 
-# The fresh-shard one-continent guard helpers (db_spatial_probe/db_imported_probe/db_never_imported/
-# foreign_spatial_maps, marker-delimited in import-world.sh so they can be extracted verbatim here,
-# same trick as the chk0/chk36 pin above). Exercising them for real needs a live node and two
-# differently-populated databases, so this pins BOTH directions offline instead, with a stub
-# `spacetime`: a never-imported shard whose only spatial rows are `init`'s map-0 demo fixtures must NOT
-# read as foreign content, while a database that genuinely holds real map-0 terrain/nav content must
-# still be flagged for a map-1 run.
 echo "[smoke] import-world.sh one-continent guard helpers:"
 guard_out="$(
   bash -c '
@@ -219,16 +186,13 @@ guard_out="$(
     echo "family_reload_never_imported=$(db_never_imported && echo yes || echo no)"
   '
 )"
-g() { echo "$guard_out" | grep "^$1=" | cut -d= -f2 | sed 's/ *$//'; } # foreign_spatial_maps trails a space
+g() { echo "$guard_out" | grep "^$1=" | cut -d= -f2 | sed 's/ *$//'; }
 chk_eq "fresh shard: db_never_imported is TRUE (terrain/nav empty)"        yes "$(g fresh_never_imported)"
 chk_eq "fresh shard: map-0 fixture rows still show up in the raw probe"   0   "$(g fresh_pre_foreign)"
 chk_eq "contaminated shard: db_never_imported is FALSE (real terrain/nav)" no  "$(g contaminated_never_imported)"
 chk_eq "contaminated shard: foreign map 0 still reported"                 0   "$(g contaminated_pre_foreign)"
 chk_eq "family-reload blind spot: db_never_imported is FALSE (row-count fallback catches it)" no "$(g family_reload_never_imported)"
 
-# import-world.sh does not enable `set -e`; a raw importer|grep|tail pipeline therefore used to keep
-# running after the importer failed. Exercise the marker-delimited status-capturing helper with both
-# outcomes, then pin the standalone DBC call site's explicit exit.
 echo "[smoke] standalone DBC import failure propagation:"
 checked_step_out="$(
   bash -c '
@@ -251,9 +215,6 @@ dbc_callsite="$(sed -n '/run_checked_step "standalone DBC catalogue import"/,/--
 case "$dbc_callsite" in *"--apply || exit 1"*) dbc_callsite_fatal=yes ;; *) dbc_callsite_fatal=no ;; esac
 chk_eq "standalone DBC call exits import-world.sh on failure" yes "$dbc_callsite_fatal"
 
-# The map-0 restore is equally load-bearing: a denied reducer call must stop the import before the
-# verification stage. Its postcondition is independently checked across the catalogue and all three
-# spatial anchors (template, spawn, live entity).
 echo "[smoke] taxi fixture restore failure propagation and anchor checks:"
 taxi_restore_out="$(
   bash -c '
@@ -299,8 +260,6 @@ chk_eq "complete taxi fixture satisfies every anchor" 0 "$(ta success_fail)"
 chk_eq "taxi verification still runs every anchor after one miss" 7 "$(ta missing_live_checked)"
 chk_eq "missing live flight master fails verification" 1 "$(ta missing_live_fail)"
 
-# The Compatibility Manifest checks source values and dependency paths before apply. The shell
-# verification makes one post-import query and checks the native definition subject invariant.
 echo "[smoke] import-world.sh EventAI catalogue verification:"
 eventai_out="$(
   bash -c '

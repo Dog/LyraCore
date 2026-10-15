@@ -2,15 +2,10 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct CastState {
-    /// Imported item templates the query path resolves by entry. Keeping this keyed fixture here
-    /// makes socket tests exercise the same durable read shape as the Coordinator cache.
     pub(crate) item_templates: Vec<codec::ItemTemplateView>,
-    /// The caller's owned items, read by world entry.
     pub(crate) player_items_fixture: Vec<codec::ItemInstanceView>,
 }
 
-/// Cast behaviour is tested through `InMemoryCasts`. Here every cast operation succeeds and every
-/// spell reads as an unknown, ordinary one; only the two item reads world entry makes are live.
 impl CastStore for WorldFake {
     fn cast_item_target(&self, _actor: Actor, _spell_id: u32, _slot: u8) -> Result<()> {
         Ok(())
@@ -75,8 +70,6 @@ impl CastStore for WorldFake {
     fn pick_lock(&self, _actor: Actor, _go_guid: u64) -> Result<()> {
         Ok(())
     }
-
-    // Shared with the character, vendor and query paths, so these two keep real fixtures.
 
     fn player_items(&self, _owner_guid: u64) -> Result<Vec<codec::ItemInstanceView>> {
         if let Some(state) = &self.benilla_gameplay {

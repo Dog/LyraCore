@@ -1,17 +1,11 @@
 #![cfg_attr(not(has_packages), allow(dead_code, unused_imports))]
 
-//! Steps a Package's own unit tests need. The root exists only under `cfg(test)`, and the Package
-//! API lint accepts it only in a Package file gated on `#![cfg(test)]`.
-
 use crate::runtime_script::{ask_event, EffectSink, RuntimeScriptHost, ScriptEvent};
 
 pub(crate) use crate::runtime_script::{EntityView, RuntimeScript};
 pub(crate) use crate::test_scan::read_scanned;
 pub(crate) use lyracore_test_support::source_scan::{code_of, shape_of};
 
-/// Run `scripts` in order for one event on a fresh Runtime Script Host and return the Script
-/// Answer, read as `script_binding::ask` reads it. Staged Effects are discarded. Any Script
-/// Diagnostic is an error, one diagnostic per line.
 pub(crate) fn ask_offline(
     event: &str,
     actor: Option<EntityView>,
@@ -41,8 +35,6 @@ pub(crate) fn ask_offline(
     }
 }
 
-/// Parse a Script Artifact and ask its enabled Event Bindings in priority and identifier order.
-/// Staged Effects are discarded. Parse failures and Script Diagnostics return their text.
 pub(crate) fn ask_artifact_offline(
     event: &str,
     actor: Option<EntityView>,

@@ -1,12 +1,3 @@
-//! Quest family: the overhead `!`/`?` status, the quest-giver menu, the details and definition
-//! screens, accept, the turn-in round trip, log abandon and party sharing all enter through
-//! `Quest::handle`; the gameobject giver, the item-started quest, the world-entry
-//! descriptor block and the gossip quest section call the shared builders here rather than
-//! reaching for the store. Every quest read and reducer the world session needs lives on
-//! `QuestActionStore`; no other Store family carries them. The stdb-tier relays in
-//! `subscriptions.rs` (quest-log sync, the shared-quest details screen) sit below the session and
-//! render their own copies from the same `codec` builders these functions use.
-
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
 use crate::world::family::{
@@ -14,36 +5,21 @@ use crate::world::family::{
 };
 use wow_world_messages::vanilla::QuestItem;
 
-/// The durable reads and reducer calls the quest family needs, in the seam's own vocabulary so it
-/// can be exercised without the broad `WorldStore`.
 pub(crate) trait QuestActionStore: Send + Sync {
-    /// Every quest `giver_guid` offers or completes for `player_guid` — the input to both the
-    /// overhead status icon and the menu. Resolves a creature giver or a gameobject giver.
     fn giver_quest_evals(
         &self,
         giver_guid: u64,
         player_guid: u64,
     ) -> Result<Vec<codec::GiverQuestEval>>;
 
-    /// A quest's detail view (the details / offer-reward / request-items screens). `None` if the
-    /// quest is not loaded.
     fn quest_detail_view(&self, quest_id: u32) -> Result<Option<codec::QuestDetailView>>;
 
-    /// Whether standing (Unfriendly or below) makes this giver refuse to talk.
     fn giver_refuses_interaction(&self, giver_guid: u64, player_guid: u64) -> Result<bool>;
 
-    /// Open the quest log row for `quest_id` offered by `giver_guid`. The module gates it, so a
-    /// refusal here is a gameplay answer, not a broken session.
     fn accept_quest(&self, actor: Actor, giver_guid: u64, quest_id: u32) -> Result<()>;
 
-    /// The quest the item in `slot` starts, as `(item instance guid, quest id)`. `None` when the
-    /// item starts no quest — an item is its own quest giver, hence the instance guid.
     fn item_start_quest(&self, owner_guid: u64, slot: u8) -> Option<(u64, u32)>;
 
-    /// Hand a completed quest in to `giver_guid` for its rewards. The module validates completion
-    /// and grants money/XP/items; `reward_index` is the player's pick-1-of-N choice reward slot,
-    /// ignored by quests with no choice rewards. A quest that sends a Reward Letter files it as
-    /// Escrow in the same transaction.
     fn turn_in_quest(
         &self,
         actor: Actor,
@@ -52,27 +28,15 @@ pub(crate) trait QuestActionStore: Send + Sync {
         reward_index: u32,
     ) -> Result<()>;
 
-    /// The player's active quests as quest-log descriptor slots (the L window), in slot order.
-    /// Empty if none. The one read behind both abandon's slot→quest resolution and the world-entry
-    /// descriptor block, so a slot means the same quest in both.
     fn player_quest_log(&self, player_guid: u64) -> Result<Vec<codec::update_mask::QuestLogSlot>>;
 
-    /// Abandon an active quest (`CMSG_QUESTLOG_REMOVE_QUEST`). The module deletes the quest-log row;
-    /// the relay clears the slot.
     fn abandon_quest(&self, actor: Actor, quest_id: u32) -> Result<()>;
 
-    /// Share `quest_id` with the caller's party (`CMSG_PUSHQUESTTOPARTY`). The module validates
-    /// grouped + actively-on-the-quest and pushes the per-member `QUEST_SHARE`/`QUEST_PUSH_RESULT`
-    /// events itself; a gameplay `Err` is per-action, not session-fatal.
     fn push_quest(&self, actor: Actor, quest_id: u32) -> Result<()>;
 
-    /// `(taken, rewarded)` for `quest_id` in `player_guid`'s quest log — feeds the
-    /// QUEST_TAKEN/QUEST_REWARDED gossip option conditions.
     fn quest_status(&self, player_guid: u64, quest_id: u32) -> (bool, bool);
 }
 
-/// A Refusal of a best-effort quest request is logged and dropped. A Transport Loss ends the
-/// World Session.
 fn ignore_refusal(result: Result<()>, operation: &str, account_id: u64) -> Result<()> {
     match result {
         Err(e) if matches!(classify(&e), DurableFailure::TransportLoss) => Err(e),
@@ -84,13 +48,6 @@ fn ignore_refusal(result: Result<()>, operation: &str, account_id: u64) -> Resul
     }
 }
 
-/// The quest menu for `giver` (a creature OR a gameobject guid — the evals resolve either) against
-/// `self_guid`: vanilla "instant quest" (mangos `SendPreparedQuest`) opens a SINGLE menu-worthy
-/// quest's screen directly — accept details for a new quest, the reward screen for a finished
-/// turn-in, the "not done yet" request-items screen for one in progress — while a giver with several
-/// shows the list. `CMSG_QUESTGIVER_HELLO` (creature giver) and `CMSG_GAMEOBJ_USE` on a
-/// `go_type::QUESTGIVER` gameobject (the client never sends HELLO for one) both land here, so the
-/// two interactions cannot drift apart. The evals are read ONCE and reused for the whole decision.
 pub(crate) fn quest_giver_menu<St: QuestActionStore + ?Sized>(
     store: &St,
     giver: u64,
@@ -116,8 +73,6 @@ pub(crate) fn quest_giver_menu<St: QuestActionStore + ?Sized>(
         .iter()
         .find(|e| e.quest_id == detail.quest_id && e.role == codec::ROLE_END && e.active);
     Ok(match turn_in {
-        // A new quest: DETAILS is raw-encoded because its 1.12 reward triples are incomplete in
-        // gtker. The turn-in screens below are typed.
         None => {
             let (opcode, body) = codec::build_quest_details_raw(giver, &detail);
             vec![Outbound::Raw { opcode, body }]
@@ -135,10 +90,6 @@ pub(crate) fn quest_giver_menu<St: QuestActionStore + ?Sized>(
     })
 }
 
-/// The details + Accept screen for one quest, offered by `giver`. Clicking a quest in a giver's
-/// menu and using an item that starts a quest both land here, so the two routes cannot render
-/// different screens for the same quest. A quest whose definition is not loaded renders nothing.
-/// RAW-encoded for the same reason the menu is: gtker's 1.12 reward triples are incomplete.
 pub(crate) fn quest_details_screen<St: QuestActionStore + ?Sized>(
     store: &St,
     giver: u64,
@@ -152,10 +103,6 @@ pub(crate) fn quest_details_screen<St: QuestActionStore + ?Sized>(
         }))
 }
 
-/// The screen a `CMSG_USE_ITEM` opens when that item starts a quest — the item instance is its own
-/// giver. `None` means the item starts no quest, which is the item family's signal to fall through
-/// to the ordinary use path; `Some` means the quest module consumed the action, so the item is
-/// never used up by opening its own quest.
 pub(crate) fn item_started_quest<St: QuestActionStore + ?Sized>(
     store: &St,
     session: &ProtocolSession,
@@ -170,9 +117,6 @@ pub(crate) fn item_started_quest<St: QuestActionStore + ?Sized>(
     Ok(Some(quest_details_screen(store, item_guid, quest_id)?))
 }
 
-/// The quest section of a combined gossip menu for `npc` against `self_guid` — the same evaluation
-/// and the same menu-item derivation `quest_giver_menu` uses, so a gossip-flagged questgiver can
-/// never show different quest icons than `CMSG_QUESTGIVER_HELLO` would.
 pub(crate) fn gossip_quest_items<St: QuestActionStore + ?Sized>(
     store: &St,
     npc: u64,
@@ -183,8 +127,6 @@ pub(crate) fn gossip_quest_items<St: QuestActionStore + ?Sized>(
     ))
 }
 
-/// `(taken, rewarded)` for `quest_id` in `player_guid`'s quest log — the read behind the
-/// QUEST_TAKEN/QUEST_REWARDED gossip option conditions that gate a gossip menu row.
 pub(crate) fn quest_gate_state<St: QuestActionStore + ?Sized>(
     store: &St,
     player_guid: u64,
@@ -193,7 +135,6 @@ pub(crate) fn quest_gate_state<St: QuestActionStore + ?Sized>(
     store.quest_status(player_guid, quest_id)
 }
 
-/// Both opening a turn-in and continuing its progress screen use the current durable evaluation.
 fn quest_reward_screen<St: QuestActionStore + ?Sized>(
     store: &St,
     giver: u64,
@@ -223,7 +164,6 @@ fn quest_reward_screen<St: QuestActionStore + ?Sized>(
     Ok(ProtocolReply::from(vec![Outbound::One(screen)]))
 }
 
-/// Map quest requests and durable outcomes to client replies.
 pub(crate) struct Quest;
 
 impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
@@ -238,7 +178,6 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
         };
         let self_guid = actor.guid();
         match msg {
-            // The client polls each nearby questgiver for its overhead icon (`!` available / `?` turn-in).
             ClientOpcodeMessage::CMSG_QUESTGIVER_STATUS_QUERY(q) => {
                 let giver = q.guid.guid();
                 let status = codec::quest_giver_status(&store.giver_quest_evals(giver, self_guid)?);
@@ -248,9 +187,6 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                     )),
                 )]))
             }
-            // Right-click a questgiver → the quest menu (every quest it offers/completes for this
-            // player). An Unfriendly-or-below giver refuses it and answers nothing at all. A
-            // QUESTGIVER GameObject reaches the same `quest_giver_menu` helper from session dispatch.
             ClientOpcodeMessage::CMSG_QUESTGIVER_HELLO(h) => {
                 let giver = h.guid.guid();
                 let refuses = store.giver_refuses_interaction(giver, self_guid)?;
@@ -260,15 +196,9 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                     quest_giver_menu(store, giver, self_guid)?
                 }))
             }
-            // Clicked a quest in the menu → its details + Accept button.
             ClientOpcodeMessage::CMSG_QUESTGIVER_QUERY_QUEST(q) => Ok(ProtocolReply::from(
                 quest_details_screen(store, q.guid.guid(), q.quest_id)?,
             )),
-            // The client asks for a quest's full definition (it sends this for any quest id it sees in a
-            // PLAYER_QUEST_LOG slot but has no data for). Without this reply the client won't
-            // display/count the quest in its log — so this is what makes the quest-log window entry
-            // actually appear. RAW-encoded: gtker's typed layout writes the rep Faction fields as u16,
-            // shifting the title by 4 bytes; the hand-rolled body matches the 5875 layout exactly.
             ClientOpcodeMessage::CMSG_QUEST_QUERY(q) => {
                 let outbound =
                     store
@@ -279,8 +209,6 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                         });
                 Ok(ProtocolReply::from(outbound))
             }
-            // Clicked Accept → the module opens the quest log row (gated). No SMSG on success: the
-            // client closes the window itself and the quest-log relay carries the new slot.
             ClientOpcodeMessage::CMSG_QUESTGIVER_ACCEPT_QUEST(a) => {
                 ignore_refusal(
                     store.accept_quest(actor, a.guid.guid(), a.quest_id),
@@ -295,14 +223,8 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
             ClientOpcodeMessage::CMSG_QUESTGIVER_REQUEST_REWARD(c) => {
                 quest_reward_screen(store, c.guid.guid(), self_guid, c.quest_id)
             }
-            // Chose the reward → the module grants money/XP/items (gated on completion). The durable
-            // turn-in is requested BEFORE any outbound is built, so a refused turn-in can never show a
-            // "Quest Complete" popup for rewards the player did not get. A refusal instead re-opens
-            // the current offer when its details remain readable, so the player can correct the choice.
             ClientOpcodeMessage::CMSG_QUESTGIVER_CHOOSE_REWARD(c) => {
                 match store.turn_in_quest(actor, c.guid.guid(), c.quest_id, c.reward) {
-                    // The popup echoes the definition's XP/money/items, so what it shows matches what
-                    // the module granted. Unreadable details drop it — the turn-in already happened.
                     Ok(()) => Ok(ProtocolReply {
                         outbound: match store.quest_detail_view(c.quest_id)? {
                             Some(detail) => vec![Outbound::One(
@@ -334,11 +256,6 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                     Err(e) => Err(e),
                 }
             }
-            // Abandon a quest from the log ("Abandon Quest"). The payload is a LOG SLOT (0..19), not a
-            // quest id — resolve it against the same `player_quest_log` ordering the world-entry block
-            // reads, then request the durable abandon. A slot that is not currently in the log (stale
-            // window, typo'd click) resolves to nothing and requests nothing — it cannot abandon an
-            // arbitrary quest. No SMSG on success: the quest-log relay re-sends the cleared block.
             ClientOpcodeMessage::CMSG_QUESTLOG_REMOVE_QUEST(r) => {
                 if let Some(s) = store
                     .player_quest_log(self_guid)?
@@ -353,9 +270,6 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                 }
                 Ok(ProtocolReply::from(Vec::new()))
             }
-            // Share a quest with the party (`CMSG_PUSHQUESTTOPARTY`). The module validates
-            // grouped + actively-on-the-quest and pushes the per-member `QUEST_SHARE`/`QUEST_PUSH_RESULT`
-            // events itself (relayed by `subscriptions.rs`'s `on_group_event`); no direct SMSG here.
             ClientOpcodeMessage::CMSG_PUSHQUESTTOPARTY(p) => {
                 ignore_refusal(
                     store.push_quest(actor, p.quest_id),
@@ -381,9 +295,6 @@ mod tests {
         CMSG_QUEST_QUERY,
     };
 
-    /// One durable call of the turn-in round trip, recorded in the order the seam made it. The
-    /// completion popup is built from `Detail`, so a `TurnIn` recorded ahead of it is the proof
-    /// that no screen can claim completion before the module granted it.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum TurnInCall {
         TurnIn {
@@ -416,12 +327,10 @@ mod tests {
         abandon_error: Option<String>,
         push_error: Option<String>,
         quest_status: (bool, bool),
-        /// Every durable call and read fails with a Transport Loss.
         transport_lost: bool,
     }
 
     impl InMemoryQuestActions {
-        /// The Module's answer to a durable request: a Refusal with `reason`, or success.
         fn answer(&self, operation: &str, reason: &Option<String>) -> Result<()> {
             if self.transport_lost {
                 return Err(ReducerCallError::transport_lost(operation).into());
@@ -588,7 +497,6 @@ mod tests {
         ClientOpcodeMessage::CMSG_QUESTLOG_REMOVE_QUEST(CMSG_QUESTLOG_REMOVE_QUEST { slot })
     }
 
-    /// One giver↔quest relation. `startable` follows the role, the way the module evaluates it.
     fn eval(quest_id: u32, role: u8, active: bool, complete: bool) -> codec::GiverQuestEval {
         codec::GiverQuestEval {
             quest_id,
@@ -621,8 +529,6 @@ mod tests {
         }
     }
 
-    /// One quest-log slot. `counts`/`state`/`timer` are irrelevant to slot resolution, so every
-    /// fixture leaves them at their zero value.
     fn log_slot(slot: u8, quest_id: u32) -> codec::update_mask::QuestLogSlot {
         codec::update_mask::QuestLogSlot {
             slot,
@@ -633,8 +539,6 @@ mod tests {
         }
     }
 
-    /// A giver with exactly one menu-worthy quest whose details are loaded — the "instant quest"
-    /// fixture the three single-quest screens differ only by eval state on.
     fn one_quest(role: u8, active: bool, complete: bool) -> InMemoryQuestActions {
         InMemoryQuestActions {
             evals: vec![eval(QUEST, role, active, complete)],
@@ -643,8 +547,6 @@ mod tests {
         }
     }
 
-    /// A store where only `QUEST` has a loaded definition — the fixture the details, definition
-    /// and accept routes differ on by the quest id they ask for.
     fn loaded_quest() -> InMemoryQuestActions {
         InMemoryQuestActions {
             details: vec![detail(QUEST)],
@@ -656,7 +558,6 @@ mod tests {
         reply.outbound
     }
 
-    /// The same client-visible traffic: same order, same messages, same raw bytes.
     fn same_batch(a: &[Outbound], b: &[Outbound]) -> bool {
         a.len() == b.len()
             && a.iter().zip(b).all(|pair| match pair {
@@ -674,8 +575,6 @@ mod tests {
                 _ => false,
             })
     }
-
-    // ── Overhead status ──────────────────────────────────────────────────────
 
     #[test]
     fn a_status_query_answers_one_status_for_the_polled_giver() {
@@ -696,8 +595,6 @@ mod tests {
             &[(GIVER, SELF_GUID)]
         );
     }
-
-    // ── The giver menu ───────────────────────────────────────────────────────
 
     #[test]
     fn a_refusing_giver_answers_nothing_and_its_quests_are_never_read() {
@@ -771,7 +668,6 @@ mod tests {
             [Outbound::One(ServerOpcodeMessage::SMSG_QUESTGIVER_QUEST_LIST(l))]
                 if l.npc == Guid::new(GIVER) && l.quest_items.len() == 2
         ));
-        // No single quest to open, so no details screen was even considered.
         assert!(actions.detail_requests.lock().unwrap().is_empty());
     }
 
@@ -791,8 +687,6 @@ mod tests {
 
     #[test]
     fn the_menu_evaluates_the_giver_once_for_the_whole_screen_decision() {
-        // The screen choice needs both the menu list and the turn-in state; reading the giver twice
-        // would let those two answers disagree inside one request.
         let actions = one_quest(codec::ROLE_END, true, true);
 
         run_quest(&actions, session(), hello(GIVER)).unwrap();
@@ -806,8 +700,6 @@ mod tests {
 
     #[test]
     fn a_gameobject_giver_opens_the_same_screen_as_a_creature_giver() {
-        // The client never sends HELLO for a gameobject giver, so `GameObject::handle` calls the menu
-        // directly. Same state, same screen — only the giver guid in the body differs.
         let actions = one_quest(codec::ROLE_START, false, false);
 
         let creature = outbound(run_quest(&actions, session(), hello(GIVER)).unwrap());
@@ -820,8 +712,6 @@ mod tests {
             [Outbound::Raw { opcode: OP_QUEST_DETAILS, body }] if body[..8] == GO_GIVER.to_le_bytes()
         ));
     }
-
-    // ── The details screen and the definition query ──────────────────────────
 
     #[test]
     fn a_details_request_opens_the_whole_screen_for_the_asking_giver() {
@@ -868,8 +758,6 @@ mod tests {
         assert!(batch.is_empty());
     }
 
-    // ── Accept ───────────────────────────────────────────────────────────────
-
     #[test]
     fn accept_requests_the_durable_accept_for_the_player_giver_and_quest() {
         let actions = loaded_quest();
@@ -910,8 +798,6 @@ mod tests {
         assert!(matches!(classify(&error), DurableFailure::TransportLoss));
     }
 
-    // ── The item-started quest ───────────────────────────────────────────────
-
     #[test]
     fn an_item_that_starts_a_quest_opens_its_details_with_the_item_as_the_giver() {
         let actions = InMemoryQuestActions {
@@ -945,8 +831,6 @@ mod tests {
 
     #[test]
     fn an_item_starting_an_unloaded_quest_still_belongs_to_the_quest_module() {
-        // The empty batch is what keeps the item from being consumed: the item family only falls
-        // through on `None`, and a missing definition is not a reason to eat the item.
         let actions = InMemoryQuestActions {
             start_quest: Some((ITEM_GIVER, QUEST + 1)),
             ..loaded_quest()
@@ -987,8 +871,6 @@ mod tests {
         assert!(same_batch(&from_giver, &from_item));
     }
 
-    // ── The quest log: abandon and the world-entry descriptor block ──────────
-
     #[test]
     fn abandon_resolves_the_log_slot_to_a_quest_id_and_requests_the_durable_abandon() {
         let actions = InMemoryQuestActions {
@@ -1010,8 +892,6 @@ mod tests {
 
     #[test]
     fn abandon_of_a_slot_not_in_the_log_requests_nothing() {
-        // A stale window or a desynced client can send a slot the log doesn't currently hold — that
-        // must resolve to nothing, so it can never abandon whatever quest a live slot happens to hold.
         let actions = InMemoryQuestActions {
             quest_log: vec![log_slot(3, 777)],
             ..Default::default()
@@ -1081,8 +961,6 @@ mod tests {
         assert!(actions.push_requests.lock().unwrap().is_empty());
     }
 
-    // ── World Session context and error classification ──────────────────────────────
-
     #[test]
     fn a_failed_interaction_gate_read_is_session_fatal() {
         let actions = InMemoryQuestActions {
@@ -1097,8 +975,6 @@ mod tests {
 
         assert!(matches!(classify(&error), DurableFailure::TransportLoss));
     }
-
-    // ── The turn-in round trip ───────────────────────────────────────────────
 
     fn complete_quest(quest_id: u32) -> ClientOpcodeMessage {
         ClientOpcodeMessage::CMSG_QUESTGIVER_COMPLETE_QUEST(Box::new(
@@ -1119,7 +995,6 @@ mod tests {
         ))
     }
 
-    /// A finished turn-in whose quest actually pays, so the popup has something to echo.
     fn rewarded_turn_in() -> InMemoryQuestActions {
         InMemoryQuestActions {
             details: vec![codec::QuestDetailView {
@@ -1151,7 +1026,6 @@ mod tests {
             [Outbound::One(ServerOpcodeMessage::SMSG_QUESTGIVER_OFFER_REWARD(r))]
                 if r.npc == Guid::new(GIVER) && r.quest_id == QUEST
         ));
-        // Opening the screen is a read. The rewards are only granted once a reward is chosen.
         assert!(!actions
             .turn_in_calls
             .lock()
@@ -1180,14 +1054,11 @@ mod tests {
         let batch = outbound(run_quest(&actions, session(), complete_quest(QUEST + 1)).unwrap());
 
         assert!(batch.is_empty());
-        // No screen to build, so the giver is never evaluated.
         assert!(actions.eval_requests.lock().unwrap().is_empty());
     }
 
     #[test]
     fn choosing_a_reward_turns_the_quest_in_before_any_outbound_is_built() {
-        // The ordering is the whole point: the popup is built from the detail read, so a turn-in
-        // recorded ahead of it is what stops a refusal from showing a false "Quest Complete".
         let actions = rewarded_turn_in();
 
         run_quest(&actions, session(), choose_reward(2)).unwrap();
@@ -1213,8 +1084,6 @@ mod tests {
         ));
     }
 
-    /// Only a granted turn-in can have filed a Reward Letter, so only it asks the session to drive
-    /// the Character's held letters.
     #[test]
     fn only_a_granted_turn_in_asks_for_the_held_letters_to_be_driven() {
         let granted = run_quest(&rewarded_turn_in(), session(), choose_reward(0));
@@ -1307,8 +1176,6 @@ mod tests {
         assert!(matches!(classify(&error), DurableFailure::TransportLoss));
     }
 
-    // ── Party sharing ────────────────────────────────────────────────────────
-
     fn push_to_party(quest_id: u32) -> ClientOpcodeMessage {
         ClientOpcodeMessage::CMSG_PUSHQUESTTOPARTY(CMSG_PUSHQUESTTOPARTY { quest_id })
     }
@@ -1356,12 +1223,8 @@ mod tests {
         assert!(matches!(classify(&error), DurableFailure::TransportLoss));
     }
 
-    // ── The gossip quest section ────────────────────────────────────────────
-
     #[test]
     fn gossip_quest_items_matches_the_giver_menus_items_for_the_same_evaluation() {
-        // Both reads come from the same eval + the same `codec::quest_menu_items` derivation, so a
-        // gossip-flagged questgiver's menu icon can never drift from what HELLO would show.
         let actions = InMemoryQuestActions {
             evals: vec![
                 eval(QUEST, codec::ROLE_START, false, false),
@@ -1395,8 +1258,6 @@ mod tests {
             .is_empty());
     }
 
-    // ── The gossip quest gate ───────────────────────────────────────────────
-
     #[test]
     fn quest_gate_state_answers_untaken_for_a_quest_never_seen() {
         let actions = InMemoryQuestActions::default();
@@ -1427,16 +1288,10 @@ mod reward_letter_durable_tests {
     use crate::durable_test_support::Standalone;
     use crate::stdb::Coordinator;
 
-    /// The Module's reward letter fixture: Character 1 holds completed quest 509091, shaped like 3645,
-    /// Membership Card Renewal, at a clone of creature 620. The quest ender sends one Tempered
-    /// Blade (5090050, max durability 70) after 86,400 s.
     const TESTER: u64 = 1;
     const GIVER: u64 = 17_379_390_972_441_394_945;
     const CARD_QUEST: u32 = 509_091;
 
-    /// The turn-in answers on the visibility pipe, whose row callbacks run before its reducer
-    /// callback, so the escrow index already names the new letter when the session drives it. On a
-    /// single-database realm the drive delivers it on the same database.
     #[test]
     #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
     fn the_drive_right_after_a_turn_in_finds_and_delivers_its_reward_letter() {

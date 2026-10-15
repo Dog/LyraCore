@@ -1,16 +1,8 @@
-//! Every crate-root path a Package source file names, read lexically from stripped source.
-
-/// One crate-root path as the Package wrote it.
 #[derive(Clone, Debug, Default)]
 pub struct RootedPath {
-    /// The segments after the crate root, raw identifiers normalized and `self` dropped. A glob
-    /// ends in `*`.
     pub segments: Vec<String>,
-    /// The path as written, from its root keyword (`crate`, `$crate` or `super::..`).
     pub written: String,
-    /// The name a `use` binds with `as`, when it renames.
     pub alias: Option<String>,
-    /// Byte offset of the last segment in the stripped source.
     offset: usize,
 }
 
@@ -21,11 +13,8 @@ pub enum UnsupportedSyntax {
     IncludeMacro,
 }
 
-/// What one Package file names beyond its own modules.
 pub struct FilePaths {
-    /// Every crate-root path, one per use-tree leaf, as (1-based line, path).
     pub paths: Vec<(usize, RootedPath)>,
-    /// Syntax whose meaning this scan cannot track, as (1-based line, kind, spelling).
     pub unsupported: Vec<(usize, UnsupportedSyntax, String)>,
 }
 
@@ -35,8 +24,6 @@ pub struct Token<'a> {
     start: usize,
 }
 
-/// The Rust tokens this lint needs, with byte positions for diagnostics. This is deliberately much
-/// smaller than a parser: identifiers, `::`, and punctuation stay distinct; whitespace vanishes.
 pub fn tokens(stripped: &str) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     let mut at = 0usize;
@@ -83,8 +70,6 @@ fn is_space(c: char) -> bool {
     c.is_whitespace() || matches!(c, '\u{200e}' | '\u{200f}')
 }
 
-// Rust punctuation is ASCII. Keep non-ASCII identifier characters together without needing the
-// full Unicode identifier tables; the compiler checks their validity.
 fn ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && !is_space(c))
 }
@@ -101,8 +86,6 @@ fn line_at(stripped: &str, offset: usize) -> usize {
     stripped[..offset].matches('\n').count() + 1
 }
 
-/// Every leaf of the use tree or plain path that starts at `tokens[at]`, the token after a root's
-/// `::`, appended below `parent`. Returns the index of the first token after the tree.
 pub fn tree_leaves(
     tokens: &[Token<'_>],
     at: usize,
@@ -143,7 +126,6 @@ pub fn tree_leaves(
     index
 }
 
-/// The leaves of one braced group whose `{` is `tokens[open]`.
 fn group_leaves(
     tokens: &[Token<'_>],
     open: usize,
@@ -164,8 +146,6 @@ fn group_leaves(
     index
 }
 
-/// Inline `mod name { .. }` bodies, as byte ranges. File position supplies the rest of a Package
-/// module's depth.
 fn inline_modules(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
     let mut open = Vec::new();
     let mut pairs = Vec::new();
@@ -187,10 +167,6 @@ fn inline_modules(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// The crate-root paths and unsupported syntax in one Package file. `file_depth` is zero for
-/// `src/mod.rs`, one for `src/foo.rs` or `src/foo/mod.rs`, and so on. Inline modules add to it.
-///
-/// A path is rooted at `crate`, `$crate`, or enough leading `super` segments to leave the Package.
 pub fn file_paths(stripped: &str, file_depth: usize) -> FilePaths {
     let tokens = tokens(stripped);
     let modules = inline_modules(&tokens);
@@ -267,8 +243,6 @@ pub fn file_paths(stripped: &str, file_depth: usize) -> FilePaths {
     }
 }
 
-/// Syntax whose meaning the lint cannot track reliably. It is refused where it is declared
-/// instead of guessing at Rust name resolution or filesystem-to-module mapping.
 fn unsupported_syntax(
     tokens: &[Token<'_>],
     stripped: &str,
@@ -282,7 +256,6 @@ fn unsupported_syntax(
         ));
     };
     for (index, token) in tokens.iter().enumerate() {
-        // A whole-crate rename, including `self` beneath anonymous use groups.
         if token.text != "crate" || !in_use_statement(tokens, index) {
             continue;
         }
@@ -304,7 +277,6 @@ fn unsupported_syntax(
             }
         }
     }
-    // `extern crate self as core` is the older spelling of the same file-local crate alias.
     for window in tokens.windows(5) {
         if window[0].text == "extern"
             && window[1].text == "crate"
@@ -316,8 +288,6 @@ fn unsupported_syntax(
         }
     }
     found.extend(path_attributes(tokens));
-    // `include!` parses another file as Rust in this module, beyond `.rs` discovery. Data
-    // inclusion (`include_str!`, `include_bytes!`) stays available.
     for window in tokens.windows(2) {
         if ident_name(window[0]) == Some("include") && window[1].text == "!" {
             found.push((
@@ -335,7 +305,6 @@ fn unsupported_syntax(
         .collect()
 }
 
-/// Whether `tokens[index]` sits inside a `use` statement.
 fn in_use_statement(tokens: &[Token<'_>], index: usize) -> bool {
     tokens[..index]
         .iter()
@@ -344,7 +313,6 @@ fn in_use_statement(tokens: &[Token<'_>], index: usize) -> bool {
         .any(|token| token.text == "use")
 }
 
-/// `#[path = ..]` and `#[cfg_attr(.., path = ..)]`, which break Package source discovery.
 fn path_attributes(tokens: &[Token<'_>]) -> Vec<(usize, UnsupportedSyntax, String)> {
     let mut found = Vec::new();
     for (index, window) in tokens.windows(2).enumerate() {

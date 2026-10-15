@@ -79,6 +79,40 @@ routing fact; module game logic never reads one, and an architecture test fails 
   [`schema.md`](./schema.md) §6 lists them all. Nothing on a gateway timer decides gameplay.
 - **All authorization of writes** — a reducer derives its actor from `ctx.sender`.
 
+The [creature cycle](../module/src/creatures/cycle/mod.rs) advances splines before behavior phases check range,
+so those phases read the position the client renders. On sensing firings, aggro precedes assist and
+pet engagement, then EventAI gets casting authority before compatibility casts and threat retargeting.
+Casting and retargeting precede chase, so a ready caster can cast and a chaser follows its current
+target in the same firing. Combat entry precedes regeneration and combat exit; regeneration precedes
+exit, so a unit that leaves combat recovers from the next firing. Returning home takes priority over
+idle wandering. Rout and fear movement follow regeneration. On other firings, EventAI runs after
+rout and fear movement. Package passes run after the Core phases.
+
+The active-cell sweep limits idle and proximity work. Engaged phases use their live engagement rows
+and firing scope, so a Character cannot freeze a fight by moving beyond every active cell. Global
+due-time maintenance, regeneration, combat exit and Package passes run only on the catch-all firing;
+dedicated Instance firings must not repeat them. The
+[maintenance adapter](../module/src/creatures/cycle/ctx.rs) runs decay before respawn, and
+[decay](../module/src/creatures/tick/lifecycle.rs) arms a future respawn deadline to prevent a corpse
+from returning in the same firing.
+
+#### Navigation legs
+
+The [shared leg search](../crates/lyracore-shared/src/nav.rs) plans short movement legs. Callers
+replan after partial progress. `find_leg_ex` returns waypoints, the number of expanded search nodes,
+and whether the search reached the goal. `find_leg` discards the count and completeness, so `Some`
+alone does not prove that the leg reaches its destination. `None` means the search found no usable
+leg, including invalid coordinates or blocked movement.
+
+Waypoints omit the starting point and a complete exact-target leg ends at `to`. When the target
+condition already holds, the result is `[from]`. A direct leg uses zero expansions. A search that
+cannot reach the goal can return a partial leg to the explored node nearest it; callers must retain
+the distinction between partial progress and reaching the goal.
+
+`find_leg_in_range_ex` uses `LegOutcome` to preserve completeness and retains the expansion count
+even for a blocked search. Its target condition is reaching a walkable point within `stop_dist`
+of `to`, with `[from]` returned immediately when already in range.
+
 ### 2.2 The gateway owns
 
 - **Socket IO and protocol state only.** Per-connection: the SRP6 scratch, the header-cipher
@@ -166,6 +200,12 @@ with no ownership token. The Module removes the Guild Invite it holds, its membe
 Petitions and Signatures. A Guild Invite it sent stays, as in mangos. A deleted Guild Leader passes leadership to the member with the highest Guild Rank,
 earliest join first, and a Guild with nobody left disbands. The op finds nothing on a second call,
 so a pass that a restart interrupts is repeated whole.
+
+Each durable presence snapshot uses a temporary filtered subscription. The ordinary Coordinator
+cache can lag a commit made through another Gateway. The temporary subscription's `on_applied`
+callback samples presence after the server snapshot reaches the cache. Removing the temporary
+subscription leaves the main subscription owning the Character rows. Replacing this step with
+ordinary cache reads could make a live Character appear absent and remove its Guild membership.
 
 The mail Delivery Delay is the same shape. The Gateway reads the Realm Account of the sender and of
 the recipient from the World Shards: the Account Character Owner name, else the name of a local
@@ -427,7 +467,7 @@ sharded tables.
 |---|---|---|
 | Cell size | 50 yd | `GRID_CELL_SIZE`, `crates/lyracore-shared/src/spatial.rs` |
 | Box | 5×5 cells (`BOX_HALF_SPAN = 2`) | `BOX_HALF_SPAN`, `spatial.rs` |
-| Guaranteed-visible radius | 100 yd (box spans ~250 yd; culls past ~150 yd on an axis) | `spatial.rs` doc comment on `GRID_CELL_SIZE` |
+| Guaranteed-visible radius | 100 yd (box spans ~250 yd; culls past ~150 yd on an axis) | `GRID_CELL_SIZE * BOX_HALF_SPAN` in `spatial.rs` |
 | Recenter | on map change or leaving the anchor cell — roughly every 7 s of walking | `gateway/src/stdb/aoi.rs` (`GridBox`/recenter logic) |
 | Kill switch | `LYRACORE_AOI=0`; **default on since 2026-07-10** | `gateway/src/config.rs` |
 
@@ -774,6 +814,12 @@ warning banner states plainly, not a contradiction to resolve in this document.
 | Recipes | Step lists for common changes: [add an opcode](./recipes/add-an-opcode.md), [add a spell effect](./recipes/add-a-spell-effect.md). |
 | [`schema.md`](./schema.md) | The table-level data model. |
 | [`package-api.md`](./package-api.md) | The Package API, version 2: what a Package's Rust half may call, and what core promises about it. |
+| [`actor-verbs.md`](./actor-verbs.md) | Before adding Actor verbs or changing their Gates. |
+| [`package-delta-format.md`](./package-delta-format.md) | Before changing artifact parsing, canonicalization or claim conflicts. |
+| [`accept-policy.md`](./accept-policy.md) | Before changing listener retries or blocking-task capacity. |
+| [`realm-loot-routing.md`](./realm-loot-routing.md) | Before changing Loot Roll promotion, voting or settlement across Shards. |
+| [`instance-lifecycle.md`](./instance-lifecycle.md) | Before changing Instance allocation, Group bindings or pool routing. |
+| [`runtime-script-host.md`](./runtime-script-host.md) | Before changing Runtime Script execution or compiler compatibility. |
 
 ### Operating and building
 

@@ -1,9 +1,7 @@
-//! Linear waypoint geometry shared by authoritative movement and the vanilla client relay.
-
 pub type Point = (f32, f32, f32);
 
 pub const MAX_POINTS: usize = 64;
-// Keep every destination-relative offset inside vanilla's signed quarter-yard XYZ fields.
+// Vanilla offsets use signed quarter-yard XYZ fields.
 pub const MAX_DISTANCE: f32 = 112.0;
 
 pub fn distance(a: Point, b: Point) -> f32 {
@@ -18,7 +16,6 @@ pub fn length(start: Point, points: &[Point]) -> f32 {
         .sum()
 }
 
-/// Return the current position and the index of the next waypoint. At arrival the index is len.
 pub fn sample(start: Point, points: &[Point], fraction: f32) -> (Point, usize) {
     let mut remaining = length(start, points) * fraction.clamp(0.0, 1.0);
     let mut from = start;
@@ -41,7 +38,6 @@ pub fn sample(start: Point, points: &[Point], fraction: f32) -> (Point, usize) {
     (from, points.len())
 }
 
-/// Progress along a path, provided the observed ground position lies on one of its segments.
 pub fn progress_2d(start: Point, points: &[Point], position: (f32, f32)) -> Option<f32> {
     let mut from = start;
     let mut travelled = 0.0;
@@ -63,7 +59,7 @@ pub fn progress_2d(start: Point, points: &[Point], position: (f32, f32)) -> Opti
     closest.map(|(_, progress)| progress)
 }
 
-/// Vanilla ground splines encode intermediate points relative to the final destination.
+// Intermediate spline points are relative to the final destination.
 pub fn packed_offset(destination: Point, point: Point) -> Option<u32> {
     let values = [
         (destination.0 - point.0) * 4.0,
@@ -91,7 +87,7 @@ pub fn unpacked_point(destination: Point, packed: u32) -> Point {
     (destination.0 - x, destination.1 - y, destination.2 - z)
 }
 
-/// Normalize before collision checks so the server follows the exact path encoded on the wire.
+// Normalize before collision checks so authoritative movement matches the encoded path.
 pub fn wire_points(points: &[Point]) -> Option<Vec<Point>> {
     let &destination = points.last()?;
     if points.len() > MAX_POINTS

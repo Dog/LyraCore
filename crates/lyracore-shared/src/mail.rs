@@ -1,53 +1,36 @@
-//! Mail rules shared by the module and gateway.
-
 pub const HAS_UNREAD_MAIL: f32 = 0.0;
 pub const NO_UNREAD_MAIL: f32 = -86400.0;
 pub const MAILBOX_GO_TYPE: u8 = 19;
 pub const MAILBOX_RANGE_SQ: f32 = 100.0;
-/// The client's inbox holds 50 mails, so the list stops there (cmangos `MailHandler.cpp:42,557`).
 pub const INBOX_CAPACITY: usize = 50;
-/// `MailCheckMask` bits (cmangos `Mails/Mail.h:65-73`). The client reads a mail's state from them.
-/// READ is stored as `game_mail.was_read`; the other bits are stored in `game_mail.check_flags`.
 pub const CHECK_MASK_READ: u32 = 0x01;
 pub const CHECK_MASK_RETURNED: u32 = 0x02;
 pub const CHECK_MASK_COPIED: u32 = 0x04;
 pub const CHECK_MASK_COD_PAYMENT: u32 = 0x08;
 pub const CHECK_MASK_HAS_BODY: u32 = 0x10;
-/// Every bit the client reads. Bits above it in `check_flags` are the server's own and never reach
-/// the wire. A new server-only bit takes the lowest free one: 0x20 is taken, so the next is 0x40.
+// Bits outside CLIENT_CHECK_MASK are durable state only and must stay off the wire.
 pub const CLIENT_CHECK_MASK: u32 = CHECK_MASK_READ
     | CHECK_MASK_RETURNED
     | CHECK_MASK_COPIED
     | CHECK_MASK_COD_PAYMENT
     | CHECK_MASK_HAS_BODY;
-/// Server-only: a Letter Copy's Plain Letter was granted. Distinct from COPIED, which only tells the
-/// client to hide the letter button: a copy stays refused after the granted item is destroyed,
-/// mailed away, or traded, because this bit, not the item's presence, records that the grant
-/// happened.
+// This grant survives item destruction or transfer; COPIED only hides the letter button.
 pub const CHECK_FLAG_LETTER_GRANTED: u32 = 0x20;
-/// `MailMessageType` codes (cmangos `Mails/Mail.h:54-61`), stored as `game_mail.sender_kind`.
 pub const SENDER_KIND_CHARACTER: u8 = 0;
 pub const SENDER_KIND_AUCTION: u8 = 2;
 pub const SENDER_KIND_CREATURE: u8 = 3;
 pub const SENDER_KIND_GAMEOBJECT: u8 = 4;
-/// `Stationery.dbc` ids (cmangos `Mails/Mail.h:79-84`).
 pub const STATIONERY_DEFAULT: u32 = 41;
 pub const STATIONERY_AUCTION: u32 = 62;
-/// Who a mail is from, as the client names it in the inbox. `game_mail` stores it as three
-/// columns: `sender_kind`, `sender_guid` and `sender_entry`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MailSender {
     Character(u64),
-    /// The `AuctionHouse.dbc` id (cmangos `Mails/Mail.cpp:81-84`).
     AuctionHouse(u32),
-    /// The creature template entry (cmangos `Mails/Mail.cpp:48-75`).
     Creature(u32),
-    /// The gameobject template entry.
     Gameobject(u32),
 }
 
 impl MailSender {
-    /// `(sender_kind, sender_guid, sender_entry)`.
     pub fn columns(self) -> (u8, u64, u32) {
         match self {
             Self::Character(guid) => (SENDER_KIND_CHARACTER, guid, 0),
@@ -56,8 +39,7 @@ impl MailSender {
             Self::Gameobject(entry) => (SENDER_KIND_GAMEOBJECT, 0, entry),
         }
     }
-    /// The inverse of [`Self::columns`]. The Module writes no other kind, so any other code reads
-    /// as a Character mail. Every row written before the column existed is one.
+    // Older rows default to Character mail.
     pub fn from_columns(kind: u8, guid: u64, entry: u32) -> Self {
         match kind {
             SENDER_KIND_AUCTION => Self::AuctionHouse(entry),
@@ -73,12 +55,9 @@ impl MailSender {
         }
     }
 }
-/// The quest giver a Reward Letter is from. Only a creature or a gameobject ends a quest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum QuestGiver {
-    /// The creature template entry.
     Creature(u32),
-    /// The gameobject template entry.
     Gameobject(u32),
 }
 
@@ -90,8 +69,6 @@ impl QuestGiver {
         }
     }
 }
-/// What makes a letter a Reward Letter: the quest giver it is from and the Mail Template it names.
-/// A Character's letter has none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RewardHeader {
     pub giver: QuestGiver,
@@ -99,8 +76,6 @@ pub struct RewardHeader {
 }
 
 impl RewardHeader {
-    /// The `(sender_kind, sender_entry, mail_template_id)` a mail escrow row and
-    /// `realm_mail_commit` carry. A Character's letter is all zeros.
     pub fn columns(header: Option<Self>) -> (u8, u32, u32) {
         match header {
             None => (SENDER_KIND_CHARACTER, 0, 0),
@@ -110,8 +85,6 @@ impl RewardHeader {
             }
         }
     }
-    /// The inverse of [`Self::columns`]. Any other value is refused, so a damaged row never
-    /// commits as a Character's letter from its recipient to itself.
     pub fn from_columns(
         sender_kind: u8,
         sender_entry: u32,
@@ -135,14 +108,10 @@ impl RewardHeader {
     }
 }
 const DAY_SECS: i64 = 86_400;
-/// When a mail became visible to its recipient. A delivery instant of 0 means "when it was
-/// created", which is true for every mail that was never delayed.
+// Delivery time 0 means the mail arrived when created.
 pub fn arrived_at_secs(created_secs: i64, deliver_secs: i64) -> i64 {
     created_secs.max(deliver_secs)
 }
-/// A mail expires 3 days after it arrives with a cash on delivery price and 30 days after it
-/// arrives without one (cmangos `Mails/Mail.cpp:301-313`). The list countdown and the expiry both
-/// read this, so they cannot drift apart.
 pub fn expires_at_secs(created_secs: i64, deliver_secs: i64, cod: u32) -> i64 {
     let lifetime_days = if cod > 0 { 3 } else { 30 };
     arrived_at_secs(created_secs, deliver_secs).saturating_add(lifetime_days * DAY_SECS)
@@ -199,8 +168,7 @@ pub fn cod_settlement(
     if cod == 0 || sender_guid == taker_guid {
         return None;
     }
-    // The payment keeps the letter's own subject. The client shows it as "COD Payment: <subject>"
-    // because the letter carries CHECK_MASK_COD_PAYMENT (cmangos `MailHandler.cpp:475-477`).
+    // CHECK_MASK_COD_PAYMENT makes the client prepend COD Payment to the subject.
     Some(CodSettlement {
         payer_guid: taker_guid,
         payee_guid: sender_guid,
@@ -223,7 +191,6 @@ pub fn unread_mail_signal(has_unread: bool) -> f32 {
         NO_UNREAD_MAIL
     }
 }
-/// The days left before [`expires_at_secs`], as the list packet's countdown.
 pub fn expiration_days(created_secs: i64, deliver_secs: i64, cod: u32, now_secs: i64) -> f32 {
     let left_secs = expires_at_secs(created_secs, deliver_secs, cod).saturating_sub(now_secs);
     (left_secs as f32 / DAY_SECS as f32).max(0.0)

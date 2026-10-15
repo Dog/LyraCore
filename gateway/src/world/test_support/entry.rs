@@ -1,17 +1,10 @@
-//! World entry as a socket test reads it.
-
 use super::*;
 use std::os::unix::net::UnixStream;
 use wow_world_messages::vanilla::{ClientMessage, CMSG_AUTH_SESSION, CMSG_PLAYER_LOGIN};
 use wow_world_messages::Guid;
 
-/// More frames than any world entry batch carries. Reaching it means the batch never ended.
 const WORLD_ENTRY_FRAME_LIMIT: usize = 64;
 
-/// Read one world entry batch: the login sequence, any item CREATEs and the self CREATE, up to and
-/// including the zone's `SMSG_WEATHER`, which always closes the batch. A fresh entry and a
-/// world-port re-entry end the same way. Panics when no `SMSG_WEATHER` arrives within
-/// [`WORLD_ENTRY_FRAME_LIMIT`] frames.
 pub(crate) fn drain_world_entry<S: Read>(
     client: &mut S,
     dec: &mut DecrypterHalf,
@@ -29,8 +22,6 @@ pub(crate) fn drain_world_entry<S: Read>(
     panic!("no SMSG_WEATHER within {WORLD_ENTRY_FRAME_LIMIT} frames: the world entry batch never ended");
 }
 
-/// The client side of every real world-session test has a bounded read. A missing server packet is
-/// a test failure, never an indefinitely blocked test process.
 pub(crate) const WORLD_SESSION_READ_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -52,13 +43,6 @@ pub(crate) fn ns(s: &str) -> NormalizedString {
     NormalizedString::new(s).unwrap()
 }
 
-/// Drive the shared prefix of every world handshake: read the plaintext `SMSG_AUTH_CHALLENGE`,
-/// derive the client-side proof + cipher pair for `key` with `wow_srp`, and send
-/// `CMSG_AUTH_SESSION`. Lower-level than [`client_handshake`] — it does not read whatever comes
-/// back, so a call site can assert on that itself (an `AuthOk`, an `AuthWaitQueue`, a plaintext
-/// rejection...). Returns the cipher pair `into_client_header_crypto` derived, split; a `key` that
-/// does not match what the server holds still produces a (mismatched, useless) pair here — the
-/// send happens regardless — so a rejection-path call site is free to bind them as `_`.
 pub(crate) fn drive_auth<S: Read + Write>(
     client: &mut S,
     username: &str,
@@ -81,10 +65,6 @@ pub(crate) fn drive_auth<S: Read + Write>(
     (enc, dec)
 }
 
-/// Drive the client side of the world handshake against a server running `run_world_session`
-/// (or `world_handshake`): read the plaintext challenge, send `CMSG_AUTH_SESSION` with a
-/// valid proof, read the encrypted AUTH_OK. Returns the client's cipher halves for the
-/// post-handshake encrypted traffic.
 pub(crate) fn client_handshake<S: Read + Write>(
     client: &mut S,
     username: &str,
@@ -116,9 +96,6 @@ pub(crate) fn auth_session(
     }
 }
 
-/// A store for a logged-in TESTER (account `account_id`), with no character/scenario state beyond
-/// the session itself — the shape every handshake/login/logout/movement test overlays with its own
-/// fields via `..`. `quest_store()` is the sibling for tests that also need a login entity.
 pub(crate) fn tester_store(account_id: u64) -> WorldFake {
     WorldFake {
         trainer: TrainerState {
@@ -138,14 +115,12 @@ pub(crate) fn tester_store(account_id: u64) -> WorldFake {
     }
 }
 
-/// Human/Warrior entity matching the seed, as the gateway would read it back after
-/// `player_login`.
 pub(crate) fn warrior_entity() -> codec::EntityView {
     codec::EntityView {
         watched_faction_index: None,
         guid: 1,
         map_id: 0,
-        instance_id: 0, // the open world
+        instance_id: 0,
         zone_id: 12,
         x: -8949.95,
         y: -132.493,
@@ -164,7 +139,7 @@ pub(crate) fn warrior_entity() -> codec::EntityView {
         level: 1,
         faction_template: 1,
         target_guid: 0,
-        unit_bytes_0: 1 | (1 << 8) | (1 << 24), // human(1) warrior(1) male(0) rage(1)
+        unit_bytes_0: 1 | (1 << 8) | (1 << 24),
         display_id: 49,
         native_display_id: 49,
         unit_flags: 0,
@@ -180,7 +155,6 @@ pub(crate) fn warrior_entity() -> codec::EntityView {
         money: 0,
         unit_bytes_1: 0,
         unit_bytes_2: 0,
-        // L1 Human Warrior base attributes (cmangos curve) — non-zero so the CREATE exercises them.
         strength: 23,
         agility: 20,
         stamina: 22,
@@ -193,11 +167,10 @@ pub(crate) fn warrior_entity() -> codec::EntityView {
         sheet_ranged_ap: 0,
         sheet_ranged_dmg_min: 0,
         sheet_ranged_dmg_max: 0,
-        npc_flags: 0,        // a player is not an NPC
-        owner_guid: 0,       // not a summon
-        effective_armor: 40, // agility 20 * 2 (base; no gear in the fixture → effective == base)
+        npc_flags: 0,
+        owner_guid: 0,
+        effective_armor: 40,
         magic_resistances: [0; 6],
-        // No hearthstone bind recorded for the test entity; fall back to login position.
         home_map: 0,
         home_zone: 0,
         home_x: 0.0,
@@ -208,8 +181,6 @@ pub(crate) fn warrior_entity() -> codec::EntityView {
     }
 }
 
-/// A store configured for an in-world TESTER (account 7, char guid 1) with a login entity — the
-/// base fixture every socket test that needs a logged-in player builds on, quest or not.
 pub(crate) fn quest_store() -> WorldFake {
     let base = tester_store(7);
     WorldFake {
@@ -221,11 +192,6 @@ pub(crate) fn quest_store() -> WorldFake {
     }
 }
 
-/// Spin up a world session over a socket pair, handshake as TESTER, enter the world as `guid`, and
-/// drain the world entry batch. Draining one
-/// message too few manifests as the CLIENT closing with unread bytes still queued — which the kernel
-/// reports back to the SERVER thread's next read as ECONNRESET, not a clean EOF.
-/// Returns the client socket + encrypted halves + the server join handle for the test to drive.
 pub(crate) fn enter_world(
     store: std::sync::Arc<WorldFake>,
     guid: u64,

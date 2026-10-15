@@ -1,9 +1,6 @@
-//! Shared auction-house protocol rules.
-
-/// Maximum squared 3-D distance for a player to use a named auctioneer: 10 yards.
+// Squared interaction distance in yards.
 pub const INTERACTION_RANGE_SQ: f32 = 100.0;
 
-/// Vanilla's minimum raise: five percent of the current bid, rounded up.
 pub fn bid_increment(current_bid: u32) -> u32 {
     if current_bid == 0 {
         0
@@ -14,7 +11,6 @@ pub fn bid_increment(current_bid: u32) -> u32 {
     }
 }
 
-/// Full next offer required by the auction protocol row and the bid validator.
 pub fn minimum_next_bid(start_bid: u32, current_bid: u32) -> Option<u32> {
     if current_bid == 0 {
         Some(start_bid)
@@ -23,9 +19,6 @@ pub fn minimum_next_bid(start_bid: u32, current_bid: u32) -> Option<u32> {
     }
 }
 
-/// The Auction Cut: the house's share of a bid, truncated (`cm:AuctionHouseMgr.cpp:733-736`). The
-/// seller pays it out of the proceeds at Settlement and out of the purse at Cancellation. `None` when
-/// the rate is not a percentage.
 pub fn auction_cut(bid: u32, consignment_rate: u32) -> Option<u32> {
     if consignment_rate > 100 {
         return None;
@@ -33,8 +26,6 @@ pub fn auction_cut(bid: u32, consignment_rate: u32) -> Option<u32> {
     u32::try_from(u64::from(bid) * u64::from(consignment_rate) / 100).ok()
 }
 
-/// Why the Module refused an auction Durable Request. The tag is the whole reducer error text,
-/// so neither tier matches on human prose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuctionRefusal {
     ItemNotFound,
@@ -67,13 +58,10 @@ impl AuctionRefusal {
     }
 }
 
-/// `FactionTemplate.dbc` group bit for a template's own team (`cm:Server/DBCEnums.h:92-95`).
+// FactionTemplate.dbc group bits, cm:Server/DBCEnums.h:92-95.
 const FACTION_MASK_ALLIANCE: u32 = 2;
 const FACTION_MASK_HORDE: u32 = 4;
 
-/// Vanilla's fixed auctioneer-template-to-house table (`cm:AuctionHouseMgr.cpp:461-518`). A
-/// template outside the table falls back to its faction group's own house, then to the neutral
-/// house (Booty Bay/Gadgetzan/Everlook, house 7).
 pub fn house_for_faction_template(template_id: u32, faction_group_mask: u32) -> u32 {
     match template_id {
         12 => 1,
@@ -89,9 +77,6 @@ pub fn house_for_faction_template(template_id: u32, faction_group_mask: u32) -> 
     }
 }
 
-/// The listing pool a house belongs to: Alliance houses 1-3 and Horde houses 4-6 each pool their
-/// listings, and house 7 stands alone as the neutral market
-/// (`cm:AuctionHouseMgr.cpp:51-63,444-459`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuctionMarket {
     Alliance,
@@ -99,8 +84,6 @@ pub enum AuctionMarket {
     Neutral,
 }
 
-/// The market a house's listings pool into. An id outside 1-7 is not an imported house; it pools
-/// as neutral rather than joining a team's listings.
 pub fn market_of(house_id: u32) -> AuctionMarket {
     match house_id {
         1..=3 => AuctionMarket::Alliance,
@@ -109,8 +92,6 @@ pub fn market_of(house_id: u32) -> AuctionMarket {
     }
 }
 
-/// Stable terminal outcome codes shared by bid Hold and decision rows. `CANCELLED` is the one
-/// accepting outcome of a Cancellation Hold. `ITEM_NOT_FOUND` and `DATABASE` refuse either operation.
 pub mod bid_outcome {
     pub const PENDING: u8 = 0;
     pub const ACCEPTED: u8 = 1;
@@ -122,24 +103,19 @@ pub mod bid_outcome {
     pub const CANCELLED: u8 = 7;
 }
 
-/// Stable `operation` codes of the bid Hold and decision rows. Every row written before
-/// Cancellation existed reads as `BID`.
+// Older Hold rows default to BID.
 pub mod hold_operation {
     pub const BID: u8 = 0;
     pub const CANCEL: u8 = 1;
 }
 
-/// Stable `game_auction_notice.kind` codes, in the vanilla notice table's own order
-/// (`cm:AuctionHouseHandler.cpp`/`AuctionHouseMgr.cpp`). Distinct from an Auction Mail's
-/// `MailAuctionAnswers` subject code: a live notice has two kinds (New bid, Removed) with no mail
-/// twin, and a mail action (Successful) with no live notice.
+// Notice kinds use a different numbering from Auction Mail subject codes.
 pub mod auction_notice {
     pub const OUTBID: u8 = 0;
     pub const WON: u8 = 1;
     pub const SOLD: u8 = 2;
     pub const EXPIRED: u8 = 3;
     pub const NEW_BID: u8 = 4;
-    /// To the displaced bidder when the seller cancels (`cm:AuctionHouseHandler.cpp:167-189`).
     pub const REMOVED: u8 = 5;
 }
 
@@ -193,9 +169,6 @@ mod tests {
         assert_eq!(super::minimum_next_bid(100, u32::MAX), None);
     }
 
-    // House ids and template rows: `cm:AuctionHouseMgr.cpp:461-518`. The DBC names each house
-    // Stormwind (1), Alliance (2), Darnassus (3), Undercity (4), Thunder Bluff (5), Horde (6) and
-    // Blackwater (7).
     #[test]
     fn house_for_faction_template_resolves_the_stormwind_row() {
         assert_eq!(super::house_for_faction_template(12, 0), 1);
@@ -247,11 +220,9 @@ mod tests {
     #[test]
     fn house_for_faction_template_falls_back_to_blackwater_for_an_unlisted_or_unknown_template() {
         assert_eq!(super::house_for_faction_template(999, 0), 7);
-        // A Monster-only group belongs to neither team.
         assert_eq!(super::house_for_faction_template(999, 8), 7);
     }
 
-    // Market pooling: `cm:AuctionHouseMgr.cpp:51-63,444-459`.
     #[test]
     fn market_of_pools_stormwind_alliance_and_darnassus_together() {
         for house in [1, 2, 3] {

@@ -1,5 +1,3 @@
-//! Item rules shared by the module and gateway.
-
 pub const fn is_carried_slot(slot: u8) -> bool {
     slot <= 38 || (slot >= 120 && slot <= 191)
 }
@@ -12,7 +10,7 @@ pub fn carried_quantity(entry: u32, items: impl IntoIterator<Item = (u8, u32, u3
         .sum()
 }
 
-/// Any projectile class is suitable; launcher subclass pairing is not enforced by the Module.
+// Launcher subclass pairing is not enforced by the Module.
 pub fn loaded_ammo<T>(
     items: impl IntoIterator<Item = T>,
     fields: impl Fn(&T) -> (u8, u32, Option<u8>),
@@ -31,38 +29,21 @@ pub const fn grants_equipped_stats(slot: u8, max_durability: u32, durability: u3
     slot <= 18 && !(max_durability > 0 && durability == 0)
 }
 
-/// Why the Module refused an item Durable Request. The tag is the whole reducer error text, so
-/// neither tier matches on human prose; the detail stays in the Module log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemRefusal {
-    /// The named slot holds no item, or the item has no template.
     ItemNotFound,
-    /// No free backpack, bag, or bag-equip slot is left to receive the item.
     InventoryFull,
-    /// The destination slot is out of range, is not an equipment slot, or is already taken.
     WrongSlot,
-    /// The item cannot go on the body: the wrong slot family for its type, or a required level
-    /// the Character has not reached.
     CannotEquip,
-    /// The Character's class, race, or armor and weapon proficiency does not cover the item.
     NoProficiency,
-    /// The item needs a trained skill rank the Character does not hold.
     RequiredSkill,
-    /// The item needs a reputation standing the Character has not earned.
     RequiredReputation,
-    /// A dead Character cannot act on its inventory.
     PlayerDead,
-    /// The action reaches bank space with no banker in range.
     BankUnavailable,
-    /// The item carries no on-use spell, sits in the bank, or restores a power the class lacks.
     ItemNotUsable,
-    /// The action is blocked for now: a live bandage cooldown, or a cast Gate.
     NotRightNow,
-    /// The item template forbids destruction.
     Indestructible,
-    /// An equipped bag still contains items.
     BagNotEmpty,
-    /// The Module could not act and has no gameplay reason to name.
     Internal,
 }
 
@@ -119,7 +100,6 @@ pub mod armor_subclass {
     pub const SHIELD: u8 = 6;
 }
 
-/// `item_template.class` values this rule branches on (vanilla `ItemClass`).
 pub mod item_class {
     pub const WEAPON: u8 = 2;
     pub const ARMOR: u8 = 4;
@@ -144,13 +124,6 @@ pub mod weapon_subclass {
     pub const FISHING_POLE: u8 = 20;
 }
 
-/// What a Character may equip: the class weapon table plus the armor tiers it has actually reached.
-/// Armor is class base set + the two upgrades a class trainer teaches at level 40 (Plate Mail, and
-/// the Hunter/Shaman Mail upgrade), so a level-1 Warrior wears mail but not plate.
-///
-/// Derive it once, then read it from either side: the Module equip Gate calls [`Proficiency::can_equip`],
-/// the Gateway sends [`Proficiency::armor_subclass_mask`] in `SMSG_SET_PROFICIENCY`. One derivation
-/// keeps the Refusal and the client's tint from drifting apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proficiency {
     player_class: u8,
@@ -158,19 +131,16 @@ pub struct Proficiency {
 }
 
 impl Proficiency {
-    /// `knows_plate` is the passive spell 750, `knows_mail_upgrade` the passive 8737
-    /// (`constants::armor_proficiency`). A flag set for a class that cannot train that upgrade adds
-    /// nothing — a Mage holding 750 still wears cloth. An unknown class gets misc only.
     pub const fn derive(player_class: u8, knows_plate: bool, knows_mail_upgrade: bool) -> Self {
         use armor_subclass::*;
 
         let cloth = bit(MISC) | bit(CLOTH);
         let mut mask = match player_class {
-            1 | 2 => cloth | bit(LEATHER) | bit(MAIL) | bit(SHIELD), // Warrior, Paladin
-            3 | 4 | 11 => cloth | bit(LEATHER),                      // Hunter, Rogue, Druid
-            7 => cloth | bit(LEATHER) | bit(SHIELD),                 // Shaman
-            5 | 8 | 9 => cloth,                                      // Priest, Mage, Warlock
-            _ => bit(MISC), // misc (rings, cloaks, trinkets) is never gated for anyone
+            1 | 2 => cloth | bit(LEATHER) | bit(MAIL) | bit(SHIELD),
+            3 | 4 | 11 => cloth | bit(LEATHER),
+            7 => cloth | bit(LEATHER) | bit(SHIELD),
+            5 | 8 | 9 => cloth,
+            _ => bit(MISC),
         };
         if knows_plate && matches!(player_class, 1 | 2) {
             mask |= bit(PLATE);
@@ -184,10 +154,6 @@ impl Proficiency {
         }
     }
 
-    /// Derive from a Character's spellbook: `knows` answers whether a spell id is in it. The Module
-    /// equip Gate asks its `game_player_spell` index, the Gateway asks the learned-spell list it
-    /// already gathered for the login batch. Which passives mean which tier is named HERE and only
-    /// here, so neither side can read a different spell than the other.
     pub fn from_spellbook(player_class: u8, knows: impl Fn(u32) -> bool) -> Self {
         use crate::constants::armor_proficiency::{MAIL_PASSIVE_SPELL_ID, PLATE_PASSIVE_SPELL_ID};
 
@@ -198,20 +164,16 @@ impl Proficiency {
         )
     }
 
-    /// Every armor tier the class can ever reach, both upgrades included. The auction "usable"
-    /// filter shows a browser what its class could wear; the equip Gate must use
-    /// [`Self::from_spellbook`] with the Character's own spellbook instead.
+    // Auction filtering uses the class ceiling; equipping must use the learned passives.
     pub const fn class_ceiling(player_class: u8) -> Self {
         Self::derive(player_class, true, true)
     }
 
-    /// Armor subclasses as a `1 << subclass` bitmask — the `SMSG_SET_PROFICIENCY` payload shape.
+    // SMSG_SET_PROFICIENCY encodes armor subclasses as 1 << subclass.
     pub const fn armor_subclass_mask(self) -> u32 {
         self.armor_subclass_mask
     }
 
-    /// Whether this Character may equip an item of `item_class`/`item_subclass`. Item classes other
-    /// than armor and weapon carry no proficiency restriction.
     pub const fn can_equip(self, item_class: u8, item_subclass: u8) -> bool {
         match item_class {
             item_class::ARMOR => self.allows_armor(item_subclass),
@@ -220,8 +182,6 @@ impl Proficiency {
         }
     }
 
-    /// Whether one armor subclass is covered. A subclass past the mask's width cannot be
-    /// represented, so it fails closed.
     pub const fn allows_armor(self, subclass: u8) -> bool {
         subclass < u32::BITS as u8 && self.armor_subclass_mask & bit(subclass) != 0
     }
@@ -312,7 +272,6 @@ mod tests {
         assert_eq!(loaded_ammo(items, |item| *item), Some((120, 5, Some(6))));
     }
 
-    /// The nine playable classes (6 and 10 are unused in 1.12).
     const PLAYABLE: [u8; 9] = [1, 2, 3, 4, 5, 7, 8, 9, 11];
 
     #[test]
@@ -327,29 +286,25 @@ mod tests {
         );
     }
 
-    /// What a class can equip with both level-40 upgrades trained — the auction "usable" filter's
-    /// question, and the shape the pre-training class table was written in.
     fn ceiling_can_equip(player_class: u8, item_class: u8, item_subclass: u8) -> bool {
         Proficiency::class_ceiling(player_class).can_equip(item_class, item_subclass)
     }
 
-    /// The armor subclasses a derivation admits, in ascending order.
     fn armor_set(proficiency: Proficiency) -> Vec<u8> {
         (0..=SHIELD)
             .filter(|&subclass| proficiency.allows_armor(subclass))
             .collect()
     }
 
-    /// Base sets are class-static: nothing is granted at creation, and no upgrade is trained yet.
     #[test]
     fn untrained_classes_wear_their_vanilla_base_set() {
         let base = |class| armor_set(Proficiency::derive(class, false, false));
-        assert_eq!(base(1), vec![MISC, CLOTH, LEATHER, MAIL, SHIELD]); // Warrior
-        assert_eq!(base(2), vec![MISC, CLOTH, LEATHER, MAIL, SHIELD]); // Paladin
-        assert_eq!(base(3), vec![MISC, CLOTH, LEATHER]); // Hunter
-        assert_eq!(base(4), vec![MISC, CLOTH, LEATHER]); // Rogue
-        assert_eq!(base(11), vec![MISC, CLOTH, LEATHER]); // Druid
-        assert_eq!(base(7), vec![MISC, CLOTH, LEATHER, SHIELD]); // Shaman
+        assert_eq!(base(1), vec![MISC, CLOTH, LEATHER, MAIL, SHIELD]);
+        assert_eq!(base(2), vec![MISC, CLOTH, LEATHER, MAIL, SHIELD]);
+        assert_eq!(base(3), vec![MISC, CLOTH, LEATHER]);
+        assert_eq!(base(4), vec![MISC, CLOTH, LEATHER]);
+        assert_eq!(base(11), vec![MISC, CLOTH, LEATHER]);
+        assert_eq!(base(7), vec![MISC, CLOTH, LEATHER, SHIELD]);
         for caster in [5u8, 8, 9] {
             assert_eq!(
                 base(caster),
@@ -359,7 +314,6 @@ mod tests {
         }
     }
 
-    /// Plate is the level-40 Warrior/Paladin purchase, and nobody else's.
     #[test]
     fn the_plate_upgrade_only_moves_warriors_and_paladins() {
         for class in PLAYABLE {
@@ -384,7 +338,6 @@ mod tests {
         }
     }
 
-    /// Mail is the level-40 Hunter/Shaman purchase. Warriors and Paladins already have it.
     #[test]
     fn the_mail_upgrade_only_moves_hunters_and_shamans() {
         for class in PLAYABLE {
@@ -409,7 +362,6 @@ mod tests {
         }
     }
 
-    /// A learned passive is not a wildcard: the class still decides what the spell unlocks.
     #[test]
     fn a_caster_holding_both_passives_still_wears_cloth() {
         let mage = Proficiency::derive(8, true, true);
@@ -418,8 +370,6 @@ mod tests {
         assert!(!mage.can_equip(item_class::ARMOR, MAIL));
     }
 
-    /// Fail closed: a class the model does not know wears accessories only, and a subclass outside
-    /// the mask's width is refused rather than shifted out of range.
     #[test]
     fn unknown_classes_and_subclasses_fail_closed() {
         for unknown in [0u8, 6, 10, 12, 255] {
@@ -439,9 +389,6 @@ mod tests {
         }
     }
 
-    /// The Gateway sends the mask, the Module answers per subclass. If those two disagree, the
-    /// client tints an item usable that the equip Gate then refuses — the exact drift one shared
-    /// derivation exists to prevent.
     #[test]
     fn the_wire_mask_agrees_with_the_gate_for_every_class_and_flag() {
         for class in PLAYABLE {
@@ -461,7 +408,6 @@ mod tests {
         }
     }
 
-    /// Weapons come from the static class table, untouched by armor training.
     #[test]
     fn armor_training_never_changes_the_weapon_table() {
         for class in PLAYABLE {
@@ -476,8 +422,6 @@ mod tests {
         }
     }
 
-    /// The class ceiling is what a Character reaches with everything trained — the auction filter's
-    /// question.
     #[test]
     fn the_class_ceiling_is_the_fully_trained_derivation() {
         for class in PLAYABLE {
@@ -499,8 +443,6 @@ mod tests {
         assert!(ceiling_can_equip(8, 7, 0));
     }
 
-    /// The spellbook reader turns the two trained passives into the two flags, and reads nothing
-    /// else. A Character's spellbook holds hundreds of spells; only these two move armor.
     #[test]
     fn the_spellbook_reader_maps_the_two_passives_and_ignores_the_rest() {
         use crate::constants::armor_proficiency::{MAIL_PASSIVE_SPELL_ID, PLATE_PASSIVE_SPELL_ID};
@@ -523,7 +465,6 @@ mod tests {
                 from(class, &[PLATE_PASSIVE_SPELL_ID, MAIL_PASSIVE_SPELL_ID]),
                 Proficiency::class_ceiling(class)
             );
-            // The trainer wrappers are what a Character BUYS; the passive they teach is what counts.
             assert_eq!(
                 from(class, &[7109, 8738, 674, 201]),
                 Proficiency::derive(class, false, false),

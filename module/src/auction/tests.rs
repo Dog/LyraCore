@@ -18,10 +18,6 @@ fn seller_proceeds_apply_the_imported_cut_and_return_the_deposit_checked() {
     assert_eq!(seller_proceeds(100, 10, 101), None);
 }
 
-// The subject is "{item_entry}:{random_property_id}:{action}" (`cm:AuctionHouseMgr.cpp:134,
-// 181,229`), and the action codes are `MailAuctionAnswers` (`cm:Mail.h:100-109`): every string
-// below is written out by hand from that format, not produced by calling the function under
-// test with different inputs.
 #[test]
 fn the_subject_is_the_item_the_random_property_and_the_mail_auction_answers_code() {
     assert_eq!(
@@ -68,9 +64,6 @@ fn mail_for_body(action: AuctionMailAction) -> AuctionMail {
     }
 }
 
-/// The invoice body's guid is lowercase hex, right-aligned in a 16-character, space-filled
-/// field (`fx:MailFrame.lua:300-361`): the padding widths below are counted by hand, not
-/// produced by the `{:>16x}` specifier under test.
 #[test]
 fn the_won_and_successful_bodies_are_the_padded_invoice_cmangos_sends() {
     let won = AuctionMail {
@@ -134,15 +127,12 @@ fn outbid_notice_fires_only_for_a_real_displaced_bidder() {
             item_entry: 1234,
             random_property_id: 56,
             bid: 100,
-            out_bid: 5, // vanilla minimum raise on a 100 bid: 5% rounded up
+            out_bid: 5,
             bidder_guid: 9,
         })
     );
 }
 
-/// cmangos's `UpdateBid` never calls `SendAuctionBidderNotification` when the new bidder is
-/// the bidder it displaces — raising your own bid is not being outbid
-/// (`cm:AuctionHouseMgr.cpp:780-793`).
 #[test]
 fn a_bidder_who_raises_their_own_bid_gets_no_outbid_notice() {
     let item = crate::items::ItemSnapshot {
@@ -174,7 +164,7 @@ fn new_bid_and_expired_notices_address_the_owner() {
             item_entry: 1234,
             random_property_id: 56,
             bid: 107,
-            out_bid: 6, // vanilla minimum raise on a 107 bid: 5% rounded up
+            out_bid: 6,
             bidder_guid: 9,
         }
     );
@@ -188,7 +178,6 @@ fn new_bid_and_expired_notices_address_the_owner() {
             item_entry: 1234,
             random_property_id: 56,
             bid: 0,
-            // bid_increment(0) is 0, but expired_notice floors an unsold listing's raise to 1.
             out_bid: 1,
             bidder_guid: 0,
         }
@@ -213,7 +202,7 @@ fn settlement_notices_are_won_to_the_buyer_and_sold_to_the_seller() {
             item_entry: 1234,
             random_property_id: 56,
             bid: 0,
-            out_bid: 25, // vanilla minimum raise on a 500 bid: 5% rounded up
+            out_bid: 25,
             bidder_guid: 9,
         }
     );
@@ -227,7 +216,7 @@ fn settlement_notices_are_won_to_the_buyer_and_sold_to_the_seller() {
             item_entry: 1234,
             random_property_id: 56,
             bid: 500,
-            out_bid: 25, // vanilla minimum raise on a 500 bid: 5% rounded up
+            out_bid: 25,
             bidder_guid: 0,
         }
     );
@@ -266,8 +255,6 @@ fn every_legacy_auction_subject_maps_to_its_action_and_an_unknown_one_does_not()
 
 #[test]
 fn listing_deposit_uses_the_imported_rate_and_supported_duration_ladder() {
-    // Hand-derived from cm:AuctionHouseMgr.cpp:65-77's
-    // `SellPrice * count * (etime / MIN_AUCTION_TIME) * depositPercent / 100`.
     assert_eq!(listing_deposit(100, 2, 120, 5), Some(10));
     assert_eq!(listing_deposit(100, 2, 480, 5), Some(40));
     assert_eq!(listing_deposit(100, 2, 1_440, 5), Some(120));
@@ -892,9 +879,6 @@ fn realm_refusal_releases_the_hold_and_mails_the_item_and_deposit_back() {
     assert_eq!(source.money, Some(40));
     assert!(source.item.is_none());
 
-    // Realm-core refused (for example, its item catalogue lacks the template), so
-    // the market never took the listing and the source Hold is the only copy of the value.
-    // The refund Mail and its receipt are written on Realm-core before its source Hold moves.
     let refund = listing_refund(&source.hold(request.operation_id).unwrap().listing);
     assert_eq!(refund_listing(&mut realm, refund.clone()), Ok(()));
     assert_eq!(realm.mails, vec![refund.mail]);
@@ -919,7 +903,6 @@ fn realm_refusal_releases_the_hold_and_mails_the_item_and_deposit_back() {
     );
     assert!(source.hold.is_none());
 
-    // A gateway crash after Realm-core commits but before source cleanup replays one Mail.
     assert_eq!(refund_listing(&mut realm, refund), Ok(()));
     assert_eq!(realm.mails.len(), 1);
     assert_eq!(
@@ -1206,7 +1189,7 @@ fn replayed_bid_expiry_mails_the_exact_item_and_imported_rate_proceeds_once() {
                 item_entry: 25,
                 random_property_id: 117,
                 bid: 0,
-                out_bid: 11, // vanilla minimum raise on a 201 bid: 5% rounded up
+                out_bid: 11,
                 bidder_guid: 8,
             },
             AuctionNoticeDraft {
@@ -1217,7 +1200,7 @@ fn replayed_bid_expiry_mails_the_exact_item_and_imported_rate_proceeds_once() {
                 item_entry: 25,
                 random_property_id: 117,
                 bid: 201,
-                out_bid: 11, // vanilla minimum raise on a 201 bid: 5% rounded up
+                out_bid: 11,
                 bidder_guid: 0,
             },
         ],
@@ -1344,17 +1327,15 @@ fn realm_bid_decision_enforces_the_vanilla_price_ladder_and_revision() {
     ));
 }
 
-/// The seven imported houses pool into three markets: a bid through any Alliance house
-/// reaches a listing at any Alliance house, but never a Horde or neutral one.
 #[test]
 fn realm_bid_decision_accepts_a_bid_within_the_listings_market_and_refuses_outside_it() {
-    let active = active_bid_auction(); // lists in house 1 (Stormwind, Alliance).
+    let active = active_bid_auction();
     let request = HoldRequest {
         operation: HoldOperation::Bid,
         operation_id: 900,
         bidder_guid: 8,
         auction_id: 41,
-        house: 2, // a different Alliance house.
+        house: 2,
         offer: 100,
     };
 
@@ -2132,7 +2113,6 @@ fn collect_flow_mail(outcome: &mut CompleteFlowOutcome, mail: Vec<AuctionMail>) 
 fn complete_flow(sharded: bool) -> CompleteFlowOutcome {
     let buyout_listing = listing_for_flow(sharded, 910);
     let mut buyout_market = bid_market_for(&buyout_listing);
-    // Browse/search renders the same authoritative Auction row that the later writes consume.
     let browse_search_rows = buyout_market
         .auction
         .into_iter()
@@ -2525,8 +2505,6 @@ fn expiry_preserves_inconsistent_or_overflowing_sale_state_for_repair() {
     assert!(store.mail.is_empty());
 }
 
-/// Seller 7's listing 41 in house 1 at a 5% cut, with bidder 9's bid of 201. The cut is
-/// 201 * 5 / 100 = 10.05, truncated to 10.
 fn bid_listing() -> BidAuction {
     BidAuction {
         highest_bidder_guid: 9,
@@ -2874,7 +2852,6 @@ fn a_bid_or_a_settlement_after_the_read_refuses_the_cancellation_and_refunds_the
         .iter()
         .all(|mail| mail.action == AuctionMailAction::Outbid));
 
-    // A settlement that wins the race removes the listing first.
     let mut settled = cancel_market(bid_listing());
     let mut late_seller = FakeBidSource::new(100);
     let late = cancel_request(957, 10);

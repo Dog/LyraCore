@@ -1,5 +1,3 @@
-//! Death and resurrection requests, handled against a Fake that models only who is alive.
-
 use super::family::{ProtocolFamily, ProtocolSession};
 use super::*;
 use handle_loot_fake::{HandleLootFake, Life};
@@ -9,13 +7,10 @@ pub(crate) mod handle_loot_fake;
 
 pub(crate) const SELF_GUID: u64 = 1;
 
-/// Protocol state for the Character named by `SELF_GUID`.
 pub(crate) fn in_world_conn() -> ProtocolSession {
     ProtocolSession::in_world(7, SELF_GUID)
 }
 
-/// Handle one request and return what the client is sent. Fails when the handler ends the session
-/// or passes the request on.
 pub(crate) fn run(
     store: &HandleLootFake,
     session: &mut ProtocolSession,
@@ -32,7 +27,6 @@ fn repop_revives_the_caller_and_no_one_else() {
         .with_life(SELF_GUID, Life::Dead)
         .with_life(2, Life::Dead);
 
-    // The revive reaches the client through the entity relay, not as a direct reply.
     let sent = run(
         &store,
         &mut in_world_conn(),
@@ -92,7 +86,6 @@ fn self_res_revives_the_caller_and_spends_the_option() {
         .with_life(SELF_GUID, Life::Dead)
         .with_self_res_option(SELF_GUID);
 
-    // The revive reaches the client through the entity relay, not as a direct reply.
     let sent = run(
         &store,
         &mut in_world_conn(),
@@ -108,7 +101,6 @@ fn self_res_revives_the_caller_and_spends_the_option() {
 fn a_refused_self_res_sends_nothing_and_keeps_the_session() {
     let store = HandleLootFake::default().with_life(SELF_GUID, Life::Dead);
 
-    // `run` fails the test when the handler ends the session.
     let sent = run(
         &store,
         &mut in_world_conn(),

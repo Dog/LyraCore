@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::{CellKey, ShardId};
@@ -11,8 +9,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use wow_world_messages::vanilla::Vector3d;
 
-/// One module-owned passenger route to self and observers. Ordinary player motion deliberately
-/// excludes self; taxi presentation must include it because the client is not driving the mover.
+/// Taxi splines must include the owner because the client is not driving the mover.
 pub(crate) fn taxi_spline_outbound(
     created: &Mutex<HashSet<u64>>,
     self_guid: u64,
@@ -64,8 +61,7 @@ pub(crate) fn append_resident_taxi_after_create(
     created_outbound.extend(taxi_spline_outbound(created, self_guid, row));
 }
 
-/// Replay a resident passenger spline after the owner's self CREATE/login batch. The same helper
-/// is used by reconnect recovery, keeping the CREATE-before-MONSTER_MOVE ordering explicit.
+/// The owner's CREATE must precede its resident MONSTER_MOVE replay.
 pub(crate) fn resident_taxi_spline_outbound(
     coord: &Coordinator,
     viewer: &Viewer,
@@ -84,8 +80,6 @@ pub(crate) fn resident_taxi_spline_outbound(
     taxi_spline_outbound(&viewer.created, viewer.self_guid, &row)
 }
 
-/// A passenger spline is always sent to its owner. Nearby sessions receive it only after the
-/// outbound visibility check confirms that the passenger already exists in their client world.
 pub(crate) fn taxi_spline(view: &WorldView, shard: ShardId, row: &TaxiPassengerSpline) {
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
     let row = row.clone();

@@ -1,5 +1,3 @@
-//! EventAI summon actions and ranged posture.
-
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use super::engine::EventAiWorld;
@@ -13,7 +11,6 @@ const SUMMON_CHECK_MS: u32 = 500;
 const SUMMON_LOW_BAND: u64 = 0x40_0000;
 const SUMMON_SEQUENCE_MASK: u64 = SUMMON_LOW_BAND - 1;
 
-/// One temporary EventAI summon waiting for its out-of-combat lifetime to finish. Module only.
 #[table(
     accessor = game_creature_ai_summon_expiry,
     scheduled(expire_eventai_summon)
@@ -28,17 +25,11 @@ pub struct CreatureAiSummonExpiry {
     pub lifetime_ms: u32,
     pub remaining_ms: u32,
     pub last_checked_ms: u64,
-    /// Which summon life holds `creature_guid`. A summon guid repeats, because the summon sequence
-    /// wraps, so the guid alone cannot tell two summon lives apart. This carries the FIRST
-    /// `scheduled_id` this summon was claimed with, which `auto_inc` never issues twice. It cannot
-    /// be `scheduled_id` itself: the lifetime check re-inserts this row, so that column names one
-    /// check rather than one life.
-    /// END-appended + defaulted (migration rule).
+    // Summon guids repeat when the sequence wraps; this id distinguishes their lives.
     #[default(0u64)]
     pub life_seq: u64,
 }
 
-/// The EventAI creature that created one temporary summon. Module only.
 #[table(accessor = game_creature_ai_summon_origin)]
 pub struct CreatureAiSummonOrigin {
     #[primary_key]
@@ -47,7 +38,6 @@ pub struct CreatureAiSummonOrigin {
     pub summoner_guid: u64,
 }
 
-/// One authored delayed source despawn. Module only.
 #[table(
     accessor = game_creature_ai_forced_despawn,
     scheduled(fire_eventai_forced_despawn)
@@ -331,9 +321,6 @@ fn applied(applied: bool) -> ActionResult {
     }
 }
 
-/// The authored ranged posture holding this creature at `(distance, angle)` from its victim, if
-/// one is active. Behind `runs_eventai` like every other EventAI read: a tamed creature answers
-/// its owner, never a posture its wild entry's state row may still carry.
 pub(crate) fn ranged_posture(ctx: &ReducerContext, creature_guid: u64) -> Option<(f32, f32)> {
     let creature = ctx.db.game_world_entity().guid().find(creature_guid)?;
     if !super::runs_eventai(&creature) {
@@ -347,7 +334,6 @@ pub(crate) fn ranged_posture(ctx: &ReducerContext, creature_guid: u64) -> Option
         .map(|state| (state.ranged_distance, state.ranged_angle))
 }
 
-/// Forget a despawned creature's pending summon-lifetime check.
 pub(crate) fn drop_summon_expiry(ctx: &ReducerContext, creature_guid: u64) {
     ctx.db
         .game_creature_ai_summon_expiry()
@@ -406,9 +392,6 @@ fn summon<W: EventAiWorld>(
     ActionResult::Applied
 }
 
-/// Reserve the durable expiry slot whose id is the summon's sequence number.
-/// The life number of the summon holding `creature_guid`, or zero when no summon does. Reached
-/// through the unique guid index, so this is one probe rather than a scan.
 pub(crate) fn summon_life_seq(ctx: &ReducerContext, creature_guid: u64) -> u64 {
     ctx.db
         .game_creature_ai_summon_expiry()
@@ -427,13 +410,11 @@ pub(super) fn claim_summon_sequence(ctx: &ReducerContext, lifetime_ms: u32) -> u
             lifetime_ms,
             remaining_ms: lifetime_ms,
             last_checked_ms: timestamp_ms(ctx),
-            // `place_summon` stamps this with the id `auto_inc` assigns to this very row.
             life_seq: 0,
         })
         .scheduled_id
 }
 
-/// Give back a claimed slot whose summon was refused.
 pub(super) fn release_summon_sequence(ctx: &ReducerContext, sequence: u64) {
     ctx.db
         .game_creature_ai_summon_expiry()
@@ -452,8 +433,7 @@ pub(super) fn place_summon(
     let expiry_table = ctx.db.game_creature_ai_summon_expiry();
     if let Some(mut expiry) = expiry_table.scheduled_id().find(sequence) {
         expiry.creature_guid = guid;
-        // The claim's own id, pinned before any lifetime check can re-insert the row and take a
-        // new one. This is the number that names this summon life for as long as it stands.
+        // Capture the claim id before re-insertion can assign a different lifetime-check id.
         expiry.life_seq = sequence;
         expiry_table.scheduled_id().update(expiry);
     }
@@ -521,7 +501,6 @@ pub(super) fn place_relay_summon(
     Ok(guid)
 }
 
-/// Place a temporary creature through the shared summon identity, origin and expiry lifecycle.
 pub(crate) fn place_temporary_summon(
     ctx: &ReducerContext,
     caster: &crate::WorldEntity,
@@ -569,9 +548,6 @@ fn next_check_ms(remaining_ms: u32) -> u32 {
     remaining_ms.clamp(1, SUMMON_CHECK_MS)
 }
 
-/// One lifetime check on a temporary summon: the out-of-combat ms it has left after `elapsed_ms`,
-/// or `None` when its time is up and it despawns. A fight refills the whole lifetime, so an
-/// engaged summon never runs out mid-swing.
 pub(crate) fn summon_lifetime_after(
     engaged: bool,
     lifetime_ms: u32,
@@ -613,8 +589,7 @@ fn apply_summon_expiry(ctx: &ReducerContext, expiry: CreatureAiSummonExpiry) {
     if current.creature_guid != expiry.creature_guid || current.life_seq != expiry.life_seq {
         return;
     }
-    // The scheduled row still holds its unique creature key during this transaction. Remove
-    // this check before inserting the next one; an obsolete callback must not remove a newer row.
+    // Remove only this check before rearming; an obsolete callback must not remove its successor.
     expiries.scheduled_id().delete(expiry.scheduled_id);
     let Some(creature) = ctx.db.game_world_entity().guid().find(expiry.creature_guid) else {
         crate::creatures::reset_creature_lifecycle(ctx, expiry.creature_guid);
@@ -648,7 +623,6 @@ fn apply_summon_expiry(ctx: &ReducerContext, expiry: CreatureAiSummonExpiry) {
         lifetime_ms: expiry.lifetime_ms,
         remaining_ms,
         last_checked_ms: now_ms,
-        // Carried, not re-taken: the summon is the same life across its lifetime checks.
         life_seq: expiry.life_seq,
     });
 }

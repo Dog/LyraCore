@@ -20,8 +20,6 @@ fn zone_weather(zone_id: u32, weather_type: u8, intensity: f32) -> ZoneWeather {
     }
 }
 
-/// A `WeatherStore` holding one zone's sky. Stands in for a shard's `game_zone_weather` cache,
-/// which a unit test has no node to populate.
 #[derive(Clone)]
 struct CannedWeather(Option<(u32, u8, f32)>);
 
@@ -46,9 +44,6 @@ fn only_weather(out: Vec<Outbound>) -> wow_world_messages::vanilla::SMSG_WEATHER
     }
 }
 
-/// Stories 5 and 6, the Elwynn/Westfall pair: a zone's weather reaches every viewer standing in
-/// THAT zone and no viewer anywhere else, however near they are — weather is per zone, and the
-/// spatial index has no say in it.
 #[test]
 fn a_weather_row_reaches_its_own_zone_and_no_other() {
     let view = WorldView::new(true);
@@ -90,8 +85,6 @@ fn a_weather_row_reaches_its_own_zone_and_no_other() {
     );
 }
 
-/// Story 7: crossing into a new zone replaces the stale source-zone sky ONCE, instantly.
-/// Staying put is silence — the slow scheduler must not turn every grid crossing into a packet.
 #[test]
 fn crossing_into_a_zone_sends_its_weather_once() {
     let view = WorldView::new(true);
@@ -104,7 +97,6 @@ fn crossing_into_a_zone_sends_its_weather_once() {
     view.add_viewer_on_shard(resident.clone(), anchor, 0);
     let store = CannedWeather(Some((WESTFALL, 3, 0.9)));
 
-    // Elwynn → Westfall.
     zone_crossed(&view, &store, 0, walker.self_guid, ELWYNN, WESTFALL);
     let m = only_weather(queued_job(&walker_rx));
     assert_eq!(m.weather_type, WeatherType::Storm);
@@ -112,9 +104,6 @@ fn crossing_into_a_zone_sends_its_weather_once() {
     assert_eq!(m.sound_id, 8558);
     assert_eq!(m.change, WeatherChangeType::Instant);
 
-    // Still walking around Westfall; a row the Module could not resolve a zone for; and a row
-    // whose own delta claims a crossing the viewer has already been told about (a re-created
-    // entity row starts from the unresolved zone).
     zone_crossed(&view, &store, 0, walker.self_guid, WESTFALL, WESTFALL);
     zone_crossed(&view, &store, 0, walker.self_guid, WESTFALL, 0);
     zone_crossed(&view, &store, 0, walker.self_guid, 0, WESTFALL);
@@ -133,7 +122,6 @@ fn crossing_into_a_zone_sends_its_weather_once() {
         "another player's crossing is not this viewer's business"
     );
 
-    // …and the arriving viewer now routes with the destination zone.
     weather_changed(&view, 0, &zone_weather(WESTFALL, 2, 0.3));
     assert_eq!(
         only_weather(queued_job(&walker_rx)).weather_type,
@@ -141,8 +129,6 @@ fn crossing_into_a_zone_sends_its_weather_once() {
     );
 }
 
-/// Story 10: a destination with no weather row is fine weather, not a missing packet — the
-/// client would otherwise keep rendering the sky of the zone it left.
 #[test]
 fn crossing_into_a_zone_with_no_weather_row_sends_fine_weather() {
     let view = WorldView::new(true);

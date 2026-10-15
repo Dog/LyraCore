@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`LootWindowStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::group::GroupKind;
 use lyracore_shared::loot::{LootBoundaryFailure, LootRefusal};
@@ -13,9 +11,6 @@ use crate::stdb::{classify, Coordinator, DurableFailure};
 use crate::world::{Actor, LootWindowRefusal, LootWindowRequestStatus, LootWindowStore};
 
 impl LootWindowStore for Coordinator {
-    /// Reads a corpse's lootable copper for `SMSG_LOOT_RESPONSE` from the privileged cache.
-    /// Returns 0 if the target is missing or not a corpse — the client only sends `CMSG_LOOT` on a
-    /// lootable corpse, but we stay defensive (an empty loot window is harmless).
     fn loot_target_money(&self, target_guid: u64) -> Result<u32> {
         Ok(self
             .0
@@ -30,14 +25,6 @@ impl LootWindowStore for Coordinator {
             .unwrap_or(0))
     }
 
-    /// Reads a corpse's item loot for the loot window, joined with each item's
-    /// template for the display id, then filtered PER VIEWER for `quest_only` rows (quest items are
-    /// per-looter, not gated on whoever got kill credit) AND group-loot rows (a live NEED/GREED
-    /// roll is withheld from EVERYONE; a round-robin/master-designated row is visible only to its
-    /// designee). Read from the privileged cache (the coordinator bypasses RLS), filtered by
-    /// `corpse_guid` (iterate+filter, like the other row queries). Returns `(slot, item_id, count,
-    /// display_id)` triples for `build_loot_response_raw`. An item whose template isn't loaded falls
-    /// back to display 0 (the client still resolves the name via query).
     fn loot_target_items(
         &self,
         target_guid: u64,
@@ -79,12 +66,10 @@ impl LootWindowStore for Coordinator {
                 )
             })
             .collect();
-        items.sort_by_key(|(slot, ..)| *slot); // stable loot-slot order (SQL has no ORDER BY in 2.5)
+        items.sort_by_key(|(slot, ..)| *slot);
         Ok(items)
     }
 
-    /// A chest rolls its loot into the corpse-loot table keyed on the GO guid, a quest-use object
-    /// grants quest credit. The module gates range + type.
     fn use_gameobject(&self, actor: Actor, go_guid: u64) -> Result<LootWindowRequestStatus> {
         let coord = self.0.call_pipe();
         legacy_loot_request_status(call_reducer!(
@@ -94,7 +79,6 @@ impl LootWindowStore for Coordinator {
         ))
     }
 
-    /// Authorizes opening a creature corpse before the Gateway reads its loot rows.
     fn open_creature_loot(
         &self,
         actor: Actor,
@@ -126,8 +110,6 @@ impl LootWindowStore for Coordinator {
         ))
     }
 
-    /// The module moves the item into a free slot and deletes the corpse-loot row; the inventory
-    /// relay then shows it in the bag.
     fn take_loot(
         &self,
         actor: Actor,
@@ -143,9 +125,6 @@ impl LootWindowStore for Coordinator {
     }
 }
 
-/// Whether `viewer_guid` is in a Raid, read from this handle's cache: the `PartyMembershipIndex`
-/// (an indexed lookup, never a table scan) names the group, and the cached `game_group.group_type`
-/// names its kind. The Gateway twin of the Module's `group::in_raid`.
 fn viewer_in_raid(guard: &LiveConn, viewer_guid: u64) -> bool {
     let Some(group_id) = guard
         .party_memberships
@@ -166,7 +145,6 @@ fn viewer_in_raid(guard: &LiveConn, viewer_guid: u64) -> bool {
         })
 }
 
-/// Read active collect objectives and carried quantities for the shared quest-item rule.
 fn viewer_needs_quest_item(guard: &LiveConn, viewer_guid: u64, item_entry: u32) -> bool {
     let db = &guard.conn.db;
     let active: Vec<u32> = db
@@ -199,7 +177,6 @@ fn viewer_needs_quest_item(guard: &LiveConn, viewer_guid: u64, item_entry: u32) 
     )
 }
 
-/// Quest rows use the same reservation and need rule as the Module's take Gate.
 pub(crate) fn quest_row_visible_to_viewer(
     quest_only: bool,
     reserved_for: u64,
@@ -210,7 +187,6 @@ pub(crate) fn quest_row_visible_to_viewer(
         || lyracore_shared::loot::quest_take_allowed(reserved_for, viewer_guid, viewer_needs_item)
 }
 
-/// Withheld rows stay hidden until their roll settles, including reserved rows.
 pub(crate) fn group_loot_row_visible_to_viewer(
     reserved_for: u64,
     withheld: bool,
@@ -233,13 +209,10 @@ enum UntaggedLootRejection {
     LegacyUnanswered,
 }
 
-/// Classify a Durable Request from a core whose gameplay refusals all have loot tags.
 fn strict_loot_request_status(result: Result<()>) -> Result<LootWindowRequestStatus> {
     loot_request_status(result, UntaggedLootRejection::Fatal)
 }
 
-/// Preserve silent gameplay refusals from the legacy GameObject and skinning cores. Boundary
-/// failures and every tagged result remain explicit, so this compatibility cannot hide them.
 fn legacy_loot_request_status(result: Result<()>) -> Result<LootWindowRequestStatus> {
     loot_request_status(result, UntaggedLootRejection::LegacyUnanswered)
 }
@@ -283,7 +256,6 @@ mod tests {
 
     #[test]
     fn non_quest_rows_are_always_visible_regardless_of_viewer_state() {
-        // FFA, unconditional — the original baseline behavior. reserved_for/need are irrelevant.
         assert!(quest_row_visible_to_viewer(false, 0, 7, false));
         assert!(quest_row_visible_to_viewer(false, 99, 7, false));
         assert!(quest_row_visible_to_viewer(false, 7, 7, false));
@@ -303,22 +275,17 @@ mod tests {
 
     #[test]
     fn a_reserved_clone_is_visible_only_to_its_owner() {
-        // The viewer's OWN clone is visible even if `viewer_needs_item` somehow reads false (a stale
-        // held-count race) — the reservation itself is the authority once split.
         assert!(
             quest_row_visible_to_viewer(true, 7, 7, false),
             "the viewer's own reserved clone"
         );
         assert!(quest_row_visible_to_viewer(true, 7, 7, true));
-        // Reserved for a DIFFERENT character — invisible to this viewer even if they also need it.
         assert!(
             !quest_row_visible_to_viewer(true, 7, 8, true),
             "reserved for someone else"
         );
         assert!(!quest_row_visible_to_viewer(true, 7, 8, false));
     }
-
-    // ---- Group loot methods ----
 
     #[test]
     fn group_loot_baseline_ffa_is_visible_to_everyone() {
@@ -328,15 +295,12 @@ mod tests {
 
     #[test]
     fn group_loot_withheld_row_is_invisible_to_everyone_including_the_eventual_winner() {
-        // The AutoLoot-safety trap: a live roll's row must not appear in ANYONE's window, not even
-        // the guid who will eventually win it.
         assert!(!group_loot_row_visible_to_viewer(0, true, false, 0, 7));
         assert!(!group_loot_row_visible_to_viewer(0, true, false, 7, 7));
     }
 
     #[test]
     fn group_loot_master_only_row_never_shows_in_the_plain_window() {
-        // Not even the stamped master sees it here — they act via SMSG_LOOT_MASTER_LIST instead.
         assert!(!group_loot_row_visible_to_viewer(0, false, true, 42, 42));
         assert!(!group_loot_row_visible_to_viewer(0, false, true, 42, 8));
     }
@@ -354,14 +318,10 @@ mod tests {
         assert!(!group_loot_row_visible_to_viewer(7, true, true, 99, 8));
     }
 
-    /// The AutoLoot-addon trap, spelled out as ONE corpse's two rows: a grey
-    /// (below-threshold, FFA-in-group) item autoloots normally while a green (at/above threshold,
-    /// mid-roll) item on the SAME corpse is simultaneously withheld from every window — proving the
-    /// two rows are decided independently and a live roll can never be swept up by autostore.
     #[test]
     fn a_grey_autoloots_while_a_green_on_the_same_corpse_is_withheld() {
-        let grey = (0u64, false, false, 0u64); // FFA baseline: (reserved_for, withheld, master_only, designated)
-        let green = (0u64, true, false, 0u64); // a live NEED/GREED roll in progress
+        let grey = (0u64, false, false, 0u64);
+        let green = (0u64, true, false, 0u64);
         for viewer in [7u64, 8u64] {
             assert!(
                 group_loot_row_visible_to_viewer(grey.0, grey.1, grey.2, grey.3, viewer),

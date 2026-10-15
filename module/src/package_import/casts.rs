@@ -1,20 +1,3 @@
-//! The casts Import Family's half of a Package Delta apply: the setters for
-//! `game_creature_cast`/`game_creature_spell`, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of casts.
-//!
-//! `game_creature_cast` is update-only ([`lyracore_package_delta::DeltaError::InsertNotSupported`]):
-//! its key names a creature template and the parser refuses the fixture cluster. It carries no
-//! Package band, so [`update_target`] and `write_row` never treat it as `Uninvented`, and
-//! [`clear_package_range`] never touches it. `game_creature_spell` follows the loot shape instead.
-//! Its own surrogate `id` is the band, checked by `is_package_cast_id`, while this family's
-//! reference Gate checks both the existing and final creature target.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -27,8 +10,6 @@ use crate::{game_creature_template, game_spell};
 
 use super::{as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a cast claim whose final row would point at data this Shard does not hold or whose
-/// existing or final target belongs to the fixture creature cluster.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         if row.table() == ClaimTable::CreatureSpell {
@@ -43,8 +24,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// Refuses both a final fixture target and an existing fixture target a claim tries to hide by
-/// omitting or replacing `creature_entry`.
 fn check_creature_spell_target(ctx: &ReducerContext, row: &TracedRow) -> Result<(), String> {
     let current = ctx
         .db
@@ -73,9 +52,6 @@ fn check_creature_spell_target(ctx: &ReducerContext, row: &TracedRow) -> Result<
     Ok(())
 }
 
-/// The value `field` will hold once this row's claim lands: the claimed value if the claim sets
-/// it, otherwise what the Shard already holds. An update that changes only one column is judged on
-/// what the row will hold after the apply, not on the column alone.
 fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row.fields().get(field).map(|claimed| &claimed.value) {
         return Ok(*value);
@@ -131,11 +107,7 @@ fn fixture_creature_reference(row: &TracedRow, entry: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
-    // Only `game_creature_spell` has a Package band to reconcile against — `game_creature_cast`
-    // permits no insert at all, so no row of it is ever "Package-invented, but no enabled Package
-    // inserts it".
     if row.table() == ClaimTable::CreatureSpell && updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
     }
@@ -164,18 +136,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range `game_creature_spell` row that no
-/// enabled Package invents.
-///
-/// The Package cast range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_cast_id(row.row_id())
 }
 
-/// Removes every `game_creature_spell` row a Package invented. `game_creature_cast` has no band —
-/// nothing to clear there. Once per import, right after the base import rewrote
-/// `game_creature_spell` anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let spells = ctx.db.game_creature_spell();
     let stale: Vec<u64> = spells
@@ -236,10 +200,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
-
 fn apply_creature_cast_field(
     cast: &mut CreatureCast,
     field: &str,
@@ -256,9 +216,6 @@ fn apply_creature_cast_field(
     Ok(())
 }
 
-/// The `creature_entry` a `game_creature_cast` row names. Total, not a `Result`:
-/// `check_claims_belong_to` has already refused a foreign-family row before this module's
-/// dispatch runs, so `row.key()` is always `PrimaryKey::CreatureCast` here.
 fn creature_entry_of(row: &TracedRow) -> u32 {
     let PrimaryKey::CreatureCast { creature_entry } = row.key() else {
         unreachable!(
@@ -268,9 +225,6 @@ fn creature_entry_of(row: &TracedRow) -> u32 {
     creature_entry
 }
 
-/// The `id` a `game_creature_spell` row names. Total, not a `Result`:
-/// `check_claims_belong_to` has already refused a foreign-family row before this module's
-/// dispatch runs.
 fn id_of(row: &TracedRow) -> u64 {
     match row.key() {
         PrimaryKey::CreatureSpell { id } => id,
@@ -320,10 +274,6 @@ fn built_creature_spell(row: &TracedRow) -> Result<CreatureSpell, String> {
     Ok(spell)
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -332,8 +282,6 @@ mod tests {
     };
     use super::*;
 
-    /// The Package cast range is cleared on every apply, so tuning a Package `game_creature_spell`
-    /// row nobody enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_creature_spell_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -380,9 +328,6 @@ mod tests {
         assert_eq!(spell.priority, 10);
     }
 
-    /// `game_creature_cast` is update-only: the row a claim names always already exists, so there
-    /// is no `built_creature_cast` counterpart to `built_creature_spell` above. The setter is
-    /// still exercised directly, on a real creature's row.
     #[test]
     fn an_update_on_creature_cast_carries_the_claimed_spell_onto_the_row() {
         let plan = plan(&[artifact(
@@ -406,8 +351,6 @@ mod tests {
         assert_eq!(cast.spell_id, 200);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_creature_cast_column_has_a_setter() {
         let mut cast = CreatureCast {

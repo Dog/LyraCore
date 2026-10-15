@@ -20,8 +20,7 @@ fn prepare() -> Result<(), Box<dyn std::error::Error>> {
     if pin.len() != 40 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid CLI revision".into());
     }
-    // Call the installed binary directly. The shim may install it with Cargo, which would wait
-    // for this build's lock. Preparation installs it before any Gateway build starts.
+    // The shim may invoke Cargo and deadlock on this build's lock; call the installed binary.
     let cli = root.join(".lyracore/cli").join(pin).join("bin/lyracore");
     println!("cargo:rerun-if-changed={}", cli.display());
     let output = Command::new(cli)

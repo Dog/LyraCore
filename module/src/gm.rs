@@ -1,32 +1,8 @@
-//! GM playtest dot-commands: `.speed/.god/.xprate/.level/.money/.heal/.kill/.tele`
-//! from Say chat. The gateway's `CMSG_MESSAGECHAT` Say arm intercepts any message starting with `.`
-//! BEFORE the normal chat relay/insert and forwards the raw text to this ONE generic reducer
-//! (`gm_command`) — module-side parsing keeps the command set data-free and easily extended (a new
-//! command is a new `match` arm here, no gateway/binding change). A nonzero `Character.gm_level`
-//! authorizes the full set. Account-owned Alpha Test Tools authorize the classified subset, which
-//! contains only `.speed` and `.tele`. The Gateway reads that Account authority from Realm-core on
-//! every command and conveys it to the Home Shard; this Module remains the final Gate.
-//!
-//! `.kill` deliberately takes NO explicit target argument: the caller's live `WorldEntity.target_guid`
-//! is already tracked server-side by `world::set_target` (`CMSG_SET_SELECTION`) every time the client
-//! changes selection, so the reducer just reads its own caller's current target — no extra gateway
-//! plumbing (and no guid-through-JSON hazard) needed.
-
 use spacetimedb::{log, reducer, table, ReducerContext, Table};
 
 use crate::helpers::require_operator;
 use crate::{game_character, game_world_entity};
 
-// ===========================================================================================
-//  `.xprate` config singleton [static] — module-only, NEVER gateway-subscribed (no binding work)
-// ===========================================================================================
-
-/// A single named world tunable, keyed by `key` (today just `"xprate"`). Module-only — no client
-/// field maps to any row here, so it is never added to the gateway's subscription list and needs no
-/// binding/parity work despite being a brand-new table (docs/danger-zones.md §1.6: a `String`
-/// PRIMARY KEY is fine; only a `String` `#[default(...)]` on an END-appended column of an EXISTING
-/// table is impossible — this is a FRESH table with no existing rows, so no column needs a default
-/// at all). Public so `spacetime sql` can read/tune it directly, like `game_config`/`game_debug_readout`.
 #[table(accessor = game_world_config, public)]
 pub struct GmWorldConfig {
     #[primary_key]
@@ -34,14 +10,9 @@ pub struct GmWorldConfig {
     pub value: u32,
 }
 
-/// The `game_world_config` key for the `.xprate` basis-points multiplier (10000 = 1.0×, the same
-/// scale `WorldEntity::run_speed_mult_bp` uses).
 const XPRATE_KEY: &str = "xprate";
-/// Missing row ⇒ 1× (Blizzlike) — read-with-default, so an untouched/fresh DB behaves exactly as if
-/// no GM had ever run `.xprate`.
 const XPRATE_DEFAULT_BP: u32 = 10_000;
 
-/// Read the current `.xprate` basis-points multiplier (10000 = 1×). Missing row ⇒ the default.
 pub(crate) fn xprate_bp(ctx: &ReducerContext) -> u32 {
     ctx.db
         .game_world_config()
@@ -51,11 +22,6 @@ pub(crate) fn xprate_bp(ctx: &ReducerContext) -> u32 {
         .unwrap_or(XPRATE_DEFAULT_BP)
 }
 
-// ===========================================================================================
-//  `.tele` destination table [pure] — a small const list, not a DB table (nothing to migrate)
-// ===========================================================================================
-
-/// A named `.tele` destination. Case-insensitive name match in [`TeleSpot::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TeleSpot {
     Goldshire,
@@ -69,15 +35,10 @@ pub(crate) enum TeleSpot {
     Darnassus,
     SentinelHill,
     WestfallCoast,
-    /// The ORC start, on map 1 — and the only `.tele` that crosses a continent. Kalimdor lives on
-    /// its own database, so this destination drives a full escrowed transfer rather than a
-    /// same-map hop; see `coords`.
     ValleyOfTrials,
 }
 
 impl TeleSpot {
-    /// Case-insensitive name → spot. `None` for an unrecognized name (the caller turns that into the
-    /// "unknown location" `Err`). Pure.
     fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "goldshire" => Some(Self::Goldshire),
@@ -96,9 +57,7 @@ impl TeleSpot {
         }
     }
 
-    /// `(map_id, x, y, z, orientation)`. Map 0 destinations use the same-map path. Map 1
-    /// destinations use the established cross-map Transfer path.
-    #[allow(clippy::excessive_precision)] // The Spec supplies these f32 coordinates verbatim.
+    #[allow(clippy::excessive_precision)]
     pub(crate) fn coords(self) -> (u32, f32, f32, f32, f32) {
         match self {
             Self::Northshire => (0, -8949.95, -132.493, 83.5312, 0.0),
@@ -117,34 +76,17 @@ impl TeleSpot {
     }
 }
 
-// ===========================================================================================
-//  Command parsing [pure] — module-side, data-free (the gateway hands over the raw dot-string)
-// ===========================================================================================
-
-/// One parsed `.command`, ready to dispatch. `God(None)` = toggle (no arg); `Speed`/`XpRate`/`Level`
-/// carry their ALREADY-CLAMPED value (parsing clamps silently rather than rejecting an out-of-range
-/// number — only a non-numeric/missing arg or an unknown command name is a hard `Err`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum GmCommand {
-    /// Run-speed multiplier, clamped to `0.5..=10.0`.
     Speed(f32),
-    /// `None` = toggle; `Some(v)` = the explicit `on`/`off` state.
     God(Option<bool>),
-    /// XP-rate multiplier (whole number), clamped to `1..=20`.
     XpRate(u32),
-    /// Target level, clamped to `1..=60`.
     Level(u32),
-    /// Purse amount in copper (unclamped — any `u32` is a legal purse).
     Money(u32),
     Heal,
     Kill,
-    /// Report the caller's own position (map/x/y/z/orientation) back as a system line — a read-only
-    /// world-building lever (place NPCs/spawns at coords you're standing on). Reported via the Err
-    /// channel since an accepted command has no success reply.
     Gps,
     Tele(TeleSpot),
-    /// Grant `count` of item `entry` to the caller's bags (playtest lever — testing gear/stat
-    /// changes without vendor runs). Count defaults to 1, clamped to `1..=20`.
     AddItem(u32, u32),
 }
 
@@ -274,22 +216,10 @@ pub(crate) fn parse_gm_command(text: &str) -> Result<GmCommand, String> {
     }
 }
 
-// ===========================================================================================
-//  Reducers
-// ===========================================================================================
-
-/// Grant/revoke GM level (operator-only CLI reducer): `level` gates
-/// [`gm_command`] (`0` = no access — the moderation-facing per-level distinctions beyond "has
-/// access at all" are out of scope). Looked up by character NAME
-/// (case-insensitive, as `/w bob` reaches Bob) since an operator drives this via
-/// `spacetime call`, which has no live guid to hand. `require_operator` gates it exactly like the
-/// importer reducers — never player-callable.
 #[reducer]
 pub fn set_gm_level(ctx: &ReducerContext, character_name: String, level: u8) -> Result<(), String> {
     require_operator(ctx)?;
     let chars = ctx.db.game_character();
-    // REFUSE verdict: an in-transit character reads as absent, so this operator write
-    // cannot land on a source copy the destination already serialized past.
     let mut c = crate::helpers::character_by_name(ctx, &character_name)
         .ok_or_else(|| format!("no player named {character_name}"))?;
     let guid = c.guid;
@@ -299,8 +229,6 @@ pub fn set_gm_level(ctx: &ReducerContext, character_name: String, level: u8) -> 
     Ok(())
 }
 
-/// The shared core behind the gateway's `gw_gm_command`. The Character's current GM level and the
-/// Account authority conveyed by the Gateway meet at this final Module Gate.
 pub(crate) fn apply_gm_command(
     ctx: &ReducerContext,
     caller: crate::WorldEntity,
@@ -340,7 +268,7 @@ pub(crate) fn apply_gm_command(
         GmCommand::XpRate(mult) => {
             let cfg = ctx.db.game_world_config();
             let bp = mult * 10_000;
-            cfg.key().delete(XPRATE_KEY.to_string()); // upsert
+            cfg.key().delete(XPRATE_KEY.to_string());
             cfg.insert(GmWorldConfig {
                 key: XPRATE_KEY.to_string(),
                 value: bp,
@@ -365,16 +293,12 @@ pub(crate) fn apply_gm_command(
             entities.guid().update(caller);
         }
         GmCommand::Gps => {
-            // Read-only: report position via the Err channel (the only caller-facing text path — an
-            // accepted command has no success reply). No mutation, so the Err rollback is a no-op.
             return Err(format!(
                 "Position: map {} | x {:.2} y {:.2} z {:.2} | o {:.3}",
                 caller.map_id, caller.x, caller.y, caller.z, caller.orientation
             ));
         }
         GmCommand::AddItem(entry, count) => {
-            // Reuses the debug/quest grant path — bag-space + stack rules enforced there; an
-            // unknown entry or full bags surface as the Err the sender sees as a system message.
             crate::items::grant_item(ctx, caller.guid, entry, count)?;
         }
         GmCommand::Kill => {
@@ -395,10 +319,6 @@ pub(crate) fn apply_gm_command(
         }
         GmCommand::Tele(spot) => {
             let (map_id, x, y, z, o) = spot.coords();
-            // `map_id` comes from the destination, so a cross-map `.tele` (ValleyOfTrials, map 1)
-            // rides the same primitive and becomes a full escrowed transfer to whichever database
-            // owns that map. Deadmines is still deliberately absent: map 36 has no imported world
-            // data, so it would .tele into an empty room.
             crate::world::teleport_player(ctx, caller.guid, map_id, 0, x, y, z, o);
         }
     }
@@ -470,8 +390,6 @@ mod tests {
         assert_eq!(gm_authority(1, true), GmAuthority::FullGm);
     }
 
-    // ---- Parsing: happy path, one per command ----
-
     #[test]
     fn parses_speed_in_range() {
         assert_eq!(parse_gm_command(".speed 3"), Ok(GmCommand::Speed(3.0)));
@@ -534,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::excessive_precision)] // The expected values pin the Spec's f32 coordinates.
+    #[allow(clippy::excessive_precision)]
     fn canonical_tele_destinations_have_the_specified_coordinates() {
         let destinations = [
             (
@@ -603,8 +521,6 @@ mod tests {
         }
     }
 
-    // ---- Clamping ----
-
     #[test]
     fn speed_clamps_to_0_5_through_10() {
         assert_eq!(parse_gm_command(".speed 0.01"), Ok(GmCommand::Speed(0.5)));
@@ -632,8 +548,6 @@ mod tests {
         assert_eq!(parse_gm_command(".level 0"), Ok(GmCommand::Level(1)));
         assert_eq!(parse_gm_command(".level 255"), Ok(GmCommand::Level(60)));
     }
-
-    // ---- Bad args ----
 
     #[test]
     fn bad_or_missing_numeric_args_are_rejected() {
@@ -663,8 +577,6 @@ mod tests {
         assert!(parse_gm_command(".tele").is_err());
     }
 
-    // ---- Unknown command / malformed input ----
-
     #[test]
     fn unknown_command_is_rejected() {
         assert!(parse_gm_command(".nuke").is_err());
@@ -677,14 +589,10 @@ mod tests {
         assert!(parse_gm_command("hello world").is_err());
     }
 
-    // ---- xprate bp math (pure, read side) ----
-
     #[test]
     fn xprate_default_bp_is_one_x() {
         assert_eq!(XPRATE_DEFAULT_BP, 10_000);
     }
-
-    // ---- Tele map paths ----
 
     #[test]
     fn eastern_kingdoms_destinations_use_the_same_map_path() {

@@ -1,12 +1,8 @@
-//! The vendor/armorer economy — sell / buyback / buy / repair, plus the shared NPC-interaction trust
-//! gate all four reduce to (split off `ops.rs`, pure code-motion, no behavior change). Each
-//! `apply_*` is the shared core behind a thin player reducer and its debug twin (see `reducers.rs`).
-
 use spacetimedb::{ReducerContext, Table};
 
 use crate::game_npc_vendor;
 use crate::game_world_entity;
-use crate::WorldEntity; // npc_interaction_gate's return type
+use crate::WorldEntity;
 
 use super::inventory::is_carried_slot;
 use super::ops::store_item;
@@ -16,23 +12,10 @@ use super::tables::{
     ItemInstance,
 };
 
-/// Max distance to interact with a vendor: (10 yd)². The client walks into range before sending
-/// `CMSG_BUY_ITEM`, so this only rejects clearly-out-of-range abuse (mirrors `loot::LOOT_RANGE_SQ`).
+// Squared yards.
 const VENDOR_RANGE_SQ: f32 = 100.0;
 
-///
-/// The four call sites' WIRE-VISIBLE error text differs in wording, not in the checks themselves, so
-/// three of the five messages stay parameterized rather than folded into one template:
-///   * `dead_verb` — the dead-player message's verb ("sell" / "use buyback" / "buy" / "repair"),
-///     formatted as `"dead players cannot {dead_verb}"`.
-///   * `noun` — the NPC-kind word used in the not-found / map / range messages ("vendor" / "armorer"),
-///     formatted as `"no such {noun}"` / `"{noun} on another map"` / `"{noun} out of range"`.
-///   * `flag_err` — the flag-mismatch message verbatim, since its wording does NOT follow the `noun`
-///     template (repair's is `"target cannot repair"`, not `"target is not a armorer"`).
-///
-/// Every string this replaces is preserved byte-for-byte at each call site — `build_buy_failed`
-/// (gateway/src/codec/item.rs) substring-matches `"out of range"` / `"another map"` / `"not enough
-/// money"` on these paths, so the SHAPE of each message (not just its presence) must survive.
+// Gateway buy-failure mapping matches substrings in these Refusal messages.
 pub(crate) fn npc_interaction_gate(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -66,8 +49,6 @@ pub(crate) fn npc_interaction_gate(
     Ok((player, npc))
 }
 
-/// The bank-access trust gate: a move or split touching a bank slot needs an OPEN bank, so the player
-/// must be alive with a live BANKER npc in reach.
 pub(crate) fn bank_access_gate(ctx: &ReducerContext, player_guid: u64) -> Result<(), String> {
     use lyracore_shared::constants::npc_flags;
     flagged_npc_in_reach_gate(
@@ -79,7 +60,6 @@ pub(crate) fn bank_access_gate(ctx: &ReducerContext, player_guid: u64) -> Result
     )
 }
 
-/// Binding a home requires the selected innkeeper to be alive and in reach.
 pub(crate) fn innkeeper_access_gate(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -100,9 +80,6 @@ pub(crate) fn innkeeper_access_gate(
     Ok(())
 }
 
-/// Is the player alive with a live NPC carrying `flag` inside the interaction radius? The gate for
-/// the interactions the client requests WITHOUT naming an NPC, so it searches the player's own
-/// partition — `npc_interaction_gate` covers the ones that do name a target.
 fn flagged_npc_in_reach_gate(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -119,7 +96,6 @@ fn flagged_npc_in_reach_gate(
     if player.dead {
         return Err(format!("dead players cannot {verb}"));
     }
-    // Grid-indexed and partition-scoped: a spatial table must never be scanned whole.
     let near = crate::helpers::entities_near(
         ctx,
         player.map_id,
@@ -144,8 +120,6 @@ fn flagged_npc_in_reach_gate(
     Ok(())
 }
 
-/// Does one nearby entity satisfy such a gate? A live NPC (never another player) carrying `flag`,
-/// inside the interaction radius. Pure so the refusal cases are unit-tested without a live module.
 pub(crate) fn flagged_npc_in_reach(
     flag: u32,
     is_player: bool,
@@ -156,24 +130,14 @@ pub(crate) fn flagged_npc_in_reach(
     !is_player && !dead && npc_flags & flag != 0 && dist_sq <= VENDOR_RANGE_SQ
 }
 
-/// The four distinguishable results of a bank bag slot purchase. Typed rather than a `Result<(),
-/// String>` so a caller tells the refusals apart without matching error prose; the reducer boundary
-/// then tags each one with its `SMSG_BUY_BANK_SLOT_RESULT` code (see `buy_bank_slot_result`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuyBankSlotOutcome {
-    /// Charged `price` copper; the buyer now owns `owned` slots.
     Bought { price: u32, owned: u8 },
-    /// All six rungs already bought.
     AlreadyMaxed,
-    /// Short of copper for the next rung.
     CannotAfford { price: u32 },
-    /// The named target is no usable banker (wrong flag, wrong map, out of range, buyer dead).
     NotBanker(String),
 }
 
-/// Map an outcome onto the reducer boundary, which can only carry `Result<(), String>`. A refusal
-/// leads with its wire code in brackets so the gateway maps it by code, not by prose (the
-/// `trainer_buy` precedent). Pure — unit-tested.
 pub(crate) fn buy_bank_slot_result(outcome: BuyBankSlotOutcome) -> Result<(), String> {
     use lyracore_shared::bank::result;
     match outcome {
@@ -190,13 +154,6 @@ pub(crate) fn buy_bank_slot_result(outcome: BuyBankSlotOutcome) -> Result<(), St
     }
 }
 
-/// Buy the next bank bag slot from `banker_guid`: charge the next unowned rung of the vanilla ladder
-/// and increment the owned count on the live entity (mirrored back to the character row by
-/// `persist_entity`, exactly as `money` is).
-///
-/// The client NAMES the banker here, so this validates that target through the shared
-/// `npc_interaction_gate` — unlike `bank_access_gate`, which searches the partition because a bank
-/// move names no NPC at all.
 pub(crate) fn apply_buy_bank_slot(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -223,16 +180,12 @@ pub(crate) fn apply_buy_bank_slot(
     player.money -= price;
     player.bank_bag_slots += 1;
     let owned = player.bank_bag_slots;
-    // PLAYER_BYTES_2 byte 2 mirrors the owned count so the client sees the bought slot without a
-    // relog; byte 0 (facial hair) and byte 3 (rest state) ride along untouched.
     player.player_bytes_2 =
         lyracore_shared::packing::with_bank_bag_slots(player.player_bytes_2, owned);
     ctx.db.game_world_entity().guid().update(player);
     BuyBankSlotOutcome::Bought { price, owned }
 }
 
-/// Does the vendor creature `vendor_entry` stock `item_entry`? Gates `apply_buy_item` so a player can
-/// only buy what a vendor actually sells (not any item with a buy price). Reads `game_npc_vendor`.
 pub(crate) fn vendor_sells(ctx: &ReducerContext, vendor_entry: u32, item_entry: u32) -> bool {
     ctx.db
         .game_npc_vendor()
@@ -241,41 +194,21 @@ pub(crate) fn vendor_sells(ctx: &ReducerContext, vendor_entry: u32, item_entry: 
         .any(|v| v.item_entry == item_entry)
 }
 
-/// FIFO eviction gate for the 12-slot buyback ring: once it already holds 12 entries, the OLDEST
-/// (ascending by auto_inc id, so the caller's already-sorted first element) is evicted before the new
-/// sale is pushed — so the ring never grows past 12. Extracted from `apply_item_sell` (pure code-motion)
-/// so the `>= 12` boundary is unit-tested without a live module.
 pub(crate) fn buyback_ring_full(current_len: usize) -> bool {
     current_len >= 12
 }
 
-/// The buyback ring's re-purchase ORDER: given the ring's entry ids (any order), return them NEWEST
-/// FIRST (descending by auto_inc id) — slot 0 is the most recently sold item. Extracted from
-/// `apply_buyback_item` (pure code-motion): the live path sorts entries by this exact id order then
-/// indexes by `slot_idx`.
 pub(crate) fn buyback_newest_first(mut ids: Vec<u64>) -> Vec<u64> {
     ids.sort_by(|a, b| b.cmp(a));
     ids
 }
 
-/// Shared sell-to-vendor logic for the player + debug paths: sell the whole stack in inventory `slot`
-/// for copper. Looks up the item's template; a 0 `sell_price` means the item has no vendor value
-/// (quest/soulbound-junk analogue) and is rejected. On success it credits the player's `money`
-/// (saturating, so the copper counter never wraps) by `sell_value(sell_price, stack_count)` and then
-/// DELETES the whole item row — vanilla sells the entire stack in one action. Errors if the user
-/// isn't in world, the slot is empty, the template is missing, or the item is valueless. Additive —
-/// touches only the user's money + the one item row. [entity]
 pub(crate) fn apply_item_sell(
     ctx: &ReducerContext,
     player_guid: u64,
     vendor_guid: u64,
     slot: u8,
 ) -> Result<(), String> {
-    // Vendor gating, mirroring apply_buy_item/apply_buyback_item/apply_player_repair (the
-    // shared npc_interaction_gate): a dead/ghost player can't vendor; the sale must be to a real
-    // VENDOR creature within range on the same map+instance. Unlike buy there is NO vendor_sells()
-    // check — vanilla lets you sell any sellable item to any vendor (junk goes to anyone), only the
-    // proximity + "is a vendor" gates apply.
     let (mut player, _vendor) = npc_interaction_gate(
         ctx,
         player_guid,
@@ -294,12 +227,9 @@ pub(crate) fn apply_item_sell(
             lyracore_shared::item::ItemRefusal::NotRightNow,
         ));
     }
-    // Only BACKPACK/bag items are sellable. Refuse an EQUIPPED item (slots 0..=18): vanilla's vendor
-    // window can't target worn gear, so a client must not be able to sell items off the body.
     if inst.slot <= equip_slot::END {
         return Err("cannot sell an equipped item".to_string());
     }
-    // Selling is a bag-only action: an item sitting in the bank is out of the vendor window's reach.
     if !is_carried_slot(inst.slot) {
         return Err("cannot sell a banked item".to_string());
     }
@@ -312,11 +242,9 @@ pub(crate) fn apply_item_sell(
     if tmpl.sell_price == 0 {
         return Err("item has no sell value".to_string());
     }
-    // Credit the copper for the whole stack (saturating), then remove the sold item.
     let earned = sell_value(tmpl.sell_price, inst.stack_count);
     player.money = player.money.saturating_add(earned);
     entities.guid().update(player);
-    // Push to the 12-slot buyback ring (oldest evicted when full).
     let buyback_tab = ctx.db.game_character_buyback();
     let mut old: Vec<BuybackEntry> = buyback_tab.by_player_guid().filter(&player_guid).collect();
     old.sort_by_key(|e| e.id);
@@ -324,7 +252,7 @@ pub(crate) fn apply_item_sell(
         buyback_tab.id().delete(old[0].id);
     }
     buyback_tab.insert(BuybackEntry {
-        id: 0, // auto_inc
+        id: 0,
         player_guid,
         item_entry: inst.entry,
         stack_count: inst.stack_count,
@@ -336,9 +264,6 @@ pub(crate) fn apply_item_sell(
     Ok(())
 }
 
-/// Re-purchase an item from the buyback ring (`CMSG_BUYBACK_ITEM`). Mirrors the vendor gating of
-/// [`apply_item_sell`]; `slot_idx` is 0-based (the gateway maps `BuybackSlot.as_int() - 69`). The
-/// buyback ring is ordered newest-first by id; slot 0 = most recently sold. [entity]
 pub(crate) fn apply_buyback_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -355,7 +280,6 @@ pub(crate) fn apply_buyback_item(
         "use buyback",
     )?;
     let entities = ctx.db.game_world_entity();
-    // Find the buyback entry: sort by id desc (newest first = slot 0), take Nth.
     let buyback_tab = ctx.db.game_character_buyback();
     let entries: Vec<BuybackEntry> = buyback_tab.by_player_guid().filter(&player_guid).collect();
     let ordered_ids = buyback_newest_first(entries.iter().map(|e| e.id).collect());
@@ -395,17 +319,6 @@ pub(crate) fn apply_buyback_item(
     Ok(())
 }
 
-/// Shared buy-from-vendor logic for the player + debug paths — the inverse of [`apply_item_sell`],
-/// closing the money loop. Charges `buy_cost(buy_price, count)` copper for `count` units of `item_entry`
-/// and grants them via `store_item`, which tops up an existing partial stack first and then spills the
-/// remainder across as many stacks as it takes (each ≤ the template's `max_stack`), so buying more than
-/// one stack's worth doesn't reject the purchase. A 0 `buy_price` means the item has no vendor value
-/// (quest/junk analogue) and is unbuyable. MONEY IS DEBITED BEFORE THE ITEM IS GRANTED: deduct
-/// (saturating, so the copper counter never wraps) and persist the player, THEN place the item — so a
-/// mid-call "inventory full" still fails the whole reducer (SpacetimeDB rolls back the tx on `Err`),
-/// never charging without delivering. Errors if the user isn't in world, is dead, `count == 0`, the
-/// template is missing, the item is valueless, the player can't afford it, or there's no room left for
-/// it all. Additive — touches only the player's money + the granted item row(s). [entity]
 pub(crate) fn apply_buy_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -413,16 +326,6 @@ pub(crate) fn apply_buy_item(
     item_entry: u32,
     count: u32,
 ) -> Result<(), String> {
-    // Death is server-authoritative everywhere — a dead/ghost player can't shop (mirrors the other
-    // paths). Vendor gating: the purchase must come from a real VENDOR creature the player is
-    // standing at, and that vendor must actually stock the item — you can't buy arbitrary items or
-    // from a non-vendor.
-    //
-    // ORDERING NOTE: before this extraction, `count == 0` was checked BETWEEN the dead
-    // check and the vendor-resolution gate; `npc_interaction_gate` folds dead+vendor into one atomic
-    // check, so `count == 0` now runs AFTER the vendor/range gate instead. This only changes which
-    // error string comes back for a MALFORMED packet that combines count=0 with a bogus/out-of-range
-    // vendor — the real client's Buy dialog never sends count=0, so no legitimate interaction changes.
     let (mut player, vendor) = npc_interaction_gate(
         ctx,
         player_guid,
@@ -444,17 +347,13 @@ pub(crate) fn apply_buy_item(
         .entry()
         .find(item_entry)
         .ok_or_else(|| format!("no such item {item_entry}"))?;
-    // A 0 buy_price is the "vendor never sells this" sentinel (quest/junk analogue) — reject before charging.
     if tmpl.buy_price == 0 {
         return Err("item cannot be bought".to_string());
     }
-    // Reputation vendor discount: Honored+ with the vendor's parent faction cuts the BUY price
-    // (vanilla 5% per rank above Neutral — Honored 10%). Sell is unchanged. Neutral / no-standing / a
-    // factionless vendor → 0% → full price. Applied at this single buy chokepoint, after the count math.
     let cost = {
         let base = buy_cost(tmpl.buy_price, count);
         let pct = crate::reputation::vendor_discount_pct(ctx, player_guid, vendor.faction_template);
-        base - base.saturating_mul(pct) / 100 // floor rounding (matches cmangos' truncating multiply)
+        base - base.saturating_mul(pct) / 100
     };
     if player.money < cost {
         return Err(format!(
@@ -462,23 +361,13 @@ pub(crate) fn apply_buy_item(
             player.money, cost
         ));
     }
-    // DEBIT FIRST: deduct (saturating, never wraps) and persist the player BEFORE granting the item, so a
-    // subsequent failure (inventory full) rolls the whole tx back rather than charging for nothing. A buy
-    // of more than `max_stack` now SPILLS across stacks (parity) — and tops up an existing partial
-    // stack of the same item — instead of being rejected.
+    // Propagate storage failure so the reducer rolls back the debit.
     player.money = player.money.saturating_sub(cost);
     let owner_identity = player.owner_identity;
     ctx.db.game_world_entity().guid().update(player);
     store_item(ctx, player_guid, owner_identity, &tmpl, count, false, None)
 }
 
-/// Repair the item in `slot` back to its template's `max_durability` — the FREE restore the harness
-/// drives via `debug_repair_item` (deterministic durability resets without money bookkeeping). The
-/// PLAYER path is `apply_player_repair` below (NPC gate + cost + batch), which deliberately does not
-/// share this body: its restore is fused with the debit so the whole tx rolls back together.
-// Sole consumer is the feature-gated debug reducer — the `debug_only!` rule (actor.rs): silence
-// dead-code ONLY in a default build; a debug_reducers build still flags it if the harness stops
-// consuming it, which is the cue to delete it.
 #[cfg_attr(not(feature = "debug_reducers"), allow(dead_code))]
 pub(crate) fn apply_repair_item(
     ctx: &ReducerContext,
@@ -501,24 +390,14 @@ pub(crate) fn apply_repair_item(
     Ok(())
 }
 
-/// Sentinel `slot` for `apply_player_repair`: repair every equipped item (the whole body) rather than
-/// one slot. The 1.12 client sends one `CMSG_REPAIR_ITEM` per damaged item (no repair-all bit), so the
-/// live gateway path passes a specific slot; this is reachable via the reducer (harness / future convenience).
 pub(crate) const REPAIR_ALL: u8 = u8::MAX;
 
-/// Player repair: restore durability at a REPAIR-flagged NPC, charging copper. Mirrors the vendor gate
-/// (`apply_item_sell`): the player must be alive, the `npc_guid` a real REPAIR creature on the same map
-/// within `VENDOR_RANGE_SQ`. `slot == REPAIR_ALL` repairs every equipped item; otherwise just `slot`.
-/// Cost (`rules::repair_cost` summed) is debited BEFORE the restore and the whole tx rolls back on Err
-/// (never charge without repairing). A no-cost call (nothing damaged) is a successful no-op. [entity]
 pub(crate) fn apply_player_repair(
     ctx: &ReducerContext,
     player_guid: u64,
     npc_guid: u64,
     slot: u8,
 ) -> Result<(), String> {
-    // REPAIR-NPC gate — same shape as apply_item_sell's vendor gate, keyed on the REPAIR flag
-    // (the shared npc_interaction_gate).
     let (mut player, _npc) = npc_interaction_gate(
         ctx,
         player_guid,
@@ -532,7 +411,6 @@ pub(crate) fn apply_player_repair(
     let instances = ctx.db.game_item_instance();
     let templates = ctx.db.game_item_template();
 
-    // Collect the damaged item(s) to repair: one slot, or every equipped item (slot 0..=END).
     let targets: Vec<ItemInstance> = instances
         .by_owner_guid()
         .filter(&player_guid)
@@ -548,7 +426,6 @@ pub(crate) fn apply_player_repair(
         return Err(format!("no item in slot {slot}"));
     }
 
-    // Sum the cost over items that actually have durability damage; skip no-durability items silently.
     let mut total_cost: u32 = 0;
     let mut to_repair: Vec<(ItemInstance, u32)> = Vec::new();
     for inst in targets {
@@ -561,12 +438,12 @@ pub(crate) fn apply_player_repair(
         }
     }
     if to_repair.is_empty() {
-        return Ok(()); // nothing damaged — successful no-op (vanilla: button greyed)
+        return Ok(());
     }
     if player.money < total_cost {
         return Err("not enough money to repair".to_string());
     }
-    // Debit first, persist, THEN restore — Err anywhere rolls the whole tx back (no charge-without-repair).
+    // Debit and repair must commit in the same transaction.
     player.money -= total_cost;
     entities.guid().update(player);
     for (mut inst, max_dur) in to_repair {
@@ -584,9 +461,6 @@ mod tests {
     };
     use lyracore_shared::constants::npc_flags::{BANKER, VENDOR};
 
-    /// BANK ACCESS: only a live BANKER-flagged NPC inside the interaction radius opens the bank. A
-    /// player, a corpse, a non-banker NPC, and a banker one yard too far all leave it shut — so a move
-    /// into a bank slot with no banker in range is refused.
     #[test]
     fn banker_in_reach_accepts_only_a_live_banker_inside_the_radius() {
         let edge = VENDOR_RANGE_SQ;
@@ -594,15 +468,13 @@ mod tests {
             |is_player, flags, dead, d| flagged_npc_in_reach(BANKER, is_player, flags, dead, d);
         assert!(banker_in_reach(false, BANKER, false, 0.0));
         assert!(banker_in_reach(false, BANKER | VENDOR, false, edge));
-        assert!(!banker_in_reach(true, BANKER, false, 0.0)); // another player, however flagged
-        assert!(!banker_in_reach(false, BANKER, true, 0.0)); // a banker's corpse
-        assert!(!banker_in_reach(false, VENDOR, false, 0.0)); // wrong npc kind
-        assert!(!banker_in_reach(false, 0, false, 0.0)); // no npc flags at all
-        assert!(!banker_in_reach(false, BANKER, false, edge + 1.0)); // out of range
+        assert!(!banker_in_reach(true, BANKER, false, 0.0));
+        assert!(!banker_in_reach(false, BANKER, true, 0.0));
+        assert!(!banker_in_reach(false, VENDOR, false, 0.0));
+        assert!(!banker_in_reach(false, 0, false, 0.0));
+        assert!(!banker_in_reach(false, BANKER, false, edge + 1.0));
     }
 
-    /// Each purchase outcome must reach the reducer boundary as its own wire code, so the relay never
-    /// has to read the prose. `Bought` is the only `Ok`.
     #[test]
     fn every_purchase_outcome_carries_its_own_wire_code() {
         use lyracore_shared::bank::result;
@@ -631,8 +503,6 @@ mod tests {
         );
     }
 
-    /// BUYBACK RING FIFO EVICTION: the ring evicts its oldest entry once it already holds 12 (so the
-    /// 13th sale pushes one out and the ring never grows past 12); below that it never evicts.
     #[test]
     fn buyback_ring_full_evicts_at_twelve_not_before() {
         assert!(!buyback_ring_full(0));
@@ -641,8 +511,6 @@ mod tests {
         assert!(buyback_ring_full(13));
     }
 
-    /// BUYBACK NEWEST-FIRST SLOT ORDER: re-purchase slot 0 is the most recently sold item (the highest
-    /// auto_inc id), descending from there — independent of the ids' original (insertion) order.
     #[test]
     fn buyback_newest_first_orders_ids_descending_by_auto_inc() {
         assert_eq!(buyback_newest_first(vec![5, 1, 9, 3]), vec![9, 5, 3, 1]);

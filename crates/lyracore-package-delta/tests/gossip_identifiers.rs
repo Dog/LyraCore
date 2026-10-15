@@ -1,7 +1,3 @@
-//! The gossip family's identifier policy. Five of its six tables follow the loot shape (one band,
-//! checked against each row's own key). `game_gossip_menu` is the sixth: its key names a creature
-//! template, so it permits no insert at all, the `game_creature_cast` shape.
-
 mod common;
 
 use common::{
@@ -64,8 +60,6 @@ fn an_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// Every insertable gossip table shares one band, so one out-of-range identifier is refused the
-/// same way whichever of them names it.
 #[test]
 fn one_band_covers_every_insertable_gossip_table() {
     let out_of_band = PACKAGE_GOSSIP_ID_FLOOR - 1;
@@ -97,8 +91,6 @@ fn an_update_may_name_a_real_imported_npc_text_row() {
     assert_eq!(delta.claims()[0].key().row_id(), u64::from(REAL_NPC_TEXT));
 }
 
-/// `game_gossip_menu`'s key names a creature template, which no Package may invent, so the table
-/// permits no insert at any identifier — the `game_creature_cast` rule.
 #[test]
 fn no_gossip_menu_row_may_be_inserted() {
     for entry in [REAL_GOSSIP_MENU, PACKAGE_GOSSIP as u32] {
@@ -178,8 +170,6 @@ fn the_package_range_is_disjoint_from_every_reserved_identifier() {
     }
 }
 
-/// The trainer, gossip and globals bands are one decade apart, so an identifier that reads as a
-/// valid gossip row must read as nothing else.
 #[test]
 fn the_gossip_band_neighbours_do_not_overlap_it() {
     for id in [PACKAGE_GOSSIP_ID_FLOOR, PACKAGE_GOSSIP_ID_CEIL] {

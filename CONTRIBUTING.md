@@ -13,6 +13,11 @@ Three documents are required reading:
 2. [`CODING_STANDARDS.md`](CODING_STANDARDS.md): how new and changed code is written.
 3. [`CORE_TERMS.md`](CORE_TERMS.md): the terms the code, the comments and the reviews use.
 
+Human and agent contributions follow the same
+[comment policy](CODING_STANDARDS.md#comments-and-documentation). Code has no explanatory comments by
+default; the policy defines which contracts, technical facts, documentation pointers and tool
+annotations belong beside it.
+
 Look everything else up when a change needs it:
 
 - [`docs/quickstart.md`](docs/quickstart.md): from a clone to a connected client.

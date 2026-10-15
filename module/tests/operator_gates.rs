@@ -1,20 +1,12 @@
-//! Every reducer the Gateway or the deploy CLI drives refuses a caller that is not the Operator.
-//! The gated set comes from the published schema, so a new reducer is gated unless it is listed
-//! here as open.
-
 mod support;
 
 use serde_json::{json, Map, Value};
 use support::Standalone;
 
-/// Open by design, beside the scheduled and lifecycle reducers the schema names. The first caller
-/// of `claim_operator` becomes the Operator.
 const OPEN: &[&str] = &["claim_operator"];
 
-/// Debug reducers are a client-automation surface and accept any caller.
 const OPEN_PREFIX: &str = "debug_";
 
-/// The gate's refusal. The loot reducers map it to a client-facing code.
 const GATE_REFUSALS: &[&str] = &["operator only", "loot:boundary_operator_rejected"];
 
 #[test]
@@ -24,7 +16,6 @@ fn every_operator_reducer_refuses_an_anonymous_caller() {
     shard.publish_module();
     shard.assert_call("claim_operator", &[]);
     shard.assert_call("install_guid_range", &["0"]);
-    // Arguments name this Character, so a missing gate meets a request it could act on.
     shard.assert_call("debug_spawn_player_entity", &["1"]);
 
     let gated = operator_reducers(&shard.describe());
@@ -67,7 +58,6 @@ fn every_operator_reducer_refuses_an_anonymous_caller() {
     );
 }
 
-/// Every reducer outside the open set, with one minimal JSON argument per parameter.
 fn operator_reducers(schema: &Value) -> Vec<(String, Vec<String>)> {
     let typespace = schema["typespace"]["types"].as_array().expect("typespace");
     let scheduled: Vec<&str> = schema["tables"]
@@ -96,8 +86,6 @@ fn operator_reducers(schema: &Value) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// The smallest value of a schema type that the CLI accepts. Integers are 1, the fixture
-/// Character's guid; a sum takes its first variant.
 fn minimal(ty: &Value, typespace: &[Value]) -> Value {
     let (kind, inner) = ty
         .as_object()
@@ -128,7 +116,6 @@ fn minimal(ty: &Value, typespace: &[Value]) -> Value {
         "String" => json!(""),
         "Bool" => json!(false),
         "F32" | "F64" => json!(0.0),
-        // An Identity is a formatted 256-bit integer.
         "U256" | "I256" => json!("0x1"),
         _ => json!(1),
     }

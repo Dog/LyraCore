@@ -3,7 +3,6 @@ mod support;
 use serde_json::{json, Value};
 use support::{actor, Standalone};
 
-// Chat Kinds, cm:SharedDefines.h:1545-1582.
 const WHISPER: u64 = 0x06;
 const WHISPER_INFORM: u64 = 0x07;
 const AFK: u64 = 0x14;
@@ -40,7 +39,6 @@ fn player_flags(shard: &Standalone) -> String {
         .clone()
 }
 
-/// `(kind, message)` of Character 1's Auto-Reply row, or `None` without one.
 fn auto_reply(shard: &Standalone) -> Option<(String, String)> {
     shard
         .query_rows("SELECT kind, message FROM game_character_away WHERE character_guid = 1")
@@ -59,9 +57,6 @@ fn reply(kind: u64, message: &str) -> Option<(String, String)> {
     Some((kind.to_string(), message.to_string()))
 }
 
-/// Criteria 1, 2 and 8: `/afk` and `/dnd` on the live entity's PLAYER_FLAGS (AFK 0x02, DND 0x04)
-/// with the Auto-Reply beside it, as cm:ChatHandler.cpp:641-693 applies them. A world-port keeps
-/// both; a real login clears both (cm:Player.cpp:2932).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn away_status_lives_on_the_entity_and_ends_at_login() {
@@ -105,8 +100,6 @@ fn away_status_lives_on_the_entity_and_ends_at_login() {
     );
     shard.assert_call("gw_heartbeat", &[]);
 
-    // A cross-map world-port rebuilds the entity from the durable row. cmangos keeps
-    // PLAYER_FLAGS across a far teleport, so DND and its Auto-Reply survive.
     shard.assert_call("gw_player_world_port", &["1", &actor("1")]);
     assert_eq!(player_flags(&shard), "4", "a world-port keeps DND");
     assert_eq!(auto_reply(&shard), reply(DND, "busy"));
@@ -133,8 +126,6 @@ fn whisper(target: u64, target_race: u8, away_kind: u64, ignores: bool) -> Strin
     .to_string()
 }
 
-/// The lines one call inserts that name `a` or `b`, in insert order. The filter keeps the event
-/// GC's deletes of earlier scenarios out of the one transaction captured.
 fn lines_naming(shard: &Standalone, a: u64, b: u64, action: impl FnOnce()) -> Vec<Value> {
     let query = format!(
         "SELECT * FROM game_realm_chat_event WHERE speaker_guid = {a} OR speaker_guid = {b}"
@@ -148,7 +139,6 @@ fn lines_naming(shard: &Standalone, a: u64, b: u64, action: impl FnOnce()) -> Ve
     rows
 }
 
-/// `(kind, speaker_guid, chat_tag, message, recipients)` of each line.
 fn plan(rows: &[Value]) -> Vec<(u64, u64, u64, String, Vec<u64>)> {
     rows.iter()
         .map(|row| {
@@ -168,16 +158,12 @@ fn plan(rows: &[Value]) -> Vec<(u64, u64, u64, String, Vec<u64>)> {
         .collect()
 }
 
-/// Criteria 4 to 6 on Realm-core: an AFK target's Auto-Reply follows the echo, an ignoring target
-/// gets nothing and the speaker learns it, and a cross-faction whisper writes no row.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn realm_whisper_writes_the_vanilla_lines() {
     let realm = start("away-whisper");
     let text = "meet me at the gate".to_string();
 
-    // cm:Player.cpp:16601-16644: the line in Universal with the speaker's tag, the echo, then the
-    // default Auto-Reply.
     let afk = lines_naming(&realm, 100, 101, || {
         realm.assert_call(
             "realm_whisper",
@@ -194,8 +180,6 @@ fn realm_whisper_writes_the_vanilla_lines() {
     );
     assert!(afk.iter().all(|row| row["language"] == 0), "{afk:?}");
 
-    // cm:ChatHandler.cpp:801-815: no line for the ignorer; the speaker gets the echo and the
-    // target's name on IGNORED.
     let ignored = lines_naming(&realm, 200, 201, || {
         realm.assert_call(
             "realm_whisper",
@@ -210,8 +194,6 @@ fn realm_whisper_writes_the_vanilla_lines() {
         ]
     );
 
-    // cm:ChatHandler.cpp:268-275: a Human whispering an Orc is refused, and the rolled-back
-    // transaction wrote nothing.
     refused(
         &realm,
         "realm_whisper",
@@ -225,7 +207,6 @@ fn realm_whisper_writes_the_vanilla_lines() {
         .is_empty());
 }
 
-/// Criterion 7: `CMSG_CHAT_IGNORED` becomes IGNORED to the dropped speaker, naming the ignorer.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_ignored_notice_reaches_the_dropped_speaker() {

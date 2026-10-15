@@ -1,5 +1,3 @@
-//! Vanilla mailbox packet mapping.
-
 use lyracore_shared::item_property::client_enchantment_id;
 use lyracore_shared::mail::{self as mail_rules, MailSender};
 use wow_world_messages::vanilla::{
@@ -27,10 +25,9 @@ pub struct MailView {
     pub random_property_id: u32,
     pub sender_kind: u8,
     pub sender_entry: u32,
-    /// `CHECK_MASK_*` bits other than READ, which is `was_read`.
     pub check_flags: u32,
     pub mail_template_id: u32,
-    /// When the recipient can first see the mail, rounded up to the second. 0 means from creation.
+    /// Rounded up to seconds; zero means visible from creation.
     pub deliver_secs: i64,
 }
 
@@ -42,9 +39,6 @@ impl MailView {
         self.deliver_secs <= now_secs
     }
 }
-/// The inbox the client shows: newest first, at most [`mail_rules::INBOX_CAPACITY`] mails
-/// (cmangos `Player.cpp:15062`, `MailHandler.cpp:557`). A returned or delayed mail counts as new
-/// from the moment it arrives.
 pub fn build_mail_list(mails: &[MailView], now_secs: i64) -> SMSG_MAIL_LIST_RESULT {
     let mut newest_first: Vec<&MailView> = mails.iter().collect();
     newest_first.sort_by_key(|m| {
@@ -86,8 +80,6 @@ pub fn build_mail_list(mails: &[MailView], now_secs: i64) -> SMSG_MAIL_LIST_RESU
             .collect(),
     }
 }
-/// cmangos writes the sender guid for a Character and the entry or house id for the rest
-/// (`MailHandler.cpp:574-586`).
 fn message_type(sender: MailSender) -> Mail_MailType {
     match sender {
         MailSender::Character(guid) => Mail_MailType::Normal {
@@ -98,9 +90,6 @@ fn message_type(sender: MailSender) -> Mail_MailType {
         MailSender::Gameobject(entry) => Mail_MailType::Gameobject { sender_id: entry },
     }
 }
-/// The `checked` field the client reads read, returned, copied, COD-payment and has-body state
-/// from (cmangos `MailHandler.cpp:610`). Server-only bits such as `CHECK_FLAG_LETTER_GRANTED` ride
-/// the same column and name no vanilla state, so only `CLIENT_CHECK_MASK` reaches the client.
 fn check_mask(m: &MailView) -> u32 {
     let read = if m.was_read {
         mail_rules::CHECK_MASK_READ
@@ -114,7 +103,6 @@ pub fn build_next_mail_time(has_unread: bool) -> MSG_QUERY_NEXT_MAIL_TIME_Server
         unread_mails: mail_rules::unread_mail_signal(has_unread),
     }
 }
-/// A Mail Arrival. The packet carries one `u32` 0 (cmangos `Player.cpp:3071-3077`).
 pub fn build_received_mail() -> SMSG_RECEIVED_MAIL {
     SMSG_RECEIVED_MAIL { unknown1: 0 }
 }
@@ -193,7 +181,6 @@ pub enum MailTakeItemError {
     NotEnoughMoney,
     Other,
 }
-/// `CMSG_MAIL_CREATE_TEXT_ITEM`'s ack: the Plain Letter was made, a full bag, or anything else.
 pub fn build_mail_made_permanent_result(
     mail_id: u32,
     made: Result<(), MailMadePermanentError>,

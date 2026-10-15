@@ -5,11 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use support::{actor, Standalone};
 
-/// The seeded Tester: it pays, sends and receives, with a live purse and bags.
 const TESTER: &str = "1";
-/// A Character on another Account that writes to the Tester.
 const SELLER: &str = "5090070";
-/// A Character that receives the Tester's letters and returns some.
 const FRIEND: &str = "5090075";
 const PURSE: u64 = 1_000;
 const BLADE: &str = "5090050";
@@ -17,7 +14,6 @@ const COD: &str = "250";
 const SEND_ESCROW: &str = "5090080";
 const PAYMENT_ESCROW: &str = "5090081";
 const TAKE_ESCROW: &str = "5090082";
-/// vanilla's `MailDeliveryDelay` default (cmangos `World.cpp:614`).
 const HOUR_MICROS: i64 = 3_600 * 1_000_000;
 
 fn now_micros() -> i64 {
@@ -31,7 +27,6 @@ fn quoted(text: &str) -> String {
     format!("\"{text}\"")
 }
 
-/// The one row `recipient` holds under `subject`.
 fn letter(standalone: &Standalone, recipient: &str, subject: &str) -> BTreeMap<String, String> {
     let rows: Vec<_> = standalone
         .query_rows(&format!(
@@ -86,10 +81,6 @@ fn refused(standalone: &Standalone, reducer: &str, args: &[&str]) -> bool {
     !standalone.call(reducer, args).status.success()
 }
 
-/// A priced item letter committed with the hour stays hidden from the Tester until its Mail
-/// Arrival. Until then the Tester cannot read or take it, and a COD payment fenced early waits in
-/// its fence: the seller is paid only after the letter arrives, and only once. A debug fixture
-/// brings the delivery forward, so no step waits on the wall clock.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_delayed_priced_letter_is_hidden_until_it_arrives_and_its_price_is_paid_after() {
@@ -236,8 +227,6 @@ fn a_delayed_priced_letter_is_hidden_until_it_arrives_and_its_price_is_paid_afte
     assert_eq!(purse(&standalone), PURSE - 250, "charged once");
 }
 
-/// The single-database send and the return apply the Delivery Delay on their own: only an item to
-/// another Account waits an hour.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn only_an_item_sent_or_returned_to_another_account_waits_an_hour() {

@@ -1,5 +1,3 @@
-//! Random Property selection and the shared enchantment contribution to equipped stats.
-
 use super::{game_item_template, EquipStat, ItemTemplate};
 use lyracore_shared::item_property as kind;
 use spacetimedb::{table, ReducerContext, Table};
@@ -35,8 +33,6 @@ pub struct ItemPropertyWeight {
     pub weight: u32,
 }
 
-/// Stable property-ID order, normalized to the total integer weight. Band endpoints round up.
-/// Input is in 0..10000. Empty pools, zero IDs, duplicate IDs and zero weights are invalid.
 fn property_pick(mut members: Vec<(u32, u32)>, roll: u32) -> Option<u32> {
     if roll >= 10_000 || members.is_empty() {
         return None;
@@ -104,8 +100,7 @@ pub(crate) fn enchant_stat(ctx: &ReducerContext, enchant_id: u32, stat_kind: u8)
     enchant_stat_for_school(ctx, enchant_id, stat_kind, u32::MAX)
 }
 
-/// Sum one Stat Kind from an enchantment when its school applies to the requested spell. A zero
-/// `school_mask` is universal. Imported school-specific spell power carries its exact school bits.
+// A zero school_mask applies to every school.
 pub(crate) fn enchant_stat_for_school(
     ctx: &ReducerContext,
     enchant_id: u32,

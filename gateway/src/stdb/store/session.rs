@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`SessionStore`] adapter.
-
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -18,19 +16,12 @@ impl SessionStore for Coordinator {
         crate::realm_core::lookup_session(self, account_name)
     }
 
-    /// Enter the world: call the `player_login` reducer on the coordinator connection
-    /// (so `ctx.sender` is the player's bound identity), then read the resulting
-    /// `game_world_entity` row back through the privileged cache as an `EntityView`.
     fn player_login(
         &self,
         account_id: u64,
         character: Actor,
         entry: codec::WorldEntry,
     ) -> Result<codec::EntityView> {
-        // Login rides `gw_player_login` on the COORDINATOR connection (module half: delegates to
-        // apply_player_login with the account's bound identity as row owner, binds entity→lease,
-        // fail-closed on either missing) — no per-player connection exists anywhere. A world-port
-        // rides its twin `gw_player_world_port`, which keeps the Away Status.
         let coord = self.0.call_pipe();
         let actor = self.session_actor(character);
         match entry {
@@ -46,14 +37,7 @@ impl SessionStore for Coordinator {
             )?,
         }
 
-        // The reducer committed; the row propagates to the owner cache asynchronously. Poll
-        // briefly until it appears (home_* ride along from the game_character row, and its
-        // zone_id is the fallback for a live row the Module could not resolve a zone for).
         let character_guid = character.guid();
-        // 15 s cap, 15 ms steps. Was 3 s — the cold-1000 measurement showed the reducer
-        // COMMITTING while the coordinator stream lagged the login-burst tail past 3 s (writer at
-        // 34.5%, so pure propagation, not CPU): 67/1000 logins died here with the entity already
-        // live. The poll exits on first sight, so the longer cap costs nothing outside a burst.
         for _ in 0..1000 {
             if let Some(e) = self
                 .0
@@ -94,9 +78,6 @@ impl SessionStore for Coordinator {
     }
 
     fn movement_update(&self, actor: Actor, opcode: u32, info: &MovementInfo) -> Result<()> {
-        // Carry the MovementInfo verbatim so the module can relay it to in-range observers under
-        // the same opcode. Queueing is the only completion observable on the shared batch;
-        // individual reducer outcomes are intentionally unavailable.
         let body = codec::movement_info_to_bytes(info)?;
         self.0.motion_batch.push(GwMove {
             actor: self.session_actor(actor),
@@ -122,7 +103,6 @@ impl SessionStore for Coordinator {
         self.subscribe_player_events(account_id, self_guid, arrival, tx)
     }
 
-    /// Forward an addon-bridge command to the module's `client_command` dispatch.
     fn client_command(&self, actor: Actor, cmd: String, payload: String) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -131,9 +111,6 @@ impl SessionStore for Coordinator {
         )
     }
 
-    /// Undelivered private System Messages addressed to `self_guid`, oldest-first, from the
-    /// shard's `game_system_message_event` cache. Rows live until the module's event GC reaps
-    /// them, so a message emitted inside `player_login` is still here at world entry.
     fn pending_system_messages(&self, self_guid: u64) -> Vec<String> {
         let mut rows: Vec<(u64, String)> = self
             .0
@@ -160,7 +137,6 @@ impl SessionStore for Coordinator {
             .is_some()
     }
 
-    /// Read from the privileged cache; the module applies the authoritative fall damage itself.
     fn entity_max_health(&self, guid: u64) -> u32 {
         self.0
             .coord()

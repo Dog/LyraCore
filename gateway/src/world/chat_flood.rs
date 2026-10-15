@@ -1,33 +1,17 @@
-//! Chat Flood Limiter: the Gateway's in-memory count of fast chat lines per World Session.
-//!
-//! cmangos keeps the same count on the player and the mute on the session, and saves neither
-//! (cm:Player.cpp:16344-16377, cm:ChatHandler.cpp:157-167). The limiter runs before any Durable
-//! Request, so a muted line costs no reducer call. The defaults are cmangos's
-//! (cm:mangosd.conf.dist.in:1158-1160).
-
 use std::time::{Duration, Instant};
 
 use lyracore_shared::chat::{chat_kind, speakable_language};
 use wow_world_messages::vanilla::opcodes::{ClientOpcodeMessage, ServerOpcodeMessage};
 use wow_world_messages::vanilla::{CMSG_MESSAGECHAT_ChatType, Language, SMSG_NOTIFICATION};
 
-/// `ChatFlood.MessageDelay`: a counted line that arrives sooner than this after the previous one
-/// is fast.
 const FAST_LINE_WINDOW: Duration = Duration::from_secs(1);
-/// `ChatFlood.MessageCount`: this many fast lines in a row mute the World Session.
 const FAST_LINES_TO_MUTE: u32 = 10;
-/// `ChatFlood.MuteTime`.
 const MUTE: Duration = Duration::from_secs(10);
 
-/// What the limiter does with one client message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloodRule {
-    /// A chat line the limiter counts and refuses while muted.
     Counted,
-    /// Refused while muted, never counted: `CMSG_TEXT_EMOTE` (cm:ChatHandler.cpp:761-766).
     RefusedWhileMuted,
-    /// Everything else, including `/afk`, `/dnd` and any addon-language line
-    /// (cm:ChatHandler.cpp:113-119, cm:ChatHandler.cpp:157).
     Free,
 }
 
@@ -49,8 +33,6 @@ fn rule(msg: &ClientOpcodeMessage) -> FloodRule {
     }
 }
 
-/// The `chat_kind` a client `CMSG_MESSAGECHAT` line carries, for every chat type this limiter
-/// counts. `None` for a type with no Chat Kind of its own (`rule` never marks those `Counted`).
 fn wire_chat_kind(chat_type: &CMSG_MESSAGECHAT_ChatType) -> Option<u8> {
     match chat_type {
         CMSG_MESSAGECHAT_ChatType::Say => Some(chat_kind::SAY),
@@ -68,10 +50,6 @@ fn wire_chat_kind(chat_type: &CMSG_MESSAGECHAT_ChatType) -> Option<u8> {
     }
 }
 
-/// cm:ChatHandler.cpp:100-111: the language check runs, and returns on failure, before
-/// `UpdateSpeakTime`, so a line the language Gate refuses never reaches the mute check and never
-/// counts. `race` is `None` when the Gateway cannot read the speaker (no live entity); such a line
-/// counts as usual; the Module's own Gate is the fallback authority when this read is stale.
 fn language_refused(msg: &ClientOpcodeMessage, race: Option<u8>) -> bool {
     let ClientOpcodeMessage::CMSG_MESSAGECHAT(chat) = msg else {
         return false;
@@ -84,19 +62,12 @@ fn language_refused(msg: &ClientOpcodeMessage, race: Option<u8>) -> bool {
 
 #[derive(Debug, Default)]
 pub(crate) struct ChatFloodLimiter {
-    /// The previous counted line's time plus [`FAST_LINE_WINDOW`].
     fast_until: Option<Instant>,
     fast_lines: u32,
     muted_until: Option<Instant>,
 }
 
 impl ChatFloodLimiter {
-    /// Judge one client message at `now`. `Some` is the answer to a refused message, which must go
-    /// no further. `exempt` is asked only when a line would mute: cmangos never mutes a game master
-    /// for flooding (cm:Player.cpp:16346-16348), so the cost of that read lands on the tenth fast
-    /// line only. `speaker_race` is asked for every counted line, to keep a line the language Gate
-    /// would refuse off the count (cm:ChatHandler.cpp:100-111); that line still reaches the Module,
-    /// which answers "You don't know that language" as its own authority.
     pub(crate) fn judge(
         &mut self,
         msg: &ClientOpcodeMessage,
@@ -126,8 +97,6 @@ impl ChatFloodLimiter {
             .filter(|remaining| !remaining.is_zero())
     }
 
-    /// `Player::UpdateSpeakTime`: the tenth fast line in a row mutes and starts the count again.
-    /// A mute never shortens one already running.
     fn count(&mut self, now: Instant, exempt: impl FnOnce() -> bool) {
         if self.fast_until.is_some_and(|until| now < until) {
             self.fast_lines += 1;
@@ -148,10 +117,6 @@ impl ChatFloodLimiter {
     }
 }
 
-/// cm mangos.sql:3981 (`LANG_WAIT_BEFORE_SPEAKING`) with the remaining whole seconds formatted by
-/// cm Util.cpp:211-232 `secsToTimeString`. The mute never reaches a minute, so only its seconds
-/// part is ever printed. cmangos counts in whole wall-clock seconds; rounding up keeps the first
-/// answer at "10 Second(s)." and the last at "1 Second(s).".
 fn wait_notice(remaining: Duration) -> ServerOpcodeMessage {
     let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
     ServerOpcodeMessage::SMSG_NOTIFICATION(Box::new(SMSG_NOTIFICATION {
@@ -195,13 +160,10 @@ mod tests {
         false
     }
 
-    /// A Human, who knows Common: every fixture line in this file speaks Common or forces
-    /// Universal, so this race never trips the language check.
     fn human_race() -> Option<u8> {
         Some(1)
     }
 
-    /// Send `count` lines 100 ms apart from `start` and return the answer to each.
     fn flood(limiter: &mut ChatFloodLimiter, start: Instant, count: u64) -> Vec<Option<String>> {
         (0..count)
             .map(|n| {
@@ -211,8 +173,6 @@ mod tests {
             .collect()
     }
 
-    /// The first line starts the count at zero and each of the next ten adds one
-    /// (cm:Player.cpp:16354-16374), so the eleventh fast line mutes and still goes out.
     #[test]
     fn the_eleventh_fast_line_mutes_and_the_twelfth_is_refused() {
         let start = Instant::now();
@@ -317,7 +277,6 @@ mod tests {
         );
     }
 
-    /// Every counted kind the 1.12 client can send, each spoken while muted.
     #[test]
     fn every_other_chat_kind_counts_and_is_refused_while_muted() {
         let kinds = [
@@ -359,8 +318,6 @@ mod tests {
         }
     }
 
-    /// cm:ChatHandler.cpp:113-119 and :157 keep `/afk`, `/dnd` and the addon language out of the
-    /// count and out of the mute.
     #[test]
     fn away_and_addon_lines_never_count_and_pass_while_muted() {
         let free = [
@@ -432,9 +389,6 @@ mod tests {
         assert_eq!(reads.get(), 1);
     }
 
-    /// cm:ChatHandler.cpp:100-111: the language check runs first and returns early, so a line the
-    /// race does not know never reaches the mute check and never counts. It still reaches the
-    /// Module, which answers "You don't know that language" on its own authority.
     #[test]
     fn a_line_in_an_unknown_language_does_not_count_toward_the_mute() {
         let orcish = || line(CMSG_MESSAGECHAT_ChatType::Say, Language::Orcish);
@@ -460,8 +414,6 @@ mod tests {
         );
     }
 
-    /// A read that fails, or finds no live entity, must not stop a line from counting: the Module's
-    /// own language Gate is the fallback authority.
     #[test]
     fn an_unreadable_race_still_counts_toward_the_mute() {
         let no_race = || None;

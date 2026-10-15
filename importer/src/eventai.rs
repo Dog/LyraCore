@@ -1,5 +1,3 @@
-//! CMaNGOS EventAI import boundary.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{bt, eventai_presentation, field, go_guid, parse_table, sql_text, world_guid};
@@ -1257,7 +1255,7 @@ struct RawRelayStep {
 }
 
 impl RelaySource {
-    #[allow(clippy::too_many_lines)] // One parse pass per dumped table.
+    #[allow(clippy::too_many_lines)]
     fn parse(dump: &str) -> Self {
         let mut source = Self::default();
         source.broadcast_ids.extend(
@@ -1904,7 +1902,6 @@ impl RelaySource {
         closure
     }
 
-    /// Static definitions needed by accepted relay steps, excluding source-loader skips.
     fn closure_entries(&self, roots: &BTreeSet<u32>, kind: &str) -> BTreeSet<u64> {
         let mut entries = BTreeSet::new();
         for relay_id in self.closure(roots) {
@@ -1935,10 +1932,7 @@ impl RelaySource {
                     .filter(|step| !step.is_loader_skipped())
                     .map(|step| step.encode(self))
                     .collect::<Result<Vec<_>, _>>()
-                    // Every relay in this closure passed `gate_root` (each instruction encodes) and
-                    // `gate_participants` (each subject resolves), which together cover both
-                    // failure arms of `encode`. A panic here means a closure reached encoding
-                    // without passing one of those two Gates.
+                    // gate_root and gate_participants cover both encode failure paths.
                     .expect("relay closure passed both relay Gates before encoding");
                 let steps = encoded_steps.join("~");
                 let material = format!("{relay_id}@parallel@map-or-instance@{steps}");
@@ -2168,7 +2162,7 @@ impl RawRelayStep {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // One arm per action kind that can name a dependency.
+    #[allow(clippy::too_many_lines)]
     fn resolved_dependencies(
         &self,
         source: &RelaySource,
@@ -2630,7 +2624,7 @@ impl RawRelayStep {
         self.encode_instruction()
     }
 
-    #[allow(clippy::too_many_lines)] // One arm per action kind.
+    #[allow(clippy::too_many_lines)]
     fn encode_instruction(&self) -> Result<String, String> {
         let bool_value = |value: u32| u8::from(value != 0);
         let forced = |value: i32| match value {
@@ -2901,9 +2895,6 @@ impl RawRelayStep {
             command => Err(format!("unsupported command {command}")),
         }
     }
-
-    // Relay Gates and encoding are kept together so accepted source rows cannot diverge from
-    // the wire form sent to the Module.
 }
 
 fn parse_source_maps(dump: &str) -> HashMap<u32, BTreeSet<u32>> {
@@ -3034,9 +3025,6 @@ impl MappingFailure {
     }
 }
 
-/// The dump's EventAI tables, parsed once. Only rule assembly depends on the World Import Scope, and
-/// the scope grows to a fixpoint while summoned templates pull in more entries, so the caller
-/// re-runs [`EventAiSource::assemble`] against the grown scope rather than re-reading the dump.
 pub(crate) struct EventAiSource {
     broadcasts: BTreeMap<u32, Broadcast>,
     summon_locations: BTreeMap<u32, SummonLocation>,
@@ -3259,7 +3247,7 @@ fn source_overlap_census(dump: &str, rules: &[RawRule]) -> (u64, u64, u64) {
 }
 
 impl EventAiSource {
-    #[allow(clippy::too_many_lines)] // One assembly pass per EventAI rule family.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn assemble(
         &self,
         imported_entries: &HashSet<u64>,
@@ -4268,7 +4256,7 @@ fn parse_summons(dump: &str, coverage: &mut Coverage) -> BTreeMap<u32, SummonLoc
                     field(&row, 2).parse::<f32>().ok()?,
                     field(&row, 3).parse::<f32>().ok()?,
                     field(&row, 4).parse::<f32>().ok()?,
-                    // The source column says seconds, but the summon API consumes it as milliseconds.
+                    // The source column says seconds, but the summon API consumes milliseconds.
                     source_u32(field(&row, 5))?,
                 ))
             };
@@ -4566,7 +4554,6 @@ fn repeats_on_each_event(event: u32) -> bool {
     )
 }
 
-/// The import-wide lookup tables one action mapping consults.
 #[derive(Clone, Copy)]
 struct ActionLookups<'a> {
     broadcasts: &'a BTreeMap<u32, Broadcast>,
@@ -4747,7 +4734,6 @@ fn map_action(
     }
 }
 
-/// The source action fell through every parameter shape this loader accepts.
 fn unsupported_action(kind: u32) -> Result<NativeAction, Vec<MappingFailure>> {
     Err(vec![MappingFailure::source(
         "action",
@@ -4756,7 +4742,6 @@ fn unsupported_action(kind: u32) -> Result<NativeAction, Vec<MappingFailure>> {
     )])
 }
 
-/// Speech: the legacy multi-text action and its newer single-text/template twin.
 fn map_speech_action(
     action: [u32; 4],
     kind: u32,
@@ -4934,7 +4919,6 @@ fn map_speech_action(
     }
 }
 
-/// Combat: casting a spell, moving threat, and stripping an aura.
 fn map_combat_action(
     action: [u32; 4],
     kind: u32,
@@ -5055,7 +5039,6 @@ fn map_combat_action(
     }
 }
 
-/// Phase: the four ways a rule moves its subject's phase mask.
 fn map_phase_action(action: [u32; 4], kind: u32) -> Result<NativeAction, Vec<MappingFailure>> {
     match kind {
         ACTION_SET_PHASE if action[1] < 32 => Ok(NativeAction {
@@ -5133,7 +5116,6 @@ fn map_phase_action(action: [u32; 4], kind: u32) -> Result<NativeAction, Vec<Map
     }
 }
 
-/// Summons: the placement-free spawn and the `creature_ai_summons` location-keyed summon.
 fn map_summon_action(
     action: [u32; 4],
     kind: u32,
@@ -5260,7 +5242,6 @@ fn map_summon_action(
     }
 }
 
-/// Movement: every action that changes how the subject moves or faces.
 fn map_movement_action(action: [u32; 4], kind: u32) -> Result<NativeAction, Vec<MappingFailure>> {
     let bool_value = |value: u32| u8::from(value != 0);
     match kind {
@@ -5367,7 +5348,6 @@ fn map_movement_action(action: [u32; 4], kind: u32) -> Result<NativeAction, Vec<
     }
 }
 
-/// Unit state: dying, despawning, stand/react state, and the AI event throw.
 fn map_state_action(
     action: [u32; 4],
     kind: u32,
@@ -5512,7 +5492,6 @@ fn map_state_action(
     }
 }
 
-/// Encounter Signals and Relay Definitions: the two actions that cross an Encounter Binding.
 fn map_encounter_action(
     action: [u32; 4],
     kind: u32,
@@ -5630,7 +5609,6 @@ fn map_encounter_action(
     }
 }
 
-/// Quest credit: the explicit quest event and the kill credit that stands in for one.
 fn map_quest_action(
     action: [u32; 4],
     kind: u32,
@@ -5948,9 +5926,7 @@ fn speech_mode(
         .map(|text| text.chat_type)
     {
         Some(1) => "yell",
-        // Source chat type 2 is a third-person narrative line, not speech. The runtime prefers the
-        // broadcast row's own chat type, so this mode is the fallback when that row cannot be read.
-        // Encoding it as `say` made the fallback disagree with the source.
+        // Source chat type 2 is a text emote; this mode is the missing-broadcast-row fallback.
         Some(2) => "emote",
         Some(3) => "boss-emote",
         Some(4) => "whisper",
@@ -6909,10 +6885,6 @@ mod tests {
         );
     }
 
-    /// An accepted action already forces its summon template into the World Import Scope. A relay
-    /// leaf that names a creature template carries the same weight, so the fixpoint must pull it in
-    /// too. Without this the manifest reports the dependency resolved and the profile apply-ready
-    /// while the run emits a relay step naming a template it never writes.
     #[test]
     fn an_accepted_relay_forces_the_creature_template_its_step_names() {
         let sql = format!(
@@ -7038,7 +7010,6 @@ mod tests {
 
     #[test]
     fn binding_startup_rules_keep_faction_then_attack_the_summoner() {
-        // classic-db cd0c426a3b2ff56dd518bf009025299468e60fdb startup actions.
         let source = parse(&dump(&[
             rule(
                 567602,
@@ -8376,7 +8347,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires LYRACORE_CLASSIC_DB_SQL pointing at the pinned decompressed SQL or gzip"]
-    #[allow(clippy::too_many_lines)] // One assertion per censused source family.
+    #[allow(clippy::too_many_lines)]
     fn pinned_full_dump_source_census_matches_the_profile() {
         use std::io::Read;
 

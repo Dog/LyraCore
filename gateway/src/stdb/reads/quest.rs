@@ -1,6 +1,3 @@
-//! Quest-log / quest-giver cache-accessor methods — pure code-motion split of the former
-//! `reads.rs`.
-
 use spacetimedb_sdk::Table;
 
 use super::super::bindings::*;
@@ -37,13 +34,6 @@ pub(in crate::stdb) fn quest_objectives_complete(
     )
 }
 
-/// Build the player's quest-log descriptor slots from raw quest + objective rows. Shared by the login
-/// read ([`Coordinator::player_quest_log`], over the privileged coordinator cache) and the live relay
-/// (`subscriptions.rs`, over the player connection's own RLS-scoped cache) so both produce identical
-/// slot assignments. Active (un-rewarded) quests for `player_guid`, sorted by quest_entry → slot 0..,
-/// capped at the 20 vanilla slots; `state` is 1 when every objective is met (INVENTORY-AWARE for
-/// COLLECT_ITEM, via `quest_objectives_complete` — so the log shows "(Complete)" for a collect quest),
-/// else 0. Reads objectives, carried items, event requirements and event credits from the same cache.
 pub(crate) fn build_quest_log_slots(
     db: &RemoteTables,
     quests: &[CharacterQuest],
@@ -53,7 +43,7 @@ pub(crate) fn build_quest_log_slots(
         .iter()
         .filter(|q| q.character_guid == player_guid && !q.rewarded)
         .collect();
-    active.sort_by_key(|q| q.quest_entry); // deterministic slot order
+    active.sort_by_key(|q| q.quest_entry);
     active
         .into_iter()
         .take(crate::codec::update_mask::idx::QUEST_LOG_SLOTS as usize)
@@ -64,7 +54,7 @@ pub(crate) fn build_quest_log_slots(
                 slot: i as u8,
                 quest_id: q.quest_entry,
                 counts: q.counts.clone(),
-                state: u8::from(complete), // 1 = complete, 0 = incomplete
+                state: u8::from(complete),
                 timer: 0,
             }
         })

@@ -1,71 +1,30 @@
-//! The module↔gateway TRADE wire contract, event-kind codes for the Trade Session status
-//! relay. Cross-boundary constants live HERE, both crates import: a module-side renumber becomes a
-//! compile-visible edit on the gateway side instead of a runtime drift. Same precedent as
-//! `group::event_kind`.
-
-/// Trade-event kinds (`game_trade_event.kind`) — which `SMSG_TRADE_STATUS` variant the gateway
-/// relays. One byte per status the module actually emits; NOT the vanilla `TradeStatus`
-/// discriminants (the gateway owns that wire mapping, and most vanilla variants are never
-/// module-emitted).
+// Durable event kinds differ from vanilla TradeStatus discriminants.
 pub mod event_kind {
-    /// You are proposed a trade (`other_guid` = the initiator) → `TradeStatus::BeginTrade`.
-    /// The client answers with `CMSG_BEGIN_TRADE`, which opens the window on both sides.
     pub const BEGIN_TRADE: u8 = 0;
-    /// The proposal was answered — both parties' windows open → `TradeStatus::OpenWindow`.
     pub const OPEN_WINDOW: u8 = 1;
-    /// The Trade Session ended without a Trade Commit (explicit cancel, logout) →
-    /// `TradeStatus::TradeCanceled`.
     pub const TRADE_CANCELED: u8 = 2;
-    /// Initiator refusal: you or the target are already in a Trade Session → `TradeStatus::Busy`.
     pub const BUSY: u8 = 3;
-    /// Initiator refusal: no such partner (absent, mid-transfer, not a player, or yourself) →
-    /// `TradeStatus::NoTarget`.
     pub const NO_TARGET: u8 = 4;
-    /// Initiator refusal: partner beyond the 10 yd interaction range (or another partition) →
-    /// `TradeStatus::TargetToFar` (the wire library's spelling).
     pub const TARGET_TO_FAR: u8 = 5;
-    /// Initiator refusal: cross-faction trade → `TradeStatus::WrongFaction`.
     pub const WRONG_FACTION: u8 = 6;
-    /// Initiator refusal: you are dead → `TradeStatus::YouDead`.
     pub const YOU_DEAD: u8 = 7;
-    /// Initiator refusal: the target is dead → `TradeStatus::TargetDead`.
     pub const TARGET_DEAD: u8 = 8;
-    /// Your OWN offer, echoed back after a mutation (payload = [`super::encode_offer`]) →
-    /// `SMSG_TRADE_STATUS_EXTENDED` with `self_player = true`.
     pub const OFFER_SELF: u8 = 9;
-    /// Your PARTNER's offer after their mutation (same payload grammar) →
-    /// `SMSG_TRADE_STATUS_EXTENDED` with `self_player = false`.
     pub const OFFER_PARTNER: u8 = 10;
-    /// Initiator notice: the target has you ignored — proposal declined →
-    /// `TradeStatus::IgnoreYou`.
     pub const IGNORE_YOU: u8 = 11;
-    /// Your partner accepted the current offer → `TradeStatus::TradeAccept`.
     pub const TRADE_ACCEPT: u8 = 12;
-    /// An accept was withdrawn — explicit unaccept, or the accept-reset rule firing on an offer
-    /// change → `TradeStatus::BackToTrade`.
     pub const BACK_TO_TRADE: u8 = 13;
-    /// The Trade Commit succeeded → `TradeStatus::TradeComplete`.
     pub const TRADE_COMPLETE: u8 = 14;
-    /// Commit refused, window closes: YOUR bags cannot fit the incoming items →
-    /// `TradeStatus::CloseWindow` with `InventoryResult::InventoryFull`, `target_error: false`.
     pub const INV_FULL_SELF: u8 = 15;
-    /// Commit refused, window closes: the PARTNER's bags cannot fit → same `CloseWindow`,
-    /// `target_error: true`.
     pub const INV_FULL_PARTNER: u8 = 16;
-    /// Commit refused, window closes: YOUR purse cannot honour the offer (short, or receipt would
-    /// pass the u32 cap) → `CloseWindow` with `InventoryResult::NotEnoughMoney`,
-    /// `target_error: false`.
     pub const GOLD_FAIL_SELF: u8 = 17;
-    /// Commit refused, window closes: the PARTNER's purse failed → same, `target_error: true`.
     pub const GOLD_FAIL_PARTNER: u8 = 18;
 }
 
-/// One offered item as the trade window renders it — resolved by the MODULE at write time (the
-/// roster payload-carry pattern: instance + template joined in the same transaction as the offer
-/// change, so the gateway relay never races a read). Field order is the payload grammar below.
+// Resolve item and template fields in the offer transaction to avoid relay read races.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferSlot {
-    /// 0..=5 traded; 6 = the Will-Not-Be-Traded Slot (shown, never committed).
+    // Slots 0..=5 trade; slot 6 is shown but never committed.
     pub trade_slot: u8,
     pub entry: u32,
     pub display_id: u32,
@@ -76,10 +35,6 @@ pub struct OfferSlot {
     pub random_property_id: u32,
 }
 
-/// Encode one side's whole offer for an `OFFER_*` event payload:
-/// `gold|slot,entry,display,stack,enchant,dur,maxdur;slot...`, occupied slots only, `gold` in
-/// copper. All-numeric fields, so no delimiter stripping is needed (unlike
-/// `group::RosterPayload::encode`).
 pub fn encode_offer(gold: u32, slots: &[OfferSlot]) -> String {
     let body: Vec<String> = slots
         .iter()
@@ -100,8 +55,6 @@ pub fn encode_offer(gold: u32, slots: &[OfferSlot]) -> String {
     format!("{gold}|{}", body.join(";"))
 }
 
-/// Decode an `OFFER_*` payload back to `(gold, slots)`. Fails closed: any malformed field drops
-/// the WHOLE payload (a half-decoded trade window is worse than a stale one).
 pub fn decode_offer(payload: &str) -> Option<(u32, Vec<OfferSlot>)> {
     let (gold, body) = payload.split_once('|')?;
     let gold: u32 = gold.parse().ok()?;
@@ -129,9 +82,6 @@ pub fn decode_offer(payload: &str) -> Option<(u32, Vec<OfferSlot>)> {
 mod tests {
     use super::*;
 
-    /// The offer payload round-trips with every window-visible field intact (the "real stack
-    /// count, durability, enchant" AC rides these fields), an empty offer is legal (gold-only or
-    /// cleared window), and malformed payloads fail closed as a whole.
     #[test]
     fn offer_payload_round_trips_and_fails_closed_on_malformed_input() {
         let slots = vec![

@@ -1,21 +1,14 @@
-//! Shared race-to-team mapping for module and gateway faction checks.
-
-/// cmangos team-faction ids, as `game_graveyard_zone.faction` carries them (0 = both factions serve
-/// a zone; 469 = Alliance-only; 67 = Horde-only).
+// Graveyard faction ids: 0 serves both teams, 469 Alliance, 67 Horde.
 pub const TEAM_ALLIANCE: u32 = 469;
 pub const TEAM_HORDE: u32 = 67;
 
-/// The team a `game_character.race` byte belongs to.
-///
-/// Unknown races default to Alliance, matching the currently imported Alliance-only content.
 pub fn team_for_race(race: u8) -> u32 {
     match race {
-        2 | 5 | 6 | 8 => TEAM_HORDE, // Orc / Undead / Tauren / Troll
+        2 | 5 | 6 | 8 => TEAM_HORDE,
         _ => TEAM_ALLIANCE,
     }
 }
 
-/// Whether two race bytes belong to the same team.
 pub fn same_team(race_a: u8, race_b: u8) -> bool {
     team_for_race(race_a) == team_for_race(race_b)
 }
@@ -24,7 +17,6 @@ pub fn same_team(race_a: u8, race_b: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// The mapping itself, both directions plus the unrecognized-byte default.
     #[test]
     fn every_race_byte_maps_to_a_team_and_an_unknown_one_defaults_alliance() {
         for alliance in [1, 3, 4, 7, 11] {
@@ -36,7 +28,6 @@ mod tests {
         assert_eq!(team_for_race(200), TEAM_ALLIANCE);
     }
 
-    /// The predicate the mail gate reads: same side yes, opposing side no.
     #[test]
     fn same_team_pairs_races_by_side() {
         assert!(same_team(1, 3), "Human and Dwarf are one team");
@@ -58,7 +49,6 @@ pub fn reputation_rank(standing: i32) -> u8 {
     }
 }
 
-/// Explicit relations take precedence over group masks. Faction zero has no explicit relation.
 pub fn relation_holds(
     asserting: &[u32; 4],
     vetoing: &[u32; 4],
@@ -77,7 +67,6 @@ pub fn relation_holds(
     mask & other_group != 0
 }
 
-/// A standing row for a faction with a reputation bar overrides template hostility.
 pub fn refuses_interaction(reputation: Option<(i32, bool)>, template_hostile: bool) -> bool {
     reputation.map_or(template_hostile, |(standing, at_war)| {
         at_war || reputation_rank(standing) <= 2

@@ -1,4 +1,3 @@
-//! Engaged EventAI scenarios.
 use super::*;
 use crate::creatures::eventai::*;
 
@@ -1496,8 +1495,6 @@ fn a_refused_interrupting_start_preserves_the_pending_cast() {
 
 #[test]
 fn an_authored_flee_runs_a_creature_the_fixed_rout_would_leave_standing() {
-    // A beast at 30% health: below no flee threshold and of a kind that fights to the death, so
-    // nothing but the authored rule can break it off.
     let mut scenario = world().hurt(CREATURE, 30).eventai_row(row(
         509_0211,
         509_0211,
@@ -1515,8 +1512,6 @@ fn an_authored_flee_runs_a_creature_the_fixed_rout_would_leave_standing() {
         "the authored action is the only thing that can open this creature's rout window"
     );
 
-    // The rout pass runs BEFORE the eventai pass in the firing order, so the window opened above is
-    // read on the next firing.
     fire(&mut scenario);
 
     let legs = scenario.effects();
@@ -1534,9 +1529,6 @@ fn an_authored_flee_runs_a_creature_the_fixed_rout_would_leave_standing() {
 
 #[test]
 fn a_repeat_authored_flee_runs_the_creature_again_later_in_the_fight() {
-    // The rule repeats every 15 s and each rout window runs 10 s, so the second firing lands on a
-    // window that is stamped but SPENT. It must re-stamp rather than treat the spent window as the
-    // fixed rout's once per Engagement.
     let mut scenario = world().hurt(CREATURE, 30).eventai_row(row(
         509_0214,
         509_0214,
@@ -1548,13 +1540,13 @@ fn a_repeat_authored_flee_runs_the_creature_again_later_in_the_fight() {
         [0; 3],
     ));
 
-    fire(&mut scenario); // the rule stamps the first window
-    fire(&mut scenario); // the rout pass reads it: the first flee leg
+    fire(&mut scenario);
+    fire(&mut scenario);
 
-    scenario.advance_clock(15_000_000); // the first window and the repeat wait are both over
-    fire(&mut scenario); // the rule fires onto the spent window and re-stamps it
-    scenario.advance_clock(5_000_000); // the chase leg thrown while the window was spent lands
-    fire(&mut scenario); // the re-stamped window runs the creature again
+    scenario.advance_clock(15_000_000);
+    fire(&mut scenario);
+    scenario.advance_clock(5_000_000);
+    fire(&mut scenario);
 
     let flee_legs: Vec<_> = scenario
         .effects()

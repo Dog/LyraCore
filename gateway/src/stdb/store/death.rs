@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`DeathStore`] adapter.
-
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -45,7 +43,6 @@ impl DeathStore for Coordinator {
         )
     }
 
-    /// `gw_spirit_res` takes no healer guid: the Module revives the ghost in place.
     fn spirit_healer_res(&self, actor: Actor, _healer_guid: u64) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(
@@ -55,7 +52,6 @@ impl DeathStore for Coordinator {
         )
     }
 
-    /// Reads the corpse from the privileged cache. `None` when the owner has no corpse.
     fn corpse_location(&self, owner_guid: u64) -> Result<Option<(u32, f32, f32, f32)>> {
         Ok(self
             .0

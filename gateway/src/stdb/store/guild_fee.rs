@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`GuildFeeStore`] adapter.
-
 use anyhow::{anyhow, Result};
 use lyracore_shared::guild::GuildRefusal;
 
@@ -16,9 +14,6 @@ impl GuildFeeStore for Coordinator {
         Ok(self.guild_fee_hold_row(actor))
     }
 
-    /// `gw_guild_fee_hold` on this Home Shard under a fresh operation id, then the Hold once this
-    /// handle's cache shows it: the hold mints a Guild Charter's guid. A tagged Refusal answers
-    /// `Ok(Err(_))`. The call is made once per operation id and never retried.
     fn guild_fee_hold(
         &self,
         actor: Actor,
@@ -54,9 +49,6 @@ impl GuildFeeStore for Coordinator {
         }
     }
 
-    /// `realm_guild_fee_decide` on Realm-core, then the decision once Realm-core's cache shows
-    /// it. The reducer is idempotent, so a re-drive calls it again. A Charter needs the owner
-    /// facts Realm-core cannot read.
     fn guild_fee_decide(&self, actor: Actor, hold: FeeHold) -> Result<FeeOutcome> {
         let terms = match hold.terms {
             FeeTerms::Emblem(emblem) => GuildFeeTerms::Emblem(guild_emblem(emblem)),
@@ -93,7 +85,6 @@ impl GuildFeeStore for Coordinator {
         fee_outcome(&decision)
     }
 
-    /// `gw_guild_fee_finish` on this Home Shard.
     fn guild_fee_finish(&self, actor: Actor, operation_id: u64, accepted: bool) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -104,8 +95,6 @@ impl GuildFeeStore for Coordinator {
 }
 
 impl Coordinator {
-    /// The Fee Hold of `payer` in THIS handle's cache. Call it on the payer's Home Shard. A kind
-    /// this Gateway does not know reads as none.
     fn guild_fee_hold_row(&self, payer: Actor) -> Option<FeeHold> {
         let hold = self
             .0
@@ -146,8 +135,6 @@ fn guild_emblem(emblem: guild_fee::Emblem) -> GuildEmblem {
     }
 }
 
-/// Realm-core's decision row as a fee outcome. A refusal tag this Gateway does not know is an
-/// error, so the Hold stays for a Gateway that does.
 fn fee_outcome(decision: &GuildFeeDecision) -> Result<guild_fee::FeeOutcome> {
     if decision.accepted {
         return Ok(guild_fee::FeeOutcome::Accepted);

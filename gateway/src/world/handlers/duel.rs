@@ -1,5 +1,3 @@
-//! Narrow Duel accept/cancel dispatcher. All client output returns on the Duel event relay.
-
 use super::super::*;
 
 pub(crate) trait DuelActionStore: Send + Sync {

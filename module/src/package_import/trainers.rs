@@ -1,21 +1,3 @@
-//! The trainers Import Family's half of a Package Delta apply: the setters for
-//! `game_trainer_spell`, and how to find one row of it.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of trainers.
-//!
-//! Trainers own exactly one table, the loot shape: `game_trainer_spell.id` is a plain surrogate,
-//! its own Package band (`is_package_trainer_id`). Unlike every other reference this crate checks,
-//! `spell_id` is NOT always a `game_spell` row: a profession offering (`learn_skill_line > 0`)
-//! carries a synthetic marker `spell_id` (`module/src/skill.rs`'s `LEARN_COOKING_SPELL_ID` and
-//! siblings) that the buy reducer routes around `game_spell` entirely
-//! (`crate::skill::learn_profession`). [`check_references`] gates the `game_spell` check on
-//! `learn_skill_line == 0` for exactly that reason.
-//!
-//! The Claim schema and the setter below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{is_package_trainer_id, FieldValue, Operation, TracedRow};
@@ -25,10 +7,7 @@ use crate::{game_creature_template, game_spell};
 
 use super::{as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a trainer claim whose final row would point at data this Shard does not hold.
-///
-/// `spell_id` is checked against `game_spell` only when the row's final `learn_skill_line` is 0: a
-/// profession offering's `spell_id` is a marker, never a real spell.
+// Profession offerings carry synthetic spell ids, so only class offerings join game_spell.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         let trainer_entry = final_u32(ctx, row, "trainer_entry")?;
@@ -54,9 +33,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// The value `field` will hold once this row's claim lands: the claimed value if the claim sets
-/// it, otherwise what the Shard already holds. An update that changes only one column is judged on
-/// what the row will hold after the apply, not on the column alone.
 fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row.fields().get(field).map(|claimed| &claimed.value) {
         return Ok(*value);
@@ -89,7 +65,6 @@ fn missing_reference(row: &TracedRow, field: &str, value: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -107,16 +82,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package trainer range is cleared on every apply, so such a row is gone by the time the
-/// write pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_trainer_id(row.row_id())
 }
 
-/// Removes every row a Package invented. A whole-table pass over `game_trainer_spell`, once per
-/// import, right after the base import rewrote it anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let rows = ctx.db.game_trainer_spell();
     let stale: Vec<u64> = rows
@@ -153,13 +122,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
-
-/// A Package trainer offering before any claim has been applied to it, defaulted the same way the
-/// Module's own auto-migration defaults a class-spell row: `learn_skill_line` 0 (not a profession),
-/// `learn_skill_cap` 75 (Apprentice, only meaningful once `learn_skill_line` is set).
 fn blank_trainer_spell(id: u64) -> TrainerSpell {
     TrainerSpell {
         id,
@@ -202,10 +164,6 @@ fn built_trainer_spell(row: &TracedRow) -> Result<TrainerSpell, String> {
     Ok(trainer)
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -215,8 +173,6 @@ mod tests {
     use super::*;
     use lyracore_package_delta::Table as ClaimTable;
 
-    /// The Package trainer range is cleared on every apply, so tuning a Package trainer row nobody
-    /// enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_trainer_spell_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -265,8 +221,6 @@ mod tests {
         assert_eq!(trainer.learn_skill_cap, 75);
     }
 
-    /// The Claim schema and the setter above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_trainer_spell_column_has_a_setter() {
         let mut trainer = blank_trainer_spell(PACKAGE_TRAINER_SPELL);

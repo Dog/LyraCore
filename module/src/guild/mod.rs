@@ -1,15 +1,3 @@
-//! Guilds on Realm-core. Every guild fact lives here: the Guild, its Guild Ranks, its members, the
-//! Petitions that found new Guilds ([`petition`]) and the Guild Events that tell members what
-//! happened. Every table is private. The copper a guild operation costs stays on the payer's Home
-//! Shard in a Fee Hold until Realm-core decides ([`fee`]).
-//!
-//! Realm-core holds no Character rows, so the Gateway conveys the Character facts a Gate needs
-//! (name, team, Realm Account, GM level) inside the Durable Request, and this Module applies the
-//! rules. Every guild Durable Request enters through [`realm_guild_op`].
-//!
-//! PLAYER_GUILDID and PLAYER_GUILDRANK are a Gateway projection of `game_guild_member` (the Guild
-//! Projection). No World Shard stores them.
-
 use lyracore_shared::guild::{
     event_kind, founding_gate, GuildRefusal, DEFAULT_MOTD, DEFAULT_RANKS, LEADER_RANK,
 };
@@ -23,7 +11,6 @@ pub mod petition;
 pub(crate) use fee::{sweep_delete_game_guild_fee_hold, sweep_transfer_game_guild_fee_hold};
 mod settings;
 
-/// One Guild. `name_key` makes names unique without regard to case.
 #[table(accessor = game_guild, index(accessor = by_leader, btree(columns = [leader_guid])))]
 pub struct Guild {
     #[primary_key]
@@ -33,7 +20,6 @@ pub struct Guild {
     pub name_key: String,
     pub name: String,
     pub leader_guid: u64,
-    /// `lyracore_shared::faction::TEAM_*`, fixed at founding.
     pub team: u32,
     pub motd: String,
     pub info: String,
@@ -45,7 +31,6 @@ pub struct Guild {
     pub created_micros: i64,
 }
 
-/// One Guild Rank. `rank_id` 0 is the highest; ids are dense from 0.
 #[table(accessor = game_guild_rank, index(accessor = by_guild, btree(columns = [guild_id])))]
 pub struct GuildRank {
     #[primary_key]
@@ -57,27 +42,19 @@ pub struct GuildRank {
     pub rights: u32,
 }
 
-/// One Character's membership. A Character is in at most one Guild.
 #[table(accessor = game_guild_member, index(accessor = by_guild, btree(columns = [guild_id])))]
 pub struct GuildMember {
     #[primary_key]
     pub character_guid: u64,
     pub guild_id: u32,
     pub rank_id: u32,
-    /// Name snapshot, like mangos `MemberSlot::Name` (`cm:Guild.h:173`). Guild Events and by-name
-    /// member ops read it, so they need no Character row. Refreshed at sign-on.
     pub name: String,
     pub public_note: String,
     pub officer_note: String,
-    /// The member's Realm Account. 0 when unknown; the guild info count treats it as its own
-    /// Account.
     pub realm_account_id: u64,
     pub joined_micros: i64,
 }
 
-/// One Guild Event. A row with `recipient_guid == 0` goes to every online member of `guild_id`;
-/// a nonzero `recipient_guid` addresses that one Character. The strings are final, so the Gateway
-/// renders without reads. Reaped on the shared event TTL.
 #[table(
     accessor = game_guild_event,
     index(accessor = by_guild, btree(columns = [guild_id])),
@@ -89,31 +66,23 @@ pub struct GuildEvent {
     pub id: u64,
     pub guild_id: u32,
     pub recipient_guid: u64,
-    /// `lyracore_shared::guild::event_kind`.
     pub kind: u8,
-    /// The Character the event is about. SMSG_GUILD_EVENT writes it after the strings when nonzero.
     pub subject_guid: u64,
-    /// A second object the event names, such as a Guild Charter item.
     pub other_guid: u64,
     pub strings: Vec<String>,
     pub created_at: Timestamp,
 }
 
-/// A GM founds a Guild led by `leader_guid`. The leader may be offline.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildGmCreate {
     pub leader_guid: u64,
     pub leader_name: String,
     pub leader_team: u32,
     pub leader_realm_account: u64,
-    /// The acting Character's GM level, read from its Home Shard.
     pub gm_level: u8,
     pub name: String,
 }
 
-/// A member invites a live Character on another World Shard to join its Guild. The Gateway
-/// resolves the target realm-wide and conveys the facts Realm-core cannot read itself: each side's
-/// team (from race) and whether the target ignores the actor.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildInviteRequest {
     pub target_guid: u64,
@@ -122,22 +91,18 @@ pub struct GuildInviteRequest {
     pub target_ignores_actor: bool,
 }
 
-/// The actor accepts its pending Guild Invite. Realm-core holds no Character row for a non-member,
-/// so the Gateway conveys the name and team `add_member` needs.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildAcceptRequest {
     pub actor_name: String,
     pub actor_team: u32,
 }
 
-/// A Public or Officer Note edit: the same shape, gated by a different Rank Right and field.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildNoteEdit {
     pub target_guid: u64,
     pub text: String,
 }
 
-/// A Guild Rank rename and rights change.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildRankEdit {
     pub rank_id: u32,
@@ -145,71 +110,36 @@ pub struct GuildRankEdit {
     pub name: String,
 }
 
-/// One guild Durable Request. Later ops append variants here.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub enum GuildOp {
     GmCreate(GuildGmCreate),
-    /// The actor entered the world. `actor_name` refreshes the member's name snapshot.
-    SignOn {
-        actor_name: String,
-    },
+    SignOn { actor_name: String },
     SignOff,
     Invite(GuildInviteRequest),
     Accept(GuildAcceptRequest),
-    /// The actor declines its pending Guild Invite. `actor_name` addresses the inviter's event,
-    /// since Realm-core holds no name snapshot for a non-member.
-    Decline {
-        actor_name: String,
-    },
+    Decline { actor_name: String },
     Leave,
-    Remove {
-        target_guid: u64,
-    },
-    Promote {
-        target_guid: u64,
-    },
-    Demote {
-        target_guid: u64,
-    },
-    SetLeader {
-        target_guid: u64,
-    },
+    Remove { target_guid: u64 },
+    Promote { target_guid: u64 },
+    Demote { target_guid: u64 },
+    SetLeader { target_guid: u64 },
     Disband,
-    SetMotd {
-        text: String,
-    },
-    SetInfo {
-        text: String,
-    },
+    SetMotd { text: String },
+    SetInfo { text: String },
     SetPublicNote(GuildNoteEdit),
     SetOfficerNote(GuildNoteEdit),
     EditRank(GuildRankEdit),
-    AddRank {
-        name: String,
-    },
+    AddRank { name: String },
     DeleteRank,
     SignPetition(petition::GuildPetitionSign),
     OfferPetition(petition::GuildPetitionOffer),
-    /// The actor declines to sign the Petition of `charter_item_guid`.
-    DeclinePetition {
-        charter_item_guid: u64,
-    },
+    DeclinePetition { charter_item_guid: u64 },
     RenamePetition(petition::GuildPetitionRename),
-    TurnInPetition {
-        charter_item_guid: u64,
-    },
-    ClosePetition {
-        petition_id: u32,
-    },
-    /// The actor, a Character that no World Shard holds any more, leaves every guild trace behind.
-    /// Only a tokenless actor may send it: the Gateway proves the deletion first.
+    TurnInPetition { charter_item_guid: u64 },
+    ClosePetition { petition_id: u32 },
     ForgetDeletedCharacter,
 }
 
-/// Run one guild op for the acting Character.
-///
-/// Operator-gated because the actor's guid is an argument: Realm-core has no live entity to derive
-/// it from. A Refusal returns its [`GuildRefusal`] tag as the whole error text and commits nothing.
 #[reducer]
 pub fn realm_guild_op(
     ctx: &ReducerContext,
@@ -250,7 +180,6 @@ pub fn realm_guild_op(
             petition::turn_in(ctx, actor_guid, actor_account, charter_item_guid)
         }
         GuildOp::ClosePetition { petition_id } => petition::close(ctx, actor_guid, petition_id),
-        // A World Session's token proves its Character is live, so it can never be forgotten.
         GuildOp::ForgetDeletedCharacter if !tokenless => {
             return Err(format!(
                 "Character {actor_guid} has a World Session and is not forgotten"
@@ -310,8 +239,6 @@ fn sign_off(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GuildRefusal> {
     Ok(())
 }
 
-/// Found a Guild with the five default Guild Ranks and `leader_guid` at rank 0
-/// (`cm:Guild.cpp:104-154`). The Gates and their order are `founding_gate`'s.
 pub(crate) fn create_guild(
     ctx: &ReducerContext,
     leader_guid: u64,
@@ -366,9 +293,6 @@ pub(crate) fn create_guild(
     Ok(guild.guild_id)
 }
 
-/// Insert one member row. This is the only place a member row is inserted. Refuses a Character
-/// that is already a member of any Guild (`cm:Guild.cpp:167-179`). A joiner's own Petition closes
-/// and its Signatures are struck.
 pub(crate) fn add_member(
     ctx: &ReducerContext,
     guild_id: u32,
@@ -394,7 +318,6 @@ pub(crate) fn add_member(
     Ok(())
 }
 
-/// The membership row of `character_guid`, if it is in a Guild.
 pub(crate) fn member(ctx: &ReducerContext, character_guid: u64) -> Option<GuildMember> {
     ctx.db
         .game_guild_member()
@@ -402,7 +325,6 @@ pub(crate) fn member(ctx: &ReducerContext, character_guid: u64) -> Option<GuildM
         .find(character_guid)
 }
 
-/// The Guild Ranks of `guild_id`, highest first.
 pub(crate) fn ranks(ctx: &ReducerContext, guild_id: u32) -> Vec<GuildRank> {
     let mut ranks: Vec<GuildRank> = ctx
         .db
@@ -414,7 +336,6 @@ pub(crate) fn ranks(ctx: &ReducerContext, guild_id: u32) -> Vec<GuildRank> {
     ranks
 }
 
-/// The lowest Guild Rank's id: where a new member starts.
 pub(crate) fn lowest_rank(ctx: &ReducerContext, guild_id: u32) -> u32 {
     ctx.db
         .game_guild_rank()
@@ -425,7 +346,6 @@ pub(crate) fn lowest_rank(ctx: &ReducerContext, guild_id: u32) -> u32 {
         .unwrap_or(LEADER_RANK)
 }
 
-/// The Rank Rights of one Guild Rank. An unknown rank reads 0 (`cm:Guild.cpp:660-666`).
 pub(crate) fn rank_rights(ctx: &ReducerContext, guild_id: u32, rank_id: u32) -> u32 {
     ctx.db
         .game_guild_rank()
@@ -435,7 +355,6 @@ pub(crate) fn rank_rights(ctx: &ReducerContext, guild_id: u32, rank_id: u32) -> 
         .map_or(0, |rank| rank.rights)
 }
 
-/// Write one Guild Event. `recipient_guid == 0` broadcasts to the Guild's online members.
 pub(crate) fn push_event(
     ctx: &ReducerContext,
     guild_id: u32,
@@ -461,10 +380,6 @@ pub(crate) fn push_event(
 mod tests {
     use super::*;
 
-    /// BSATN encodes a `GuildOp` variant as its ordinal position, so appending a variant in the
-    /// wrong place silently renames every variant after it on the wire. This pins each variant's
-    /// tag byte to a hand-written value: reordering `GuildOp` fails this test instead of shipping
-    /// a schema a live client silently decodes as the wrong op.
     #[test]
     fn guild_op_variant_bsatn_tags_are_pinned_by_position() {
         let cases: [(&str, GuildOp, u8); 26] = [

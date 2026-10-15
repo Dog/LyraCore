@@ -1,4 +1,3 @@
-// Every test crate compiles this module and uses a different part of it.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -6,7 +5,6 @@ use std::collections::BTreeMap;
 use lyracore_shared::spatial::{grid_cell, GRID_CELL_SIZE, MAP_COORD_MAX};
 pub use lyracore_test_support::*;
 
-/// Long enough to span several creature firings, short enough to stay inside one 50 yd cell.
 pub const LEG_YD: f32 = 20.0;
 
 pub type Row = BTreeMap<String, String>;
@@ -17,9 +15,6 @@ pub fn number<T: std::str::FromStr>(row: &Row, column: &str) -> T {
         .unwrap_or_else(|_| panic!("{column} is not a number in {row:?}"))
 }
 
-/// Publish the module and leave one wolf (entry 51000) per offset, in yards ahead of a Character,
-/// out of combat: with the Character gone no cell is awake, so only a leg advance touches a wolf's
-/// row. Returns their `game_world_entity` rows in spawn order.
 pub fn wolves(shard: &mut Standalone, offsets: &[f32]) -> Vec<Row> {
     shard.publish_module();
     shard.assert_call("claim_operator", &[]);
@@ -37,8 +32,6 @@ pub fn wolves(shard: &mut Standalone, offsets: &[f32]) -> Vec<Row> {
     wolves
 }
 
-/// Replace every wolf (entry 51000) with one per offset, in yards ahead of the live `character`.
-/// Needs `debug_seed_scenario_fixtures`. Returns their guids in spawn order.
 pub fn wolves_beside(shard: &Standalone, character: &str, offsets: &[f32]) -> Vec<String> {
     shard.assert_sql("DELETE FROM game_world_entity WHERE entry = 51000");
     for offset in offsets {
@@ -61,8 +54,6 @@ pub fn lone_wolf(shard: &mut Standalone) -> Row {
     wolves(shard, &[5.0]).remove(0)
 }
 
-/// The point `LEG_YD` from `at` toward the centre of its cell, so no step of the leg crosses a
-/// cell edge.
 pub fn leg_destination(at: &Row) -> (f32, f32, f32) {
     let (x, y, z): (f32, f32, f32) = (number(at, "x"), number(at, "y"), number(at, "z"));
     let (grid_x, _) = grid_cell(x, y);
@@ -72,7 +63,6 @@ pub fn leg_destination(at: &Row) -> (f32, f32, f32) {
     destination
 }
 
-/// The creature's leg row. Panics unless it has exactly one.
 pub fn leg(shard: &Standalone, guid: &str) -> Row {
     let mut legs = shard.query_rows(&format!(
         "SELECT sx, sy, sz, dx, dy, dz, start_micros, dur_ms, spline_id FROM game_creature_spline \

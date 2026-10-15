@@ -1,8 +1,5 @@
-//! Trainer window, purchase results, and learned-spell packets.
-
 use super::*;
 
-/// An offering and the Character facts used to render its training state.
 #[derive(Clone, Copy, Debug)]
 pub struct TrainerSpellView {
     pub spell_id: u32,
@@ -10,20 +7,14 @@ pub struct TrainerSpellView {
     pub required_level: u8,
     pub player_level: u32,
     pub known: bool,
-    /// Skill line taught by this offering, or 0 for a spell or recipe. Includes professions,
-    /// weapon skills and riding, which need distinct trainer list types.
     pub learn_skill_line: u32,
 }
 
-/// Build the trainer window. Profession learn rows select the recipe icon lookup in build 5875.
-/// Known offerings are gray, offerings above the Character's level are red, and others are green.
 pub fn build_trainer_list(
     trainer_guid: u64,
     spells: &[TrainerSpellView],
     greeting: &str,
 ) -> SMSG_TRAINER_LIST {
-    // The importer supplies learn rows for each profession a trainer teaches. The packet type is
-    // distinct from the creature template type, which also labels weapon masters as tradeskills.
     let teaches_profession = spells.iter().any(|s| {
         matches!(
             Skill::try_from(s.learn_skill_line),
@@ -71,7 +62,6 @@ pub fn build_trainer_list(
     }
 }
 
-/// Build `SMSG_TRAINER_BUY_SUCCEEDED` — confirms the purchase; pair with [`build_learned_spell`].
 pub fn build_trainer_buy_succeeded(trainer_guid: u64, spell_id: u32) -> SMSG_TRAINER_BUY_SUCCEEDED {
     SMSG_TRAINER_BUY_SUCCEEDED {
         guid: Guid::new(trainer_guid),
@@ -79,9 +69,6 @@ pub fn build_trainer_buy_succeeded(trainer_guid: u64, spell_id: u32) -> SMSG_TRA
     }
 }
 
-/// Build `SMSG_TRAINER_BUY_FAILED`. The caller picks `error` from the Module's typed Refusal; gtker
-/// vanilla carries only 3 reasons, so several Refusals share Unavailable — cosmetic, since the client
-/// gates the Learn button on the Green state from the list.
 pub fn build_trainer_buy_failed(
     trainer_guid: u64,
     spell_id: u32,
@@ -94,8 +81,6 @@ pub fn build_trainer_buy_failed(
     }
 }
 
-/// Build `SMSG_LEARNED_SPELL` — the live push after a buy so the spell appears on the action bar without
-/// a relog (the login `SMSG_INITIAL_SPELLS` sync is login-only).
 pub fn build_learned_spell(spell_id: u32) -> SMSG_LEARNED_SPELL {
     SMSG_LEARNED_SPELL { id: spell_id }
 }
@@ -131,7 +116,6 @@ mod tests {
             build_trainer_list(42, &spells, "Greetings")
                 .write_unencrypted_server(&mut packet)
                 .unwrap();
-            // Four-byte server header, guid, then the list type and row count.
             assert_eq!(&packet[12..16], &2u32.to_le_bytes(), "skill line {line}");
             assert_eq!(&packet[16..20], &2u32.to_le_bytes());
             assert_eq!(&packet[20..24], &3984u32.to_le_bytes());
@@ -165,7 +149,7 @@ mod tests {
                 player_level: 10,
                 known: false,
                 learn_skill_line: 0,
-            }, // learnable
+            },
             TrainerSpellView {
                 spell_id: 101,
                 cost: 10,
@@ -173,7 +157,7 @@ mod tests {
                 player_level: 2,
                 known: false,
                 learn_skill_line: 0,
-            }, // too low
+            },
             TrainerSpellView {
                 spell_id: 102,
                 cost: 10,
@@ -181,7 +165,7 @@ mod tests {
                 player_level: 10,
                 known: true,
                 learn_skill_line: 0,
-            }, // already known
+            },
         ];
         let msg = build_trainer_list(42, &v, "Greetings");
         assert_eq!(msg.spells[0].state, TrainerSpellState::Green);
@@ -189,7 +173,6 @@ mod tests {
         assert_eq!(msg.spells[2].state, TrainerSpellState::Gray);
         assert_eq!(msg.guid, Guid::new(42));
         assert_eq!(msg.greeting, "Greetings");
-        // boundary: at exactly required_level → learnable (Green)
         let edge = [TrainerSpellView {
             spell_id: 1,
             cost: 0,

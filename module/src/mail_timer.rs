@@ -1,7 +1,3 @@
-//! The Mail Timer: one one-shot schedule per Mail. It fires at the delivery instant of a Mail that
-//! is not delivered yet, and at the end of every Mail's life to run Mail Expiry. Mail rows live on
-//! Realm-core in a sharded realm, so the timers and the Mail Arrival events live there too.
-
 use lyracore_shared::mail::{MailSender, CHECK_MASK_COD_PAYMENT, CHECK_MASK_RETURNED};
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
@@ -9,7 +5,6 @@ use crate::mail::{game_mail, Mail};
 
 const MICROS_PER_SEC: i64 = 1_000_000;
 
-/// The next firing of one Mail. `mail_id` is unique, so a Mail has at most one.
 #[table(accessor = game_mail_timer, scheduled(fire_mail_timer))]
 pub struct MailTimer {
     #[primary_key]
@@ -20,8 +15,6 @@ pub struct MailTimer {
     pub mail_id: u64,
 }
 
-/// A Mail became visible to `recipient_guid`. The Gateway relays it as `SMSG_RECEIVED_MAIL` to that
-/// recipient's World Session on any Shard, and the event GC reaps it.
 #[table(
     accessor = game_mail_arrival,
     index(accessor = by_recipient, btree(columns = [recipient_guid]))
@@ -34,9 +27,6 @@ pub struct MailArrival {
     pub created_at: Timestamp,
 }
 
-/// The end of a Mail's life: 3 days after it arrives with a cash on delivery price, else 30 days
-/// (cmangos `Mail.cpp:301-313`). Whole seconds, rounded as the Gateway rounds the list countdown,
-/// so the countdown reaches zero when the Mail expires.
 pub(crate) fn expires_at(mail: &Mail) -> Timestamp {
     let secs = lyracore_shared::mail::expires_at_secs(
         mail.created_at
@@ -50,18 +40,12 @@ pub(crate) fn expires_at(mail: &Mail) -> Timestamp {
     Timestamp::from_micros_since_unix_epoch(secs.saturating_mul(MICROS_PER_SEC))
 }
 
-/// What Mail Expiry does with a Mail (cmangos `ObjectMgr.cpp:6188-6232`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Expiry {
-    /// Back to its Character sender in place, as a Returned Mail.
     Return,
-    /// Deleted with its item and copper.
     Delete,
 }
 
-/// Only a Character's Mail that still carries an item goes back. A Returned Mail, a COD payment,
-/// any other Mail Sender and a Mail from guid 0, which has nobody to take it back, are deleted.
-/// So is a Mail without an item: its copper goes with it, as in cmangos and vmangos.
 pub(crate) fn expiry_of(mail: &Mail) -> Expiry {
     let from_character = matches!(mail.sender(), MailSender::Character(guid) if guid != 0);
     let sent_back_before = mail.check_flags & (CHECK_MASK_RETURNED | CHECK_MASK_COD_PAYMENT) != 0;
@@ -72,21 +56,14 @@ pub(crate) fn expiry_of(mail: &Mail) -> Expiry {
     }
 }
 
-/// What one firing does with its Mail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Firing {
-    /// Too early: the Mail is not delivered yet, or its life grew after the timer was armed
-    /// because its cash on delivery price was paid. Fire again at this instant.
     Rearm(Timestamp),
-    /// The Mail's delivery instant: send its Mail Arrival, then fire again at its expiry.
-    Deliver {
-        expires: Timestamp,
-    },
+    Deliver { expires: Timestamp },
     Expire(Expiry),
 }
 
-/// `due` is the instant the firing was armed for. The scheduler never runs it earlier, so
-/// `now >= due`. Only a firing armed at the delivery instant delivers.
+// Only a firing armed at the delivery instant may emit the delivery notification.
 pub(crate) fn firing(mail: &Mail, due: Timestamp, now: Timestamp) -> Firing {
     if !mail.is_delivered(now) {
         return Firing::Rearm(delivery(mail));
@@ -105,7 +82,6 @@ fn delivery(mail: &Mail) -> Timestamp {
     Timestamp::from_micros_since_unix_epoch(mail.deliver_micros)
 }
 
-/// The instant a Mail's timer fires next: its delivery while it is not delivered, else its expiry.
 fn next_due(mail: &Mail, now: Timestamp) -> Timestamp {
     if mail.is_delivered(now) {
         expires_at(mail)
@@ -114,8 +90,6 @@ fn next_due(mail: &Mail, now: Timestamp) -> Timestamp {
     }
 }
 
-/// Start `mail`'s life with its current recipient: send a Mail Arrival when that recipient can see
-/// it now, and arm its timer. A new Mail and a Returned Mail both come here.
 pub(crate) fn start(ctx: &ReducerContext, mail: &Mail) {
     if mail.is_delivered(ctx.timestamp) {
         arrive(ctx, mail.recipient_guid);
@@ -123,18 +97,15 @@ pub(crate) fn start(ctx: &ReducerContext, mail: &Mail) {
     arm_next(ctx, mail);
 }
 
-/// Arm `mail`'s timer for its next firing, replacing any timer it has.
 pub(crate) fn arm_next(ctx: &ReducerContext, mail: &Mail) {
     arm(ctx, mail.id, next_due(mail, ctx.timestamp));
 }
 
-/// Cancel a Mail's timer. Every path that deletes a Mail row calls this.
 pub(crate) fn stop(ctx: &ReducerContext, mail_id: u64) {
     ctx.db.game_mail_timer().mail_id().delete(mail_id);
 }
 
-/// A fired row stays until its reducer returns, so delete by `mail_id` before the insert, or the
-/// unique index refuses the next row.
+// Fired rows remain until reducer return; delete before inserting the next unique mail_id.
 fn arm(ctx: &ReducerContext, mail_id: u64, at: Timestamp) {
     let timers = ctx.db.game_mail_timer();
     timers.mail_id().delete(mail_id);
@@ -153,16 +124,9 @@ fn arrive(ctx: &ReducerContext, recipient_guid: u64) {
     });
 }
 
-/// The gap between two past-due timers that one repair pass arms. Each firing is its own
-/// transaction and may write one Mail Arrival. Arming a backlog at the same past instant would
-/// run every firing back to back after the pass commits. At 10 ms the backlog fires at 100
-/// transactions a second, and 100,000 legacy Mail drain in under 17 minutes. Staggering keeps the
-/// work in the one pass the Operator already runs, where a cap would leave Mail untimed until the
-/// next publish.
+// Stagger overdue timers so a repair cannot unleash the whole backlog in consecutive transactions.
 const BACKLOG_SPACING_MICROS: i64 = 10_000;
 
-/// When the timers a repair pass arms fire, in the order of `dues`. A future instant stays. The
-/// `n`th past-due instant, counted from 1, moves to `now + n × 10 ms`.
 fn spaced(dues: &[Timestamp], now: Timestamp) -> Vec<Timestamp> {
     let mut past_due = 0;
     dues.iter()
@@ -178,9 +142,6 @@ fn spaced(dues: &[Timestamp], now: Timestamp) -> Vec<Timestamp> {
         .collect()
 }
 
-/// Arm a timer for every Mail that has none: Mail written before the timer existed, or Mail a
-/// Transfer imported. Mail past its life expires shortly after this transaction commits, spaced
-/// by [`BACKLOG_SPACING_MICROS`]. Returns how many timers it armed.
 pub(crate) fn arm_missing(ctx: &ReducerContext) -> u64 {
     let timers = ctx.db.game_mail_timer();
     let untimed: Vec<Mail> = ctx
@@ -199,7 +160,6 @@ pub(crate) fn arm_missing(ctx: &ReducerContext) -> u64 {
     untimed.len() as u64
 }
 
-/// Scheduler-only.
 #[reducer]
 pub fn fire_mail_timer(ctx: &ReducerContext, timer: MailTimer) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
@@ -209,8 +169,6 @@ pub fn fire_mail_timer(ctx: &ReducerContext, timer: MailTimer) -> Result<(), Str
     Ok(())
 }
 
-/// One firing of `timer`. A firing that is no longer its Mail's armed timer, or whose Mail is gone,
-/// changes nothing, so a replay is a no-op.
 pub(crate) fn fire(ctx: &ReducerContext, timer: &MailTimer) {
     let armed = ctx.db.game_mail_timer().mail_id().find(timer.mail_id);
     if armed.is_some_and(|armed| armed.scheduled_id != timer.scheduled_id) {
@@ -221,7 +179,6 @@ pub(crate) fn fire(ctx: &ReducerContext, timer: &MailTimer) {
     };
     let due = match timer.scheduled_at {
         ScheduleAt::Time(at) => at,
-        // `arm` writes only instants, so no interval row exists. Read one as due now.
         ScheduleAt::Interval(_) => ctx.timestamp,
     };
     match firing(&mail, due, ctx.timestamp) {
@@ -230,7 +187,6 @@ pub(crate) fn fire(ctx: &ReducerContext, timer: &MailTimer) {
             arrive(ctx, mail.recipient_guid);
             arm(ctx, mail.id, expires);
         }
-        // Auto-return arrives at once (cmangos `ObjectMgr.cpp:6214-6215`).
         Firing::Expire(Expiry::Return) => crate::mail::send_back(ctx, mail, 0),
         Firing::Expire(Expiry::Delete) => crate::mail::delete_mail(ctx, mail.id),
     }

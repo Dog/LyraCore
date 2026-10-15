@@ -1,12 +1,5 @@
-//! Encounter kernel levers, operator stand-ins until the Deadmines package
-//! consumes the primitives for real. Each is a thin `?`-wrapper over the `crate::encounter` fn it
-//! names, so the runbook can exercise every primitive on a live node without an encounter package.
-
 use spacetimedb::{log, reducer, ReducerContext};
 
-/// Register an HP-threshold watch (`encounter::watch_hp_threshold`). NOTE: a watch alone fires
-/// nothing — `on_hp_threshold` handlers are compile-time registrations (`game_hook!` markers), so
-/// without one anywhere in the build the kernel's damage probe stays on its zero-cost early-out.
 #[reducer]
 pub(crate) fn debug_encounter_watch_hp(
     ctx: &ReducerContext,
@@ -17,8 +10,6 @@ pub(crate) fn debug_encounter_watch_hp(
     crate::encounter::watch_hp_threshold(ctx, entry, pct)
 }
 
-/// Set one encounter's state + payload (`encounter::set_encounter_state`/`set_encounter_data`) —
-/// readable back via `spacetime sql "select * from game_encounter_state"`.
 #[reducer]
 pub fn debug_encounter_set_state(
     ctx: &ReducerContext,
@@ -33,7 +24,6 @@ pub fn debug_encounter_set_state(
     Ok(())
 }
 
-/// Flip every DOOR/BUTTON of `go_entry` open (`encounter::open_door`); logs the flip count.
 #[reducer]
 pub fn debug_encounter_open_door(
     ctx: &ReducerContext,
@@ -46,8 +36,7 @@ pub fn debug_encounter_open_door(
     Ok(())
 }
 
-/// Spawn `count` adds of `entry` as one tracked wave (`encounter::spawn_wave`); logs the guids.
-#[allow(clippy::too_many_arguments)] // a debug lever mirrors the primitive's full signature
+#[allow(clippy::too_many_arguments)]
 #[reducer]
 pub fn debug_encounter_spawn_wave(
     ctx: &ReducerContext,
@@ -83,7 +72,6 @@ pub fn debug_encounter_spawn_wave(
     Ok(())
 }
 
-/// Write a creature's client-visible virtual-item slots (`encounter::equip_swap`).
 #[reducer]
 pub fn debug_encounter_equip(
     ctx: &ReducerContext,
@@ -96,7 +84,6 @@ pub fn debug_encounter_equip(
     crate::encounter::equip_swap(ctx, creature_guid, main_hand, off_hand, ranged)
 }
 
-/// Send a creature on one move leg (`encounter::move_to_point`) — the Smite rack-run motion.
 #[reducer]
 pub fn debug_encounter_move(
     ctx: &ReducerContext,
@@ -110,8 +97,6 @@ pub fn debug_encounter_move(
     crate::encounter::move_to_point(ctx, creature_guid, x, y, z, run)
 }
 
-/// Reset one encounter (`encounter::encounter_reset`): state → NotStarted, tracked wave despawned.
-/// HP fired-marks are entry-keyed, so clear them separately: `debug_encounter_reset_hp_fired`.
 #[reducer]
 pub fn debug_encounter_reset(
     ctx: &ReducerContext,
@@ -123,7 +108,6 @@ pub fn debug_encounter_reset(
     Ok(())
 }
 
-/// Clear the per-instance HP fired-marks for `entry` (`encounter::reset_hp_fired`).
 #[reducer]
 pub fn debug_encounter_reset_hp_fired(
     ctx: &ReducerContext,
@@ -135,9 +119,6 @@ pub fn debug_encounter_reset_hp_fired(
     Ok(())
 }
 
-/// Sweep EVERY kernel row for an instance (`encounter::sweep_encounter_state`) — kept as the
-/// narrow kernel-only lever; the FULL instance reap (which calls this sweep as its 228 splice)
-/// is `debug_reap_instance` (`debug/instance.rs`).
 #[reducer]
 pub fn debug_sweep_encounter_state(ctx: &ReducerContext, instance_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;

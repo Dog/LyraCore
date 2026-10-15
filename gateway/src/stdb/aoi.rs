@@ -1,48 +1,9 @@
-//! What is left of the Area-of-Interest tier after the shared-connection model landed: the
-//! per-viewer state that outlived the per-player subscription, and the frozen SQL oracle its
-//! replacement is tested against.
-
-//!
-//! Before the shared-connection model, this file owned a per-player, grid-SCOPED subscription
-//! over four tables that recentered (unsubscribe + resubscribe) as the player crossed cells. All
-//! of it existed to push AOI filtering into the database.
-//!
-//! It measured badly. At 600 players it produced ~600 distinct subscription query strings that
-//! could neither be shared nor pruned, and every committed transaction woke ~600 SDK pumps —
-//! load average 11–14 on 8 cores at 34% CPU with 7 runnable threads, i.e. a wakeup storm rather
-//! than work. The filtering now happens in-process, indexed by cell, in
-//! [`super::world_index`] + [`super::world_view`], driven by ONE global subscription per shard on
-//! the coordinator connection. Every shard's stream feeds one index.
-//!
-//! `GridBox` itself stayed where it was (`lyracore_shared::spatial`) — it is pure, unit-tested, and
-//! still defines the interest square both tiers agree on.
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Count every AOI recenter (a viewer crossing a cell) across every session, cheaply — one
-/// `fetch_add` on the movement hot path, read back by the periodic log line in `world/mod.rs`. A
-/// COUNT, not a rate; the log line takes the delta.
-///
-/// Under the shared-connection model a recenter is a 10-cell set diff in memory instead of a
-/// subscription round trip, so the number is no longer a proxy for database load — it is still
-/// the right proxy for how much
-/// CREATE/DESTROY churn the movement path is generating.
 pub(crate) static AOI_RECENTERS: AtomicU64 = AtomicU64::new(0);
 
-/// Viewer-owned state that a relay running on a SHARED connection cannot look up.
-///
-/// The ghost flag was already a mirror before the shared-connection model (a relay could not read
-/// the viewer's own row, which lives only on its home shard). It stayed a mirror afterwards for
-/// the same reason with a different cause: a coordinator callback holds the cache of the shard that owns the ROW, which for
-/// a cross-shard peer is not the shard that owns the VIEWER. A plain atomic, written on paths that
-/// already run per session — never a cross-shard read per row.
 #[derive(Default)]
 pub(crate) struct ViewerGates {
-    /// The viewer's own GHOST player-flag, for the spirit-healer visibility gate. Seeded at world
-    /// entry from the character's own row and edge-detected thereafter by the self-row update relay.
-    ///
-    /// The seeding is not optional: before the shared-connection model the gate re-read the live
-    /// row on every offer, so a player who logged in ALREADY dead saw the spirit healer without any transition ever firing.
     pub(crate) is_ghost: AtomicBool,
 }
 
@@ -52,10 +13,7 @@ impl ViewerGates {
     }
 }
 
-/// The FROZEN subscription-SQL oracle, from before the shared-connection model.
-///
-/// **Do not "fix" these to match the index.** Their whole value is being the independent side of
-/// that comparison; a change here that makes a failing differential test pass has deleted the test.
+// Keep the SQL oracle independent of the index; matching it to the implementation voids the test.
 #[cfg(test)]
 mod frozen_sql_oracle {
     use lyracore_shared::spatial::GridBox;
@@ -81,9 +39,6 @@ mod frozen_sql_oracle {
         )
     }
 
-    /// ONE point-probe query per (table, cell) — the shape the missing-AOI-index fix landed. Kept alongside the range
-    /// form because a future change has to satisfy BOTH or it has narrowed visibility on one of
-    /// them.
     fn cell_queries(
         map_id: u32,
         instance_id: u64,
@@ -101,8 +56,6 @@ mod frozen_sql_oracle {
         out
     }
 
-    /// THE box's query set — every table the player's 5×5 box scoped, in one place. `per_cell` picks
-    /// the query SHAPE: one indexed equality probe per cell, or the single range box.
     pub(crate) fn box_queries(instance_id: u64, box_: &GridBox, per_cell: bool) -> Vec<String> {
         if per_cell {
             return cell_queries(box_.map_id, instance_id, box_.cell_ids());
@@ -133,10 +86,6 @@ mod tests {
     use super::*;
     use lyracore_shared::spatial::GridBox;
 
-    /// The oracle must still describe the box the shared crate defines: anchor ± span on both axes,
-    /// partition-qualified. If the spatial constants ever move, this fails HERE — the one place that
-    /// would otherwise let the frozen oracle and the live index drift apart for a reason that is
-    /// nobody's bug.
     #[test]
     fn the_frozen_oracle_still_describes_the_shared_crates_box() {
         let b = GridBox {
@@ -159,8 +108,6 @@ mod tests {
         assert!(entity.contains("grid_y >= 5") && entity.contains("grid_y <= 9"));
     }
 
-    /// The per-cell shape probes exactly the box's own 25 cells per table — no more (a peer spawned
-    /// outside the box) and no fewer (a blind spot the player walks into).
     #[test]
     fn the_frozen_oracle_probes_exactly_the_boxs_own_cells() {
         let b = GridBox {

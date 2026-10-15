@@ -1,10 +1,3 @@
-//! Durable Loot Tag ownership for live creatures.
-//!
-//! The first positive player-controlled threat fixes the tagger and party roster. Death resolves
-//! that ceiling against the same party's current membership and the existing kill-reward range,
-//! then snapshots the result into corpse eligibility. The two `game_creature_quest_tap*` table
-//! names stay unchanged because generated bindings and deployed schemas already pin them.
-
 use std::collections::BTreeSet;
 
 use spacetimedb::{table, ReducerContext, Table};
@@ -22,7 +15,6 @@ use crate::{
     game_melee_attack, game_player_skill,
 };
 
-/// The Character whose controlled unit first generated positive threat on this creature.
 #[table(accessor = game_creature_quest_tap)]
 pub struct CreatureQuestTap {
     #[primary_key]
@@ -30,7 +22,6 @@ pub struct CreatureQuestTap {
     pub character_guid: u64,
 }
 
-/// One Character in the Loot Tag's tag-time party roster.
 #[table(
     accessor = game_creature_quest_tap_member,
     index(accessor = by_creature, btree(columns = [creature_guid]))
@@ -43,11 +34,7 @@ pub struct CreatureQuestTapMember {
     pub character_guid: u64,
 }
 
-/// The party identity captured with a grouped Loot Tag.
-///
-/// The retained tag tables cannot distinguish a two-person party's leaver after that party
-/// disbands because both Characters then have no current group row. This additive row records the
-/// original party without changing either pinned table shape. Its absence means the tag was solo.
+// Preserve the original party identity even if both members leave and current rows disappear.
 #[table(accessor = game_creature_loot_tag_group)]
 pub struct CreatureLootTagGroup {
     #[primary_key]
@@ -55,13 +42,11 @@ pub struct CreatureLootTagGroup {
     pub group_id: u64,
 }
 
-/// A resolved Loot Tag at the death site.
 pub(crate) struct DeathEntitlement {
     pub group_id: Option<u64>,
     pub recipients: Vec<u64>,
 }
 
-/// Whether a live creature's Loot Tag can still reward one Character.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LiveLootTagEligibility {
@@ -70,8 +55,6 @@ pub(crate) enum LiveLootTagEligibility {
     ReadLimit,
 }
 
-/// Resolve a threat source to its controlling Character. A Character controls itself and its
-/// owned creature. Dead or missing Characters cannot create a Loot Tag.
 pub(crate) fn controlling_character(ctx: &ReducerContext, source_guid: u64) -> Option<u64> {
     let entities = ctx.db.game_world_entity();
     let source = entities.guid().find(source_guid)?;
@@ -85,8 +68,7 @@ pub(crate) fn controlling_character(ctx: &ReducerContext, source_guid: u64) -> O
         .map(|owner| owner.guid)
 }
 
-/// Record the first positive player-controlled threat on a live wild creature. Later calls are
-/// no-ops. The stored entity receives `TAPPED`, while `TAPPED_BY_PLAYER` remains viewer-relative.
+// TAPPED is stored; TAPPED_BY_PLAYER remains viewer-relative.
 pub(crate) fn record_first_threat(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -150,9 +132,6 @@ pub(crate) fn record_first_threat(
     true
 }
 
-/// Resolve the tag-time ceiling at a kill or EventAI credit site. A grouped member must still
-/// belong to the captured party. Every recipient must also be alive, present on the same map and
-/// instance, and within the 74-yard reward range.
 pub(crate) fn death_entitlement(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -216,10 +195,6 @@ fn membership_is_current(
     }
 }
 
-/// Read one live Loot Tag: tap membership alone, with no reward-distance check. A Package
-/// calls it so a bot skips a creature another Character has tagged, and keeps fighting one
-/// it still has a claim on. Loot and quest credit read the same membership rule once, at death,
-/// through `death_entitlement`. The read is bounded at the Raid cap.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn live_loot_tag_eligibility(
     ctx: &ReducerContext,
@@ -261,8 +236,7 @@ pub(crate) fn live_loot_tag_eligibility(
     }
 }
 
-/// Remove a former party member from every live Loot Tag owned by that party. Rejoining the same
-/// party later must not restore rights from an earlier tag-time snapshot.
+// Rejoining must not restore rights from an earlier Loot Tag snapshot.
 pub(crate) fn revoke_group_member(ctx: &ReducerContext, group_id: u64, character_guid: u64) {
     let tagged_creatures: Vec<u64> = ctx
         .db
@@ -284,8 +258,6 @@ pub(crate) fn revoke_group_member(ctx: &ReducerContext, group_id: u64, character
     }
 }
 
-/// Replace a corpse's eligibility rows with the resolved Loot Tag recipients. The input is
-/// deduplicated so every eligible Character receives exactly one row, including a solo tagger.
 pub(crate) fn record_corpse_eligibility(
     ctx: &ReducerContext,
     corpse_guid: u64,
@@ -309,7 +281,6 @@ pub(crate) fn record_corpse_eligibility(
     }
 }
 
-/// Read the canonical corpse-eligibility set in stable guid order.
 pub(crate) fn corpse_eligible_recipients(ctx: &ReducerContext, corpse_guid: u64) -> Vec<u64> {
     ctx.db
         .game_corpse_loot_eligible()
@@ -325,9 +296,7 @@ pub(crate) fn corpse_eligible_for_access(recipients: &[u64], actor_guid: u64) ->
     recipients.binary_search(&actor_guid).is_ok()
 }
 
-/// Require an Actor to appear in the corpse's resolved eligibility set. An empty set is
-/// authoritative, so an unentitled corpse is not solo loot. Call this only after resolving a
-/// creature corpse; GameObject loot has no Loot Tag and keeps its existing rules.
+// Empty corpse eligibility refuses everyone; GameObjects do not use Loot Tags.
 pub(crate) fn corpse_access_gate(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -341,8 +310,6 @@ pub(crate) fn corpse_access_gate(
     })
 }
 
-/// Typed Loot Tag Gate for in-module Actor requests. The reducer adapter above keeps the stable
-/// wire tag for legacy callers; Package callers retain the refusal without parsing that tag.
 pub(crate) fn corpse_access(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -355,8 +322,6 @@ pub(crate) fn corpse_access(
     Err(LootRefusal::LootTagIneligible)
 }
 
-/// Clear a creature's live Loot Tag at combat end or despawn. Corpse and other dynamic flags stay
-/// intact; only the live tag bits are removed.
 pub(crate) fn clear(ctx: &ReducerContext, creature_guid: u64) {
     ctx.db
         .game_creature_quest_tap()
@@ -403,11 +368,9 @@ const LOOT_TAG_FIXTURE_CHARACTER_E: u64 = 5_093_855;
 #[cfg(feature = "debug_reducers")]
 const LOOT_TAG_FIXTURE_CHARACTER_F: u64 = 5_093_856;
 
-/// Exercise Loot Tag creation, lifetime, recipient resolution, and tag-owned death against live
-/// Module rows in one isolated standalone transaction.
 #[cfg(feature = "debug_reducers")]
 #[spacetimedb::reducer]
-#[allow(clippy::too_many_lines)] // One durable step per staged fixture row.
+#[allow(clippy::too_many_lines)]
 pub fn debug_verify_loot_tag_fixture(ctx: &ReducerContext) -> Result<(), String> {
     let origin = ctx
         .db

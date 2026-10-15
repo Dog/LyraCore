@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`TrainerStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::trainer::TrainerRefusal;
 use spacetimedb_sdk::Table;
@@ -13,7 +11,6 @@ use crate::world::{Actor, InteractionOutcome, TrainerStore};
 use super::interaction_outcome;
 
 impl TrainerStore for Coordinator {
-    /// The Module's current talent reset price for the confirmation dialog.
     fn talent_reset_cost(&self, character_guid: u64) -> Option<u32> {
         self.0
             .coord()
@@ -25,8 +22,6 @@ impl TrainerStore for Coordinator {
             .map(|character| lyracore_shared::talent::respec_cost_copper(character.respec_count))
     }
 
-    /// A character's live presence `(online, level, class, zone_id)` for `SMSG_FRIEND_STATUS`/
-    /// `SMSG_FRIEND_LIST`. `None` if the guid doesn't resolve to any character (a stale reference).
     fn character_presence(&self, guid: u64) -> Result<Option<(bool, u8, u8, u32)>> {
         Ok(self
             .0
@@ -39,8 +34,6 @@ impl TrainerStore for Coordinator {
             .map(|c| (c.online, c.level, c.class, c.zone_id)))
     }
 
-    /// Does this trainer serve `player_guid`'s class? Fail-open on any missing read (trainer,
-    /// character, template), matching `npc_refuses_interaction`.
     fn trainer_serves(&self, player_guid: u64, trainer_guid: u64) -> Result<bool> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -59,9 +52,6 @@ impl TrainerStore for Coordinator {
             }))
     }
 
-    /// The skill line offering `spell_id` teaches at trainer `trainer_guid`, or 0 for an ordinary spell
-    /// offering (and for any missing trainer/offering row). The offering list is keyed by the trainer's
-    /// creature-template `entry`, like the vendor stock. Read from the privileged cache.
     fn trainer_offer_skill_line(&self, trainer_guid: u64, spell_id: u32) -> u32 {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -82,10 +72,6 @@ impl TrainerStore for Coordinator {
         line
     }
 
-    /// The spells trainer `trainer_guid` teaches, folded with `player_guid`'s level + known-state so the
-    /// codec can render each Green/Red/Gray. The trainer's creature-template `entry` keys the list (like
-    /// the vendor stock); `known` = a `game_player_spell` row (the one castability source). A missing
-    /// trainer/player → empty list. Read from the privileged cache (coordinator bypasses RLS).
     fn trainer_list(
         &self,
         player_guid: u64,
@@ -110,9 +96,6 @@ impl TrainerStore for Coordinator {
             .filter(|s| s.character_guid == player_guid)
             .map(|s| s.spell_id)
             .collect();
-        // The player's trained skill caps, by line — for the per-row "known" of a PROFESSION offering
-        // (game_player_spell never holds a profession id, so we gray a tier on the skill cap, not the
-        // spellbook). RLS-bypassed via the coordinator cache, same as the reads above.
         let skill_caps: std::collections::HashMap<u32, u32> = db
             .game_player_skill()
             .iter()
@@ -169,14 +152,6 @@ impl TrainerStore for Coordinator {
             .collect())
     }
 
-    /// The KNOWN rank that learning `new_spell` supersedes: the game_spell_chain prev of
-    /// `new_spell`, if the player knows it AND the spell's ranks don't stack in the book. Drives
-    /// SMSG_SUPERCEDED_SPELL instead of LEARNED_SPELL on a trainer buy.
-    ///
-    /// The stacking rule is cmangos' canStackSpellRanksInSpellBook (operator-corrected live:
-    /// downranking Holy Light is a real thing): MANA spells keep EVERY rank visible (casters
-    /// downrank for mana efficiency); rage/energy/health-cost spells and PASSIVES supersede
-    /// (Heroic Strike replaces its old rank — there is no "downranked HS").
     fn superseded_old_rank(&self, new_spell: u32, player_guid: u64) -> Option<u32> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -217,8 +192,6 @@ impl TrainerStore for Coordinator {
         )
     }
 
-    /// The `grant_spell_id` for `talent_id` from the coordinator's `game_talent` cache (0 = passive,
-    /// no ability granted, or an unseeded talent).
     fn talent_grant_spell(&self, talent_id: u32) -> u32 {
         self.0
             .coord()
@@ -231,9 +204,6 @@ impl TrainerStore for Coordinator {
             .unwrap_or(0)
     }
 
-    /// Sum of the character's spent talent ranks (`game_character_talent`, coordinator RLS-bypassed).
-    /// Non-zero gates the post-CREATE login correction of `PLAYER_CHARACTER_POINTS1` (the CREATE's
-    /// formula counts points EARNED only — see `codec/entity.rs`).
     fn talent_points_spent(&self, character_guid: u64) -> u32 {
         let guard = self.0.coord();
         guard
@@ -246,15 +216,6 @@ impl TrainerStore for Coordinator {
             .sum()
     }
 
-    /// Talent-pane sync data read AFTER a successful `learn_talent` (the blocking reducer call
-    /// returns with the cache already consistent): `(teach_spell, superseded_prev, points_remaining)`.
-    /// `teach_spell` = the rank-spell the module just put in the spellbook — the 1.12 TalentFrame
-    /// derives a talent's shown rank from which rank-spell is KNOWN, so this must relay live as
-    /// SMSG_LEARNED_SPELL or the pane freezes until relog; 0 when the Module spellbook has no row
-    /// for that rank. `superseded_prev` = the previous
-    /// rank's now-replaced spell (drives SMSG_SUPERCEDED_SPELL; 0 for rank 1 / same-spell demo
-    /// trees). `points_remaining` = earned (level−9, floor 0) minus spent — the live
-    /// `PLAYER_CHARACTER_POINTS1` value. Callers may pass `talent_id = 0` to get just the points.
     fn talent_pane_sync(&self, character_guid: u64, talent_id: u32) -> (u32, u32, u32) {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -286,7 +247,6 @@ impl TrainerStore for Coordinator {
         } else {
             0
         };
-        // The Module's resulting spellbook row is the authority for what was taught.
         let teach = if new_spell != 0
             && db
                 .game_player_spell()
@@ -305,10 +265,6 @@ impl TrainerStore for Coordinator {
         (teach, superseded, remaining)
     }
 
-    /// Learn `spell_id` from trainer `trainer_guid` (`CMSG_TRAINER_BUY_SPELL`) over the coordinator
-    /// connection. The module gates it (range / level / cost / not-already-known) and charges copper.
-    /// A Refusal the Module tagged comes back as an outcome; anything else stays an error.
-    /// Rides the coordinator connection as `gw_trainer_buy`.
     fn buy_trainer_spell(
         &self,
         actor: Actor,
@@ -339,7 +295,6 @@ impl TrainerStore for Coordinator {
         )
     }
 
-    /// Confirm a talent reset. The Module checks the trainer, range and price.
     fn reset_talents(&self, actor: Actor, trainer_guid: u64) -> Result<InteractionOutcome> {
         let coord = self.0.call_pipe();
         interaction_outcome(call_reducer!(
@@ -349,8 +304,6 @@ impl TrainerStore for Coordinator {
         ))
     }
 
-    /// Persist one action-bar button (`CMSG_SET_ACTION_BUTTON`): upsert by (character, button);
-    /// action 0 clears. Without this every bar drag was lost on relog (only creation seeds survived).
     fn set_action_button(
         &self,
         actor: Actor,
@@ -366,9 +319,7 @@ impl TrainerStore for Coordinator {
         )
     }
 
-    /// Persist the rep pane's At-War checkbox (`CMSG_SET_FACTION_ATWAR`): the wire's
-    /// u32 is the client's 0..63 rep-array slot (ReputationListID — the gtker `Faction` field name
-    /// lies, same as SET_FACTION_STANDING); the module reverse-resolves the faction and upserts.
+    /// The wire's Faction field is a ReputationListID slot, 0..63, not a faction id.
     fn set_faction_at_war(
         &self,
         actor: Actor,
@@ -423,8 +374,6 @@ fn pick_rank_spell(rank: u8, t: &Talent) -> u32 {
     )
 }
 
-/// The Module's typed trainer Refusal. Only a reducer the Module rejected carries a tag; a timeout,
-/// transport, or SDK failure stays an error with an unknown outcome.
 fn trainer_refusal(error: &anyhow::Error) -> Option<TrainerRefusal> {
     reducer_refusal_reason(error).and_then(TrainerRefusal::parse_tag)
 }

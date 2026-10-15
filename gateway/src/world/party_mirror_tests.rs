@@ -1,14 +1,9 @@
-//! The Roster Revision Relay against the realm-wide party topology. Each test changes the Fake
-//! Realm-core party directly, as a Module rule that no `party::run` drives would, then runs one
-//! worker pass and reads both World Shard mirrors.
-
 use super::party_tests::{
     form_split_party, party_topology, party_topology_with, GINGER, TRIN, VIM,
 };
 use super::*;
 use crate::world::party_mirror::RosterRevisionRelay;
 
-/// The split party's id after `form_split_party`.
 fn split_party_id(realm: &WorldFake) -> u64 {
     realm
         .group_roster(GINGER)
@@ -17,7 +12,6 @@ fn split_party_id(realm: &WorldFake) -> u64 {
         .group_id
 }
 
-/// Add `guid` to `group_id` on Realm-core and advance its Roster Revision, with no party op.
 fn join_on_realm(realm: &WorldFake, group_id: u64, guid: u64) {
     let mut party = realm.party.party.lock().unwrap();
     party.members.push((group_id, guid));

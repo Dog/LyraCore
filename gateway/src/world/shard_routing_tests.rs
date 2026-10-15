@@ -1,32 +1,15 @@
-//! Multi-shard routing tests through the shared WorldFake topology.
-
 use super::*;
-
-// ===========================================================================================
-//  Cross-database Transfer and Shard routing
-//  Requirement: reducer calls and subscriptions never target a shard other than the player's home
-//  shard. The `WorldFake` pair below stands for two DATABASES sharing one ordered call log, so
-//  a test can read off exactly which database served every player-scoped call of a whole live
-//  session.
-// ===========================================================================================
 
 pub(super) type ShardCallLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
-/// A two-database topology: `world` (the default handle the listener hands every session — where
-/// accounts, sessions, and the character list live) and `instances` (the shard that owns this
-/// character's location, i.e. what `home_shard` resolves to). Both write to one shared call log.
 pub(super) fn sharded_stores() -> (std::sync::Arc<WorldFake>, ShardCallLog) {
     sharded_stores_with_home_entity(true)
 }
 
-/// Build the routed topology with an explicit answer for whether the old-map entity still exists.
-/// A genuine world-port ack follows `teleport_player`, which has removed it; ordinary routed
-/// sessions remain in-world and use the default constructor above.
 fn sharded_stores_with_home_entity(
     home_entity_in_world: bool,
 ) -> (std::sync::Arc<WorldFake>, ShardCallLog) {
     let calls: ShardCallLog = Default::default();
-    // The character's post-world-port entity, for the re-entry test below.
     let mut ported = warrior_entity();
     ported.map_id = 1;
     let home = std::sync::Arc::new(WorldFake {
@@ -105,7 +88,6 @@ fn auctioneer_lookup_uses_the_sessions_pinned_home_shard() {
     );
 }
 
-/// One heartbeat at a fixed position — the movement half of the routed traffic.
 fn heartbeat(timestamp: u32) -> wow_world_messages::vanilla::MSG_MOVE_HEARTBEAT_Client {
     use wow_world_messages::vanilla::{MovementInfo, MovementInfo_MovementFlags, Vector3d};
     wow_world_messages::vanilla::MSG_MOVE_HEARTBEAT_Client {
@@ -123,8 +105,6 @@ fn heartbeat(timestamp: u32) -> wow_world_messages::vanilla::MSG_MOVE_HEARTBEAT_
     }
 }
 
-/// Drive a full session (char-select → login → movement → an attack → disconnect) and return the
-/// ordered `(shard, call)` log.
 pub(super) fn drive_routed_session(
     store: std::sync::Arc<WorldFake>,
     calls: ShardCallLog,
@@ -136,20 +116,16 @@ pub(super) fn drive_routed_session(
     });
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
 
-    // Character select — REALM-scoped, before any character (and therefore any shard) is chosen.
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
     ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap();
 
-    // Enter the world: this is where the session pins itself to the character's home shard.
     CMSG_PLAYER_LOGIN { guid: Guid::new(1) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
     drain_world_entry(&mut client, &mut c_dec);
 
-    // In-world traffic: a movement heartbeat (flushed by the following non-movement opcode) and a
-    // melee swing — one subscription-driven path and one reducer path.
     heartbeat(100)
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -160,7 +136,7 @@ pub(super) fn drive_routed_session(
     .unwrap();
     let _ = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec);
 
-    drop(client); // EOF → teardown runs `logout`
+    drop(client);
     server.join().unwrap();
     let log = calls.lock().unwrap().clone();
     log
@@ -168,9 +144,6 @@ pub(super) fn drive_routed_session(
 
 #[test]
 fn every_player_scoped_call_after_login_targets_the_home_shard_only() {
-    // Requirement: once the session resolves the character's home shard, EVERY reducer call and the
-    // per-player subscription run against that database — the login itself, the AOI/relay
-    // subscription, movement, combat, and the teardown logout. Nothing leaks back to the default.
     let (store, calls) = sharded_stores();
     let log = drive_routed_session(store, calls);
 
@@ -186,7 +159,7 @@ fn every_player_scoped_call_after_login_targets_the_home_shard_only() {
     );
     for expected in [
         "player_login",
-        "subscribe_player_events", // the per-player connection + AOI subscriptions
+        "subscribe_player_events",
         "movement_update",
         "start_attack",
         "logout",
@@ -201,9 +174,6 @@ fn every_player_scoped_call_after_login_targets_the_home_shard_only() {
 
 #[test]
 fn a_single_entry_shard_map_never_routes_and_keeps_every_call_on_the_one_database() {
-    // The safety property: with no second shard to resolve to — which is what a single-entry
-    // (default/unconfigured) shard map always answers — the session never swaps handles, so the
-    // whole flow is served by the database the listener handed it, byte-identically to before.
     let (store, calls) = sharded_stores();
     let single = std::sync::Arc::new(WorldFake {
         session: SessionState {
@@ -219,7 +189,7 @@ fn a_single_entry_shard_map_never_routes_and_keeps_every_call_on_the_one_databas
         topology: TopologyState {
             shard: "world".into(),
             calls: calls.clone(),
-            home: None, // ← a single-entry shard map: "you are already on the right shard"
+            home: None,
             ..Default::default()
         },
         characters: store.characters.clone(),
@@ -247,16 +217,6 @@ fn a_single_entry_shard_map_never_routes_and_keeps_every_call_on_the_one_databas
 
 #[test]
 fn a_routing_flip_re_routes_the_next_entrant_and_leaves_the_resident_alone() {
-    // Home-shard routing at the session level. `pool-b` stands for the shard a character was
-    // just re-homed to; the mock swaps its answer between the two logins the way a shard-map
-    // edit (or a realm-core index re-home) landing between them does.
-    //
-    // TWO claims are being pinned here, and they are different claims:
-    //   1. NEW ENTRANTS follow the flip — the second session's login, subscription, movement,
-    //      combat and logout all run on `pool-b`.
-    //   2. RESIDENTS DO NOT — the first session's traffic stays on `instances` for its whole life,
-    //      because routing is resolved once per world ENTRY and the pin is never revisited.
-    //      Nothing moves a live session.
     let calls: ShardCallLog = Default::default();
     let resolutions: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
     let instances = std::sync::Arc::new(WorldFake {
@@ -293,7 +253,7 @@ fn a_routing_flip_re_routes_the_next_entrant_and_leaves_the_resident_alone() {
             calls: calls.clone(),
             home_shard_calls: resolutions.clone(),
             home: Some(instances),
-            home_after_flip: Some(pool_b), // the routing flips between the two sessions
+            home_after_flip: Some(pool_b),
             ..Default::default()
         },
         session: SessionState {
@@ -316,7 +276,6 @@ fn a_routing_flip_re_routes_the_next_entrant_and_leaves_the_resident_alone() {
         ..Default::default()
     });
 
-    // Session 1 — the RESIDENT. Enters before the flip.
     let resident = drive_routed_session(world.clone(), calls.clone());
     assert!(
         resident
@@ -336,7 +295,6 @@ fn a_routing_flip_re_routes_the_next_entrant_and_leaves_the_resident_alone() {
          re-resolve a live session mid-flight"
     );
 
-    // Session 2 — the NEXT ENTRANT. Same stores, same character, post-flip.
     calls.lock().unwrap().clear();
     let entrant = drive_routed_session(world, calls.clone());
     assert!(
@@ -365,9 +323,6 @@ fn a_routing_flip_re_routes_the_next_entrant_and_leaves_the_resident_alone() {
 
 #[test]
 fn a_world_port_keeps_the_pin_when_the_home_shard_still_owns_the_new_map() {
-    // A world-port re-resolves routing (the new map may belong to another shard). When the shard
-    // the session is ALREADY on still owns the destination it answers "no swap needed" — which must
-    // KEEP the pin, not silently drop the session back to the default database.
     let (store, calls) = sharded_stores_with_home_entity(false);
     let (mut client, server_end) = world_session_socket_pair();
     let server_store = store.clone();
@@ -407,8 +362,6 @@ fn a_world_port_keeps_the_pin_when_the_home_shard_still_owns_the_new_map() {
 
 #[test]
 fn a_spurious_worldport_ack_is_ignored_on_a_session_pinned_off_the_default_shard() {
-    // The gate reads the live entity through the handler's `store`, which `RoutedStore` has
-    // already routed home. If either stops holding, the stray ack re-runs the world entry.
     let calls: ShardCallLog = Default::default();
     let home = std::sync::Arc::new(WorldFake {
         topology: TopologyState {
@@ -418,7 +371,6 @@ fn a_spurious_worldport_ack_is_ignored_on_a_session_pinned_off_the_default_shard
         },
         session: SessionState {
             login_entity: Some(warrior_entity()),
-            // The live entity IS in the world on the home shard — the ack is spurious.
             entity_in_world: true,
             ..Default::default()
         },
@@ -438,8 +390,6 @@ fn a_spurious_worldport_ack_is_ignored_on_a_session_pinned_off_the_default_shard
                 session_key: K,
             }),
             login_entity: Some(warrior_entity()),
-            // The default handle has NO entity for this guid (it lives on `instances`) — a
-            // default-shard read here would wrongly answer "absent" and re-enter.
             entity_in_world: false,
             ..Default::default()
         },
@@ -465,11 +415,10 @@ fn a_spurious_worldport_ack_is_ignored_on_a_session_pinned_off_the_default_shard
         .unwrap();
     drain_world_entry(&mut client, &mut c_dec);
 
-    // The stray ack: no teleport despawned the entity — it must be dropped, not answered.
     MSG_MOVE_WORLDPORT_ACK {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    drop(client); // EOF right after — the session loop consumes the ack, then tears down
+    drop(client);
     server.join().unwrap();
 
     assert_eq!(
@@ -488,8 +437,6 @@ fn a_spurious_worldport_ack_is_ignored_on_a_session_pinned_off_the_default_shard
 
 #[test]
 fn a_spurious_worldport_ack_is_ignored_on_the_default_shard() {
-    // The single-database twin of the test above — the `entity_in_world: true` ignore path was
-    // untested before these two.
     let store = std::sync::Arc::new({
         let base = tester_store(7);
         WorldFake {
@@ -537,7 +484,6 @@ fn a_logout_to_character_select_releases_the_home_shard_pin() {
     });
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
 
-    // Enter the world (pins to "instances"), then log out back to character select.
     CMSG_PLAYER_LOGIN { guid: Guid::new(1) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -545,10 +491,9 @@ fn a_logout_to_character_select_releases_the_home_shard_pin() {
     CMSG_LOGOUT_REQUEST {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(); // SMSG_LOGOUT_RESPONSE
-    ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(); // SMSG_LOGOUT_COMPLETE
+    ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap();
+    ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap();
 
-    // Back at character select: this must be served by the REALM (default) database again.
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -575,22 +520,6 @@ fn a_logout_to_character_select_releases_the_home_shard_pin() {
 
 #[test]
 fn a_freshly_created_characters_first_login_transfers_off_the_default_shard() {
-    // Requirement: `create_character` always writes to the DEFAULT/realm shard, even when the
-    // start position routes to a different one under `LYRACORE_SHARD_MAP` — a deliberate decision (see
-    // the doc comment on `CharacterStore::create_character` for `Coordinator`): create-then-
-    // transfer-on-first-login, not create-directly-on-the-owning-shard. That decision rides the
-    // SAME `route_home`/`settle_home_shard` machinery every other login already uses — prove it
-    // end to end for a guid the CREATE call ITSELF produced, not one hardcoded
-    // independently of it (the tautology the first version of this test was caught on: a bare
-    // `CMSG_PLAYER_LOGIN { guid: Guid::new(1) }` logs into `sharded_stores()`'s pre-seeded
-    // "Tester" fixture whether or not the preceding CREATE ever ran).
-    //
-    // So this drives the REAL 1.12 flow instead: CREATE, then re-ENUMERATE — `SMSG_CHAR_CREATE`
-    // carries no guid, the client is expected to learn it from the next `CMSG_CHAR_ENUM` — and
-    // pick "Newbie"'s guid out of THAT reply before logging in with it. `WorldFake::
-    // create_character` now actually records the character (see its doc comment) so this guid is
-    // genuinely create-produced, and `sharded_stores()`'s single connected `home` shard
-    // (`instances`) stands in for a start map that routes off `world`.
     let (store, calls) = sharded_stores();
 
     let (mut client, server_end) = world_session_socket_pair();
@@ -600,8 +529,6 @@ fn a_freshly_created_characters_first_login_transfers_off_the_default_shard() {
     });
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
 
-    // The creation itself must land on the default (`world`) shard — the chosen behaviour, not an
-    // accident of this test.
     CMSG_CHAR_CREATE {
         name: "Newbie".into(),
         race: Race::Orc,
@@ -622,7 +549,6 @@ fn a_freshly_created_characters_first_login_transfers_off_the_default_shard() {
         other => panic!("expected SMSG_CHAR_CREATE, got {other}"),
     }
 
-    // Learn the new character's guid the way a real client does: re-enumerate.
     CMSG_CHAR_ENUM {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
@@ -644,7 +570,6 @@ fn a_freshly_created_characters_first_login_transfers_off_the_default_shard() {
         other => panic!("expected SMSG_CHAR_ENUM, got {other}"),
     };
 
-    // That same character's FIRST login, in the SAME session, right after creation.
     CMSG_PLAYER_LOGIN {
         guid: Guid::new(new_guid),
     }

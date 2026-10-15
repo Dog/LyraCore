@@ -165,16 +165,12 @@ confirms *"the server sent the right packet"* and nothing more. It shares gtker'
 **cannot** reproduce a client crash or lock-up. That class of bug needs a real 5875 client and a human
 watching it.
 
-### Reading `work-item N` in code comments
+### Reading `work-item N` in older revisions
 
-Comments written before 2026-07-30 sometimes cite `work-item N` (occasionally just a bare 3-digit
-number) — an id from a retired internal task queue, not a GitHub issue or PR number. That queue's
-index is maintainer-side and not included in this repository, so these ids don't resolve to anything
-you can open here; treat them as an opaque historical label ("this behavior was decided while working
-task N") rather than a link. **Do not assume `work-item N` and issue `#N` are the same thing** — the
-two id ranges overlap, so for a number under a few hundred it is easy to land on an unrelated GitHub
-issue by guessing. A comment's own `#N` references (this repository's actual issues/PRs) are a
-separate, resolvable convention and are unaffected by this.
+Source comments in older revisions sometimes cite `work-item N` or a bare three-digit number.
+These refer to a retired internal task queue whose index is maintainer-side. They do not identify
+GitHub issues or PRs. The number ranges overlap, so do not turn a work-item number into an issue
+link. Explicit `#N` references still identify this repository's issues and PRs.
 
 ## 3. Deploy + verify procedure (use exactly this)
 

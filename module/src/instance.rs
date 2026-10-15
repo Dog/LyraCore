@@ -1,4 +1,4 @@
-//! Instance lifecycle. See `docs/instance-lifecycle.md` for the contract and rationale.
+//! Before changing Instance allocation or pool routing, read docs/instance-lifecycle.md.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,35 +10,21 @@ use crate::{
     game_gameobject_template, game_group, game_group_member, game_world_entity,
 };
 
-// ===========================================================================================
-//  Constants / policy
-// ===========================================================================================
-
 pub(crate) use lyracore_shared::instance::is_dungeon_map;
 
 pub(crate) struct DungeonMap {
     pub(crate) map_id: u32,
-    /// The open-world position OUTSIDE the entrance — `(map, x, y, z, o)`, the stranding fallback
-    /// for a login whose `pending_instance_id` was reaped ("fall back to the entrance at instance
-    /// 0", design doc §3).
-    ///
     pub(crate) entrance: (u32, f32, f32, f32, f32),
-    /// The instance's own zone id for graveyard release (cmangos `game_graveyard_zone.ghost_zone`)
-    /// — the map→zone hop `world::graveyard::resolve_zone_id` can't make without terrain.
     pub(crate) release_zone: u32,
-    /// Static release floor when nothing is imported — `(map, x, y, z, o)`. NEVER
-    /// `world::graveyard::nearest(px, py)` for an instance map: cross-map 2-D distance against the
-    /// open-world consts is meaningless (see `world::graveyard`'s section doc).
+    // Never resolve dungeon graveyards by outside-map coordinates.
     pub(crate) release_fallback: (u32, f32, f32, f32, f32),
 }
 
-/// Bootstrap fallback for a fixture without imported portal or graveyard metadata.
-/// Full imports resolve exits and release locations from the Operator's source data.
 pub(crate) const BOOTSTRAP_DUNGEONS: &[DungeonMap] = &[DungeonMap {
     map_id: 36,
-    entrance: (0, -11080.0, 1520.0, 46.0, 0.0), // [V] Moonbrook, Westfall
-    release_zone: 1581,                         // [V] The Deadmines
-    release_fallback: (0, -10650.0, 1180.0, 34.0, 0.0), // [V] Sentinel Hill
+    entrance: (0, -11080.0, 1520.0, 46.0, 0.0),
+    release_zone: 1581,
+    release_fallback: (0, -10650.0, 1180.0, 34.0, 0.0),
 }];
 
 pub(crate) fn dungeon(map_id: u32) -> Option<&'static DungeonMap> {
@@ -49,8 +35,6 @@ pub(crate) fn entrance_fallback(map_id: u32) -> Option<(u32, f32, f32, f32, f32)
     dungeon(map_id).map(|d| d.entrance)
 }
 
-/// Prefer a source-defined exit. An entrance volume also gives a valid outside-map fallback
-/// when a dungeon uses a scripted exit instead of an Area Trigger teleport.
 pub(crate) fn imported_entrance_fallback(
     ctx: &ReducerContext,
     map_id: u32,
@@ -81,7 +65,6 @@ pub(crate) fn imported_entrance_fallback(
     .or_else(|| entrance_fallback(map_id))
 }
 
-/// Copy a source patrol in source order. Each population operation reserves waypoint ids once.
 pub(crate) fn copy_spawn_waypoints(
     ctx: &ReducerContext,
     source_guid: u64,
@@ -117,7 +100,6 @@ pub(crate) fn remove_spawn_waypoints(ctx: &ReducerContext, guid: u64) {
     }
 }
 
-/// Updating or removing an authored source retires each of its runtime copies.
 pub(crate) fn remove_spawn_copies(ctx: &ReducerContext, source_guid: u64) {
     let spawns = ctx.db.game_creature_spawn();
     for spawn in spawns
@@ -131,49 +113,13 @@ pub(crate) fn remove_spawn_copies(ctx: &ReducerContext, source_guid: u64) {
     }
 }
 
-/// Reap an instance after it has been EMPTY this long (30min const). Vanilla
-/// keeps an untouched instance alive ~1h; 30min is the item's chosen constant (deviation noted).
 pub(crate) const INSTANCE_EMPTY_REAP_MICROS: i64 = 30 * 60 * 1_000_000;
 
-/// `reap_instances` cadence — minutes-scale per the design (occupancy resolution; see the module
-/// doc). 60s: fine-grained enough that `reset_requested` lands fast, coarse enough to cost nothing.
 pub(crate) const INSTANCE_REAPER_INTERVAL_MICROS: i64 = 60 * 1_000_000;
 
-/// How long a **LEASE** must read empty before the reaper takes it.
-///
-/// A lease is a `game_instance` row on a database that does not host instance populations
-/// (`game_config.hosts_instances = false`).
-/// It reads EMPTY within seconds of the last party member transferring to the instance shard, i.e.
-/// seconds after the run *starts*, because occupancy is counted from live player entities and there
-/// are none here any more. Reaping it on the ordinary 30-minute timer therefore deletes the world
-/// shard's only record of "this party is in instance N" **while they are still fighting in it**, and
-/// the next member through the portal — someone who died, released, and ran back — resolves
-/// `InstanceRoute::Create` and is teleported into a fresh, empty dungeon while their party is in the
-/// old one. That is the same split fixed from the other direction.
-///
-/// **The countdown starts at the run's START, not at its end**, which is what sizes this number.
-/// The lease reads empty seconds after the party leaves the world shard, so the timer has to exceed
-/// the run's WALL-CLOCK LENGTH — it is not an idle grace period. Anything shorter than the longest
-/// run the realm intends to support just moves the 30-minute fork further out: a BRD or Stratholme
-/// clear runs 3–5 hours in vanilla and a 40-man raid night runs longer, so 3h (the first value this
-/// constant held) re-created the same split for exactly the runs that hurt most to lose.
-///
-/// The error is deliberately one-sided. Too SHORT forks a party mid-run — the bug. Too LONG costs
-/// one stub row per run, and its only behavioural effect is that a re-entry within the window
-/// resolves the OLD instance id, which the owning shard then re-mints with a fresh population
-/// (`ensure_instance`) — i.e. indistinguishable from a new instance to the players. So the value is
-/// pushed well past any plausible run rather than tuned: 12h, pinned by
-/// `a_lease_only_database_holds_its_stub_rows_far_past_the_thirty_minute_run_timer`.
-///
-/// Deliberate simplification: a constant, not a protocol — the simplest thing that closes the
-/// hole. Upgrade path is the one [`teardown_instance_inner`] already names: realm-core owns the
-/// instance→shard index and the lease stops existing. **Single-database realms never reach
-/// this arm at all** — `hosts_instances` defaults to true, so their reap semantics are byte-for-byte
-/// what they were.
+// A lease reads empty at run start, so its expiry must exceed the whole dungeon run.
 pub(crate) const INSTANCE_LEASE_REAP_MICROS: i64 = 12 * 60 * 60 * 1_000_000;
 
-/// The empty-timer this database reaps instances on: [`INSTANCE_EMPTY_REAP_MICROS`] where the
-/// populations actually live, [`INSTANCE_LEASE_REAP_MICROS`] where only leases do. Pure.
 pub(crate) fn empty_reap_micros(hosts_populations: bool) -> i64 {
     if hosts_populations {
         INSTANCE_EMPTY_REAP_MICROS
@@ -182,18 +128,12 @@ pub(crate) fn empty_reap_micros(hosts_populations: bool) -> i64 {
     }
 }
 
-/// Cap on instances torn down in ONE reaper firing — bounds the transaction like the corpse
-/// reaper's batching discipline (a mass-expiry event tears down over a few firings, not one
-/// giant commit).
 const REAP_MAX_PER_FIRING: usize = 4;
 
-/// Bit 23 separates Instance population copies from imported spawns and encounter summons.
-/// Both live and respawning copies reserve their sequence until the Instance is reaped.
+// Bit 23 separates Instance copies; respawning copies still reserve their sequence.
 pub(crate) const INSTANCE_POP_LOW_BAND: u64 = 0x80_0000;
 
-/// Bit 46 of a gameobject guid low: the per-instance GO-COPY band. Below `gameobject::POOL_TAG`
-/// (bit 47 — pool points), far above static imported db-guid lows and the debug spawner's
-/// entry-derived lows (< 2^24).
+// Bit 46 reserves gameobject Instance copies below pool bit 47.
 pub(crate) const GO_COPY_BAND: u64 = 1 << 46;
 
 const GO_COPY_TYPES: [u8; 4] = [
@@ -203,16 +143,6 @@ const GO_COPY_TYPES: [u8; 4] = [
     crate::gameobject::go_type::GOOBER,
 ];
 
-// ===========================================================================================
-//  Private instance tables [server]
-// ===========================================================================================
-
-/// One live dungeon instance. `instance_id` auto_inc from 1 (0 = open world, reserved by
-/// construction). `party_id` is the owning `game_group.group_id`, or 0 for a solo-created
-/// instance (resolution for those rides `game_instance_binding` only — party_id 0 is NEVER
-/// queried by `by_party`, or every solo instance in the world would alias one "party").
-/// `last_empty_at_micros`: 0 = occupied/never-observed-empty; else when the reaper first saw it
-/// empty. `reset_requested`: flagged by [`reset_instance`], honored by the reaper when empty. [server]
 #[table(
     accessor = game_instance,
     index(accessor = by_party, btree(columns = [party_id])),
@@ -229,9 +159,6 @@ pub struct GameInstance {
     pub reset_requested: bool,
 }
 
-/// One row per (character, map): the instance this character re-enters through that map's portal.
-/// REPLACED on a new binding (resolve step 2/3 rebinds), survives party disband (vanilla), dropped
-/// by the instance reap and by character deletion (the `character_owned` sweep below). [server]
 #[table(
     accessor = game_instance_binding,
     index(accessor = by_character, btree(columns = [character_guid])),
@@ -246,18 +173,12 @@ pub struct GameInstanceBinding {
     pub map_id: u32,
 }
 
-// A deleted character's instance bindings go with it (the tripwire-enforced sweep). Delete-only:
-// bindings carry no owner_identity, so there is nothing to restamp (the GroupInvite precedent).
 crate::character_owned!(delete, fn sweep_delete_game_instance_binding(ctx, character_guid) {
     let t = ctx.db.game_instance_binding();
     for b in t.by_character().filter(&character_guid).collect::<Vec<_>>() {
         t.id().delete(b.id);
     }
 });
-// CROSS-DATABASE transport: the binding is what "you re-enter YOUR instance" means, and
-// on the instance shard it is what `resolve_or_create_instance` reads when the character zones back
-// in after a disconnect. `instance_id` is carried VERBATIM — it is the id the gateway mirrored to
-// this shard via `ensure_instance`, so the two agree by construction. `id` is a surrogate PK.
 crate::character_owned!(transfer, fn sweep_transfer_game_instance_binding(ctx, character_guid, io) {
     table = game_instance_binding,
     by = by_character,
@@ -272,14 +193,9 @@ pub struct InstanceReaperSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// How long an Instance Removal counts down before it moves the Character home.
 pub(crate) const INSTANCE_REMOVAL_MICROS: i64 =
     lyracore_shared::instance::INSTANCE_REMOVAL_MS as i64 * 1_000;
 
-/// One Character's running Instance Removal: the one-shot schedule that fires
-/// [`INSTANCE_REMOVAL_MICROS`] after it is armed. `instance_id` is the instance the Character
-/// stood in when it was armed and `group_id` is the Group that owns that instance. The Gateway
-/// relays an insert as the client countdown and a delete as its end. [server]
 #[table(accessor = game_instance_removal, scheduled(expire_instance_removal))]
 pub struct InstanceRemoval {
     #[primary_key]
@@ -295,17 +211,8 @@ pub struct InstanceRemoval {
 crate::character_owned!(delete, fn sweep_delete_game_instance_removal(ctx, character_guid) {
     ctx.db.game_instance_removal().character_guid().delete(character_guid);
 });
-// The countdown belongs to the instance. A Character that leaves the Instance Pool has left the
-// instance, and leaving the instance cancels the countdown (cm:MovementHandler.cpp:133-135).
 crate::character_owned!(not_transported, fn sweep_transfer_game_instance_removal());
 
-// ===========================================================================================
-//  Pure decisions (unit-tested below)
-// ===========================================================================================
-
-/// The resolve order, as data: the party's live instance → the character's own live binding →
-/// create (swapped the first two; see [`route_instance`]). Pure — the DB reads live in
-/// [`resolve_or_create_instance`].
 #[derive(Debug, PartialEq)]
 pub(crate) enum InstanceRoute {
     Own(u64),
@@ -324,7 +231,6 @@ pub(crate) fn route_instance(
     }
 }
 
-/// Admission uses the dungeon or raid capacity. Occupancy and saved raid lockouts remain separate.
 fn instance_capacity(map_id: u32) -> usize {
     match map_id {
         249 | 409 | 469 | 531 | 533 => lyracore_shared::group::RAID_MAX_MEMBERS,
@@ -338,17 +244,11 @@ pub(crate) fn party_size_allows_entry(map_id: u32, member_count: usize) -> bool 
     member_count <= instance_capacity(map_id)
 }
 
-/// What the reaper does to one instance this firing, given its observed occupancy. Pure —
-/// unit-tested; the entity scan and row writes live in [`reap_instances`].
 #[derive(Debug, PartialEq)]
 pub(crate) enum OccupancyAction {
-    /// Players inside and a stale empty-stamp → clear it (re-entry cancels the countdown).
     ClearStamp,
-    /// Empty and unstamped → start the 30min countdown now.
     Stamp,
-    /// Nothing to do this firing.
     Wait,
-    /// Tear it down (30min empty elapsed, or reset requested while empty).
     Reap,
 }
 
@@ -367,8 +267,6 @@ pub(crate) fn occupancy_action(
         };
     }
     if reset_requested {
-        // Reset honors the CURRENT emptiness observation, not the stamp — a leader's reset lands
-        // on the next firing (≤60s), never waits out the 30min countdown.
         return OccupancyAction::Reap;
     }
     if last_empty_at_micros == 0 {
@@ -381,17 +279,10 @@ pub(crate) fn occupancy_action(
     }
 }
 
-/// Where a login whose `pending_instance_id` was reaped lands (NEVER strand, design trap).
-/// Pure over the two facts the caller derives ([`entrance_fallback`], [`is_dungeon_map`]);
-/// alive-or-ghost is orthogonal and preserved per the `pending_ghost` rules at the call site.
 #[derive(Debug, PartialEq)]
 pub(crate) enum StrandingFallback {
-    /// A dungeon entrance on its outside map, at instance zero.
     Entrance(u32, f32, f32, f32, f32),
-    /// A NON-dungeon map (the dev-map fixture case): the position is fine open-world terrain —
-    /// stay in place, drop to instance 0.
     InPlaceOpenWorld,
-    /// A dungeon with no imported entrance or bootstrap fallback returns to the Character's home.
     HearthstoneHome,
 }
 
@@ -406,22 +297,11 @@ pub(crate) fn stranding_fallback(
     }
 }
 
-// Live only under `debug_reducers`: `apply_reset_instances` is its sole caller.
 #[cfg_attr(not(feature = "debug_reducers"), allow(dead_code))]
-/// May this caller flag this instance for reset? Vanilla "Reset all instances" semantics: never
-/// while players are inside; a party instance takes its CURRENT leader, a solo instance
-/// (`party_id == 0`) takes any character bound to it (the caller reaches it via their own binding,
-/// which IS the bound-to proof). Pure.
 pub(crate) fn reset_eligible(party_id: u64, caller_is_leader: bool, occupied: bool) -> bool {
     !occupied && (party_id == 0 || caller_is_leader)
 }
 
-/// The Instance Removal rule: a Character standing in a dungeon instance that a Group owns, while
-/// it is not a member of that Group, gets the countdown. `instance_party` is 0 for a solo instance.
-/// `own_group` is the Character's Group on this Shard's rows. A GM is exempt
-/// (cm:Group.cpp:1470-1484). cmangos asks `IsGameMaster()`, which is GM mode switched on. LyraCore
-/// has no GM mode toggle, so a nonzero `gm_level` stands in for it: every GM is exempt, all the
-/// time. Pure.
 pub(crate) fn instance_removal_due(
     map_id: u32,
     instance_id: u64,
@@ -436,13 +316,6 @@ pub(crate) fn instance_removal_due(
         && gm_level == 0
 }
 
-// ===========================================================================================
-//  Entry: resolve-or-create (the areatrigger hook's target)
-// ===========================================================================================
-
-/// A binding/party instance is LIVE for resolution iff its row still exists, is for the right
-/// map, and is not flagged for reset (a reset-flagged instance is already condemned — resolving
-/// into it would race the reaper; vanilla's reset invalidates the old id immediately).
 fn live_instance_for(ctx: &ReducerContext, instance_id: u64, map_id: u32) -> bool {
     ctx.db
         .game_instance()
@@ -452,8 +325,6 @@ fn live_instance_for(ctx: &ReducerContext, instance_id: u64, map_id: u32) -> boo
         .unwrap_or(false)
 }
 
-/// Bind `character_guid` to `instance_id` for `map_id` — one row per (character, map), REPLACE on
-/// a new binding (delete-then-insert).
 fn bind_character(ctx: &ReducerContext, character_guid: u64, instance_id: u64, map_id: u32) {
     let t = ctx.db.game_instance_binding();
     let stale: Vec<u64> = t
@@ -473,12 +344,6 @@ fn bind_character(ctx: &ReducerContext, character_guid: u64, instance_id: u64, m
     });
 }
 
-/// The dungeon-entry chokepoint: resolve which instance of `target_map` this
-/// character enters — party's live instance → own live binding → create — enforcing the 5-player
-/// cap at trigger time. Solo entry allowed (binds to the character, `party_id = 0`). A stale
-/// binding (instance reaped or reset-flagged) self-heals: the row is dropped and resolution falls
-/// through. Returns the instance id to teleport into, or a loud `Err` (cap breach — surfaced by
-/// the caller as a warn; there is no "instance full" wire packet in 1.12's portal flow).
 pub(crate) fn resolve_or_create_instance(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -496,8 +361,6 @@ pub(crate) fn resolve_or_create_instance(
         ));
     }
 
-    // 1. The character's own binding for this map, if its instance is still live. A dead binding
-    //    is dropped here (self-heal) so it never shadows the party's live instance below.
     let bindings = ctx.db.game_instance_binding();
     let own_binding = bindings
         .by_character()
@@ -512,8 +375,6 @@ pub(crate) fn resolve_or_create_instance(
         None => None,
     };
 
-    // 2. The party's live instance for this map (party_id 0 — solo — is never queried: it is the
-    //    "no party" sentinel, not a party; see the GameInstance doc).
     let party_live = group.as_ref().and_then(|g| {
         ctx.db
             .game_instance()
@@ -526,14 +387,6 @@ pub(crate) fn resolve_or_create_instance(
     let party_id = group.as_ref().map(|g| g.group_id).unwrap_or(0);
     match route_instance(own_live, party_live) {
         InstanceRoute::Own(id) => {
-            // ADOPTION (defect 3, the other half of the split): the holder of a SOLO
-            // instance who has since joined a party is the first of that party through the portal,
-            // and `by_party` cannot see a `party_id = 0` instance — so without this the members
-            // behind them would mint a second dungeon and the party would play in two of them.
-            // Re-stamping the owner makes the instance they are walking into the party's, which is
-            // also the cheap outcome: nobody re-spawns a population that already exists. Only a
-            // solo instance or one whose Group disbanded is adopted. An instance a living Group
-            // owns is never stolen.
             adopt_instance_for_party(ctx, id, party_id);
             Ok(id)
         }
@@ -549,10 +402,6 @@ pub(crate) fn resolve_or_create_instance(
     }
 }
 
-/// Admit a session-less party member into one exact instance already selected by a remote party
-/// member. Unlike [`resolve_or_create_instance`], this never creates an alternative: every Gate is
-/// checked before the admitted binding is written, because Package callers record a Refusal instead
-/// of aborting their outer reducer transaction.
 pub(crate) fn admit_existing_party_instance(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -592,18 +441,10 @@ pub(crate) fn admit_existing_party_instance(
     Ok(expected_instance)
 }
 
-/// Whether an instance has no living owner on this Shard: it was created solo (`party_id == 0`),
-/// or the Group that owned it disbanded here. A Group that enters or forms in it may adopt it.
-/// cmangos gives a new Group its leader's binds (`Player::ConvertInstancesToGroup`), and a disband
-/// leaves the binds with the players. The Group mirror deletes a Group's row only on disband, so a
-/// missing row is a disbanded Group, never one this Shard has not heard of yet.
 fn instance_is_ownerless(ctx: &ReducerContext, party_id: u64) -> bool {
     party_id == 0 || ctx.db.game_group().group_id().find(party_id).is_none()
 }
 
-/// Re-stamp an ownerless instance (see [`instance_is_ownerless`]) as `party_id`'s, so the rest of
-/// that party resolves into it through `by_party` instead of creating a second one. No-op when
-/// the caller has no party, when a living Group owns the instance, or when the row is gone.
 fn adopt_instance_for_party(ctx: &ReducerContext, instance_id: u64, party_id: u64) {
     if party_id == 0 {
         return;
@@ -618,14 +459,6 @@ fn adopt_instance_for_party(ctx: &ReducerContext, instance_id: u64, party_id: u6
     }
 }
 
-// ===========================================================================================
-//  create_instance — row + population + GO copies + tick row
-// ===========================================================================================
-
-/// Does THIS database host dungeon-instance POPULATIONS (`game_config.hosts_instances`)?
-/// A missing config row reads `true`, so a database that predates the column — or a fresh one whose
-/// seed has not run — behaves exactly as it did before the flag existed. The `nav::nav_enabled`
-/// shape, deliberately: a world policy read at the one decision point, not a shard id.
 pub(crate) fn hosts_instance_populations(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
@@ -635,10 +468,6 @@ pub(crate) fn hosts_instance_populations(ctx: &ReducerContext) -> bool {
         .unwrap_or(true)
 }
 
-/// Create a live instance of `map_id` owned by `party_id` (0 = solo): insert the `game_instance`
-/// row, spawn the per-instance creature population, and copy the map's interactive gameobjects. The
-/// creature tick rides the global catch-all row. Copies retain independent death and respawn timers.
-/// Returns the new instance id.
 pub(crate) fn create_instance(
     ctx: &ReducerContext,
     map_id: u32,
@@ -647,11 +476,6 @@ pub(crate) fn create_instance(
     create_instance_with_id(ctx, 0, map_id, party_id)
 }
 
-/// [`create_instance`] with the id supplied by the caller (`0` = let `auto_inc` allocate, the
-/// normal path). The explicit form exists for ONE caller: [`ensure_instance`], the gateway's
-/// cross-database mirror, which has to re-create the SAME instance id on the shard that
-/// owns the map so every party member's `game_instance_binding` — which travels in their transfer
-/// blob carrying that id verbatim — still resolves.
 pub(crate) fn create_instance_with_id(
     ctx: &ReducerContext,
     instance_id: u64,
@@ -659,17 +483,15 @@ pub(crate) fn create_instance_with_id(
     party_id: u64,
 ) -> Result<u64, String> {
     let inst = ctx.db.game_instance().insert(GameInstance {
-        instance_id, // 0 → auto_inc allocates from 1, so 0 stays the open world
+        instance_id,
         map_id,
         party_id,
         created_at: ctx.timestamp,
-        last_empty_at_micros: 0, // occupied-until-observed-otherwise (the party is mid-teleport)
+        last_empty_at_micros: 0,
         reset_requested: false,
     });
     let instance_id = inst.instance_id;
 
-    // A non-hosting database files the lease and binding without population.
-    // The owning Shard creates population when ensure_instance receives this lease.
     if !hosts_instance_populations(ctx) {
         log::info!(
             "create_instance: instance {instance_id} map {map_id} party {party_id} — LEASE only \
@@ -678,10 +500,6 @@ pub(crate) fn create_instance_with_id(
         return Ok(instance_id);
     }
 
-    // --- Population: every spawn template on the map through the NORMAL spawn path. -----------
-    // Guid allocation: wave-guid layout with the INSTANCE_POP_LOW_BAND bit (see the module doc's
-    // namespace section). One prepass over live entities builds the per-entry max BAND-low so
-    // consecutive creates (and two live instances of the same map) never collide.
     let entities = ctx.db.game_world_entity();
     let mut max_band_low: HashMap<u32, u64> = HashMap::new();
     for e in entities.iter() {
@@ -698,7 +516,6 @@ pub(crate) fn create_instance_with_id(
         }
     }
 
-    // A dead copy awaiting respawn still owns its guid.
     for spawn in ctx.db.game_creature_spawn().by_instance().filter(1u64..) {
         let low = spawn.guid & 0xFF_FFFF;
         if low & INSTANCE_POP_LOW_BAND != 0 {
@@ -754,9 +571,6 @@ pub(crate) fn create_instance_with_id(
         spawned += 1;
     }
 
-    // --- GO copies: the map's interactive props (type-gated), one copy per instance. -----------
-    // Source rows are the STATIC (instance 0) spawns; copies carry the new instance id and a
-    // GO_COPY_BAND guid. `state` is copied (startOpen doors keep their initial state).
     let gos = ctx.db.game_gameobject();
     let mut next_go_seq = gos
         .iter()
@@ -802,8 +616,6 @@ pub(crate) fn create_instance_with_id(
             grid_x: lyracore_shared::spatial::grid_cell(src.x, src.y).0,
             grid_y: lyracore_shared::spatial::grid_cell(src.x, src.y).1,
             cell: lyracore_shared::spatial::cell_id_at(src.x, src.y),
-            // Copy the source door/chest/goober's real spawn quaternion — a dungeon copy is
-            // the same prop at the same orientation, not a reset to identity.
             rotation_0: src.rotation_0,
             rotation_1: src.rotation_1,
             rotation_2: src.rotation_2,
@@ -820,26 +632,6 @@ pub(crate) fn create_instance_with_id(
     Ok(instance_id)
 }
 
-// ===========================================================================================
-//  Reap — scheduled reducer + shared teardown
-// ===========================================================================================
-
-// ===========================================================================================
-//  Cross-database instance placement — the two calls the gateway drives
-// ===========================================================================================
-
-/// **Destination side.** Mirror instance `instance_id` of `map_id` onto THIS database, spawning its
-/// population if it isn't here yet. Idempotent: the second party member through the portal finds
-/// the instance already live and joins it. A solo lease, or one whose Group disbanded here, adopts
-/// the admitted party; a living different party is refused instead of sharing the same instance id.
-///
-/// The id is supplied, not allocated, because it was allocated on the SOURCE shard — the
-/// areatrigger hook runs where the player was standing, and the module deliberately knows nothing
-/// about shards (spec "no module game logic ever reads a shard id"). Every member's
-/// `game_instance_binding` carries that id verbatim in their transfer blob, so mirroring it is what
-/// makes the party land in one instance.
-///
-/// Operator-gated: orchestration machinery, never a client action.
 #[reducer]
 pub fn ensure_instance(
     ctx: &ReducerContext,
@@ -880,17 +672,7 @@ pub fn ensure_instance(
     Ok(())
 }
 
-/// **Source side.** Evict an instance's POPULATION from this database, keeping the `game_instance`
-/// row and its bindings as a lease (see [`teardown_instance_inner`]).
-///
-/// This is what makes AC true: the world shard spawned the dungeon when the first
-/// player stepped through the portal, but the run happens on the instance shard, so the world
-/// writer must stop ticking its creatures. Refuses while a live player is inside — the same guard
-/// `teardown_instance` has, and here it is load-bearing: a member who has NOT transferred yet is a
-/// live player in that instance on this database, and evicting around them would delete the
-/// creatures they are standing next to.
-///
-/// Operator-gated.
+// Keep the lease for later party arrivals and refuse eviction while a Character remains inside.
 #[reducer]
 pub fn evict_instance_population(
     ctx: &ReducerContext,
@@ -909,27 +691,19 @@ pub fn evict_instance_population(
         .find(instance_id)
         .is_none()
     {
-        return Ok(()); // nothing here to evict — replay-safe
+        return Ok(());
     }
     teardown_instance_inner(ctx, instance_id, false);
     Ok(())
 }
 
-/// The instance reaper (scheduled, scheduler-only): one entity pass classifies every instance's
-/// player-occupancy, then each instance stamps/clears/waits/reaps per [`occupancy_action`].
-/// Teardown is batched ([`REAP_MAX_PER_FIRING`]); leftovers reap next firing (60s later).
-///
-/// Each database reaps only its hosted Instances. With no leases, it skips the entity scan.
-/// Empty timers are database-local; see [`empty_reap_micros`].
 #[reducer]
 pub fn reap_instances(ctx: &ReducerContext, _schedule: InstanceReaperSchedule) {
     if ctx.sender() != ctx.database_identity() {
-        return; // scheduler-only (the gc.rs guard)
+        return;
     }
     let instances: Vec<GameInstance> = ctx.db.game_instance().iter().collect();
     if instances.is_empty() {
-        // No instances on THIS database → nothing to classify. Skipping the entity scan is what
-        // makes "the reaper lives on the owning database" a cost statement and not just a comment.
         return;
     }
     let now = ctx.timestamp.to_micros_since_unix_epoch();
@@ -957,20 +731,12 @@ pub fn reap_instances(ctx: &ReducerContext, _schedule: InstanceReaperSchedule) {
                     teardown_instance(ctx, inst.instance_id);
                     reaped += 1;
                 }
-                // Over-batch instances keep their stamp and reap next firing.
             }
             OccupancyAction::Wait => {}
         }
     }
 }
 
-/// The set of instance ids with at least one live PLAYER entity — one pass classifies every
-/// instance at once (bots count: a parked bot holds its instance open, correctly).
-///
-/// Plus every instance claimed by a pending Transfer Intent or Escrow. A Transfer Intent removes
-/// the live body before the Gateway can begin Escrow, so both durable phases must hold the source
-/// lease and destination. An unexpected intent overflow keeps every instance rather than letting
-/// an incomplete bounded read reap one that is still claimed.
 pub(crate) fn occupied_instances(ctx: &ReducerContext) -> HashSet<u64> {
     let mut occupied: HashSet<u64> = ctx
         .db
@@ -993,34 +759,13 @@ pub(crate) fn occupied_instances(ctx: &ReducerContext) -> HashSet<u64> {
     occupied
 }
 
-/// Tear one instance down, in the design's order: population (entities + their combat/threat/leg/
-/// loot state, player corpses, GO copies + chest loot) → the encounter-kernel sweep splice →
-/// the tick row → bindings → the `game_instance` row itself. Refuses instance 0 (the open
-/// world) and any instance with a live player inside (belt over the caller's occupancy check —
-/// same-transaction, so no race). Shared by the reaper and `debug_reap_instance`.
 pub(crate) fn teardown_instance(ctx: &ReducerContext, instance_id: u64) {
     teardown_instance_inner(ctx, instance_id, true)
 }
 
-/// [`teardown_instance`], optionally KEEPING the `game_instance` row and its bindings.
-///
-/// `keep_lease = true` is the cross-database eviction: the world shard created this instance when
-/// the first player stepped through the portal (the areatrigger hook runs there, and the module
-/// deliberately knows nothing about shards), but the RUN happens on the instance shard. Deleting
-/// the population here is what makes the world writer stop paying for it; keeping the row is what
-/// makes the NEXT party member's `resolve_or_create_instance` resolve to the SAME id instead of
-/// minting a second instance the rest of the party is not in.
-///
-/// Note: the leased row is a stub the world shard never populates again, and it is left to the
-/// reaper's empty timer — but NOT the 30-minute one. A lease reads empty seconds after the party
-/// transfers out, so a lease-only database reaps on [`INSTANCE_LEASE_REAP_MICROS`] instead;
-/// the 30-minute run timer would delete the world shard's record of "this party is in instance N"
-/// while they were still in it. The cost is one row per run for the length of that timer. Upgrade
-/// path: the instance→shard index moves to realm-core and neither the lease nor this arm
-/// exists.
 pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, delete_row: bool) {
     if instance_id == 0 {
-        return; // never "reap" the open world
+        return;
     }
     let entities = ctx.db.game_world_entity();
     if entities
@@ -1031,10 +776,6 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
         return;
     }
 
-    // 1. Population: every non-player entity in the instance (alive or corpse), through the ONE
-    //    canonical creature-teardown checklist (this loop, `encounter::despawn_tracked`
-    //    and `creatures::tick::pass_decay` had each grown their own copy, and they had diverged on
-    //    the loot family, the taunt lock and the withheld gate).
     let doomed: Vec<u64> = entities
         .iter()
         .filter(|e| e.instance_id == instance_id && !e.is_player())
@@ -1052,9 +793,6 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
     }
     crate::creatures::population::clear_instance(ctx, instance_id);
 
-    // 2. Player corpses left in the instance (a ghost who never corpse-ran back). The owner's
-    //    stranding outcome is the vanilla one: nothing left to reclaim — spirit healer only
-    //    (documented on `player_login`'s fallback and in the runbook).
     let corpses = ctx.db.game_corpse();
     let dead_bodies: Vec<u64> = corpses
         .iter()
@@ -1065,7 +803,6 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
         corpses.guid().delete(guid);
     }
 
-    // 3. GO copies + any chest loot rows keyed on a copy's guid.
     let gos = ctx.db.game_gameobject();
     let copies: Vec<u64> = gos
         .iter()
@@ -1073,19 +810,14 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
         .map(|g| g.guid)
         .collect();
     for guid in &copies {
-        crate::loot::reap_corpse_loot_family(ctx, *guid); // a GO is not a creature — the loot family only
+        crate::loot::reap_corpse_loot_family(ctx, *guid);
         crate::go_collider::remove(ctx, *guid);
         gos.guid().delete(guid);
     }
 
-    // 4. Encounter-kernel state (splice documented on sweep_encounter_state): tracked
-    //    waves (their untagged spawn rows MUST die here or they'd respawn into instance 0),
-    //    encounter state + HP fired-marks, equip rows.
     crate::creatures::cancel_relay_runs_for_instance(ctx, instance_id);
     crate::encounter::sweep_encounter_state(ctx, instance_id);
 
-    // 5. The dedicated tick row (debug_disarm_instance_tick's body) — coverage of the (now
-    //    empty) id falls back to the catch-all, which is a no-op for a population of zero.
     let sched = ctx.db.game_creature_move_schedule();
     let ticks: Vec<u64> = sched
         .iter()
@@ -1096,15 +828,7 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
         sched.scheduled_id().delete(id);
     }
 
-    // 6/7. Bindings, then the instance row itself, last — the design's documented order ends at the
-    //    row (within one reducer transaction the order is atomic anyway; keeping it makes the
-    //    invariant readable: population never outlives its row).
-    //
-    //    SKIPPED for a cross-database eviction (`delete_row == false`): the row is a
-    //    LEASE the world shard keeps so the party's later arrivals resolve to the same instance,
-    //    and the bindings are the manifest rows that just travelled to the instance shard in each
-    //    member's transfer blob — deleting them here would delete the source copy of state the
-    //    destination now owns, which is the one thing a transfer must never do.
+    // Remove bindings and the Instance last; population must never outlive its parent row.
     if !delete_row {
         log::info!(
             "teardown_instance: instance {instance_id} population EVICTED ({} entities, {} GO \
@@ -1131,15 +855,7 @@ pub(crate) fn teardown_instance_inner(ctx: &ReducerContext, instance_id: u64, de
     );
 }
 
-// ===========================================================================================
-//  reset_instance — the party-leader / solo reset verb
-// ===========================================================================================
-
-// Live only under `debug_reducers`: `debug_reset_instance` is its sole caller.
 #[cfg_attr(not(feature = "debug_reducers"), allow(dead_code))]
-/// The instance-reset core keyed off an explicit guid. Walks the caller's OWN bindings (being
-/// bound is the reach — vanilla resets the instances you're bound to), gating each per
-/// [`reset_eligible`]. Returns how many instances were flagged, `Err` if none were eligible.
 pub(crate) fn apply_reset_instances(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -1154,7 +870,7 @@ pub(crate) fn apply_reset_instances(
     let mut flagged = 0u32;
     for b in bindings {
         let Some(mut inst) = ctx.db.game_instance().instance_id().find(b.instance_id) else {
-            continue; // already reaped — the binding dies on the reap/next resolve
+            continue;
         };
         let caller_is_leader = ctx
             .db
@@ -1183,25 +899,13 @@ pub(crate) fn apply_reset_instances(
     }
 }
 
-// ===========================================================================================
-//  Instance Removal
-// ===========================================================================================
-
-/// Where the Instance Removal rule holds for one Character on this Shard.
 #[derive(Clone, Copy)]
 struct RemovalStanding {
     instance_id: u64,
     group_id: u64,
-    /// The Character has a live entity. Only then does a countdown start.
     in_world: bool,
 }
 
-/// The instance `character_guid` stands in and the Group that owns it, when the Instance Removal
-/// rule holds on this Shard. A Character with a live entity stands where the entity is. A
-/// Character with no live entity stands where its durable row says, because its next login builds
-/// it there. A session-less Character with a live entity reads as exempt: only a World Session
-/// turns the cross-map teleport home into a Transfer, so a bot stays where it is. An in-transit
-/// Character reads as absent, because it is leaving this Shard.
 fn instance_removal_standing(ctx: &ReducerContext, character_guid: u64) -> Option<RemovalStanding> {
     let character = crate::helpers::character_by_guid(ctx, character_guid)?;
     let entity = ctx.db.game_world_entity().guid().find(character_guid);
@@ -1231,10 +935,6 @@ fn instance_removal_standing(ctx: &ReducerContext, character_guid: u64) -> Optio
     })
 }
 
-/// A Group formed again inside the instance of a Group that disbanded takes the instance over, so
-/// its members stand in their own Group's instance and no countdown runs. cmangos gets the same
-/// outcome: the new Group takes its leader's binds, and `Group::AddMember` cancels the countdown
-/// of a member whose bind matches its instance (cm:Group.cpp:880-885). Returns the adopting Group.
 fn adopt_for_regrouped_member(ctx: &ReducerContext, character_guid: u64) -> Option<u64> {
     let standing = instance_removal_standing(ctx, character_guid)?;
     let own_group = crate::group::group_of(ctx, character_guid)?.group_id;
@@ -1245,12 +945,6 @@ fn adopt_for_regrouped_member(ctx: &ReducerContext, character_guid: u64) -> Opti
     Some(own_group)
 }
 
-/// Make `character_guid`'s Instance Removal match the rule: start the countdown when the rule holds
-/// for a Character in the world and no countdown runs for that instance, and cancel it when the
-/// rule no longer holds. cmangos marks only a Character in the world (cm:Group.cpp:1470-1484), so a
-/// Character removed while logged out starts its countdown at its next login. A countdown that is
-/// already running survives a logout, and its expiry moves the logged-out Character home.
-/// Idempotent. Realm-core holds no Characters, so there it does nothing.
 pub(crate) fn reconcile_instance_removal(ctx: &ReducerContext, character_guid: u64) {
     if let Some(group_id) = adopt_for_regrouped_member(ctx, character_guid) {
         reconcile_group_members(ctx, group_id);
@@ -1279,14 +973,12 @@ pub(crate) fn reconcile_instance_removal(ctx: &ReducerContext, character_guid: u
     }
 }
 
-/// Reconcile every member of `group_id` on this Shard, after the Group adopted an instance.
 fn reconcile_group_members(ctx: &ReducerContext, group_id: u64) {
     for member in crate::group::members_of(ctx, group_id) {
         reconcile_instance_removal(ctx, member.character_guid);
     }
 }
 
-/// Scheduler-only: an Instance Removal countdown ran out. See [`fire_instance_removal`].
 #[reducer]
 pub fn expire_instance_removal(
     ctx: &ReducerContext,
@@ -1299,10 +991,6 @@ pub fn expire_instance_removal(
     Ok(())
 }
 
-/// End one countdown. A firing that is not the Character's running countdown changes nothing, so
-/// a replay is a no-op. The rule is read again first: a Character that rejoined the Group, left
-/// the instance or left this Shard stays where it is. Otherwise the Character goes to its
-/// hearthstone home in the open world (cm:Player.cpp:17710-17716).
 pub(crate) fn fire_instance_removal(ctx: &ReducerContext, removal: &InstanceRemoval) {
     let removals = ctx.db.game_instance_removal();
     if removals
@@ -1325,10 +1013,6 @@ pub(crate) fn fire_instance_removal(ctx: &ReducerContext, removal: &InstanceRemo
     }
 }
 
-// ===========================================================================================
-//  Tests — the pure decisions above (the module crate has no ReducerContext harness by design)
-// ===========================================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,13 +1027,7 @@ mod tests {
 
     #[test]
     fn route_prefers_the_party_then_the_personal_binding_then_create() {
-        // Defect 3 — THE SPLIT. Ginger entered Deadmines solo (instance 4, `party_id 0`),
-        // then partied up; the party's own entry made instance 5. With the personal binding ranked
-        // first she re-entered 4 while her party was in 5 — two dungeons, one party. The party now
-        // wins, which is also vanilla's rule for a non-saved 5-man.
         assert_eq!(route_instance(Some(7), Some(9)), InstanceRoute::Party(9));
-        // No party instance → the personal binding still carries you back into your own dungeon,
-        // which is what makes a binding survive a disband (a party-less character lands here).
         assert_eq!(route_instance(Some(7), None), InstanceRoute::Own(7));
         assert_eq!(route_instance(None, Some(9)), InstanceRoute::Party(9));
         assert_eq!(route_instance(None, None), InstanceRoute::Create);
@@ -1382,10 +1060,8 @@ mod tests {
     #[test]
     fn occupancy_action_covers_stamp_clear_wait_and_both_reap_paths() {
         let now = 1_800_000_000_000_000i64;
-        // The single-database timer — the ONLY one a realm without a shard map ever uses.
         let t = empty_reap_micros(true);
         assert_eq!(t, INSTANCE_EMPTY_REAP_MICROS);
-        // Occupied: a stale stamp clears; no stamp → nothing.
         assert_eq!(
             occupancy_action(true, now - 1, false, now, t),
             OccupancyAction::ClearStamp
@@ -1394,17 +1070,14 @@ mod tests {
             occupancy_action(true, 0, false, now, t),
             OccupancyAction::Wait
         );
-        // Occupied + reset_requested: NEVER reaped out from under live players.
         assert_eq!(
             occupancy_action(true, 0, true, now, t),
             OccupancyAction::Wait
         );
-        // Empty, unstamped → start the countdown.
         assert_eq!(
             occupancy_action(false, 0, false, now, t),
             OccupancyAction::Stamp
         );
-        // Empty, stamped just short of 30min → wait; exactly 30min → reap (inclusive boundary).
         let stamped = now - INSTANCE_EMPTY_REAP_MICROS;
         assert_eq!(
             occupancy_action(false, stamped + 1, false, now, t),
@@ -1414,7 +1087,6 @@ mod tests {
             occupancy_action(false, stamped, false, now, t),
             OccupancyAction::Reap
         );
-        // Reset + empty reaps IMMEDIATELY — no 30min wait, stamp or not.
         assert_eq!(
             occupancy_action(false, 0, true, now, t),
             OccupancyAction::Reap
@@ -1425,8 +1097,6 @@ mod tests {
         );
     }
 
-    /// **AC**, reap semantics on a shard-pool deployment, stated against the single-database
-    /// ones they must not change.
     #[test]
     fn a_lease_only_database_holds_its_stub_rows_far_past_the_thirty_minute_run_timer() {
         let now = 1_800_000_000_000_000i64;
@@ -1443,9 +1113,6 @@ mod tests {
              instance the party is in while they are still in it"
         );
 
-        // The bug this closes, as data. A party enters Deadmines; every member transfers to the
-        // instance shard, so the world shard's lease reads EMPTY from minute ~0 of the run. Forty
-        // minutes in, a member dies and runs back through the portal.
         let entered = now - 40 * 60 * 1_000_000;
         assert_eq!(
             occupancy_action(false, entered, false, now, hosting),
@@ -1473,14 +1140,11 @@ mod tests {
             "an 8-hour raid night must still find its lease on the world shard"
         );
 
-        // It is a longer timer, not an immortal row: the stub is still collected.
         let ancient = now - INSTANCE_LEASE_REAP_MICROS;
         assert_eq!(
             occupancy_action(false, ancient, false, now, lease),
             OccupancyAction::Reap
         );
-        // And an occupied instance is never reaped on either timer — the guard is orthogonal (an
-        // occupied instance with a stale stamp clears it, exactly as on the hosting timer).
         for t in [hosting, lease] {
             assert_eq!(
                 occupancy_action(true, ancient, true, now, t),
@@ -1495,18 +1159,14 @@ mod tests {
 
     #[test]
     fn stranding_fallback_prefers_entrance_then_in_place_then_home() {
-        // A known dungeon map: its entrance const (the map-36 arm).
         assert_eq!(
             stranding_fallback(entrance_fallback(36), true),
             StrandingFallback::Entrance(0, -11080.0, 1520.0, 46.0, 0.0)
         );
-        // A non-dungeon map (the dev-map fixture instance): stay in place at instance 0 — the
-        // position is real open-world terrain.
         assert_eq!(
             stranding_fallback(None, false),
             StrandingFallback::InPlaceOpenWorld
         );
-        // A dungeon map with no entrance arm (pinned-never above, but never strand): hearthstone.
         assert_eq!(
             stranding_fallback(None, true),
             StrandingFallback::HearthstoneHome
@@ -1515,7 +1175,6 @@ mod tests {
 
     #[test]
     fn instance_removal_is_due_only_for_a_non_member_in_a_group_instance() {
-        // Deadmines is map 36. Instance 7 belongs to Group 42.
         assert!(instance_removal_due(36, 7, 42, None, 0), "left the Group");
         assert!(
             instance_removal_due(36, 7, 42, Some(43), 0),
@@ -1536,10 +1195,8 @@ mod tests {
 
     #[test]
     fn reset_eligibility_requires_unoccupied_and_leadership_for_party_instances() {
-        // Solo instance (party 0): any bound caller, but never while occupied.
         assert!(reset_eligible(0, false, false));
         assert!(!reset_eligible(0, false, true));
-        // Party instance: the current leader only, and never while occupied.
         assert!(reset_eligible(42, true, false));
         assert!(
             !reset_eligible(42, false, false),
@@ -1553,25 +1210,16 @@ mod tests {
 
     #[test]
     fn instance_population_low_band_is_disjoint_from_spawn_row_allocators() {
-        // spawn_wave's allocator: max over SPAWN-ROW lows + 1 — spawn lows are imported cmangos db
-        // guids (~10^5) or seed ordinals, all far below bit 23. The band bit keeps every
-        // instance-population low ABOVE anything that allocator can ever produce from them.
         let realistic_spawn_lows = [1u64, 3, 40_000, 150_000];
         let wave_next = realistic_spawn_lows.iter().max().unwrap() + 1;
         assert!(
             wave_next & INSTANCE_POP_LOW_BAND == 0,
             "wave allocation stays below the band"
         );
-        // The documented invariant's exact boundary: EVERY spawn low strictly below bit 23 yields
-        // a wave allocation (max+1) that is still band-free — only a low at 0x7F_FFFF itself (16×
-        // any real cmangos guid) could push max+1 into the band, and that is the loud-duplicate-PK
-        // `[V]` the band const documents.
         const { assert!(INSTANCE_POP_LOW_BAND == 0x80_0000) };
         let pop_low = INSTANCE_POP_LOW_BAND | 1;
         assert!(pop_low & INSTANCE_POP_LOW_BAND != 0);
         assert_ne!(pop_low, wave_next);
-        // The band bit survives wave_guid's 24-bit low mask (it IS bit 23) — the full guid keeps
-        // the entry bits intact, so the client still classifies the copy as a Unit.
         let g = crate::encounter::wave_guid(636, pop_low);
         assert_eq!(g >> 48, 0xF130);
         assert_eq!((g >> 24) & 0xFF_FFFF, 636);
@@ -1581,14 +1229,9 @@ mod tests {
     #[test]
     fn go_copy_band_is_disjoint_from_pool_static_and_debug_namespaces() {
         let copy_guid = (0xF110u64 << 48) | GO_COPY_BAND | 1;
-        // Below the pool tag: pool_point_id_of must NOT classify a copy as a pool point (else the
-        // GO respawn pass would try to reroll a foreign pool on it).
         const { assert!(GO_COPY_BAND < crate::gameobject::POOL_TAG) };
         assert_eq!(crate::gameobject::pool_point_id_of(copy_guid), None);
-        // Above every static/debug low: imported db guids and the debug spawner's entry-derived
-        // lows are < 2^24, far under bit 46.
         const { assert!(GO_COPY_BAND > 0xFF_FFFF) };
-        // And distinct from a pool point at the same sequence.
         assert_ne!(copy_guid, crate::gameobject::pool_point_guid(1));
     }
 }

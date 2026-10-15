@@ -1,6 +1,3 @@
-//! A Character in Escrow stays frozen on its source Shard: login, the background passes and the
-//! Instance reaper leave it alone until the Transfer settles.
-
 mod support;
 
 use std::time::Duration;
@@ -10,10 +7,8 @@ use support::{actor, poll_until, Row, Standalone};
 const ESCROWED: &str = "1";
 const BYSTANDER: &str = "2";
 
-/// The rested pass fires once per 30 s window.
 const REST_WINDOW_WAIT: Duration = Duration::from_secs(45);
 
-/// Character 1 in the world, and Character 2 on the same account when `bystander` is set.
 fn start(name: &str, bystander: bool) -> Standalone {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -87,8 +82,6 @@ fn login_refuses_a_character_in_escrow() {
         .is_empty());
 }
 
-/// The timed-quest and rested passes scan durable rows, not live entities, so each carries its
-/// own fence. The Bystander shows both passes ran over the same rows.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn background_passes_leave_a_character_in_escrow_unchanged() {
@@ -132,8 +125,6 @@ fn rest(shard: &Standalone, guid: &str) -> Row {
         .clone()
 }
 
-/// `debug_reap_instance` reads the same occupancy as the scheduled reaper, without its 30 min
-/// empty window.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_instance_reaper_holds_an_instance_claimed_by_escrow() {

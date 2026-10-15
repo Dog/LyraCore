@@ -1,5 +1,3 @@
-//! M2 collision geometry, independent of rendering and animation records.
-
 use anyhow::{bail, Context, Result};
 use std::io::Cursor;
 

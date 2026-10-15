@@ -1,5 +1,3 @@
-//! Compatibility helpers for tests that still construct the retired flat migration row.
-
 use crate::creatures::eventai::{CreatureAiEvent, EventKind};
 
 pub(crate) const EVENT_ON_AGGRO: u8 = 0;
@@ -297,9 +295,6 @@ impl Rule {
         } else {
             event_params(first)
         };
-        // A timer rule waits its initial window before its first firing; every recurring kind
-        // carries its repeat window in params 3 and 4. An inverted window is a bad row, not a
-        // fixed cadence: left to the roller it wraps the delay to weeks, so it surfaces here.
         let inverted_initial =
             event == EventKind::TimedInCombat && decoded_event_params[0] > decoded_event_params[1];
         let inverted_repeat =

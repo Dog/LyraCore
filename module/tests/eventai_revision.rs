@@ -8,11 +8,8 @@ const PLAYER_GUID: u64 = 1;
 const WOLF_ENTRY: u32 = 51_000;
 const WOLF_GUID: u64 = (0xF130_u64 << 48) | ((WOLF_ENTRY as u64) << 24) | 1;
 const SOURCE_RULE_ID: u64 = 900_001;
-/// `tick_creatures` fires on the seeded catch-all row every 0.5 s. The module counts no scheduled
-/// visits anywhere, so the only way to span one is to hold a window this wide open.
 const WORLD_TICK: Duration = Duration::from_millis(500);
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn scheduled_visits_preserve_state_then_clean_a_reloaded_definition() {
@@ -28,8 +25,6 @@ fn scheduled_visits_preserve_state_then_clean_a_reloaded_definition() {
 
     wait_for_verifier(&standalone, true);
 
-    // Every scheduled visit inside this window is checked, not just the last one, so a visit that
-    // clobbers the adopted state fails here the moment it lands.
     hold_verifier(&standalone, true, 2 * WORLD_TICK);
 
     let changed_rules = format!("{SOURCE_RULE_ID},aggro,100,4294967295,once,all,ordinary,phase:7");
@@ -67,8 +62,6 @@ fn wait_for_verifier(standalone: &Standalone, expect_rule_state: bool) {
     }
 }
 
-/// Re-check the verifier for `window`. Each check is a reducer call, which paces the loop. The last
-/// check lands at or after the end of the window, so a visit in its final milliseconds is seen.
 fn hold_verifier(standalone: &Standalone, expect_rule_state: bool, window: Duration) {
     let until = Instant::now() + window;
     loop {

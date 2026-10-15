@@ -1,5 +1,3 @@
-//! Lexical helpers for architecture tests. These scans do not prove runtime control flow.
-
 use std::ops::Range;
 
 use rustc_lexer::{tokenize, TokenKind};
@@ -28,17 +26,14 @@ fn masked(src: &str, omit: impl Fn(TokenKind) -> bool) -> String {
     String::from_utf8(bytes).expect("masking whole tokens preserves UTF-8")
 }
 
-/// Mask comments, literals, and test-only items or blocks, preserving byte offsets.
-/// Handles outer `#[cfg(...)]` predicates. Inner `#![cfg(...)]` attributes remain in the scan.
-/// This does not expand macros or `cfg_attr`.
+// Inner cfg attributes, cfg_attr and macros are not expanded.
 pub fn code_only(src: &str) -> String {
     without_test_code(&masked(src, |kind| {
         is_comment(kind) || matches!(kind, TokenKind::Literal { .. })
     }))
 }
 
-// Unknown configuration predicates can hold in production. Only remove code when
-// setting `test = false` proves its cfg false.
+// Unknown cfg predicates may hold in production; remove only provably test-only code.
 fn cfg_without_test(tokens: &[(&str, Range<usize>)]) -> Option<bool> {
     if tokens.len() == 1 && tokens[0].0 == "test" {
         return Some(false);
@@ -170,7 +165,6 @@ fn token_at(src: &str, byte_idx: usize) -> TokenKind {
     unreachable!("the lexer covers every source byte")
 }
 
-/// Whether this byte belongs to a line or block comment.
 pub fn in_comment(src: &str, byte_idx: usize) -> bool {
     is_comment(token_at(src, byte_idx))
 }
@@ -202,19 +196,14 @@ fn body_range(src: &str, signature: &str) -> Range<usize> {
     panic!("unterminated body for `{signature}`");
 }
 
-/// Find a body without matching signatures or braces inside comments and literals.
-/// Returns the original body, including comments. Use `code_of` for content checks.
 pub fn body_of(src: &str, signature: &str) -> String {
     src[body_range(src, signature)].to_string()
 }
 
-/// Extract a body with comments removed, preserving literal values and test-only code.
-/// Use `code_only` when a check must exclude non-production tokens.
 pub fn code_of(src: &str, signature: &str) -> String {
     compact(&masked(&body_of(src, signature), is_comment))
 }
 
-/// Collapse whitespace in `code_of` for the Package API's source comparisons.
 pub fn shape_of(src: &str, signature: &str) -> String {
     code_of(src, signature)
         .split_whitespace()

@@ -1,5 +1,3 @@
-//! Hunter-pet XP, level-dependent live stats and loyalty progression.
-
 use spacetimedb::ReducerContext;
 
 use crate::{game_creature_template, game_hunter_pet, game_world_entity, HunterPet};
@@ -8,8 +6,6 @@ const MAX_LOYALTY_LEVEL: u8 = 6;
 const LOYALTY_LEVEL_UP: [u32; 6] = [5_500, 11_500, 17_000, 23_500, 31_000, 39_500];
 const LOYALTY_LEVEL_START: [u32; 6] = [2_000, 4_500, 7_000, 10_000, 13_500, 17_500];
 
-/// The care state T2 passes after updating happiness. Keeping the state explicit leaves happiness
-/// thresholds and scheduling in the care module while progression owns only loyalty transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PetHappinessState {
     Happy,
@@ -23,7 +19,6 @@ struct PetProgress {
     xp: u32,
 }
 
-/// Vanilla Hunter pets need one quarter of the player XP for the same level transition.
 pub(crate) fn pet_xp_to_next_level(level: u32) -> u32 {
     crate::xp::xp_to_next_level(level) / 4
 }
@@ -99,8 +94,6 @@ fn kill_loyalty_bonus(pet_level: u32, loyalty_level: u8) -> u32 {
     ((100 - pet_level) / 10) + u32::from(MAX_LOYALTY_LEVEL - loyalty_level.min(6))
 }
 
-/// Apply one care tick's loyalty delta to a durable Hunter pet. T2 owns when the tick happens and
-/// how happiness maps to the explicit state; this function owns all threshold and bound behavior.
 pub(crate) fn update_pet_loyalty_from_care(
     ctx: &ReducerContext,
     pet_id: u64,
@@ -181,9 +174,6 @@ fn eligible_live_pet(pet_id: u64, kind: super::PetKind, dead: bool) -> bool {
     !dead && kind == (super::PetKind::Hunter { pet_id })
 }
 
-/// Advance the active Hunter pet belonging to one authoritative kill-credit recipient. Summoned,
-/// dead, missing and mismatched live pets are excluded before any durable write, and a kill gray
-/// to the owner awards nothing.
 pub(crate) fn award_hunter_pet_kill_progression(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -202,7 +192,6 @@ pub(crate) fn award_hunter_pet_kill_progression(
     let Some(owner) = ctx.db.game_world_entity().guid().find(owner_guid) else {
         return;
     };
-    // Pet XP shares the owner's gray clamp: a kill worth no XP to the owner advances no pet.
     if crate::xp::xp_for_kill(mob_level, owner.level) == 0 {
         return;
     }

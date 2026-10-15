@@ -1,21 +1,3 @@
-//! The loot Import Family's half of a Package Delta apply: the setters for the four non-creature
-//! loot tables a Package may claim, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of loot.
-//!
-//! Unlike items, spells and quests, a loot row's owning entity (a creature, a gameobject/chest, or
-//! a zone) is never Package-invented. Creature and gameobject templates stay out of this issue's
-//! scope. So the Package identifier band applies to a loot row's OWN `id`, exactly the way
-//! `PACKAGE_ITEM_ID_FLOOR` applies to `game_item_template.entry`, rather than to an owning
-//! identifier the way `is_package_quest_id` is checked against `quest_entry`. One band covers all
-//! four tables: they are independent `SpacetimeDB` tables with independent primary-key spaces, so
-//! sharing one numeric range across them cannot collide.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -30,7 +12,6 @@ use crate::{game_creature_template, game_gameobject_template, game_item_template
 
 use super::{as_bool, as_u32, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a loot claim whose final row would point at data this Shard does not hold.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         let item_entry = final_u32(ctx, row, "item_entry")?;
@@ -164,7 +145,6 @@ fn missing_reference(row: &TracedRow, field: &str, value: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -201,16 +181,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package loot range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_loot_id(row.row_id())
 }
 
-/// Removes every row a Package invented, across all four tables. Once per import, right after the
-/// base import rewrote them anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let pickpocket = ctx.db.game_pickpocket_loot();
     let stale_pickpocket: Vec<u64> = pickpocket
@@ -347,12 +321,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
-
-/// The `id` a loot-family row names. Total, not a `Result`: `check_claims_belong_to` has already
-/// refused a foreign-family row before this module's dispatch runs.
 fn id_of(row: &TracedRow) -> u64 {
     match row.key() {
         PrimaryKey::PickpocketLoot { id }
@@ -529,10 +497,6 @@ fn built_fishing_loot(row: &TracedRow) -> Result<GameFishingLoot, String> {
     Ok(loot)
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -541,8 +505,6 @@ mod tests {
     };
     use super::*;
 
-    /// The Package loot range is cleared on every apply, so tuning a Package loot row nobody
-    /// enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_loot_row_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -589,8 +551,6 @@ mod tests {
         assert_eq!(loot.chance_bp, 5000);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_pickpocket_loot_column_has_a_setter() {
         let mut loot = blank_pickpocket_loot(PACKAGE_LOOT);

@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`MeetingStoneActionStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::constants::go_type;
 use lyracore_shared::meeting_stone::MeetingStoneRefusal;
@@ -10,7 +8,6 @@ use crate::stdb::Coordinator;
 use crate::world::{presence, Actor, MeetingStoneActionStore, MeetingStoneOutcome};
 
 impl MeetingStoneActionStore for Coordinator {
-    /// `gw_admit_meeting_stone` on this Home Shard: may the actor use the stone? Writes nothing.
     fn admit_meeting_stone(&self, actor: Actor, go_guid: u64) -> Result<MeetingStoneOutcome> {
         meeting_stone_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -19,7 +16,6 @@ impl MeetingStoneActionStore for Coordinator {
         ))
     }
 
-    /// The dungeon area of the Meeting Stone spawned as `go_guid` on this database, if any.
     fn meeting_stone_area(&self, go_guid: u64) -> Result<Option<u32>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -57,8 +53,6 @@ impl MeetingStoneActionStore for Coordinator {
         )
     }
 
-    /// `realm_meeting_stone_op`: run one Meeting Stone Queue op on Realm-core, or on the one
-    /// database of an unsharded Realm. The Module applies every queue rule.
     fn meeting_stone_op(
         &self,
         actor: Actor,
@@ -82,7 +76,6 @@ impl MeetingStoneActionStore for Coordinator {
         ))
     }
 
-    /// The area `character_guid` is queued for, read from the party authority.
     fn queued_area(&self, character_guid: u64) -> Result<Option<u32>> {
         let realm = self.realm_core()?;
         let guard = realm.0.coord();

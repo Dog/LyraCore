@@ -1,8 +1,3 @@
-//! Meeting Stone Seekers on two World Shards meet in one queue on Realm-core. Each Seeker uses its
-//! stone through the real Coordinator, the stone forms one Party, the Roster Revision Relay carries
-//! it to both World Shard mirrors, and the group event relay gives each session its stone events
-//! in the order the Module inserted them.
-
 use super::roster_relay_durable_tests::{mirrors_follow_realm_core, TopologyEnv};
 use super::*;
 use crate::accept::BlockingTaskCapacity;
@@ -21,14 +16,11 @@ use wow_world_messages::Guid;
 const INSTANCES: &str = "meeting-stone-instances";
 const REALM: &str = "meeting-stone-realm";
 
-// Fixture ids sit in 509_6000-509_6099.
 const STONE_ENTRY: &str = "5096000";
 const WORLD_STONE: u64 = 509_6001;
 const INSTANCES_STONE: u64 = 509_6002;
-/// The Deadmines (AreaTable 1581).
 const DEADMINES: u32 = 1581;
 const STONE_AT: [&str; 3] = ["-11208", "1672", "24"];
-/// The default World Shard serves map 0; the shard map sends map 36 to the Instance Pool.
 const WORLD_MAP: &str = "0";
 const INSTANCES_MAP: &str = "36";
 
@@ -39,7 +31,6 @@ const MAGE: &str = "8";
 const ROGUE: &str = "4";
 const HUNTER: &str = "3";
 
-/// In queue order. The Warrior waits longest, so it leads; the Priest heals; the rest deal damage.
 const TANK: u64 = 509_6010;
 const HEALER: u64 = 509_6011;
 const MAGE_SEEKER: u64 = 509_6012;
@@ -47,7 +38,6 @@ const ROGUE_SEEKER: u64 = 509_6013;
 const HUNTER_SEEKER: u64 = 509_6014;
 const SEEKERS: [u64; 5] = [TANK, HEALER, MAGE_SEEKER, ROGUE_SEEKER, HUNTER_SEEKER];
 
-/// The World Session Token the fixture claims carry: each Seeker owns the Account of its guid.
 fn token(guid: u64) -> WorldSessionToken {
     WorldSessionToken {
         account_id: guid,
@@ -56,7 +46,6 @@ fn token(guid: u64) -> WorldSessionToken {
     }
 }
 
-/// A Seeker at the stone on `database`, with its claim on that database and on Realm-core.
 fn stage_seeker(standalone: &Standalone, database: &str, map: &str, guid: u64, class: &str) {
     let guid = guid.to_string();
     standalone.assert_call_database(
@@ -115,8 +104,6 @@ fn send(session: &Coordinator, guid: u64, msg: ClientOpcodeMessage) -> Vec<Outbo
     .outbound
 }
 
-/// The meeting stone messages in `outbound`, running each relay job the way the session writer
-/// does.
 fn stone_messages(outbound: Vec<Outbound>) -> Vec<ServerOpcodeMessage> {
     let mut messages = Vec::new();
     for item in outbound {
@@ -151,7 +138,6 @@ fn member_added(guid: u64) -> ServerOpcodeMessage {
     ))
 }
 
-/// One Seeker's World Session as the relay sees it: its registration and what reached its queue.
 struct Session {
     guid: u64,
     _registration: PlayerSubscriptions,
@@ -179,7 +165,6 @@ impl Session {
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
-// One topology stays alive from staging to the filled Party to prove one realm-wide scenario.
 #[allow(clippy::too_many_lines)]
 fn seekers_on_two_world_shards_form_one_party_that_reaches_every_mirror() {
     let mut standalone = Standalone::start_persistent("meeting-stone-world");
@@ -245,15 +230,12 @@ fn seekers_on_two_world_shards_form_one_party_that_reaches_every_mirror() {
         .map(|&guid| Session::open(gateway.world_view(), guid))
         .collect();
 
-    // The tank queues alone on the default World Shard.
     assert!(use_stone(&bind(&gateway, TANK), TANK, WORLD_STONE).is_empty());
     assert!(poll_until(POLL_TIMEOUT, || realm
         .queued_area(TANK)
         .unwrap()
         == Some(DEADMINES)));
 
-    // It crosses into the Instance Pool, which holds it now. Its Account Claim stays on
-    // Realm-core, so it stays queued, and the status query on arrival says so.
     stage_seeker(&standalone, INSTANCES, INSTANCES_MAP, TANK, WARRIOR);
     standalone.assert_call("debug_delete_character", &[&TANK.to_string()]);
     assert!(poll_until(POLL_TIMEOUT, || {
@@ -267,8 +249,6 @@ fn seekers_on_two_world_shards_form_one_party_that_reaches_every_mirror() {
     ));
     assert_eq!(arrived, [set_queue(DEADMINES, JOINED_QUEUE)]);
 
-    // Three Seekers wait on the Instance Pool now and two on the default World Shard. The fifth
-    // JOIN forms the Party and fills it in the same transaction.
     for (home, guid, stone) in [
         (&instances, HEALER, INSTANCES_STONE),
         (&gateway, MAGE_SEEKER, WORLD_STONE),
@@ -298,7 +278,6 @@ fn seekers_on_two_world_shards_form_one_party_that_reaches_every_mirror() {
         .query_database_rows(REALM, "SELECT * FROM game_meeting_stone_party")
         .is_empty());
 
-    // No party op ran for these Characters, so only the Roster Revision Relay moved the mirrors.
     assert!(
         poll_until(POLL_TIMEOUT, || mirrors_follow_realm_core(
             &realm, &shards, group_id, TANK

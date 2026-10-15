@@ -1,12 +1,9 @@
-//! Loot-window action dispatch plus the remaining corpse, GameObject, and group-loot handler.
-
 use super::super::*;
 use super::combat::ignore_refusal;
 use crate::world::family::{ProtocolFamily, ProtocolReply, ProtocolRequest, ProtocolSession};
 use lyracore_shared::loot::LootRefusal;
 use wow_world_messages::vanilla::LootMethodError;
 
-/// Durable reads and requests needed by the loot-window lifecycle.
 pub(crate) trait LootWindowStore: Send + Sync {
     fn loot_target_money(&self, target_guid: u64) -> Result<u32>;
     fn loot_target_items(
@@ -27,33 +24,24 @@ pub(crate) trait LootWindowStore: Send + Sync {
     ) -> Result<LootWindowRequestStatus>;
 }
 
-/// How the Module answered a loot Durable Request. A Refusal is an outcome; a Transport Loss stays
-/// an error and ends the World Session.
 pub(crate) enum LootWindowRequestStatus {
     Applied,
     Refused(LootWindowRefusal),
 }
 
-/// How the Module answered a Loot Roll or master-loot Durable Request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LootActionStatus {
     Applied,
     Refused(LootRefusal),
 }
 
-/// A loot Refusal as the vanilla client can hear it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LootWindowRefusal {
-    /// The Actor is not in the Loot Source's Loot Tag eligibility set.
     LootTagIneligible,
-    /// The Loot Source is on another map, in another instance, or beyond loot range.
     OutOfRange,
-    /// A Refusal vanilla has no loot-window code for. It is logged at the Store seam and dropped.
     Unanswered,
 }
 
-// Only recognized Module tags reach this conversion. The Coordinator maps untagged legacy
-// GameObject and skinning refusals to `Unanswered` and propagates strict-core failures.
 impl From<LootRefusal> for LootWindowRefusal {
     fn from(refusal: LootRefusal) -> Self {
         match refusal {
@@ -80,13 +68,11 @@ impl LootWindowRefusal {
     }
 }
 
-/// The target whose loot window is currently open for this world session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLootState {
     pub(crate) target_guid: Option<u64>,
 }
 
-/// The client traffic a loot Refusal earns. An unanswered Refusal stays silent.
 fn refusal_outbound(refusal: LootWindowRefusal, target_guid: u64) -> Vec<Outbound> {
     refusal
         .loot_error()
@@ -99,7 +85,6 @@ fn refusal_outbound(refusal: LootWindowRefusal, target_guid: u64) -> Vec<Outboun
         .collect()
 }
 
-/// An answered Refusal invalidates the open Loot Window; an unanswered one leaves it alone.
 fn refusal_transition(
     refusal: LootWindowRefusal,
     current_state: OpenLootState,
@@ -125,7 +110,6 @@ fn finish_loot_action(status: LootActionStatus) {
     }
 }
 
-/// Map a client request through the loot-window lifecycle without owning session transport.
 pub(crate) struct LootWindow;
 
 impl<St: LootWindowStore + ?Sized> ProtocolFamily<St> for LootWindow {
@@ -193,7 +177,6 @@ impl<St: LootWindowStore + ?Sized> ProtocolFamily<St> for LootWindow {
                 let money = store.loot_target_money(target_guid)?;
                 let items = store.loot_target_items(target_guid, viewer.guid())?;
                 if items.is_empty() && money == 0 {
-                    // Skinning an empty corpse is opportunistic: a Refusal still shows the empty window.
                     store.skin_corpse(viewer, target_guid)?;
                 }
                 let (opcode, body) = codec::build_loot_response_raw(target_guid, money, &items);
@@ -268,7 +251,6 @@ impl<St: LootWindowStore + ?Sized> ProtocolFamily<St> for LootWindow {
     }
 }
 
-/// Handle loot rolls, general GameObject use and death recovery.
 pub(crate) struct Loot;
 
 impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingStore + ?Sized>
@@ -283,17 +265,9 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
         let mut outbound = Vec::new();
         let actor = session.actor();
         match msg {
-            // Group loot methods: a need/greed vote, and the master looter's
-            // explicit assign. Both are per-action — a rejection (no roll open, already voted, not the
-            // master) is logged + ignored rather than tearing the session; the live vote/winner/master
-            // packets ride the `game_group_event` roll relay (`stdb/subscriptions.rs`), not a direct
-            // reply here.
             ClientOpcodeMessage::CMSG_LOOT_ROLL(c) => {
                 let corpse_guid = c.item.guid();
                 let vote = c.vote.as_int();
-                // Unsharded, `loot::run_vote` is exactly the call above (`store.loot_roll`);
-                // sharded, it routes to realm-core instead, so the Actor it votes as must be the one
-                // THIS socket authenticated with, never a literal from the packet.
                 let actor = actor.ok_or_else(|| anyhow!("CMSG_LOOT_ROLL before world entry"))?;
                 finish_loot_action(loot::run_vote(
                     store,
@@ -344,9 +318,6 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
                     }
                 }
             }
-            // Enter an area trigger (CMSG_AREATRIGGER): the client fires this when the player physically
-            // walks into a trigger zone (e.g. a mine for an "explore" quest). The module credits any active
-            // explore quest tied to the trigger id. A transient/no-match result is logged + ignored.
             ClientOpcodeMessage::CMSG_AREATRIGGER(a) => {
                 if let Some(actor) = session.actor() {
                     super::trainer::settle_per_action(
@@ -356,8 +327,6 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
                     )?;
                 }
             }
-            // Gameobject template query (CMSG_GAMEOBJECT_QUERY): the client asks for a GO's name/type/display
-            // before it renders/interacts. Reply with the template, or the not-found form.
             ClientOpcodeMessage::CMSG_GAMEOBJECT_QUERY(q) => {
                 let tmpl = store.gameobject_template(q.entry_id)?;
                 outbound.push(Outbound::One(
@@ -366,19 +335,11 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
                     )),
                 ));
             }
-            // Release Spirit after death. The client sends this (empty body) when the player
-            // clicks Release on the death screen. Revive in place at full health; the restored health
-            // replicates via the on_update VALUES relay and the client leaves the death screen.
-            // SMSG_CORPSE_RECLAIM_DELAY is now relay-driven (the escalated per-corpse
-            // delay, not a flat 30s) — see `on_corpse_insert` in `stdb/subscriptions.rs`, which fires off
-            // the SAME `game_corpse` insert `repop`'s reducer call just caused, so no explicit send here.
             ClientOpcodeMessage::CMSG_REPOP_REQUEST => {
                 if let Some(actor) = actor {
                     ignore_refusal("repop", session.account_id, store.repop(actor))?;
                 }
             }
-            // Corpse location query: the client asks where the player's corpse is to draw the
-            // map marker + offer "Reclaim Corpse" near it. Reply with the corpse's position, or NotFound.
             ClientOpcodeMessage::MSG_CORPSE_QUERY => {
                 if let WorldState::InWorld(iw) = &session.state {
                     let loc = store.corpse_location(iw.self_guid)?;
@@ -387,29 +348,18 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
                     )));
                 }
             }
-            // Reclaim your corpse: the ghost, near its corpse and past the 30s delay, resurrects
-            // at 50%. The module validates ownership/ghost/range/delay; a failure (too far, too soon, not
-            // a ghost) is expected and silently ignored — the client just stays a ghost.
             ClientOpcodeMessage::CMSG_RECLAIM_CORPSE(r) => {
                 if let Some(actor) = actor {
                     let result = store.reclaim_corpse(actor, r.guid.guid());
                     ignore_refusal("reclaim_corpse", session.account_id, result)?;
                 }
             }
-            // Resurrection accept-prompt response: the dead player answered the SMSG_RESURRECT_REQUEST
-            // offer. `status` is vanilla's accept(1)/decline(0) byte; the offer's guid is ignored (mirrors
-            // `reclaim_corpse`'s own-corpse derivation — the module resolves the pending offer from the
-            // CALLER via `ctx.sender()`, never the wire guid). A failure (no pending offer — already
-            // answered/lapsed) is expected and silently ignored.
             ClientOpcodeMessage::CMSG_RESURRECT_RESPONSE(r) => {
                 if let Some(actor) = actor {
                     let result = store.resurrect_response(actor, r.status != 0);
                     ignore_refusal("resurrect_response", session.account_id, result)?;
                 }
             }
-            // The death dialog's second button: use the Self-Resurrection Option the Module wrote into
-            // PLAYER_SELF_RES_SPELL. The revive replicates through the entity VALUES relay. A Refusal
-            // (already used, already alive) is expected after a race and sends nothing.
             ClientOpcodeMessage::CMSG_SELF_RES => {
                 if let Some(actor) = actor {
                     ignore_refusal(
@@ -419,11 +369,6 @@ impl<St: DeathStore + LootRollStore + LootWindowStore + NpcStore + ShardRoutingS
                     )?;
                 }
             }
-            // Spirit-Healer resurrection: a ghost activated the graveyard Spirit Healer (npc_flags
-            // SPIRITHEALER). The module res's in place at 50% + applies Resurrection Sickness; on success
-            // reply with SMSG_SPIRIT_HEALER_CONFIRM (echoing the healer's guid) so the client closes the
-            // dialog. The res itself replicates via the entity VALUES relay (health > 0 + cleared ghost
-            // bits), exactly like reclaim_corpse. A failure (not a ghost) is per-action — log + ignore.
             ClientOpcodeMessage::CMSG_SPIRIT_HEALER_ACTIVATE(s) => {
                 if let Some(actor) = actor {
                     let result = store.spirit_healer_res(actor, s.guid.guid());
@@ -481,11 +426,9 @@ mod tests {
         item_take_failure: Option<Failure>,
     }
 
-    /// How a Store call fails before the Store has an answer to hand the handler.
     #[derive(Clone, Copy)]
     enum Failure {
         TransportLost,
-        /// The Store returns a Module refusal it does not decode, such as a boundary failure.
         Refused(&'static str),
     }
 
@@ -1024,7 +967,6 @@ mod tests {
                 let outcome = run_window(&store, session(), open_window, message).unwrap();
                 let (next_state, outbound) = outcome;
                 match loot_error {
-                    // An answered Refusal invalidates the Loot Window the client is showing.
                     Some(loot_error) => {
                         assert_loot_error(&outbound, 60, loot_error);
                         assert_eq!(next_state, OpenLootState::default(), "{refusal:?}");
@@ -1383,7 +1325,6 @@ mod tests {
         assert_transport_loss(&error);
     }
 
-    /// Run one request as the session does: apply the state transition, return the client traffic.
     fn run(
         store: &InMemoryLootWindow,
         state: &mut OpenLootState,
@@ -1402,8 +1343,6 @@ mod tests {
         ClientOpcodeMessage::CMSG_AUTOSTORE_LOOT_ITEM(CMSG_AUTOSTORE_LOOT_ITEM { item_slot })
     }
 
-    /// `(slot, item_id, count, display_id)` of item `index` in a raw loot window body: the header is
-    /// 8 guid + 1 method + 4 money + 1 count bytes, then 22 bytes per item.
     fn window_item(body: &[u8], index: usize) -> (u8, u32, u32, u32) {
         let base = 14 + index * 22;
         let word =
@@ -1412,7 +1351,6 @@ mod tests {
     }
 
     fn assert_clear_money(outbound: &[Outbound]) {
-        // A solo looter gets no SMSG_LOOT_MONEY_NOTIFY: the client prints its own copper line.
         assert!(matches!(
             outbound,
             [Outbound::One(ServerOpcodeMessage::SMSG_LOOT_CLEAR_MONEY)]

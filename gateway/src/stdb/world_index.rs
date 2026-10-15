@@ -1,37 +1,17 @@
-//! Indexed snapshots of subscribed World Shard rows.
-
 use lyracore_shared::spatial::{grid_cell, grid_cell_id, BOX_HALF_SPAN};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-/// One world session's identity inside the index. Minted per world session (NOT per account: an
-/// account can hold a logon socket and a world socket at once, and only the latter is a viewer),
-/// so a relogin can never inherit the previous session's interest set.
 pub type SessionId = u64;
 
-/// Which shard's coordinator cache holds an entity's row — an index into the dispatcher's shard
-/// table, kept alongside the cell so a sweep can read the row back without probing every shard.
 pub type ShardId = usize;
 
-/// The two independent row namespaces that share one viewer anchor index.
-///
-/// GUIDs are unique inside each SpacetimeDB table, but the gateway does not assume a world entity
-/// and a game object cannot have the same numeric GUID. Every row operation therefore names its
-/// layer explicitly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntityLayer {
     WorldEntity,
     GameObject,
 }
 
-/// A grid cell, partition-qualified. `cell` is the packed `(grid_x, grid_y)` id
-/// ([`grid_cell_id`]) — a bijection on the whole `(i32, i32)` domain, so this triple names exactly
-/// one cell of exactly one `(map_id, instance_id)` partition and two distinct cells can never
-/// collide.
-///
-/// **`instance_id` is part of the key, not a filter applied afterwards**: a per-instance
-/// dungeon copy reuses its source map's coordinates, so a key without the partition would place a
-/// raid boss and an open-world critter in the same bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CellKey {
     pub map_id: u32,
@@ -40,7 +20,6 @@ pub struct CellKey {
 }
 
 impl CellKey {
-    /// The key for grid cell `(gx, gy)` of one partition.
     pub fn at(map_id: u32, instance_id: u64, gx: i32, gy: i32) -> Self {
         Self {
             map_id,
@@ -49,32 +28,19 @@ impl CellKey {
         }
     }
 
-    /// The key for a world position — the one call every row writer and every viewer recenter uses,
-    /// so a cell can never be computed two different ways.
     pub fn of_position(map_id: u32, instance_id: u64, x: f32, y: f32) -> Self {
         let (gx, gy) = grid_cell(x, y);
         Self::at(map_id, instance_id, gx, gy)
     }
 
-    /// This key's partition — the `(map_id, instance_id)` pair the AOI-off path scopes by.
     pub fn partition(&self) -> (u32, u64) {
         (self.map_id, self.instance_id)
     }
 
-    /// The 25 keys of the `(2·BOX_HALF_SPAN+1)`-square neighbourhood centred here, this key
-    /// included.
-    ///
-    /// Used in BOTH directions, which is the whole trick: centred on an ENTITY's cell it enumerates
-    /// the anchors of every viewer that can see it; centred on a VIEWER's anchor it enumerates the
-    /// cells of every entity they can see. Both are true only because the interest square is
-    /// symmetric — `neighbourhood_is_exactly_the_grid_box_bounds` (below) pins it against
-    /// `GridBox::bounds`, the predicate the deleted subscription SQL was built from.
     pub fn neighbourhood(&self) -> impl Iterator<Item = CellKey> {
         self.neighbourhood_within(BOX_HALF_SPAN)
     }
 
-    /// The `(2·half_span+1)`-square of keys centred here, this key included. The box is the
-    /// `BOX_HALF_SPAN` case; a relay whose range exceeds the box (a yell) widens it.
     pub fn neighbourhood_within(&self, half_span: i32) -> impl Iterator<Item = CellKey> {
         let (gx, gy) = lyracore_shared::spatial::grid_cell_of_id(self.cell);
         let (map_id, instance_id) = (self.map_id, self.instance_id);
@@ -84,10 +50,7 @@ impl CellKey {
         })
     }
 
-    /// (Inspection only — the dispatch never needs it; the differential tests do.)
     #[cfg(test)]
-    /// The `GridBox` this key anchors — the bridge back to the shared spatial crate, and what the
-    /// differential test drives the (frozen) subscription-SQL oracle from.
     pub fn grid_box(&self) -> lyracore_shared::spatial::GridBox {
         let (gx, gy) = lyracore_shared::spatial::grid_cell_of_id(self.cell);
         lyracore_shared::spatial::GridBox {
@@ -98,14 +61,12 @@ impl CellKey {
     }
 }
 
-/// What one layer gained and lost after a viewer crossed a cell boundary.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct ViewerDelta {
     pub entered: Vec<(u64, ShardId)>,
     pub left: Vec<(u64, ShardId)>,
 }
 
-/// Both layer deltas produced by one anchor move and one neighbourhood comparison.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct RecenterDelta {
     pub world_entities: ViewerDelta,
@@ -114,37 +75,21 @@ pub struct RecenterDelta {
 
 #[derive(Default)]
 struct EntityIndex {
-    /// cell → the guids resident in it. The forward direction of the interest question.
     cell_entities: HashMap<CellKey, HashSet<u64>>,
-    /// GUID to cell, Shard, and pet owner. The owner survives a reconnect so a missing
-    /// pet clears its Character's action bar as well as its client object.
     entity_cell: HashMap<u64, (CellKey, ShardId, u64)>,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// Separate row namespaces. Equal GUID values in the two tables never overwrite each other.
     world_entities: EntityIndex,
     game_objects: EntityIndex,
-    /// cell → the sessions ANCHORED there (not the sessions that can see it). Small by
-    /// construction — a `Vec` beats a `HashSet` at these sizes and keeps iteration cache-friendly.
     cell_viewers: HashMap<CellKey, Vec<SessionId>>,
-    /// session → its anchor cell. The recenter's "where was it" half.
     viewer_cell: HashMap<SessionId, CellKey>,
 }
 
-/// The gateway-wide AOI index. One instance per gateway, shared by every shard's coordinator
-/// dispatch and by every world session.
-///
-/// Everything is behind ONE mutex on purpose: every operation is a handful of hash lookups with no
-/// I/O and no encoding inside the critical section (see the module doc's complexity table), so the
-/// lock is held for nanoseconds and sharding it would buy contention accounting rather than
-/// throughput. The rule that keeps it that way: **never call out into relay/encode work while
-/// holding this lock** — `viewers_of` and `visible_entities` return owned answers precisely so the
-/// caller does its work after the guard drops.
+/// Keep I/O, encoding and Relays outside the index mutex; copy results before calling them.
 pub struct WorldIndex {
     inner: Mutex<Inner>,
-    /// `false` = `LYRACORE_AOI=0`: no cell scoping, whole-partition visibility (see the module doc).
     cell_scoped: bool,
 }
 
@@ -157,8 +102,6 @@ impl WorldIndex {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        // Matches the file-wide `.lock().unwrap()` discipline in `connection.rs`: a poisoned index
-        // must degrade to a possibly-stale read, never take every future relay down with it.
         self.inner.lock().unwrap_or_else(|p| {
             log::error!(
                 "world index lock poisoned (a prior panic in a critical section) — recovering"
@@ -181,12 +124,6 @@ impl WorldIndex {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
-    //  Entities
-    // ---------------------------------------------------------------------------------------
-
-    /// Record (or move) an entity. Returns the cell it came FROM when this was a move, so a caller
-    /// can decide whether a viewer needs a DESTROY for it.
     pub fn upsert_entity(
         &self,
         layer: EntityLayer,
@@ -217,7 +154,6 @@ impl WorldIndex {
         previous
     }
 
-    /// Which shard's coordinator cache holds this entity's row.
     pub fn shard_of(&self, layer: EntityLayer, guid: u64) -> Option<ShardId> {
         let inner = self.lock();
         Self::layer(&inner, layer)
@@ -226,7 +162,6 @@ impl WorldIndex {
             .map(|(_, s, _)| *s)
     }
 
-    /// Remove a row only from its current Shard. Returns its old cell and pet owner GUID.
     pub fn remove_entity(
         &self,
         layer: EntityLayer,
@@ -249,9 +184,6 @@ impl WorldIndex {
         Some((key, owner_guid))
     }
 
-    /// Where the index believes `guid` is: the anchor of a relay driven by a table with no cell of
-    /// its own (an aura names its target, a chat line its speaker). `None` for a guid it has never
-    /// seen (a row on a table it does not index, or one deleted already).
     #[cfg(test)]
     pub fn entity_cell(&self, layer: EntityLayer, guid: u64) -> Option<CellKey> {
         let inner = self.lock();
@@ -274,9 +206,6 @@ impl WorldIndex {
             .and_then(|(key, owner, _)| (*owner == shard).then_some(*key))
     }
 
-    /// Replace one shard's snapshot, preserving viewers and rows already owned by another shard.
-    /// Rows and returned removals carry GUID, cell, and pet owner GUID. Former viewers can
-    /// drop vanished or moved rows and clear a vanished pet's action bar.
     pub fn replace_shard(
         &self,
         layer: EntityLayer,
@@ -322,17 +251,11 @@ impl WorldIndex {
         removed
     }
 
-    // ---------------------------------------------------------------------------------------
-    //  Viewers
-    // ---------------------------------------------------------------------------------------
-
-    /// Register a session as a viewer anchored on `key`.
     pub fn add_viewer(&self, session: SessionId, key: CellKey) {
         let mut inner = self.lock();
         Self::place_viewer(&mut inner, session, key);
     }
 
-    /// Unregister a session. Idempotent.
     pub fn remove_viewer(&self, session: SessionId) {
         let mut inner = self.lock();
         if let Some(old) = inner.viewer_cell.remove(&session) {
@@ -340,9 +263,7 @@ impl WorldIndex {
         }
     }
 
-    /// (Inspection only — the dispatch never needs it; the differential tests do.)
     #[cfg(test)]
-    /// A viewer's current anchor.
     pub fn viewer_cell(&self, session: SessionId) -> Option<CellKey> {
         self.lock().viewer_cell.get(&session).copied()
     }
@@ -366,21 +287,10 @@ impl WorldIndex {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
-    //  The two interest queries
-    // ---------------------------------------------------------------------------------------
-
-    /// Every session that can see cell `key` — the dispatch's hot path, called once per indexed row
-    /// delta. The explicit layer keeps the row namespace visible at every dispatch call even though
-    /// both layers use the same viewer anchors. O(25 + V) with cell scoping on; O(total viewers)
-    /// with `LYRACORE_AOI=0`.
     pub fn viewers_of(&self, _layer: EntityLayer, key: CellKey) -> Vec<SessionId> {
         self.viewers_within(key, BOX_HALF_SPAN)
     }
 
-    /// Every session anchored within `half_span` cells of `key`. The box (`BOX_HALF_SPAN`) is
-    /// what [`Self::viewers_of`] asks; a relay whose range exceeds the box widens the span so the
-    /// yard-range gate in its job still sees every candidate. O((2·half_span+1)² + V).
     pub fn viewers_within(&self, key: CellKey, half_span: i32) -> Vec<SessionId> {
         let inner = self.lock();
         if !self.cell_scoped {
@@ -401,9 +311,6 @@ impl WorldIndex {
         out
     }
 
-    /// Move a viewer's anchor and report the VISIBILITY delta the move implies, or `None` when the
-    /// anchor did not change (the overwhelmingly common per-heartbeat call — a plain hash lookup and
-    /// a compare, no allocation).
     pub fn move_viewer_delta(&self, session: SessionId, key: CellKey) -> Option<RecenterDelta> {
         let mut inner = self.lock();
         let old = *inner.viewer_cell.get(&session)?;
@@ -412,9 +319,6 @@ impl WorldIndex {
         }
         Self::place_viewer(&mut inner, session, key);
         if !self.cell_scoped {
-            // No cell scoping: the box IS the partition, so a move inside one changes nothing and a
-            // move ACROSS one is a map/instance change, which tears the whole session's view down
-            // and rebuilds it through `sweep_into_view` rather than through a delta.
             return Some(RecenterDelta::default());
         }
         let old_cells: HashSet<CellKey> = old.neighbourhood().collect();
@@ -448,9 +352,6 @@ impl WorldIndex {
         })
     }
 
-    /// Every entity a viewer can see, with the shard whose cache holds each row — the login /
-    /// world-entry sweep, and the inverse the differential test checks. O(25 + E) with cell scoping
-    /// on; O(world) with `LYRACORE_AOI=0`.
     pub fn visible_entities(&self, layer: EntityLayer, session: SessionId) -> Vec<(u64, ShardId)> {
         let inner = self.lock();
         let Some(anchor) = inner.viewer_cell.get(&session).copied() else {
@@ -479,11 +380,6 @@ impl WorldIndex {
         out
     }
 
-    /// Can `session` currently see `guid`? The point query behind relays that are driven by a
-    /// DIFFERENT table (a stealth aura, say) and therefore have no cell of their own to dispatch on.
-    /// Before the shared-connection model these asked "is the row in my connection's cache",
-    /// which the box subscription made equivalent; on a shared connection the cache holds the whole world, so the question has
-    /// to be asked of the index instead.
     pub fn can_see(&self, layer: EntityLayer, session: SessionId, guid: u64) -> bool {
         let inner = self.lock();
         let Some(anchor) = inner.viewer_cell.get(&session) else {
@@ -503,7 +399,6 @@ impl WorldIndex {
         (ax - cx).abs() <= BOX_HALF_SPAN && (ay - cy).abs() <= BOX_HALF_SPAN
     }
 
-    /// Index sizes for tests: `(entities, viewers, occupied entity cells)`.
     #[cfg(test)]
     pub fn stats(&self, layer: EntityLayer) -> (usize, usize, usize) {
         let inner = self.lock();
@@ -521,10 +416,6 @@ mod tests {
     use super::*;
     use crate::stdb::aoi::box_queries;
 
-    // ===========================================================================================
-    //  Fixture + the SQL ORACLE.
-    //
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Row {
         guid: u64,
@@ -534,9 +425,6 @@ mod tests {
         gy: i32,
     }
 
-    /// Evaluate one generated AOI query against a fixture row. Understands exactly the grammar the
-    /// AOI builders emit — `col = n`, `col >= n`, `col <= n`, joined by ` AND ` — and PANICS on
-    /// anything else, so a future query shape cannot silently pass by being unparsed.
     fn sql_selects(query: &str, row: &Row) -> bool {
         let (_, where_clause) = query
             .split_once(" WHERE ")
@@ -573,7 +461,6 @@ mod tests {
         })
     }
 
-    /// The set the deleted per-player subscription would have delivered to a viewer for one layer.
     fn sql_visible(layer: EntityLayer, viewer: CellKey, rows: &[Row]) -> HashSet<u64> {
         let queries = box_queries(viewer.instance_id, &viewer.grid_box(), false);
         let table = match layer {
@@ -590,7 +477,6 @@ mod tests {
             .collect()
     }
 
-    /// The same set, per the index.
     fn index_visible(index: &WorldIndex, layer: EntityLayer, session: SessionId) -> HashSet<u64> {
         index
             .visible_entities(layer, session)
@@ -613,8 +499,6 @@ mod tests {
         index
     }
 
-    /// xorshift64* — a deterministic PRNG so a failure is reproducible from the seed alone, with no
-    /// new dev-dependency.
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -628,20 +512,6 @@ mod tests {
         }
     }
 
-    // ===========================================================================================
-    //  THE DIFFERENTIAL PROPERTY (the shared-connection model's whole safety argument)
-    // ===========================================================================================
-
-    /// For every viewer, over randomised fixtures: **the index's visible set equals the set the box
-    /// subscription's SQL predicate selects.** Both directions matter and both are checked by set
-    /// equality — a missing guid is a peer that never appears, an extra one is a peer visible
-    /// through a wall.
-    ///
-    /// The fixture deliberately packs viewers and entities into a small cell range (so boxes
-    /// overlap heavily, and edge cells are exercised constantly), spreads them over several
-    /// `(map_id, instance_id)` partitions (so a partition leak shows up), and includes negative
-    /// grid indices (legal: `grid_cell` inverts the axis, so out-of-bounds coordinates produce
-    /// them).
     #[test]
     fn the_index_visible_set_equals_the_box_subscription_sql_for_every_viewer() {
         let mut rng = Rng(0x5EED_1234_ABCD_0001);
@@ -677,10 +547,6 @@ mod tests {
         }
     }
 
-    /// The INVERSE direction, over the same oracle: `viewers_of(cell)` must name exactly the
-    /// viewers whose box query selects a row in that cell. The dispatch calls this one on every row
-    /// delta, so an asymmetry here is a peer that spawns but never moves (or moves but never
-    /// spawns) — the two halves would be scoped by different predicates.
     #[test]
     fn viewers_of_a_cell_is_exactly_the_inverse_of_the_box_subscription_sql() {
         let mut rng = Rng(0x00C0_FFEE_0000_0042);
@@ -793,9 +659,6 @@ mod tests {
         }
     }
 
-    /// The property the whole 25-lookup shape rests on: the neighbourhood of a cell is EXACTLY the
-    /// cell set `GridBox::bounds` accepts. If the shared crate's span ever changes, this fails here
-    /// rather than silently shrinking everyone's view.
     #[test]
     fn neighbourhood_is_exactly_the_grid_box_bounds() {
         let key = CellKey::at(3, 9, 12, -7);
@@ -809,15 +672,11 @@ mod tests {
             .collect();
         assert_eq!(got, want);
         assert_eq!(got.len(), ((2 * BOX_HALF_SPAN + 1) as usize).pow(2));
-        // Every neighbour keeps the partition — a leak here is a dungeon copy visible from the
-        // open world.
         assert!(key
             .neighbourhood()
             .all(|k| k.map_id == 3 && k.instance_id == 9));
     }
 
-    /// A widened span names exactly the anchors within that many cells on both axes, and the
-    /// box span is the ordinary `viewers_of` answer.
     #[test]
     fn viewers_within_widens_the_box_by_chebyshev_distance() {
         let index = WorldIndex::new(true);
@@ -835,7 +694,7 @@ mod tests {
                 }
             }
         }
-        index.add_viewer(session + 1, CellKey::at(0, 1, 0, 0)); // another instance
+        index.add_viewer(session + 1, CellKey::at(0, 1, 0, 0));
         for span in 0..=8 {
             let got: HashSet<SessionId> = index.viewers_within(centre, span).into_iter().collect();
             assert_eq!(got, expected[&span], "span {span}");
@@ -846,15 +705,11 @@ mod tests {
         );
     }
 
-    // ===========================================================================================
-    //  Bookkeeping
-    // ===========================================================================================
-
     #[test]
     fn an_entity_move_leaves_no_residue_in_its_old_cell() {
         let index = WorldIndex::new(true);
         let a = CellKey::at(0, 0, 0, 0);
-        let b = CellKey::at(0, 0, 40, 40); // far outside a's box
+        let b = CellKey::at(0, 0, 40, 40);
         index.upsert_entity(EntityLayer::WorldEntity, 5, a, 0, 0);
         index.add_viewer(1, a);
         assert_eq!(
@@ -924,8 +779,6 @@ mod tests {
             .move_viewer_delta(1, CellKey::at(0, 0, 1, 0))
             .is_some());
         assert_eq!(index.viewer_cell(1), Some(CellKey::at(0, 0, 1, 0)));
-        // Only one anchor is ever held: walking away must not leave the session visible from the
-        // cell it started in.
         index.upsert_entity(EntityLayer::WorldEntity, 5, CellKey::at(0, 0, 0, 0), 0, 0);
         index.move_viewer_delta(1, CellKey::at(0, 0, 30, 30));
         assert!(index
@@ -937,11 +790,9 @@ mod tests {
         );
         index.remove_viewer(1);
         assert_eq!(index.viewer_cell(1), None);
-        index.remove_viewer(1); // idempotent
+        index.remove_viewer(1);
     }
 
-    /// `LYRACORE_AOI=0` reproduces the pre-AOI global-subscription semantics: whole partition, and
-    /// nothing across a partition boundary.
     #[test]
     fn the_aoi_off_hatch_sees_the_whole_partition_and_nothing_outside_it() {
         let index = WorldIndex::new(false);
@@ -953,8 +804,8 @@ mod tests {
             0,
             0,
         );
-        index.upsert_entity(EntityLayer::WorldEntity, 3, CellKey::at(0, 77, 0, 0), 0, 0); // another instance
-        index.upsert_entity(EntityLayer::WorldEntity, 4, CellKey::at(1, 0, 0, 0), 0, 0); // another map
+        index.upsert_entity(EntityLayer::WorldEntity, 3, CellKey::at(0, 77, 0, 0), 0, 0);
+        index.upsert_entity(EntityLayer::WorldEntity, 4, CellKey::at(1, 0, 0, 0), 0, 0);
         index.add_viewer(1, CellKey::at(0, 0, 0, 0));
         assert_eq!(
             index_visible(&index, EntityLayer::WorldEntity, 1),
@@ -969,9 +820,6 @@ mod tests {
             .is_empty());
     }
 
-    /// `can_see` is a point query and `visible_entities` is the set form of the same question —
-    /// they must never disagree, or the stealth reveal would show a peer the box does not contain
-    /// (or hide one it does).
     #[test]
     fn can_see_agrees_with_visible_entities_everywhere() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);

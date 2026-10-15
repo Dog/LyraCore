@@ -1,5 +1,3 @@
-//! Talent reset pricing shared by the Module and the confirmation dialog.
-
 pub fn respec_cost_copper(respec_count: u32) -> u32 {
     match respec_count.min(10) {
         0 => 10_000,
@@ -12,7 +10,6 @@ pub fn points_available(level: u32, spent: u32) -> u32 {
     level.saturating_sub(9).saturating_sub(spent)
 }
 
-/// Rank zero is unlearned; absent higher ranks use the base spell.
 pub fn rank_spell(rank: u8, spells: [u32; 5]) -> u32 {
     if rank == 0 {
         return 0;

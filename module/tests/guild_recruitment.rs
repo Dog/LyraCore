@@ -1,6 +1,3 @@
-//! A Guild member stays out of the GuildRecruitment channel and hears nothing about it
-//! (`cm:Channel.cpp:94-95`); a Character outside every Guild joins it as usual.
-
 mod support;
 
 use serde_json::json;
@@ -68,7 +65,6 @@ fn a_guild_member_never_joins_guild_recruitment() {
     join(&realm, STRANGER, "GuildRecruitment - City");
     assert_eq!(memberships(&realm, STRANGER), 1);
 
-    // Every other channel still admits a Guild member.
     join(&realm, MEMBER, "LookingForGroup");
     assert_eq!(memberships(&realm, MEMBER), 1);
 }

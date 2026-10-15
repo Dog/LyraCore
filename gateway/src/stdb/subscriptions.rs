@@ -1,5 +1,3 @@
-//! World Session registration, queue metrics and durable background work.
-
 use crate::codec;
 use crate::codec::corpse::subscriptions::relay_corpse_create;
 use crate::codec::entity::subscriptions::instance_relay_gate;
@@ -21,18 +19,12 @@ use super::world_view::{self, Viewer, WorldView};
 #[cfg(test)]
 pub(crate) static DURABLE_TOPOLOGY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// RAII guard for one world session's shared-view registration, held by the world connection.
-/// Dropping the guard makes the session unreachable from every shard-level dispatcher.
 pub struct PlayerSubscriptions {
-    /// This session's registration in the gateway-wide shared view. `None` only for the
-    /// in-memory test store. Dropping the guard unregisters it, which is what stops the shared
-    /// coordinator dispatch from ever enqueueing for a dead session.
     viewer: Option<Arc<Viewer>>,
     view: Option<Arc<WorldView>>,
 }
 
 impl PlayerSubscriptions {
-    /// A no-op guard (used by the in-memory test store; drops harmlessly).
     #[cfg(test)]
     pub fn empty() -> Self {
         Self {
@@ -41,7 +33,6 @@ impl PlayerSubscriptions {
         }
     }
 
-    /// Build a real shared-view registration for world-session ordering tests.
     #[cfg(test)]
     pub(crate) fn registered_for_test(
         view: Arc<WorldView>,
@@ -84,11 +75,7 @@ impl PlayerSubscriptions {
         }
     }
 
-    /// Remove this session from owner, identity, shard, and spatial routing immediately.
-    ///
-    /// World-port uses this before driving a cross-shard transfer because the drive can delete
-    /// owner rows on the source shard. `Drop` calls the same method, so failure and re-entry paths
-    /// remain idempotent.
+    /// Unregister before Transfer deletes source rows whose Relays could reach the destination.
     pub(crate) fn unregister_viewer(&mut self) {
         if let (Some(view), Some(viewer)) = (self.view.take(), self.viewer.take()) {
             viewer
@@ -98,19 +85,10 @@ impl PlayerSubscriptions {
         }
     }
 
-    /// What this session's client holds of its group mates' Member Stats. `None` for the in-memory
-    /// test store.
     pub(crate) fn member_stats_record(&self) -> Option<&crate::world::MemberStatsRecord> {
         self.viewer.as_ref().map(|viewer| &viewer.member_stats)
     }
 
-    /// Drive the shared AOI index from the player's movement: on a cell crossing, move the
-    /// viewer's anchor and relay the CREATE/DESTROY delta the move implies.
-    ///
-    /// Runs on the session's own thread and does no I/O: the delta is a 10-cell set diff in memory
-    /// and the entering rows are read out of coordinator caches that are already resident. Before
-    /// Before the shared-connection model, this was an unsubscribe + resubscribe round trip per
-    /// cell crossing, per player.
     pub fn aoi_update(&mut self, x: f32, y: f32) {
         let (Some(viewer), Some(view)) = (self.viewer.as_ref(), self.view.as_ref()) else {
             return;
@@ -125,32 +103,13 @@ impl Drop for PlayerSubscriptions {
     }
 }
 
-/// Diagnosis counters for a failure where the peer-movement relay died permanently on a session —
-/// the motion subscription stopped delivering while the module kept accepting movement. Deliberately
-/// atomics read ONCE at logout rather than a log per call: a
-/// `log::info!` on the relay path made the intermittent failure vanish across six consecutive runs,
-/// so any instrument that touches the hot path perturbs the very race being measured.
-///
-/// `MOTION_CALLS` counts per-viewer [`motion_outbound`] work before its audience Gate.
-/// `MOTION_SENT` counts packets built, and `MOTION_DROPPED` counts discarded writer work.
-/// These are fan-out counters. Incoming subscription rows are counted separately per Shard.
 pub(crate) static MOTION_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static MOTION_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) static MOTION_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-// One argument per counter in the diagnostic line this formats.
 #[allow(clippy::too_many_arguments)]
-/// The `MOTIONSTAT` 10-second line — pure, so what the operator reads is pinned by a
-/// test instead of by eyeballing a `log::info!`. Deltas are the CHANGE over the last window, which is
-/// what makes a degradation visible while the cumulative totals keep climbing.
-///
-/// `delivery` is `sent/calls` over the window: the relay's own guard-rejection rate. `fanout` is
-/// `calls per submitted movement` — the observers-per-mover the subscription engine actually
-/// delivered to. That second number is the one the 371-client run needed and did not have: at 371
-/// co-located clients each submitted movement SHOULD wake ~370 relay callbacks, and the under-
-/// delivery showed up as that ratio collapsing, not as a guard rejecting anything.
 pub(crate) fn motionstat_line(
     calls: u64,
     sent: u64,
@@ -177,95 +136,29 @@ pub(crate) fn motionstat_line(
     )
 }
 
-/// Observers per submitted movement over one window — `None` for a window with no movement at all
-/// (an idle server must not read as a fan-out of zero). ONE definition, shared by the `MOTIONSTAT`
-/// line and the collapse check below, so the number the operator reads and the number the warning
-/// fires on can never disagree.
 pub(crate) fn fanout_ratio(d_calls: u64, d_submitted: u64) -> Option<f64> {
     (d_submitted > 0).then(|| d_calls as f64 / d_submitted as f64)
 }
 
-/// How far below its own trailing baseline the fan-out must fall to count as collapsed. 0.6 = "at
-/// least 40 % of the observers a mover was reaching ten seconds ago are no longer being reached".
-/// Well outside the wobble of a live crowd (players logging in and out, AOI boxes recentering, a
-/// window that lands mid-teleport), so it takes an actual step change to reach.
 pub(crate) const FANOUT_COLLAPSE_RATIO: f64 = 0.6;
 
-/// Consecutive collapsed windows before the warning fires — 3 × 10 s, so ~30 s of sustained
-/// under-delivery. THE HYSTERESIS IS A DELIBERATE DIVERGENCE FROM THE STUCK-RELAY SIGNAL (the
-/// `MOTION_CALLS`/`MOTION_SENT` diagnosis above), which has none
-/// and re-fires every window: that signal keys on "movement submitted but the relay callback fired almost
-/// never", which is a binary, unambiguous, does-not-self-heal condition worth shouting about
-/// instantly. Fan-out is a RATIO of two noisy counters over a 10-second window, and it moves for
-/// legitimate reasons every time the crowd changes shape. A signal like that fires spuriously if it
-/// is instant, and a warning that has cried wolf once is a warning the operator greps away.
 pub(crate) const FANOUT_COLLAPSE_WINDOWS: u32 = 3;
 
-/// After this many consecutive collapsed windows the current (low) fan-out is accepted as the new
-/// baseline, which silences the warning until the NEXT collapse. Deliberate: fan-out also drops
-/// permanently for the entirely legitimate reason that the crowd thinned, and an alarm that never
-/// stops is an alarm nobody reads. So the operator gets windows 3..6 of the collapse — ~30 s of loud
-/// warnings — and then the gateway adapts.
 pub(crate) const FANOUT_REBASELINE_WINDOWS: u32 = 6;
 
-/// Weight of the newest healthy window in the trailing baseline. An EWMA rather than a ring of
-/// recent windows because it needs no allocation and no window bookkeeping, and because the
-/// smoothing constant is the only tunable: 0.3 over 10-second windows ≈ a 30-second memory, fast
-/// enough to follow a crowd filling up a zone and slow enough that one quiet window does not become
-/// the reference point. Note the baseline is fed ONLY by non-collapsed windows (see
-/// [`fanout_health_step`]) — an EWMA that absorbed the collapse would decay under the current
-/// fan-out within two windows and the run would never reach [`FANOUT_COLLAPSE_WINDOWS`].
 pub(crate) const FANOUT_BASELINE_ALPHA: f64 = 0.3;
 
-/// Trailing fan-out baseline + the length of the current run of collapsed windows. Lives in the
-/// 10-second `MOTIONSTAT` task; nothing on the relay hot path touches it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FanoutHealth {
-    /// `None` until the first informative window establishes it.
     pub(crate) baseline: Option<f64>,
     pub(crate) low_windows: u32,
 }
 
-/// One 10-second window of the fan-out health check — pure, so the decision is unit-tested directly
-/// instead of being eyeballed in a log. Returns the next state, and
-/// `Some(consecutive_collapsed_windows)` when this window should warn (`None` = stay quiet).
-///
-/// **What it catches.** Peer movement being delivered to fewer observers than it was a moment ago,
-/// while players are still moving — the 371-client shape, where nothing errored, nothing logged, and
-/// peers simply updated less often than they moved. `delivery` (= sent/calls) read ~100 % throughout
-/// that run, because the shortfall was `calls` never reaching the rate it should have; `fanout` is
-/// the field that showed it, and this turns that field from "a number an operator has to know the
-/// expected value of" into a warning.
-///
-/// **What it does NOT catch — read this before trusting it.**
-/// * **A gateway that has been degraded since startup.** The baseline is the gateway's OWN recent
-///   behaviour, so if fan-out was already wrong when the first window was measured, that wrong value
-///   IS the baseline and nothing ever trips. This check reports a CHANGE, never an absolute truth.
-///   Nothing in the gateway currently knows how many observers a mover *should* have reached —
-///   the AOI box is per-session, invisible to this task, and `GridBox` has no
-///   overlap test, so a true expectation needs a global registry of per-session boxes plus box
-///   intersection. That is the honest version of this warning and it is not what this is.
-/// * **A slow slide.** A degradation that takes minutes to develop keeps each window within
-///   [`FANOUT_COLLAPSE_RATIO`] of the last, and the baseline follows it down. Only a step change of
-///   ≥40 % inside ~30 s trips.
-/// * **A collapse that starts during a quiet spell.** Windows below
-///   [`crate::world::MOVE_ACTIVITY_FLOOR`] submitted movements are treated as uninformative: they do
-///   not warn, and they break a run in progress.
-/// * **Under-delivery to SOME sessions.** Both counters are process-global, so one wedged session
-///   among 300 healthy ones is invisible here.
-///
-/// A TOTAL loss of the relay trips this as well as the stuck-relay signal (fan-out goes to ~0, which is
-/// certainly below any baseline) — two lines about one failure, 30 s apart, which is the right way
-/// round: the stuck-relay signal is instant and keeps repeating, this one adds "and it stayed that way".
 pub(crate) fn fanout_health_step(
     state: FanoutHealth,
     fanout: Option<f64>,
     submitted_delta: u64,
 ) -> (FanoutHealth, Option<u32>) {
-    // Uninformative window: too little movement to compare, or none at all. Keep the baseline (a
-    // quiet window is not evidence about fan-out) but break any run in progress — the same activity
-    // floor the stuck-relay signal uses, for the same reason: a handful of movements with little relay
-    // traffic is one lonely player, not a broken relay.
     let Some(f) = fanout.filter(|_| submitted_delta > crate::world::MOVE_ACTIVITY_FLOOR) else {
         return (
             FanoutHealth {
@@ -276,7 +169,6 @@ pub(crate) fn fanout_health_step(
         );
     };
     let Some(baseline) = state.baseline else {
-        // First informative window: nothing to compare against yet.
         return (
             FanoutHealth {
                 baseline: Some(f),
@@ -286,7 +178,6 @@ pub(crate) fn fanout_health_step(
         );
     };
     if f >= baseline * FANOUT_COLLAPSE_RATIO {
-        // Healthy window — fold it into the trailing baseline and forget any partial run.
         let next = baseline + FANOUT_BASELINE_ALPHA * (f - baseline);
         return (
             FanoutHealth {
@@ -299,8 +190,6 @@ pub(crate) fn fanout_health_step(
     let low_windows = state.low_windows + 1;
     let warn = (low_windows >= FANOUT_COLLAPSE_WINDOWS).then_some(low_windows);
     if low_windows >= FANOUT_REBASELINE_WINDOWS {
-        // Warned for ~30 s and it is still low: accept this as the new normal (see
-        // FANOUT_REBASELINE_WINDOWS) — this window still warns, the next one will not.
         return (
             FanoutHealth {
                 baseline: Some(f),
@@ -318,28 +207,6 @@ pub(crate) fn fanout_health_step(
     )
 }
 
-/// **Should this peer-motion packet be dropped instead of queued?** The one decision behind the
-/// per-session egress bound (task B2) — pure and unit-tested, called with `tx.depth()`.
-///
-/// The channel behind [`crate::world::SessionTx`] is unbounded, so a session whose socket has
-/// stopped taking bytes grows its backlog for as long as the stall lasts: a memory path under crowd
-/// load, and the reason `MOTION_DROPPED` could not mean backpressure before this. Bounding the
-/// CHANNEL is not available to us — ~110 of the send sites run inside SpacetimeDB SDK row callbacks
-/// on the connection's pump thread, and a blocking send from there on a full channel would deadlock
-/// that connection (see `SessionTx`'s own comment). So the queue stays unbounded and the only
-/// traffic that can plausibly outrun a socket sheds itself.
-///
-/// **Why only peer motion and creature legs, out of ~180 send sites.** They are the N²-shaped
-/// traffic: one packet per OBSERVER per mover per heartbeat, ~740/s per session at 371 co-located
-/// clients, versus a handful per player action for everything else. And they are the only sends that
-/// are SELF-HEALING when lost — a movement heartbeat is superseded by the next one 500 ms later, so
-/// a shed packet costs a moment of coarser interpolation on a peer that is already being rendered
-/// from stale data (the queue is half a second deep). A quest-log page, an item CREATE, a
-/// `SMSG_DESTROY_OBJECT` is not superseded by anything: dropping one leaves the client permanently
-/// wrong. Those keep queueing exactly as before.
-///
-/// Shedding is counted in [`MOTION_DROPPED`], so it is visible on the existing `MOTIONSTAT` line as
-/// both a rising `dropped` and a falling `delivery` — a shed that fires is not silent.
 pub(crate) fn shed_motion_at_depth(depth: usize) -> bool {
     depth > crate::world::EGRESS_SHED_DEPTH
 }
@@ -410,8 +277,6 @@ impl Coordinator {
         }
     }
 
-    /// Prepare and register one live viewer. Row callbacks are already armed once per shard in
-    /// `world_view::arm_shard`; this method registers no callback of its own.
     pub fn subscribe_player_events(
         &self,
         account_id: u64,
@@ -427,37 +292,12 @@ impl Coordinator {
             arrival.x,
             arrival.y,
         );
-        // Ghost-only visibility constants (vanilla 1.12): a spirit-healer creature carries
-        // UNIT_NPC_FLAGS SPIRITHEALER and is visible ONLY to a viewer in the GHOST player-flag state.
-        // BUG FIX: was 0x4000 — but 0x4000 is REPAIR in cmangos 1.12 numbering (SPIRITHEALER is 0x20).
-        // The wrong constant (a) failed to ghost-gate the real Spirit Healer (npc_flags 0x21) and
-        // (b) wrongly ghost-gated the 39 armorers/quartermasters that carry REPAIR (0x4000), hiding
-        // them from living players.
         let created = Arc::new(Mutex::new(HashSet::from([self_guid])));
-        // The view-merge fast-follow gap: the one piece of viewer-owned state the away leg's
-        // peer-visibility gate needs but cannot read off an away connection. Written by the ghost-flag
-        // relay (this viewer's OWN row), read by every per-viewer relay body in this file — a
-        // shared coordinator callback holds the cache of the shard that owns the ROW, which for a
-        // cross-shard peer is not the shard that owns the VIEWER. See `ViewerGates`'s doc comment.
+        // Read ghost state from the mirror; re-entering the cache from a callback would deadlock.
         let viewer_gates = Arc::new(ViewerGates::default());
-        // This session's handle on the gateway-wide shared view. Minted HERE, at the top,
-        // because relays registered further down capture it — the actual REGISTRATION (which makes
-        // the shared dispatch start enqueueing for this session) happens near the end, once
-        // everything that could still fail with `?` has succeeded.
         let view = self.world_view();
         let session = view.next_session_id();
 
-        // ======================================================================================
-        //  SKILL-UP — game_player_skill (insert/update)
-        //  Live PLAYER_SKILL_INFO[slot] VALUES so a newly-learned or trained skill line updates the
-        //  open pane without a relog.
-        // ======================================================================================
-        // LIVE skill pane relay: a game_player_skill INSERT (new line learned) or UPDATE
-        // (skill-up/train) pushes the PLAYER_SKILL_INFO[slot] partial so the open pane moves and
-        // the client prints its own "Your skill in X has increased to N." line — no relog. The
-        // slot map is seeded from the SAME deterministic layout the login CREATE used
-        // (codec::skill_slot_layout); a line learned mid-session appends at the next free slot,
-        // exactly as the next login's CREATE will lay it out.
         let skill_slots: std::sync::Arc<
             std::sync::Mutex<(std::collections::HashMap<u32, u8>, u8)>,
         > = {
@@ -485,19 +325,11 @@ impl Coordinator {
 
         let mut explored = world_view::ExplorationReplay::default();
 
-        // The bound identity WITHOUT touching a per-player connection — synthetic under the
-        // flag (what establish_session bound and the module stamps on event rows), the cached
-        // connection's real identity otherwise. Identical values to the old `player.identity` read.
-        // Stored with the viewer for identity-addressed shared dispatch.
         let self_identity =
             spacetimedb_sdk::Identity::from_byte_array(self.bound_identity(account_id)?);
 
         {
-            // Seed the viewer's replay state before registration. A coordinator reconnect replays
-            // every resident row: exploration is state-sync (the fog word must re-send, the
-            // discovery feedback must not repeat), so it carries this per-viewer seed, while the
-            // event families (teleport, faction announce, item toast) drop replayed rows outright
-            // in `world_view`'s live-insert registrations.
+            // Seed before registration so replay restores fog without discovery feedback.
             let guard = self.0.coord();
             explored.seed(
                 guard
@@ -510,18 +342,6 @@ impl Coordinator {
             );
         }
 
-        // Register with the gateway-wide shared view, then sweep everything already inside
-        // the box into this client's world.
-        //
-        // The sweep is not belt-and-braces here, it is the ONLY thing that populates a fresh
-        // client: there is no subscription apply to fire per-row `on_insert` any more — the rows
-        // were resident in the coordinator caches long before this session existed. It is
-        // idempotent through `created` regardless.
-        // Seed the ghost mirror from the character's OWN row before anything can read it. Before
-        // the shared-connection model, the spirit-healer gate re-read the live row on every offer,
-        // so a player who logged in
-        // ALREADY DEAD saw the healer without any ghost transition ever firing; the mirror has to
-        // start at the truth or that login regresses.
         {
             const GHOST_PLAYER_FLAG: u32 = lyracore_shared::constants::player_flags::GHOST;
             let is_ghost = self
@@ -538,11 +358,6 @@ impl Coordinator {
                 .is_ghost
                 .store(is_ghost, std::sync::atomic::Ordering::Relaxed);
         }
-        // The Realm Chat Relay's per-listener filter, and the Account Claim Relay's per-listener
-        // audience: this Character's own ignore and friend guids, from its contact rows on this
-        // Home Shard. The contact Relay keeps both current from here on. Read from the Shard's
-        // owner-keyed `ContactIndex` rather than `contact_lists`, which reads the registered Viewer
-        // this call is about to seed.
         let (ignored, friends): (HashSet<u64>, HashSet<u64>) = {
             let guard = self.0.coord();
             let contacts = guard.contacts.read().unwrap_or_else(|p| p.into_inner());
@@ -579,14 +394,6 @@ impl Coordinator {
         )?;
         world_view::sweep_into_view(&view, &viewer);
 
-        // Corpse resident sweep: corpse rows ride the base subscription
-        // and their callbacks may have fired before this point. Re-offer every resident one through
-        // the same instance gate — idempotent for the client (a repeat CREATE for the same corpse
-        // guid re-renders it), and the gate is now the session's authoritative `login_instance`
-        // rather than a cache lookup that could answer `None`.
-        //
-        // Read from the COORDINATOR cache: same global rows in both flag states,
-        // while the per-player cache stops carrying the corpse query under the flag.
         let resident_corpses: Vec<Corpse> = {
             let guard = self.0.coord();
             guard.conn.db.game_corpse().iter().collect()
@@ -596,13 +403,6 @@ impl Coordinator {
                 relay_corpse_create(&tx, self_guid, row);
             }
         }
-        // Armor/sheet resident sweep (login-low-armor live find, 2026-07-11): the base sub's ITEM
-        // and aura replay callbacks fire before the self entity is readable, so `effective_armor`'s
-        // base term read 0 and their pushes OVERWROTE the CREATE's correct gear-folded armor. Push
-        // the authoritative values once, from the COORDINATOR's cache — which holds the entity, the
-        // auras, the item instances AND the item templates, i.e. every term of the fold (the
-        // per-player cache lost `game_item_template` to the connection reclaim and has never held
-        // the entity since the shared-connection model).
         {
             let guard = self.0.coord();
             let db = &guard.conn.db;
@@ -619,10 +419,6 @@ impl Coordinator {
                 )));
             }
         }
-        // Login fog restore: with no per-player subscription there
-        // is no initial-sync replay to re-send the fog words, so sweep them explicitly from the
-        // coordinator cache — one idempotent full-word PLAYER_EXPLORED_ZONES VALUES per explored
-        // 32-bit bucket of THIS character.
         {
             let guard = self.0.coord();
             let mut words: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
@@ -700,13 +496,6 @@ fn next_party_command_claim_token() -> u64 {
 }
 
 impl Coordinator {
-    /// Wire up the bot-initiated (serendipity) invite relay: one registration per
-    /// connected WORLD SHARD — `all_shards()`, not a per-player relay — because there is no player
-    /// session to hang this off. A bot's goal tick decides "invite this fellow quester" with no
-    /// client behind it, so nothing else in the gateway would ever notice the row.
-    ///
-    /// Called ONCE, at gateway startup (`main.rs`). Also installs its own reconnect hook, parallel
-    /// to `world_view::arm_shard`, so a module republish binds the callback to the fresh `LiveConn`.
     pub fn spawn_bot_invite_relay(&self) {
         for shard in self.all_shards() {
             shard.arm_bot_invite_relay();
@@ -722,11 +511,6 @@ impl Coordinator {
         }
     }
 
-    /// One shard's half of [`spawn_bot_invite_relay`] — pulled out so both the initial call and the
-    /// watchdog's post-reconnect re-arm run the IDENTICAL registration, rather than two copies that
-    /// could drift. Re-reads `self.0.coord()` fresh each call, which is the whole point: called again
-    /// after a reconnect, it registers on the NEW `LiveConn`, not the dead one the old callback was
-    /// bound to.
     fn arm_bot_invite_relay(&self) {
         let store = self.clone();
         self.0
@@ -738,9 +522,7 @@ impl Coordinator {
                 let store = store.clone();
                 let (intent_id, op, inviter_guid, target_guid) =
                     (row.id, row.op, row.inviter_guid, row.target_guid);
-                // The claim targets this same Shard. Run it off the SDK callback thread so a
-                // one-pipe Gateway can receive the reducer completion instead of blocking its own
-                // connection pump.
+                // Run off-pump so a one-pipe Gateway can receive its own reducer completion.
                 let spawned = std::thread::Builder::new()
                     .name("bot-invite-intent".into())
                     .spawn(move || {
@@ -767,11 +549,6 @@ impl Coordinator {
             });
     }
 
-    /// Start the Roster Revision Relay: Realm-core's `game_group_roster_revision` callbacks mark a
-    /// party dirty, and one worker pushes it to every stale World Shard mirror. Called once at
-    /// startup. Arms nothing unless Realm-core is a distinct database. A Realm-core reconnect
-    /// re-arms the callbacks on the fresh connection; changes missed while it was down are the
-    /// reconciliation pass's, which that reconnect also starts.
     pub fn spawn_roster_revision_relay(&self) {
         let realm = match self.realm_core() {
             Ok(realm) => realm,
@@ -810,8 +587,6 @@ impl Coordinator {
             }));
     }
 
-    /// Realm-core's half of [`Self::spawn_roster_revision_relay`], on the current connection. The
-    /// callbacks only mark the party dirty; the worker makes every reducer call.
     fn arm_roster_revision_relay(
         &self,
         relay: &std::sync::Arc<crate::world::party_mirror::RosterRevisionRelay>,
@@ -830,8 +605,6 @@ impl Coordinator {
             .on_update(move |_ctx, _old, row| updated.mark_dirty(row.group_id));
     }
 
-    /// Start one bounded Transfer Intent dispatcher per configured World Shard. Each pass reads the
-    /// current connection, so a reconnect needs no second thread or connection-scoped callback.
     pub fn spawn_bot_transfer_relay(&self) {
         for shard in self.all_shards() {
             if let Err(error) = std::thread::Builder::new()
@@ -905,10 +678,6 @@ impl Coordinator {
         next_after
     }
 
-    /// Reconcile party and guild membership when a World Shard deletes a Character.
-    ///
-    /// Fresh Character subscriptions on every Shard distinguish deletion from a Transfer whose
-    /// destination update has not reached this Gateway yet.
     pub fn spawn_character_gone_relay(&self) {
         for shard in self.all_shards() {
             shard.arm_character_gone_relay();
@@ -939,14 +708,11 @@ impl Coordinator {
         self.request_deleted_character_reconciliation();
     }
 
-    /// A full pass: every party member and every Character guild state names. Startup and a
-    /// reconnect ask for it, since a delete may have gone unseen.
     fn request_deleted_character_reconciliation(&self) {
         self.1.guild_cleanup.lock().unwrap().sweep = true;
         self.start_deleted_character_reconciliation();
     }
 
-    /// A `game_character` delete: the party pass, and guild cleanup for `character_guid` only.
     fn request_deleted_character_cleanup(&self, character_guid: u64) {
         self.1
             .guild_cleanup
@@ -978,7 +744,6 @@ impl Coordinator {
                         .1
                         .deleted_character_reconciliation_requested
                         .store(false, Ordering::Release);
-                    // Both run on every pass: a party failure must not hold up guild cleanup.
                     let guild_work = std::mem::take(&mut *store.1.guild_cleanup.lock().unwrap());
                     let parties = crate::world::party::reconcile_deleted_character_parties(&store);
                     let guilds =
@@ -1142,31 +907,9 @@ mod tests {
         assert_eq!(wrapped, [1, 2, 3, 4, 5, 6]);
     }
 
-    // ── Peer-motion relay: the CALL SITE, not just the codec helper ──────────
-    //
-    // §8 of the agent playbook: the dominant failure here is a test that pins an extracted helper
-    // while the wiring that calls it stays free to vanish. `codec::tests` proves the raw builder
-    // emits the same bytes the typed path did; these tests drive `relay_entity_motion` /
-    // `relay_creature_leg` themselves — a real `SessionTx`, a real `created` set, a real row —
-    // so deleting the send, sending the wrong variant, passing the wrong guid or opcode, or dropping
-    // a guard all show up here.
-
-    /// `MOTION_CALLS`/`SENT`/`DROPPED` are process-global atomics and the test binary runs tests in
-    /// PARALLEL, so any test that moves them or measures a delta around them must hold this lock.
-    /// Without it, the delta a counter test measures silently includes whatever a concurrent relay
-    /// test did (which is exactly how the shed test below first turned the motion-counters test red). Poison is
-    /// ignored deliberately: a panicking test has already failed and must not cascade into every
-    /// other one.
+    // Tests that read or change process-global motion counters must hold this lock.
     static MOTION_COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Test shims for the two relays the shared-connection model split in half.
-    ///
-    /// Before the shared-connection model, each of these pushed straight onto the session channel
-    /// from the per-player SDK
-    /// callback. Now the SHARED dispatch (`stdb::world_view`) makes the shed decision on the pump
-    /// and enqueues a job, and the job calls the `*_outbound` half on the session's writer thread.
-    /// These shims are that pair, back to back, so the wire-pinning and counter tests below keep
-    /// asserting on the queue exactly as they did — and keep failing if either half regresses.
     fn relay_entity_motion(
         tx: &SessionTx,
         created: &Arc<Mutex<HashSet<u64>>>,
@@ -1204,7 +947,6 @@ mod tests {
         MOTION_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// One motion row for `guid`, carrying the wire-form `MovementInfo` the module stores.
     fn motion_row(guid: u64, opcode: u16, movement_info: Vec<u8>) -> EntityMotion {
         EntityMotion {
             guid,
@@ -1219,7 +961,6 @@ mod tests {
         }
     }
 
-    /// A running-forward movement block plus the bytes the module would have stored for it.
     fn moving_forward() -> (wow_world_messages::vanilla::MovementInfo, Vec<u8>) {
         let info = wow_world_messages::vanilla::MovementInfo {
             flags: wow_world_messages::vanilla::MovementInfo_MovementFlags::new_forward(),
@@ -1236,10 +977,6 @@ mod tests {
         (info, bytes)
     }
 
-    /// What the observer's writer actually receives for one peer heartbeat: an `Outbound::Raw` whose
-    /// opcode and body equal what the TYPED path would have serialized. The typed
-    /// message is built here independently of the raw builder, so this fails if the relay passes the
-    /// wrong guid, the wrong opcode, the row's bytes in the wrong place — or stops sending at all.
     #[test]
     fn the_motion_relay_queues_the_bytes_the_typed_path_would_have_sent() {
         let _counters = motion_counter_lock();
@@ -1281,10 +1018,6 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly one packet per motion row");
     }
 
-    /// The two guards that were free before the raw path and must stay: a player never receives
-    /// their OWN movement echoed back (they would fight the server for authority over their
-    /// position), and no `MSG_MOVE_*` goes out for a guid this client never got a CREATE for
-    /// (a movement packet for an unknown entity desyncs the client).
     #[test]
     fn the_motion_relay_skips_self_and_uncreated_movers() {
         let _counters = motion_counter_lock();
@@ -1306,8 +1039,6 @@ mod tests {
         );
     }
 
-    /// A malformed row must produce no packet at all — the raw path memcpys the block, so a short
-    /// one would be framed with a `size` the client trusts and would desync its header stream.
     #[test]
     fn the_motion_relay_drops_a_truncated_movement_block() {
         let _counters = motion_counter_lock();
@@ -1328,9 +1059,6 @@ mod tests {
         );
     }
 
-    ///
-    /// Deltas rather than absolutes because the counter is a process-global atomic; this is the only
-    /// test that increments it, so the deltas are exact.
     #[test]
     fn a_discarded_relay_send_increments_the_dropped_counter_287() {
         let _counters = motion_counter_lock();
@@ -1340,7 +1068,6 @@ mod tests {
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT as u16;
         let before = MOTION_DROPPED.load(Relaxed);
 
-        // A live receiver: delivered, so nothing is counted as dropped.
         let (tx, rx) = crate::world::SessionTx::with_depth(0);
         relay_entity_motion(&tx, &created, 1, &motion_row(42, opcode, bytes.clone()));
         assert!(rx.try_recv().is_ok());
@@ -1350,7 +1077,6 @@ mod tests {
             "a delivered packet is not a drop"
         );
 
-        // The writer half is gone (the session ended) — the send is discarded and MUST be counted.
         let (dead_tx, dead_rx) = crate::world::SessionTx::with_depth(0);
         drop(dead_rx);
         relay_entity_motion(&dead_tx, &created, 1, &motion_row(42, opcode, bytes));
@@ -1360,7 +1086,6 @@ mod tests {
             "a peer-motion packet discarded by a dead writer channel must increment MOTION_DROPPED"
         );
 
-        // The sibling relay discards the same way (creature legs share the writer channel).
         relay_creature_leg(
             &dead_tx,
             &created,
@@ -1393,13 +1118,8 @@ mod tests {
         );
     }
 
-    /// The operator-facing half of the delivery instrument: the 10-second line must carry the
-    /// delivery ratio, the
-    /// per-movement fan-out, and the dropped count — the three numbers the 371-client run had to
-    /// reconstruct by hand afterwards. Pinned as text because that text IS the instrument.
     #[test]
     fn the_motionstat_line_reports_delivery_dropped_and_fanout_287() {
-        // 1000 callbacks, 900 packets queued, 7 discarded, from 10 submitted movements.
         let line = motionstat_line(5000, 4500, 21, 1000, 900, 7, 10, 400);
         assert!(
             line.contains("calls=5000"),
@@ -1438,7 +1158,6 @@ mod tests {
             "retired outstanding count remains: {line}"
         );
 
-        // An idle window must not divide by zero or print a fake 0 %.
         let idle = motionstat_line(5000, 4500, 21, 0, 0, 0, 0, 400);
         assert!(
             idle.contains("delivery=--") && idle.contains("fanout=--/move"),
@@ -1446,11 +1165,6 @@ mod tests {
         );
     }
 
-    // ── Fan-out collapse signal ─────────────────────────────────────────────────────────────────
-
-    /// The shared ratio: observers per submitted movement, and `None` — never a fake 0.0 — for a
-    /// window with no movement in it. The `MOTIONSTAT` line and the warning both read this, which is
-    /// the point: a number the operator sees and a number the gateway warns on cannot disagree.
     #[test]
     fn fanout_ratio_is_observers_per_move_and_none_when_idle() {
         assert_eq!(fanout_ratio(3710, 10), Some(371.0));
@@ -1466,9 +1180,6 @@ mod tests {
         );
     }
 
-    /// A quiet window is not evidence. Below `MOVE_ACTIVITY_FLOOR` submitted movements the check must
-    /// stay silent AND keep the baseline it learned while the server was busy — one lone player
-    /// wandering with nobody nearby must not become the reference point for a full zone.
     #[test]
     fn a_quiet_window_neither_warns_nor_rebaselines_b1() {
         let busy = FanoutHealth {
@@ -1487,14 +1198,10 @@ mod tests {
             "and it breaks any collapse run in progress"
         );
 
-        // No movement at all: same treatment, no divide-by-zero fake.
         let (idle, warn) = fanout_health_step(busy, None, 0);
         assert_eq!((idle.baseline, warn), (Some(300.0), None));
     }
 
-    /// The first informative window can only ESTABLISH the baseline — there is nothing to compare it
-    /// against. This is also the honest limit of the whole signal: a gateway that is already
-    /// under-delivering when it starts up bakes that into the baseline and never trips.
     #[test]
     fn the_first_window_establishes_the_baseline_and_cannot_warn_b1() {
         let (next, warn) = fanout_health_step(FanoutHealth::default(), Some(40.0), 1_000);
@@ -1504,10 +1211,6 @@ mod tests {
         );
     }
 
-    /// **The hysteresis, which is the deliberate divergence from the stuck-relay signal.** A 40 %+ fan-out
-    /// collapse must persist for `FANOUT_COLLAPSE_WINDOWS` consecutive windows before it says
-    /// anything: the ratio wobbles, and a warning that cries wolf gets grepped away. Windows 1 and 2
-    /// are silent; window 3 warns and reports the run length.
     #[test]
     fn a_fanout_collapse_warns_only_after_three_consecutive_windows_b1() {
         let mut st = FanoutHealth {
@@ -1540,8 +1243,6 @@ mod tests {
         );
     }
 
-    /// Half a collapse is not a collapse: one bad window followed by a healthy one resets the run, so
-    /// an alternating wobble never fires however long it goes on.
     #[test]
     fn a_healthy_window_resets_the_collapse_run_b1() {
         let mut st = FanoutHealth {
@@ -1561,29 +1262,23 @@ mod tests {
         }
     }
 
-    /// Just above the ratio is NOT a collapse (the boundary), and a healthy window moves the trailing
-    /// baseline by exactly one EWMA step — the mechanism that lets the signal follow a zone filling up
-    /// instead of firing on it.
     #[test]
     fn the_collapse_boundary_and_the_ewma_step_b1() {
         let st = FanoutHealth {
             baseline: Some(100.0),
             low_windows: 2,
         };
-        // Exactly at the ratio: healthy, so the run resets rather than firing on window 3.
         let (next, warn) = fanout_health_step(st, Some(100.0 * FANOUT_COLLAPSE_RATIO), 1_000);
         assert_eq!(
             warn, None,
             "fan-out exactly at the ratio is not yet a collapse"
         );
         assert_eq!(next.low_windows, 0);
-        // baseline 100 + 0.3 * (60 - 100) = 88
         assert!(
             (next.baseline.unwrap() - 88.0).abs() < 1e-9,
             "one EWMA step at alpha {FANOUT_BASELINE_ALPHA}, got {:?}",
             next.baseline
         );
-        // A hair below it, on the third window, does fire.
         let (_, warn) = fanout_health_step(st, Some(100.0 * FANOUT_COLLAPSE_RATIO - 0.001), 1_000);
         assert_eq!(
             warn,
@@ -1592,10 +1287,6 @@ mod tests {
         );
     }
 
-    /// After `FANOUT_REBASELINE_WINDOWS` the low level is accepted as the new normal, so the warning
-    /// stops. Deliberate and documented: fan-out also drops permanently because the crowd thinned,
-    /// and an alarm that never stops is one nobody reads. It fires for windows 3..6 — ~30s of loud
-    /// warnings — and then goes quiet with the new baseline in place.
     #[test]
     fn a_sustained_collapse_rebaselines_and_stops_warning_b1() {
         let mut st = FanoutHealth {
@@ -1622,11 +1313,6 @@ mod tests {
         );
     }
 
-    // ── Egress shedding (task B2) ──────────────────────────────────────────────────────────────────
-
-    /// The shed decision and its boundary. A session AT the threshold still gets its packet — only a
-    /// queue that has grown PAST it sheds — so the constant reads as "this many queued packets are
-    /// acceptable", which is how the comment on it is written.
     #[test]
     fn the_egress_shed_boundary_is_strictly_above_the_threshold_b2() {
         assert!(!shed_motion_at_depth(0), "an empty queue must never shed");
@@ -1640,11 +1326,6 @@ mod tests {
         );
     }
 
-    /// The shed at its CALL SITE (playbook §8: pinning the pure decision while the wiring stays free
-    /// to vanish is this repo's most repeated test defect). A real `SessionTx` whose queue is one item
-    /// past the threshold must produce NO packet from either high-volume relay, and each skip must be
-    /// counted in `MOTION_DROPPED` — so a shed shows up on `MOTIONSTAT` as falling `delivery` instead
-    /// of being silent.
     #[test]
     fn a_backed_up_session_sheds_peer_motion_and_creature_legs_b2() {
         let _counters = motion_counter_lock();
@@ -1674,10 +1355,6 @@ mod tests {
             path: None,
         };
 
-        // A session AT the threshold still receives its packet (this half is what stops the test from
-        // passing for the trivial reason that the relays send nothing at all). One `SessionTx` each,
-        // because a delivered packet raises the depth by one — the second send on a shared sender
-        // would already be over the line, which is the mechanism working, not a failure.
         let (tx, rx) = crate::world::SessionTx::with_depth(crate::world::EGRESS_SHED_DEPTH);
         relay_entity_motion(&tx, &created, 1, &motion_row(42, opcode, bytes.clone()));
         assert!(
@@ -1691,8 +1368,6 @@ mod tests {
             "at-threshold creature legs must still flow"
         );
 
-        // One item past it: each relay skips, and each counts its skip. Driven SEPARATELY so a
-        // failure names which of the two call sites lost its shed.
         let (sent_before, dropped_before) =
             (MOTION_SENT.load(Relaxed), MOTION_DROPPED.load(Relaxed));
         let (tx, rx) = crate::world::SessionTx::with_depth(crate::world::EGRESS_SHED_DEPTH + 1);
@@ -1724,10 +1399,6 @@ mod tests {
         );
     }
 
-    /// The depth counter's own arithmetic: every enqueue counts, and a send that FAILS (the writer
-    /// half is gone) must roll its increment back. Without the rollback a session that ends while
-    /// relays are still firing would leave a permanently high depth — on a live gateway the
-    /// `SessionTx` clones outlive the writer briefly on every logout.
     #[test]
     fn the_egress_depth_counts_queued_items_and_rolls_back_a_failed_send_b2() {
         let (tx, rx) = crate::world::SessionTx::with_depth(0);

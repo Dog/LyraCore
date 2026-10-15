@@ -1,5 +1,3 @@
-//! Client talent data extraction and import planning.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -11,9 +9,6 @@ use wow_dbc::DbcTable;
 use crate::dbc::{open_chain, read_table};
 use crate::{push_insert, run_sql_statements, sql_text, Args};
 
-/// Clear+reload SQL for `game_talent_tab` from `TalentTab.dbc` — one row per class talent-tree tab (27 in
-/// vanilla: 9 classes × 3 tabs). `class_mask`/`race_mask` are the DBC's raw bitmasks; `order_index` is the
-/// tab's 0-based position within its class. No Timestamp → plain SQL. Returns (statements, row_count).
 fn map_talent_tabs(tabs: &DbcTalentTab) -> (Vec<String>, usize) {
     let rows: Vec<String> = tabs
         .rows()
@@ -40,15 +35,6 @@ fn map_talent_tabs(tabs: &DbcTalentTab) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_talent` from `Talent.dbc` — every class tree's real talents (tier/column/
-/// prereqs/rank spells), replacing the `module/src/talent.rs` demo Warrior seed by id collision (the demo
-/// ids 1-8 sit far below the real Talent.dbc id range, so a clear+reload never touches them — see the
-/// module doc's KEEP decision). `order_map` resolves each talent's DBC `tab` id to that tab's
-/// `order_index` (0/1/2), which becomes `tree_id` (mirrors the demo's Arms/Fury/Protection convention);
-/// an unresolved tab (shouldn't happen with both DBCs from the same client) falls back to 0.
-/// `max_rank` is derived by counting the nonzero entries in `spell_rank` (rank 1 lives in `spell_id`,
-/// ranks 2-5 in `rank_spell_2..5`); `required_points_in_tree` derives from `tier * POINTS_PER_TIER` (5).
-/// No Timestamp → plain SQL. Returns (statements, talent_count).
 fn map_talents(talents: &DbcTalent, order_map: &HashMap<u32, u8>) -> (Vec<String>, usize) {
     let rows: Vec<String> = talents
         .rows()
@@ -57,9 +43,7 @@ fn map_talents(talents: &DbcTalent, order_map: &HashMap<u32, u8>) -> (Vec<String
             let tree_id = order_map.get(&r.tab.id).copied().unwrap_or(0);
             let tier = r.tier.max(0) as u32;
             let column = r.column_index.max(0);
-            // Clamp to the 5 stored slots (spell_id + rank_spell_2..5): the DBC array has 9, but
-            // no vanilla talent exceeds 5 ranks — a hypothetical 6th would otherwise make max_rank
-            // promise a rank the table can't resolve.
+            // The DBC has nine rank slots, but vanilla talents and durable rows use at most five.
             let max_rank = (r.spell_rank.iter().filter(|&&s| s != 0).count() as u8).min(5);
             let required_talent_rank = r.prereq_ranks[0].max(0) as u8;
             format!(
@@ -72,7 +56,7 @@ fn map_talents(talents: &DbcTalent, order_map: &HashMap<u32, u8>) -> (Vec<String
                 max_rank,
                 r.spell_rank[0],
                 r.prereq_talents[0],
-                tier * 5, // required_points_in_tree = tier * POINTS_PER_TIER
+                tier * 5,
                 r.tab.id,
                 r.spell_rank[1],
                 r.spell_rank[2],
@@ -96,7 +80,6 @@ fn map_talents(talents: &DbcTalent, order_map: &HashMap<u32, u8>) -> (Vec<String
     (stmts, n)
 }
 
-/// Coverage accounting for the talent import — drives the coverage print.
 #[derive(Default)]
 struct Coverage {
     tabs: usize,
@@ -104,8 +87,6 @@ struct Coverage {
     classes: usize,
 }
 
-/// Print the coverage line + a warning when the shape doesn't match the expected vanilla layout (9
-/// classes × 3 tabs = 27 tabs).
 fn print_coverage(cov: &Coverage) {
     println!(
         "\ntalents: {} tabs, {} talents across {} classes",
@@ -122,9 +103,6 @@ fn print_coverage(cov: &Coverage) {
     }
 }
 
-/// `--dbc <Data dir> --talents` mode: import `TalentTab.dbc` + `Talent.dbc` → `game_talent_tab` +
-/// `game_talent`. Dry-run by default (parse + map + print coverage, write NOTHING); `--apply` runs the
-/// SQL. Mirrors `spell::run_spells`'s shape.
 pub fn run_talents(data_dir: &str, args: &Args) -> Result<()> {
     let dir = Path::new(data_dir);
     let mut chain = open_chain(dir)?;
@@ -189,10 +167,6 @@ pub fn run_talents(data_dir: &str, args: &Args) -> Result<()> {
     Ok(())
 }
 
-// ===========================================================================================
-//  Tests
-// ===========================================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,7 +229,7 @@ mod tests {
             rows: vec![
                 tab_row(161, "Arms", 1, 0, 0),
                 tab_row(162, "Fury", 1, 0, 1),
-                tab_row(163, "O'Ryan's Tab", 1, 0, 2), // apostrophe escaping
+                tab_row(163, "O'Ryan's Tab", 1, 0, 2),
             ],
         };
         let (stmts, n) = map_talent_tabs(&tabs);
@@ -272,17 +246,16 @@ mod tests {
 
     #[test]
     fn talents_map_two_rank_with_prereq_and_tab_order() {
-        // tab 161 is the FIRST tab of its class (order_index 0) → tree_id 0.
         let order_map: HashMap<u32, u8> = [(161u32, 0u8)].into_iter().collect();
         let talents = DbcTalent {
             rows: vec![talent_row(
                 100,
                 161,
-                1,                                 // tier
-                0,                                 // column_index
-                [5001, 5002, 0, 0, 0, 0, 0, 0, 0], // rank 1 + rank 2 (2-rank talent)
-                [99, 0, 0],                        // prereq talent 99
-                [2, 0, 0],                         // must be learned to rank 2
+                1,
+                0,
+                [5001, 5002, 0, 0, 0, 0, 0, 0, 0],
+                [99, 0, 0],
+                [2, 0, 0],
                 0,
             )],
         };
@@ -293,9 +266,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_talent "))
             .unwrap();
-        // talent_id=100,name,tree_id=0,tier=1,column=0,max_rank=2,spell_id=5001,required_talent_id=99,
-        // required_points_in_tree=5(tier*5),grant_spell_id=0,tab_id=161,rank_spell_2=5002,
-        // rank_spell_3=0,rank_spell_4=0,rank_spell_5=0,required_talent_rank=2,required_spell_id=0
         assert!(
             insert.contains("(100,'Talent 100',0,1,0,2,5001,99,5,0,161,5002,0,0,0,2,0)"),
             "{insert}"
@@ -304,7 +274,7 @@ mod tests {
 
     #[test]
     fn talents_map_missing_tab_falls_back_to_tree_zero() {
-        let order_map: HashMap<u32, u8> = HashMap::new(); // no TalentTab row for tab 999
+        let order_map: HashMap<u32, u8> = HashMap::new();
         let talents = DbcTalent {
             rows: vec![talent_row(
                 1,

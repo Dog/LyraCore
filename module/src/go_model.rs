@@ -1,26 +1,13 @@
-//! Imported DOOR and BUTTON meshes in model-local coordinates.
-//! Registration derives conservative world bounds; rays read current spawn state and transform.
-
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
 #[table(accessor = game_go_model)]
 pub struct GoModel {
     #[primary_key]
     pub entry: u32,
-    /// `gameobject_template.size` (render/collision scale), carried verbatim from the dump.
     pub scale: f32,
-    /// Importer's AABB-centered radius. Registration derives an origin bound from the vertices.
     pub radius: f32,
-    /// `lyracore_shared::vmap`-codec local-space triangles. The class tag the codec carries is
-    /// unused here — a door's dynamic-ray participation is decided per `game_gameobject` row
-    /// (state/liveness), not per triangle class.
     pub blob: Vec<u8>,
 }
-
-// ===========================================================================================
-//  Import reducers — same packed-string convention as `vmap::import_vmap_chunks`/`_append`:
-//  rows `;`, fields `,`, the blob hex LAST so `splitn` keeps it intact.
-// ===========================================================================================
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
@@ -40,7 +27,6 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// One packed row: `entry,scale,radius,blob_hex`.
 fn parse_row(row: &str) -> Result<(u32, f32, f32, Vec<u8>), String> {
     let f: Vec<&str> = row.splitn(4, ',').collect();
     if f.len() != 4 {
@@ -75,8 +61,6 @@ fn parse_row(row: &str) -> Result<(u32, f32, f32, Vec<u8>), String> {
     Ok((entry, scale, radius, blob))
 }
 
-/// Load one batch, REPLACING any row whose entry repeats (retry-safe: re-appending the same
-/// entry with the same bytes is a no-op in effect, and a corrected re-extract simply overwrites).
 fn load_go_model_batch(ctx: &ReducerContext, packed: &str) -> Result<u32, String> {
     let models = ctx.db.game_go_model();
     let mut loaded = 0u32;
@@ -94,7 +78,6 @@ fn load_go_model_batch(ctx: &ReducerContext, packed: &str) -> Result<u32, String
     Ok(loaded)
 }
 
-/// Clear + load the first go-model batch (operator-only), mirroring `vmap::import_vmap_chunks`.
 #[reducer]
 pub fn import_go_models(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -109,8 +92,6 @@ pub fn import_go_models(ctx: &ReducerContext, packed: String) -> Result<(), Stri
     crate::go_collider::rebuild_go_colliders(ctx)
 }
 
-/// Append a go-model batch WITHOUT the reset — a full catalogue can span many `spacetime call`
-/// args, same reason `import_vmap_chunks_append` exists.
 #[reducer]
 pub fn import_go_models_append(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;

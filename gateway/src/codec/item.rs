@@ -1,9 +1,6 @@
-//! Item wire mapping: the `CMSG_ITEM_QUERY_SINGLE` reply and the item CREATE_OBJECT, plus the flattened template/instance row views. Pure code-motion out of `mod.rs`.
-
 use super::*;
 use lyracore_shared::item::{item_class, weapon_subclass, ItemRefusal, Proficiency};
 
-/// Map vanilla bag coordinates to the Module's slot address. Capacity stays a Module Gate.
 pub fn inventory_slot(bag: u8, slot: u8) -> Option<u8> {
     match (bag, slot) {
         (255, 0..=62) => Some(slot),
@@ -12,16 +9,12 @@ pub fn inventory_slot(bag: u8, slot: u8) -> Option<u8> {
     }
 }
 
-/// Recover the bag equipment slot and position for a Module bag-content address.
 pub fn bag_content_parts(slot: u8) -> Option<(u8, u8)> {
     (120..192)
         .contains(&slot)
         .then(|| (19 + (slot - 120) / 18, (slot - 120) % 18))
 }
 
-/// An item-template row as the gateway reads it from `game_item_template`, flattened for the
-/// `CMSG_ITEM_QUERY_SINGLE` reply + the item CREATE. Decoupled from the SDK row
-/// type. `class`/`subclass` together pick the typed `ItemClassAndSubClass`; the rest map 1:1.
 #[derive(Clone, Debug, Default)]
 pub struct ItemTemplateView {
     pub entry: u32,
@@ -40,36 +33,20 @@ pub struct ItemTemplateView {
     pub damage_min: f32,
     pub damage_max: f32,
     pub delay_ms: u32,
-    // equip stat bonuses (mirrored from module ItemTemplate)
     pub stat_strength: i32,
     pub stat_agility: i32,
     pub stat_stamina: i32,
     pub stat_intellect: i32,
     pub stat_spirit: i32,
-    pub stat_armor: i32,  // bonus armor for the tooltip
-    pub block_value: i32, // shield block value (0 for non-shields)
-    // On-use/on-equip spell slots 1-2 (id + ItemSpellTriggerType) — drive the client green "Use:" text.
+    pub stat_armor: i32,
+    pub block_value: i32,
     pub spellid_1: u32,
     pub spelltrigger_1: u8,
     pub spellid_2: u32,
     pub spelltrigger_2: u8,
-    // NOTE: no `container_slots` here. The bag CREATE reads it off `ItemInstanceView` (below), which
-    // gets it from its own `game_item_template` lookup at read/subscription time — a template mirror
-    // on this struct would be a second, never-read copy of the same column.
-    /// Item binding: the cmangos `bonding` value (0=NoBind,1=BoP,2=BoE,3=BoU,
-    /// 4/5=QuestItem), sent as-is into `SMSG_ITEM_QUERY_SINGLE_RESPONSE.bonding` so the client renders
-    /// "Binds when picked up/equipped". Trade/mail enforcement lives in the trade-window/mailbox
-    /// systems — this is query-only.
     pub bonding: u8,
-    /// Sheathe posture: the raw cmangos `item_template.sheath` byte — where the weapon stows
-    /// visually (Worn Shortsword=3 → hip; shields/2H on the back). Passed THROUGH to the wire (cmangos
-    /// sends `pProto->Sheath` verbatim; gtker's SheatheType variant NAMES don't track the client's
-    /// actual postures — values rule).
+    /// Preserve raw sheath values; gtker's SheatheType names differ from cmangos.
     pub sheath: u8,
-    // The dropped item_template columns, mirrored straight from the module's
-    // `ItemTemplate` (no consumer system reads these server-side yet — this view carries them ONLY
-    // so `build_item_query_response` can fill in the wire fields it already writes hardcoded 0/default
-    // for — the free gateway win).
     pub holy_res: i32,
     pub fire_res: i32,
     pub nature_res: i32,
@@ -96,56 +73,37 @@ pub struct ItemTemplateView {
     pub random_property: u32,
 }
 
-/// An owned-item instance as the gateway reads it from `game_item_instance`,
-/// joined with its template for the CREATE descriptors. Decoupled from the SDK row type.
 #[derive(Clone, Debug, Default)]
 pub struct ItemInstanceView {
     pub guid: u64,
     pub entry: u32,
-    pub owner_guid: u64, // the owning character — ITEM_FIELD_OWNER / ITEM_FIELD_CONTAINED
-    pub slot: u8,        // the inventory slot it occupies (ItemSlot ordinal)
+    pub owner_guid: u64,
+    pub slot: u8,
     pub stack_count: u32,
     pub durability: u32,
     pub max_durability: u32,
-    /// Number of container slots (0 = regular item, > 0 = bag). Drives the CREATE_OBJECT choice:
-    /// bags are sent as `ObjectType::Container` with `CONTAINER_FIELD_NUM_SLOTS` set so the client
-    /// opens the bag window. Non-bags use `ObjectType::Item` as before (baseline-safe).
     pub container_slots: u8,
     pub random_property_id: u32,
-    /// The Random Property's three enchant ids, zero where it names none. An owned item's tooltip
-    /// takes its property stat lines from these; `random_property_id` only names the Suffix.
     pub random_property_enchant_ids: [u32; 3],
-    /// `ITEM_FIELD_ITEM_TEXT_ID` — nonzero on a Letter Copy's Plain Letter
-    /// (`CMSG_MAIL_CREATE_TEXT_ITEM`). Zero means the item carries no readable text.
     pub item_text_id: u32,
-    /// ITEM_FIELD_ENCHANTMENT. An item with a permanent enchant carries the enchantment ID the
-    /// client resolves (`client_enchantment_id`), not the stored ID. A Guild Charter carries its
-    /// Petition id here, projected from Realm-core (`cm:PetitionsHandler.cpp:141`). Every other
-    /// item leaves it 0 and unwritten.
     pub enchantment: u32,
 }
 
-/// ITEM_FIELD_ENCHANTMENT, the first enchantment word of an item (`cm:UpdateFields.h:48`).
 pub const ITEM_FIELD_ENCHANTMENT: u16 = 22;
 
-/// A Guild Charter's Petition id as a partial VALUES update of the Charter item. Raw, so it never
-/// carries `OBJECT_FIELD_TYPE`.
 pub fn build_charter_petition_values(charter_item_guid: u64, petition_id: u32) -> (u16, Vec<u8>) {
     let mut mask = update_mask::UpdateMaskValues::new();
     mask.set_u32(ITEM_FIELD_ENCHANTMENT, petition_id);
     build_values_update_raw(charter_item_guid, &mask)
 }
 
-/// The id words of enchantment slots 3, 4 and 5, where cmangos `Item::SetItemRandomProperties`
-/// writes a Random Property's enchant ids. Each slot is three words: id, duration, charges.
 const RANDOM_PROPERTY_ENCHANT_ID_FIELDS: [u16; 3] = [
     ITEM_FIELD_ENCHANTMENT + 3 * 3,
     ITEM_FIELD_ENCHANTMENT + 4 * 3,
     ITEM_FIELD_ENCHANTMENT + 5 * 3,
 ];
 
-/// A Random Property's enchant ids as a partial VALUES update that follows the item's CREATE. The
-/// typed CREATE reaches only enchantment slot 0. `None` when the item has no property enchant ids.
+/// The typed CREATE reaches only enchantment slot 0; property slots follow in VALUES.
 pub fn build_random_property_values(inst: &ItemInstanceView) -> Option<(u16, Vec<u8>)> {
     if inst.random_property_enchant_ids == [0; 3] {
         return None;
@@ -161,32 +119,17 @@ pub fn build_random_property_values(inst: &ItemInstanceView) -> Option<(u16, Vec
     Some(build_values_update_raw(inst.guid, &mask))
 }
 
-/// Build `SMSG_ITEM_QUERY_SINGLE_RESPONSE` so the client caches the item's name/tooltip/icon (the
-/// item analogue of the creature query). The 1.12 client only queries an item it has *encountered*
-/// (i.e. has an object for), so this is what makes `GetItemInfo`/the bag tooltip resolve a real name
-/// instead of staying blank. The response struct derives `Default`, so we set only the load-bearing
-/// fields (class/subclass, name, icon display, quality, prices, equip type, level, the weapon's
-/// damage + speed, sheathe, durability) and leave the ~40 cosmetic fields at their zero defaults.
 pub fn build_item_query_response(
     item: u32,
     t: Option<&ItemTemplateView>,
 ) -> SMSG_ITEM_QUERY_SINGLE_RESPONSE {
-    // Unknown entry → reply `found: None` (NotFound) so the client stops re-asking, matching a real
-    // server's miss (the creature query just logs + drops, but an item miss would re-query forever).
     let Some(t) = t else {
         return SMSG_ITEM_QUERY_SINGLE_RESPONSE { item, found: None };
     };
-    // ItemClassAndSubClass packs subclass in the high u32, class in the low u32 (e.g. a one-hand
-    // sword = (7 << 32) | 2 = 0x7_0000_0002). An unknown pairing degrades to the enum's default
-    // rather than failing the query (the worst case is a wrong category line on the tooltip).
+    // ItemClassAndSubClass packs subclass in the high u32 and class in the low u32.
     let class_and_sub_class =
         ItemClassAndSubClass::try_from((u64::from(t.subclass) << 32) | u64::from(t.class))
             .unwrap_or_default();
-    // Build a compact stats array: pack non-zero stats into the first N slots (max 10), pad the
-    // rest with (Mana, 0) which the 1.12 client skips when rendering the tooltip. The 7 stat columns
-    // the module stores map directly to 5 attribute stats + crit/hit (which don't show as "+N Stat"
-    // lines in vanilla — skip them to avoid confusing the tooltip). stat_armor feeds the `armor`
-    // field instead.
     let stats: [ItemStat; 10] = {
         let pairs: [(ItemStatType, i32); 5] = [
             (ItemStatType::Strength, t.stat_strength),
@@ -211,10 +154,6 @@ pub fn build_item_query_response(
         }
         out
     };
-    // On-use/on-equip spell slots → the client renders the green "Use:/Equip:/Chance on hit:" text from
-    // its OWN Spell.dbc. All 5 slots are populated from the template (slots 3-5 were wired
-    // in later — previously hardcoded empty). spell_trigger maps the raw ItemSpellTriggerType byte
-    // (0=on-use, 1=on-equip, 2=chance-on-hit).
     let spell_slot = |id: u32, trig: u8| ItemSpells {
         spell: id,
         spell_trigger: SpellTriggerType::try_from(u32::from(trig)).unwrap_or_default(),
@@ -233,8 +172,6 @@ pub fn build_item_query_response(
             name1: t.name.clone(),
             display_id: t.display_id,
             quality: ItemQuality::try_from(u32::from(t.quality)).unwrap_or_default(),
-            // The raw item_template.Flags bitmask (unique/conjured/etc) — was
-            // hardcoded to the wire default (empty) before the column existed server-side.
             flags: ItemFlag::new(t.item_flags),
             buy_price: Gold::new(t.buy_price),
             sell_price: Gold::new(t.sell_price),
@@ -244,25 +181,15 @@ pub fn build_item_query_response(
             required_level: Level::new(t.required_level),
             allowed_class: AllowedClass::new(t.allowed_class),
             allowed_race: AllowedRace::new(t.allowed_race),
-            // Weapon-skill / mail-plate proficiency gate. An out-of-range skill id
-            // degrades to Skill::None rather than failing the query (matches the other try_from
-            // degrades in this function).
             required_skill: Skill::try_from(t.required_skill).unwrap_or_default(),
             required_skill_rank: t.required_skill_rank,
-            // The reputation-gated-item half of faction reaction gating.
             required_faction: Faction::try_from(t.required_reputation_faction).unwrap_or_default(),
             required_faction_rank: t.required_reputation_rank,
             stackable: t.max_stack.max(1),
-            // Unique-item stack cap (was hardcoded 0 before the column existed
-            // server-side).
             max_count: t.max_count,
             stats,
             armor: t.stat_armor,
-            // block carries the shield's base block value (0 for every non-shield); u32 cast is
-            // safe because every seeded block_value is ≥ 0 (i32 future-proofs enchant negatives).
             block: t.block_value.max(0) as u32,
-            // The weapon's white-damage range + swing speed (drives the tooltip "N - M Damage" and
-            // "Speed X.XX"); slot 0 physical, the rest left empty.
             damages: {
                 let mut d = [ItemDamageType::default(); 5];
                 d[0] = ItemDamageType {
@@ -272,8 +199,6 @@ pub fn build_item_query_response(
                 };
                 d
             },
-            // The 6 resistance schools — resist gear tooltips were dead (always 0)
-            // until these columns existed server-side.
             holy_resistance: t.holy_res,
             fire_resistance: t.fire_res,
             nature_resistance: t.nature_res,
@@ -281,28 +206,14 @@ pub fn build_item_query_response(
             shadow_resistance: t.shadow_res,
             arcane_resistance: t.arcane_res,
             delay: t.delay_ms,
-            // The per-item sheathe posture (was a blanket MainHand → every weapon/shield stowed
-            // in the same spot). An out-of-range byte degrades to None rather than failing the query.
             sheathe_type: SheatheType::try_from(t.sheath).unwrap_or_default(),
             spells,
-            // Item binding: the raw cmangos byte maps directly onto the wire enum
-            // (NoBind=0, PickUp=1 "Binds when picked up", Equip=2 "Binds when equipped", Use=3,
-            // QuestItem=4/5) — an out-of-range byte degrades to NoBind rather than failing the query.
             bonding: Bonding::try_from(u32::from(t.bonding)).unwrap_or_default(),
-            // Readable-item page id (needs its own page_text dump table + reader
-            // packet before a player can actually read one — data plumbing only for now) and the
-            // quest-starter link (consumed by the quest system).
             page_text: t.page_text,
             start_quest: t.start_quest,
             max_durability: t.max_durability,
-            // Bag-type restriction bitmask (Soul Bag/Quiver/etc). An out-of-range
-            // value degrades to BagFamily::None rather than failing the query.
             bag_family: BagFamily::try_from(t.bag_family).unwrap_or_default(),
-            // Ranged weapon RANGE multiplier (mangos `RangedModRange`, % of base). The client scales a
-            // ranged attack's spell range (Auto Shot = 35yd) by THIS — a `Default::default()` of 0.0
-            // collapsed the effective range to 0, so Auto Shot read "out of range" at EVERY distance. The
-            // mangos column defaults to 100.0 for ALL items (only ranged weapons consult it); we don't
-            // import per-item overrides, so send the universal vanilla default. [hunter Auto Shot fix]
+            // RangedModRange is percent of base range; zero makes every ranged target out of range.
             ranged_range_modification: 100.0,
             random_property: t.random_property,
             ..Default::default()
@@ -310,12 +221,6 @@ pub fn build_item_query_response(
     }
 }
 
-/// Build a generic `SMSG_INVENTORY_CHANGE_FAILURE` — the error popup for a rejected inventory
-/// action (equip, move, store, or use). The gateway doesn't have the specific reason at this
-/// level (the module surfaced only an opaque `Err`), so we use `ItemCantBeEquipped` with zero
-/// item guids. Any non-OK result triggers the client's error sound and prevents the snap-back
-/// from looking like success. Specific codes (with the actual item guids and cause) require
-/// the module to surface them via a structured error; this is the gateway-only baseline.
 pub fn build_inventory_change_failure() -> SMSG_INVENTORY_CHANGE_FAILURE {
     SMSG_INVENTORY_CHANGE_FAILURE::ItemCantBeEquipped {
         item1: Guid::new(0),
@@ -324,11 +229,6 @@ pub fn build_inventory_change_failure() -> SMSG_INVENTORY_CHANGE_FAILURE {
     }
 }
 
-/// Build `SMSG_INVENTORY_CHANGE_FAILURE` for one typed item Refusal — the vanilla result code the
-/// 1.12 client turns into its own error line. The item guids stay zero: the module names the reason,
-/// not the rows. `Internal` has no gameplay meaning, so it reads as the client's internal bag error.
-/// A required level has no payload-free code (vanilla's level result carries the level itself), so it
-/// falls back to the generic equip and use failures.
 pub fn build_inventory_refusal(refusal: ItemRefusal) -> SMSG_INVENTORY_CHANGE_FAILURE {
     let (item1, item2, bag_type_subclass) = (Guid::new(0), Guid::new(0), 0);
     match refusal {
@@ -405,9 +305,6 @@ pub fn build_inventory_refusal(refusal: ItemRefusal) -> SMSG_INVENTORY_CHANGE_FA
     }
 }
 
-/// `SMSG_INVENTORY_CHANGE_FAILURE` CANT_CARRY_MORE_OF_THIS for an item whose unique count is
-/// reached, with no item guids, as mangos answers a second Guild Charter
-/// (`cm:PetitionsHandler.cpp:128-134`).
 pub fn build_cant_carry_more_of_this() -> SMSG_INVENTORY_CHANGE_FAILURE {
     SMSG_INVENTORY_CHANGE_FAILURE::CantCarryMoreOfThis {
         item1: Guid::new(0),
@@ -416,9 +313,6 @@ pub fn build_cant_carry_more_of_this() -> SMSG_INVENTORY_CHANGE_FAILURE {
     }
 }
 
-/// Build `SMSG_BUY_FAILED` — the red on-screen error for a rejected vendor purchase.
-/// Maps the module's Err string to the closest `BuyResult` code (displayed as a toast by the
-/// 1.12 client). `vendor_guid` is the NPC, `item_entry` is the `c.item` from the client packet.
 pub fn build_buy_failed(vendor_guid: u64, item_entry: u32, err: &str) -> SMSG_BUY_FAILED {
     let result = if err.contains("not enough money") {
         BuyResult::NotEnoughMoney
@@ -429,7 +323,6 @@ pub fn build_buy_failed(vendor_guid: u64, item_entry: u32, err: &str) -> SMSG_BU
     } else if err.contains("sold out") || err.contains("no stock") {
         BuyResult::ItemSoldOut
     } else {
-        // "vendor does not sell that item", "item cannot be bought", "dead", etc. — generic.
         BuyResult::CantFindItem
     };
     SMSG_BUY_FAILED {
@@ -439,24 +332,16 @@ pub fn build_buy_failed(vendor_guid: u64, item_entry: u32, err: &str) -> SMSG_BU
     }
 }
 
-/// Build `SMSG_SHOW_BANK` — opens the bank window, carrying the banker's guid.
 pub fn build_show_bank(banker_guid: u64) -> SMSG_SHOW_BANK {
     SMSG_SHOW_BANK {
         guid: Guid::new(banker_guid),
     }
 }
 
-/// Build `SMSG_BUY_BANK_SLOT_RESULT`.
 pub fn build_buy_bank_slot_result(result: BuyBankSlotResult) -> SMSG_BUY_BANK_SLOT_RESULT {
     SMSG_BUY_BANK_SLOT_RESULT { result }
 }
 
-/// Map `apply_buy_bank_slot`'s `Err` string onto `BuyBankSlotResult` by its leading `[N]` code
-/// (the trainer `[N]` precedent) — never by matching the prose, which can drift out from under a
-/// substring match. `lyracore_shared::bank::result`'s constants ARE the wire numbering, so `[N]`
-/// decodes straight through `BuyBankSlotResult::from_int`. An unparseable or out-of-range code
-/// falls back to `NotBanker`: a refusal, and the one outcome that asserts nothing about money or
-/// slot count, so a fallback here can never mislead the client into thinking a charge went through.
 pub fn parse_buy_bank_slot_result(err: &str) -> BuyBankSlotResult {
     err.strip_prefix('[')
         .and_then(|rest| rest.split(']').next())
@@ -465,9 +350,6 @@ pub fn parse_buy_bank_slot_result(err: &str) -> BuyBankSlotResult {
         .unwrap_or(BuyBankSlotResult::NotBanker)
 }
 
-/// Build `SMSG_BUY_BANK_SLOT_RESULT` straight from the store call's outcome, so the dispatch
-/// handler never needs to name the gtker enum itself (the trainer/vendor handlers keep the same
-/// distance from their wire enums).
 pub fn build_buy_bank_slot_reply(outcome: Result<(), &str>) -> SMSG_BUY_BANK_SLOT_RESULT {
     let result = match outcome {
         Ok(()) => BuyBankSlotResult::Ok,
@@ -476,21 +358,12 @@ pub fn build_buy_bank_slot_reply(outcome: Result<(), &str>) -> SMSG_BUY_BANK_SLO
     build_buy_bank_slot_result(result)
 }
 
-/// Build the item or container CREATE_OBJECT. A non-spatial object:
-/// NO living/position movement block — just `UPDATEFLAG_ALL`. Branches on `inst.container_slots`:
-/// - Regular items (0): `ObjectType::Item` + `UpdateMask::Item` (baseline-safe, byte-identical).
-/// - Bags (> 0): `ObjectType::Container` + `UpdateMask::Container` with `CONTAINER_FIELD_NUM_SLOTS`
-///   set so the client shows a bag window with the correct slot count. `ITEM_FIELD_OWNER` and
-///   `ITEM_FIELD_CONTAINED` both point at the owning player. Sent before the player self-spawn.
-///
-/// `ITEM_FIELD_ENCHANTMENT` is written only when nonzero, so an item without one keeps its bytes.
 pub fn build_item_create_object(inst: &ItemInstanceView) -> SMSG_UPDATE_OBJECT {
     let owner = Guid::new(inst.owner_guid);
     let update_flag =
         MovementBlock_UpdateFlag::empty().set_all(MovementBlock_UpdateFlag_All { unknown1: 1 });
     let guid3 = Guid::new(inst.guid);
     if inst.container_slots > 0 {
-        // This item is a bag — send a CONTAINER CREATE so the client shows the bag window.
         let mut container = UpdateContainer::builder()
             .set_object_guid(guid3)
             .set_object_entry(inst.entry as i32)
@@ -519,7 +392,6 @@ pub fn build_item_create_object(inst: &ItemInstanceView) -> SMSG_UPDATE_OBJECT {
             }],
         }
     } else {
-        // Regular item — `ObjectType::Item`, byte-identical to the pre-bag path.
         let mut item = UpdateItem::builder()
             .set_object_guid(guid3)
             .set_object_entry(inst.entry as i32)
@@ -531,8 +403,6 @@ pub fn build_item_create_object(inst: &ItemInstanceView) -> SMSG_UPDATE_OBJECT {
             .set_item_durability(inst.durability as i32)
             .set_item_maxdurability(inst.max_durability as i32)
             .finalize();
-        // A copied letter's item text — the field a plain item leaves unset (byte-identical to the
-        // pre-Letter-Copy wire shape).
         if inst.item_text_id != 0 {
             item.set_item_item_text_id(inst.item_text_id as i32);
         }
@@ -555,13 +425,6 @@ use wow_world_messages::vanilla::{
     NewItemChatAlert, NewItemCreationType, NewItemSource, SMSG_ITEM_PUSH_RESULT,
 };
 
-/// `SMSG_ITEM_PUSH_RESULT` — the "You receive item: [X]." chat/toast for a
-/// windowless gain, and the client's trigger to re-check watched-quest item objectives (the
-/// tracker + "Wolf Meat: 3/8" floaty — 1.12 recomputes those from its bags when this arrives).
-/// `stack_add` sends item_slot 0xFFFFFFFF (the mangoszero added-to-stack convention). Source is
-/// always Looted/Received — the relay can't see WHERE the row came from (loot/buy/conjure);
-/// "You receive item" reads fine for all three. Deliberate simplification: thread a source hint
-/// through when this grates.
 pub fn build_item_push_result(
     player_guid: u64,
     bag_slot: u8,
@@ -585,17 +448,10 @@ pub fn build_item_push_result(
     }
 }
 
-/// The Character's armor Proficiency, read off its spellbook. The two level-40 upgrades are the
-/// passive spells a class trainer teaches, so knowing the passive IS the knowledge — the same
-/// question the Module equip Gate asks before it allows the item move.
 pub fn armor_proficiency(player_class: u8, learned: &[u32]) -> Proficiency {
     Proficiency::from_spellbook(player_class, |spell_id| learned.contains(&spell_id))
 }
 
-/// The pair of `SMSG_SET_PROFICIENCY` messages that tell the client what this Character may wield
-/// and wear: the static class weapon table, then the armor tiers it has actually trained. Both
-/// masks are `1 << subclass`, and both come from the shared [`Proficiency`] rule, so the client's
-/// red tint and the Module's Refusal cannot drift apart.
 pub fn build_set_proficiency_msgs(player_class: u8, learned: &[u32]) -> [ServerOpcodeMessage; 2] {
     [
         ServerOpcodeMessage::SMSG_SET_PROFICIENCY(SMSG_SET_PROFICIENCY {
@@ -606,8 +462,6 @@ pub fn build_set_proficiency_msgs(player_class: u8, learned: &[u32]) -> [ServerO
     ]
 }
 
-/// The ARMOR message alone — what a proficiency purchase refreshes. A weapon table never moves, so
-/// resending it after a trainer buy would say nothing.
 pub fn build_armor_proficiency_msg(player_class: u8, learned: &[u32]) -> ServerOpcodeMessage {
     ServerOpcodeMessage::SMSG_SET_PROFICIENCY(SMSG_SET_PROFICIENCY {
         class: ItemClass::Armor,
@@ -615,8 +469,6 @@ pub fn build_armor_proficiency_msg(player_class: u8, learned: &[u32]) -> ServerO
     })
 }
 
-/// Weapon subclasses the class table admits, folded into a `1 << subclass` mask. Armor training
-/// never touches weapons, so the ceiling answers this for every Character of the class.
 fn weapon_subclass_mask(player_class: u8) -> u32 {
     let table = Proficiency::class_ceiling(player_class);
     (0..=weapon_subclass::FISHING_POLE)
@@ -694,8 +546,6 @@ mod tests {
         assert_eq!(item_mask(&charter(0)).item_enchantment(), None);
     }
 
-    /// `cm:PetitionsHandler.cpp:128-134` sends `SendEquipError(msg, nullptr, nullptr, 5863)`: a u8
-    /// result, CANT_CARRY_MORE_OF_THIS (17), then two zero item guids and a zero bag subclass.
     #[test]
     fn a_second_charter_answers_cant_carry_more_of_this() {
         let message = ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
@@ -742,8 +592,7 @@ mod tests {
         updates[0].fields.clone()
     }
 
-    /// Slot k's id word is 22 + 3k (`cm:UpdateFields.h`, `cm:Item.h`), so slots 3, 4 and 5 are
-    /// words 31, 34 and 37.
+    /// Enchantment slot k uses word 22 + 3k in the vanilla item descriptor.
     #[test]
     fn a_random_property_fills_enchantment_slots_three_to_five() {
         assert_eq!(

@@ -1,6 +1,3 @@
-//! The raid leader moves and swaps members between Subgroups through the Realm-core party
-//! reducer, on a private Standalone.
-
 mod support;
 
 use lyracore_shared::group::RaidSlot;
@@ -62,7 +59,6 @@ fn failure_text(node: &Standalone, reducer: &str, args: &[&str]) -> String {
     text
 }
 
-/// Every LIST row one action inserted, decoded.
 fn lists_pushed_by(
     node: &Standalone,
     action: impl FnOnce(),
@@ -117,9 +113,6 @@ fn join(node: &Standalone, leader: u64, guid: u64) {
     node.assert_call("realm_group_op", &args);
 }
 
-/// **AC 1-4, 9**: a 6-member Raid — Subgroup 0 full with 1 through 5, member 6 alone in Subgroup 1.
-/// The leader moves a member; a plain member, an out-of-range Subgroup, and a full destination are
-/// each refused; only the accepted move advances the Roster Revision.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_leader_moves_a_member_while_a_plain_member_and_bad_input_are_refused() {
@@ -137,17 +130,14 @@ fn a_leader_moves_a_member_while_a_plain_member_and_bad_input_are_refused() {
         "Subgroup 0 already holds 5, so member 6 fills Subgroup 1"
     );
 
-    // AC 2: a plain member (6, no Assistant bit, not the leader) cannot move anybody.
     let revision_before = roster_revision(&realm);
     let text = call_failure(&realm, CHANGE_SUBGROUP, 6, 2, 3, 0);
     assert!(text.contains("group:not_leader"), "{text}");
     assert_eq!(slot_of(&realm, 2), "0", "the refused move changes nothing");
 
-    // AC 4: a Raid has only 8 Subgroups, 0 to 7.
     let text = call_failure(&realm, CHANGE_SUBGROUP, 1, 2, 8, 0);
     assert!(text.contains("group:invalid_subgroup"), "{text}");
 
-    // AC 3: Subgroup 0 already holds 5.
     let text = call_failure(&realm, CHANGE_SUBGROUP, 1, 6, 0, 0);
     assert!(text.contains("group:subgroup_full"), "{text}");
     assert_eq!(slot_of(&realm, 6), "1", "the refused move changes nothing");
@@ -157,8 +147,6 @@ fn a_leader_moves_a_member_while_a_plain_member_and_bad_input_are_refused() {
         "no refusal above advanced the Roster Revision"
     );
 
-    // AC 1: the leader moves member 2 into Subgroup 1, which has room (member 6 alone). Every
-    // member's list shows member 2's flags byte as 1, and the Roster Revision advances.
     let lists = lists_pushed_by(&realm, || call_ok(&realm, CHANGE_SUBGROUP, 1, 2, 1, 0));
     assert_eq!(lists.len(), 6, "every member of the Raid receives the list");
     for (_, roster) in &lists {
@@ -172,7 +160,6 @@ fn a_leader_moves_a_member_while_a_plain_member_and_bad_input_are_refused() {
         "the accepted move advances the Roster Revision"
     );
 
-    // The same Subgroup succeeds and changes nothing: member 2 already holds Subgroup 1.
     let revision_before = roster_revision(&realm);
     call_ok(&realm, CHANGE_SUBGROUP, 1, 2, 1, 0);
     assert_eq!(slot_of(&realm, 2), "1");
@@ -183,9 +170,6 @@ fn a_leader_moves_a_member_while_a_plain_member_and_bad_input_are_refused() {
     );
 }
 
-/// **AC 6, 7, 9**: a 10-member Raid with Subgroup 0 and Subgroup 1 both full. Swapping two members
-/// of the two full Subgroups needs no capacity Gate; swapping two members of one Subgroup changes
-/// nothing.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_leader_swaps_members_of_two_full_subgroups_and_a_same_subgroup_swap_is_a_no_op() {
@@ -214,8 +198,6 @@ fn a_leader_swaps_members_of_two_full_subgroups_and_a_same_subgroup_swap_is_a_no
         );
     }
 
-    // AC 6: swap a member of the full Subgroup 0 with a member of the full Subgroup 1. One atomic
-    // swap can never overfill a Subgroup, so cmangos applies no capacity Gate here.
     let revision_before = roster_revision(&realm);
     let lists = lists_pushed_by(&realm, || call_ok(&realm, SWAP_SUBGROUP, 1, 1, 0, 6));
     assert_eq!(lists.len(), 10, "one list per member, not two moves' worth");
@@ -227,7 +209,6 @@ fn a_leader_swaps_members_of_two_full_subgroups_and_a_same_subgroup_swap_is_a_no
         "the swap advances the Roster Revision"
     );
 
-    // AC 7: members 2 and 3 both still sit in Subgroup 0 — swapping them changes nothing.
     let revision_before = roster_revision(&realm);
     call_ok(&realm, SWAP_SUBGROUP, 1, 2, 0, 3);
     assert_eq!(slot_of(&realm, 2), "0");
@@ -239,7 +220,6 @@ fn a_leader_swaps_members_of_two_full_subgroups_and_a_same_subgroup_swap_is_a_no
     );
 }
 
-/// **AC 5**: in a Party, both ops refuse and change nothing.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn subgroup_ops_in_a_party_are_refused() {

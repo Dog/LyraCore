@@ -35,7 +35,7 @@ Start at [`architecture.md`](./architecture.md) for how these tables fit into th
 
 1. **A default must be END-appended and explicitly typed.** A bare `#[default(0)]` on a `u64` column
    encodes as a 4-byte i32 and the publish migration rejects it (`data too short for u64`). Write
-   `#[default(0u64)]`. `module/src/character.rs` carries several worked examples in its comments.
+   `#[default(0u64)]`. See the typed field defaults in `module/src/character.rs`.
 2. **`#[default(...)]` cannot default a `String`.** The macro type-checks the expression in a const
    block, and dropping a `String` in const-evaluated Rust is `error[E0493]` on stable. This is a Rust
    limitation, not a repo convention. Put new string data in a **new table** instead — the same
@@ -592,10 +592,10 @@ until the generation is verified again or the vmap data is imported again.
 **The module declares no `#[client_visibility_filter]` filters.** Recount at any time:
 
 ```bash
-grep -rn 'client_visibility_filter' module/src --include='*.rs'
+rg -n '#\[client_visibility_filter' module/src --glob '*.rs'
 ```
 
-Only two comment lines match. This document used to list sixteen owner-scoped filters, all of the
+No attributes match. This document used to list sixteen owner-scoped filters, all of the
 shape `SELECT * FROM <table> WHERE <identity column> = :sender`. Commit `7fda35a` (2026-08-11)
 deleted every one of them, in the same change that deleted per-player client connections. An RLS
 filter only ever applied to a client-identity subscription, and no client-identity subscription is
@@ -641,7 +641,7 @@ Two constraints survive the removal and bind any filter added later.
 timer decides gameplay. Recount and re-list them with:
 
 ```bash
-grep -rn 'scheduled(' module/src --include='*.rs'   # 27 tables plus 4 comment lines, 2026-10-03
+rg -n 'scheduled\(' module/src --glob '*.rs'
 ```
 
 | Scheduled table | Reducer | Cadence | Where |

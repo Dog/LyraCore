@@ -1,25 +1,12 @@
-//! Region definitions and epoch-versioned assignments.
-//! The Module writes routing data for the Gateway and never branches on a Shard name.
-
 use lyracore_shared::region::RegionMap;
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
-/// `(map_id, region_id)` as one u64 primary key. Same trick as `terrain::cell_key` — SpacetimeDB
-/// takes a single `#[primary_key]` column, and a packed key is cheaper than a scan-and-match.
 pub(crate) fn region_key(map_id: u32, region_id: u32) -> u64 {
     ((map_id as u64) << 32) | region_id as u64
 }
 
-/// One region definition: `region_id` on `map_id` covers the inclusive cell rectangle
-/// `[gx_min..=gx_max] × [gy_min..=gy_max]`. Content data — replaced wholesale by
-/// [`import_map_regions`], never written at runtime. [static]
-///
-/// PRIVATE (no `public`): the seam menu is operations data. It is harmless in itself, but a client
-/// has no use for it and the gateway's coordinator connection (owner token, RLS bypass) reads it
-/// exactly the way it reads `game_character_shard`.
 #[table(accessor = game_map_region)]
 pub struct MapRegion {
-    /// [`region_key`]`(map_id, region_id)`.
     #[primary_key]
     pub key: u64,
     pub map_id: u32,
@@ -30,39 +17,17 @@ pub struct MapRegion {
     pub gy_max: i32,
 }
 
-/// `region_assignment { map_id, region_id, shard, epoch }` — which database owns a region, and at
-/// which epoch. Authoritative on realm-core; inert everywhere else (nothing writes it there).
-///
-/// PRIVATE: this table names the realm's databases. Never hand a client the topology.
 #[table(accessor = game_region_assignment)]
 pub struct RegionAssignment {
-    /// [`region_key`]`(map_id, region_id)`.
     #[primary_key]
     pub key: u64,
     pub map_id: u32,
     pub region_id: u32,
-    /// The DATABASE NAME that owns this region — gateway routing data. No module game logic reads
-    /// this column (`partition_discipline_tripwire` enforces it).
     pub shard: String,
-    /// Monotonic per `(map_id, region_id)`; see the type docs.
     pub epoch: u64,
-    /// When the flip landed — diagnostics only.
     pub updated_micros: i64,
 }
 
-/// Replace the realm's whole seam menu with `packed` (the `RegionMap::parse` format).
-/// Operator-only, like every other importer.
-///
-/// Rejects the WHOLE payload if any line is malformed or breaks the geometry rules (overlap, the
-/// ~10×10 cell floor, a reserved region id) rather than importing a partial menu: this is content
-/// data with an operator watching, so failing loudly beats a silently half-drawn map. A dropped row
-/// would leave its cells on region 0, which routes through the plain shard map — safe, but not what
-/// the operator asked for.
-// Deliberate simplification: replace-everything, no append variant and no per-map scoping. A
-// realm's entire seam menu is a few dozen lines of text (~3-6 useful regions per zone, per the
-// spec's floor analysis), so it fits in one `spacetime call` argument with room to spare. Ceiling:
-// importing one zone's menu means passing the whole realm's file. Upgrade path: the `_append`
-// twin `terrain.rs` already demonstrates, if a menu ever outgrows one call.
 #[reducer]
 pub fn import_map_regions(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -93,27 +58,10 @@ pub fn import_map_regions(ctx: &ReducerContext, packed: String) -> Result<(), St
     Ok(())
 }
 
-/// The epoch rule, as a pure function so it can be tested without a node: an assignment may only be
-/// replaced by a STRICTLY higher epoch. The first assignment for a region accepts any epoch (there
-/// is nothing to supersede). Equal is rejected too — two operators picking the same number is a
-/// race, and the second one should hear about it rather than silently win or silently lose.
 pub(crate) fn epoch_accepted(current: Option<u64>, incoming: u64) -> bool {
     current.is_none_or(|c| incoming > c)
 }
 
-/// What [`set_region_assignment`] must write, decided PURELY (the reducer only executes it) so the
-/// epoch rule *and* the shape of an un-assign are testable without a node.
-///
-/// `Ok(shard)` — store this shard name at the incoming epoch. **`Ok("")` is a TOMBSTONE**: an
-/// un-assigned region, which the gateway routes exactly like a missing row. `Err(current)` — refuse,
-/// the stored row is already at that epoch or newer.
-///
-/// An un-assign is a tombstone rather than a delete, and that is the whole point: deleting the row
-/// would drop the epoch high-water mark with it, so the very next stale retry
-/// (`set_region_assignment 0 2 pool-b 1` after an un-assign at epoch 2) would find `current = None`,
-/// be accepted, and RESURRECT the assignment the un-assign just superseded. A tombstone keeps the
-/// mark, and the gateway already treats an empty shard as "no region opinion", so routing is
-/// unchanged either way.
 pub(crate) fn assignment_write(
     current: Option<u64>,
     incoming: u64,
@@ -125,18 +73,6 @@ pub(crate) fn assignment_write(
     Ok(shard.trim().to_string())
 }
 
-/// Flip a region's shard assignment (operator-only). Called against **realm-core**.
-///
-/// - `epoch` must be strictly greater than the current row's, so a stale retry cannot undo a newer
-///   flip. Equal or lower is an error, not a silent no-op — an operator who sees "stale epoch"
-///   knows someone else moved first.
-/// - An EMPTY `shard` un-assigns the region: the row is kept as a TOMBSTONE at the new epoch and the
-///   region falls back to the ordinary `(map_id, instance_id)` shard map, i.e. to today's behavior.
-///   That is how a demo flip is reverted, and it costs an epoch bump so the revert itself is
-///   ordered — and, because the row survives, so is everything after it ([`assignment_write`]).
-/// - The region's GEOMETRY is deliberately not checked: definitions are imported on the world
-///   shards by the ETL, and realm-core does not run it. An assignment naming a region no gateway
-///   can resolve routes nobody, which is the same no-op as having no row at all.
 #[reducer]
 pub fn set_region_assignment(
     ctx: &ReducerContext,
@@ -185,10 +121,6 @@ mod tests {
 
     #[test]
     fn only_a_strictly_higher_epoch_may_replace_an_assignment() {
-        // Epoch semantics, module half: a retried or reordered operator call can never resurrect a
-        // superseded assignment, and two operators picking the same number is an error rather than
-        // a coin flip. The gateway half (highest epoch wins among the rows it can see) is pinned by
-        // `the_highest_epoch_wins_...` in `gateway/src/config.rs`.
         assert!(
             epoch_accepted(None, 0),
             "the first assignment accepts any epoch"
@@ -205,11 +137,6 @@ mod tests {
 
     #[test]
     fn an_unassign_is_a_tombstone_so_a_stale_retry_cannot_resurrect_the_old_assignment() {
-        // The adversarial case the delete-on-unassign form got WRONG:
-        //   1. flip region 2 to pool-b at epoch 2, 2. flip back (empty shard) at epoch 3,
-        //   3. a retried/reordered `… pool-b 2` arrives.
-        // With the row deleted at step 2, step 3 sees `current = None`, is ACCEPTED, and the region
-        // is silently back on pool-b at a superseded epoch. With the tombstone, it is refused.
         assert_eq!(
             assignment_write(None, 2, "pool-b"),
             Ok("pool-b".to_string())
@@ -224,7 +151,6 @@ mod tests {
             Err(3),
             "the stale retry is refused"
         );
-        // And the tombstone is not a wall: the operator's next real flip still lands.
         assert_eq!(
             assignment_write(Some(3), 4, " pool-c "),
             Ok("pool-c".to_string())
@@ -233,8 +159,6 @@ mod tests {
 
     #[test]
     fn region_keys_are_unique_per_map_and_region() {
-        // The packed key is the primary key: a collision would let one region silently overwrite
-        // another's definition or assignment. `region_id` occupies the low half, `map_id` the high.
         let keys = [
             region_key(0, 1),
             region_key(0, 2),

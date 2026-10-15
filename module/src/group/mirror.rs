@@ -1,5 +1,3 @@
-//! Roster Revision and Party Partition rules for a World Shard's Group mirror.
-
 use super::{
     game_group, game_group_member, game_group_member_partition, game_group_roster_revision,
     group_kind_of, Group, GroupMember, GroupMemberPartition, GroupRosterRevision,
@@ -8,12 +6,8 @@ use super::{
 use lyracore_shared::group::{GroupKind, RaidSlot, RAID_MAX_MEMBERS};
 use spacetimedb::{reducer, ReducerContext, Table};
 
-/// Apply one Realm-core roster to this World Shard's Group mirror atomically.
-/// Older Roster Revisions are ignored; equal revisions must agree on the roster and its rules.
-/// Party Partition ordering preserves newer location and membership facts. Membership changes
-/// also revoke departed Loot Tags and reconcile Instance Removal in this transaction.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // The roster and initiating Actor are the reducer wire contract.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_group_mirror(
     ctx: &ReducerContext,
     group_id: u64,
@@ -152,8 +146,6 @@ pub fn sync_group_mirror(
         .map(|m| (m.id, m.character_guid))
         .collect();
     let (stale_row_ids, arriving) = mirror_plan(&current, &effective_members);
-    // Every guid whose membership this push changes. Only these can start or end an Instance
-    // Removal, so a push that moves Raid Slots or the lead evaluates nothing.
     let mut membership_changed = arriving.clone();
     for id in stale_row_ids {
         if let Some((_, guid)) = current.iter().find(|(row_id, _)| *row_id == id) {
@@ -170,9 +162,6 @@ pub fn sync_group_mirror(
         }
         return Ok(());
     }
-    // A character is in at most one group (the `by_character` uniqueness the whole system assumes),
-    // so an arriving member's row in some OTHER group on this shard — a mirror that missed the push
-    // where they left it — is stale by construction and goes first.
     for guid in &arriving {
         for m in member_tbl.by_character().filter(guid).collect::<Vec<_>>() {
             crate::loot::tag::revoke_group_member(ctx, m.group_id, *guid);
@@ -201,8 +190,7 @@ pub fn sync_group_mirror(
                 leader_guid: effective_leader,
                 loot_method: loot_method_setting,
                 loot_threshold,
-                // The round-robin cursor is per-SHARD kill state, not realm state: it advances on
-                // this shard's kills and means nothing on another. A fresh mirror starts it at 0.
+                // Round-robin loot follows this Shard's kills; keep its local cursor.
                 rr_cursor: 0,
                 master_looter_guid,
                 group_type: kind.wire(),
@@ -210,13 +198,7 @@ pub fn sync_group_mirror(
         }
     }
     write_mirror_slots(ctx, group_id, &slots);
-    // `slots` is keyed by `members`, which equals the effective roster here, so every arriving
-    // member has an entry and the default below is unreachable.
     for guid in arriving {
-        // The identity binding is this shard's, re-derived here the same way `player_login` restamps
-        // every other character-owned row. A member who has never logged in HERE — or who is mid-hop,
-        // which is why this reads through the in-transit chokepoint rather than raw — has no
-        // readable character row and mirrors as ZERO; their own login restamps it.
         let owner_identity = crate::helpers::event_recipient_identity(
             crate::helpers::character_by_guid(ctx, guid).map(|c| c.owner_identity),
         );
@@ -235,7 +217,6 @@ pub fn sync_group_mirror(
     Ok(())
 }
 
-/// Record the Roster Revision a mirror push was accepted at.
 fn store_group_revision(ctx: &ReducerContext, group_id: u64, revision: u64, active: bool) {
     let revisions = ctx.db.game_group_roster_revision();
     let row = GroupRosterRevision {
@@ -250,7 +231,6 @@ fn store_group_revision(ctx: &ReducerContext, group_id: u64, revision: u64, acti
     }
 }
 
-/// Check the kind byte and one Raid Slot byte per member, and key the slots by member guid. Pure.
 fn mirror_kind_and_slots(
     members: &[u64],
     group_kind: u8,
@@ -284,8 +264,6 @@ fn mirror_kind_and_slots(
     Ok((kind, slots))
 }
 
-/// Give every mirrored member of `group_id` the Raid Slot `slots` names. `sync_group_mirror` keys
-/// `slots` by the effective roster, so every remaining row has an entry.
 fn write_mirror_slots(
     ctx: &ReducerContext,
     group_id: u64,
@@ -301,7 +279,6 @@ fn write_mirror_slots(
     }
 }
 
-/// Whether a mirrored member of `group_id` holds another Raid Slot than `slots` gives it.
 fn mirror_slots_differ(
     ctx: &ReducerContext,
     group_id: u64,
@@ -402,7 +379,6 @@ fn partition_update(
     }
 }
 
-/// Return departed member row ids and arriving Character guids for the accepted roster.
 fn mirror_plan(current: &[(u64, u64)], incoming: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let stale = current
         .iter()
@@ -439,21 +415,12 @@ mod tests {
 
     #[test]
     fn the_mirror_diff_deletes_departed_rows_and_inserts_arriving_members() {
-        // Steady state: the mirror already matches the authority — nothing to do at all. (A diff
-        // that re-inserted every member on every push would churn `game_group_member` row ids on
-        // every party op, on every shard.)
         let current = [(10u64, 100u64), (11, 200)];
         assert_eq!(mirror_plan(&current, &[100, 200]), (vec![], vec![]));
-        // A member joined: only the newcomer is inserted.
         assert_eq!(mirror_plan(&current, &[100, 200, 300]), (vec![], vec![300]));
-        // A member left: only their ROW is deleted, addressed by row id (not guid — the delete is
-        // applied through the member table's PK).
         assert_eq!(mirror_plan(&current, &[100]), (vec![11], vec![]));
-        // A swap does both, and the ROW ID of the departing member is what comes back.
         assert_eq!(mirror_plan(&current, &[200, 300]), (vec![10], vec![300]));
-        // Disband: every row goes and nothing arrives.
         assert_eq!(mirror_plan(&current, &[]), (vec![10, 11], vec![]));
-        // A shard with no mirror yet (a party crossing a boundary for the first time) inserts all.
         assert_eq!(mirror_plan(&[], &[100, 200]), (vec![], vec![100, 200]));
     }
 

@@ -447,6 +447,14 @@ correction now addresses source slot 0.
 The authored seal marker and Power Word: Shield's linked Weakened Soul rule remain because their
 Module behavior is not an equivalent DBC effect.
 
+The binding summon correction follows the
+[pinned ClassicDB snapshot](https://github.com/cmangos/classic-db/blob/cd0c426a3b2ff56dd518bf009025299468e60fdb/Full_DB/ClassicDB_1_12_1_z2815.sql.gz).
+Spell 7728 sends event 1131 for creature 5676; spell 8674 sends event 1134 for creature 5677.
+Both require spell focus 83, and their event scripts set a 360000 ms despawn delay.
+[Their EventAI rows](https://github.com/cmangos/classic-db/blob/cd0c426a3b2ff56dd518bf009025299468e60fdb/ACID/acid_classic.sql#L18699-L18705)
+set faction 14 and attack the summoner. The importer maps these source events to `E_SUMMON_HOSTILE`
+and preserves the focus requirement.
+
 Every World Import Profile loads the same full Spell catalogue. After this importer change, each
 World Shard and Instance Pool needs the normal Spell reimport and curated class-spell pass. Rebuild
 Base Snapshots and review Package Deltas that name affected effect indices before replaying them.

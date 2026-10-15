@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`PartyStore`] adapter.
-
 use anyhow::{anyhow, Result};
 use lyracore_shared::group::{GroupKind, GroupRefusal, RaidSlot};
 use spacetimedb_sdk::{Identity, Table};
@@ -13,7 +11,6 @@ use crate::world::party::{AdmittedCompanionCommand, CompanionCommandOutcome, Par
 use crate::world::{Actor, PartyStore, ShardRoutingStore};
 
 impl PartyStore for Coordinator {
-    /// Claim and admit a Group Intent in one World Shard transaction.
     fn claim_bot_invite_intent(&self, intent_id: u64) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -147,7 +144,6 @@ impl PartyStore for Coordinator {
             .map(|entity| (entity.map_id, entity.instance_id))
     }
 
-    /// Wait for the owning World Shard's current consent Gate, without subscription readback.
     fn admit_sessionless_group_action(&self, character_guid: u64) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -156,18 +152,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// `realm_group_op` — one party op against the database THIS handle points at. The gateway
-    /// calls it on the **realm-core** handle, where membership is authoritative.
-    ///
-    /// Through an operator connection, not the player's: the reducer is operator-gated because it
-    /// takes the acting character's guid as an argument (realm-core has no live entity to derive
-    /// one from), so only the token that holds the operator identity may call it. The guid passed is
-    /// the one this socket authenticated into the world with — see `world::party`.
-    ///
-    /// This form rides a call pipe, which subscribes no group table, so the Coordinator cache may
-    /// still hold the old roster when it returns. Only an op that pushes no Group mirror after it
-    /// uses it: a Group Broadcast or a Target Icon request. Every roster op uses
-    /// [`Self::realm_group_op_visible`].
     fn realm_group_op(
         &self,
         op: u8,
@@ -191,9 +175,7 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// [`Self::realm_group_op`] on the visibility pipe: it returns only after the Coordinator cache
-    /// holds the committed roster, so the mirror push that follows reads the op's own result. The
-    /// caller must not run on the Coordinator pump: World Sessions and the bot intent threads.
+    /// Wait off-pump for the committed roster before pushing the Group mirror.
     fn realm_group_op_visible(
         &self,
         op: u8,
@@ -218,8 +200,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// Remove a deleted Character from a party and return only after the Coordinator cache holds
-    /// the committed Realm-core roster. The caller always runs off the Coordinator pump.
     fn deleted_character_party_leave(&self, character: Actor) -> Result<PartyOutcome> {
         let coordinator = self.0.visibility_pipe();
         party_outcome(call_reducer!(
@@ -243,8 +223,6 @@ impl PartyStore for Coordinator {
         Ok(self.group_roster(character_guid))
     }
 
-    /// Read only the bounded roster projection accepted by companion-command authority. The bound
-    /// is the Raid cap: a longer list is a damaged cache.
     fn party_command_group_roster(
         &self,
         character_guid: u64,
@@ -299,7 +277,6 @@ impl PartyStore for Coordinator {
         Ok(self.group_roster_by_id(group_id))
     }
 
-    /// Realm-core's roster order survives disband in `game_group_roster_revision`.
     fn group_roster_revision(&self, group_id: u64) -> Result<u64> {
         Ok(self
             .0
@@ -411,9 +388,6 @@ impl PartyStore for Coordinator {
             .collect())
     }
 
-    /// `sync_group_mirror` — replace THIS shard's mirror of one party with realm-core's roster.
-    /// Operator-gated, coordinator connection, same reasoning as above; called
-    /// on each WORLD shard after a party op and at world entry.
     fn sync_group_mirror(&self, roster: &crate::world::party::GroupRoster) -> Result<()> {
         let partitions = roster
             .partitions
@@ -460,7 +434,6 @@ impl PartyStore for Coordinator {
         )
     }
 
-    /// `CMSG_GROUP_INVITE` — `target_guid` is already resolved by the gateway.
     fn group_invite(&self, actor: Actor, target_guid: u64) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -469,7 +442,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// `CMSG_GROUP_ACCEPT`. Rides the coordinator connection as `gw_accept_group_invite`.
     fn group_accept(&self, actor: Actor) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -486,7 +458,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// `CMSG_GROUP_DISBAND` — leave the caller's group.
     fn group_leave(&self, actor: Actor) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -495,8 +466,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// `CMSG_GROUP_UNINVITE` or `CMSG_GROUP_UNINVITE_GUID` — the leader or an Assistant kicks
-    /// `target_guid`.
     fn group_uninvite(&self, actor: Actor, target_guid: u64) -> Result<PartyOutcome> {
         party_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -505,10 +474,6 @@ impl PartyStore for Coordinator {
         ))
     }
 
-    /// `CMSG_LOOT_METHOD` — the leader sets the party's loot method/threshold/master. Echoed to
-    /// every member via the existing `SMSG_GROUP_LIST` relay (the module's `group_loot_method`
-    /// reducer re-renders the roster payload); no separate ack packet (vanilla sends none for this
-    /// opcode either).
     fn group_loot_method(
         &self,
         actor: Actor,
@@ -530,8 +495,6 @@ impl PartyStore for Coordinator {
 }
 
 impl Coordinator {
-    /// The Roster Revision this database holds for one party, or `None` when it holds no row. On a
-    /// World Shard this is the mirror's revision, which outlives a disband.
     pub fn held_roster_revision(&self, group_id: u64) -> Option<u64> {
         self.0
             .coord()
@@ -544,7 +507,6 @@ impl Coordinator {
     }
 }
 
-/// The Module's Refusal tag. A Transport Loss carries none, so its outcome stays unknown.
 fn refusal_tag(error: &anyhow::Error) -> Option<&str> {
     match classify(error) {
         DurableFailure::Refusal { reason } => Some(reason),
@@ -601,8 +563,6 @@ fn command_outcome_binding(
     }
 }
 
-/// A tagged party Refusal is an outcome the client renders; an untagged one or a Transport Loss
-/// stays `Err` and ends the session.
 fn party_outcome(result: Result<()>) -> Result<PartyOutcome> {
     let Err(error) = result else {
         return Ok(PartyOutcome::Ran);

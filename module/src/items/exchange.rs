@@ -1,5 +1,3 @@
-//! Plan item consumption and grants together before changing the Character's inventory.
-
 use crate::actor::{ActionRefusal, ActionRefusalKind};
 use spacetimedb::{Identity, ReducerContext, Table, Timestamp};
 
@@ -9,8 +7,7 @@ use super::{
     select_property, ItemInstance, ItemTemplate,
 };
 
-/// Quest collect items and all rewards form one exchange. Every Refusal precedes item changes;
-/// GUID reservation may consume unused identities, but never returns them to the range.
+// Refusals leave items unchanged; GUID reservations may still advance the range.
 pub(crate) fn exchange_items(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -35,7 +32,6 @@ pub(crate) fn exchange_items(
     plan.commit(ctx)
 }
 
-/// Check the complete carried quantity before changing any stack. Bank copies stay untouched.
 pub(super) fn consume_item_stacks(
     items: &mut [ItemInstance],
     entry: u32,
@@ -67,7 +63,7 @@ pub(super) fn consume_item_stacks(
     Ok(())
 }
 
-/// Existing rows retain their identities. New rows receive GUIDs only after the full plan passes.
+// Reserve every new GUID before committing any inventory change.
 pub(super) struct ItemStoragePlan {
     character_guid: u64,
     owner_identity: Identity,
@@ -232,7 +228,7 @@ impl ItemStoragePlan {
                 enchant_id: 0,
                 soulbound,
                 random_property_id,
-                item_text_id: 0, // a plan-based grant is an ordinary item, never a Letter Copy
+                item_text_id: 0,
             });
             count -= take;
         }
@@ -269,7 +265,6 @@ impl ItemStoragePlan {
                 }
                 Some(_) => {}
                 None => {
-                    // The reservation above issued one GUID for every appended item.
                     item.guid = guids.next().expect("item plan reserved every new GUID");
                     instances.insert(item);
                 }

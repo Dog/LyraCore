@@ -1,5 +1,3 @@
-//! Reversible EventAI creature projection.
-
 use spacetimedb::{table, ReducerContext, Table};
 
 use super::eventai::RelayFlagOperation;
@@ -50,11 +48,6 @@ pub struct CreatureRelayTemporaryFaction {
     pub creature_guid: u64,
 }
 
-/// Apply one named EventAI instruction and refresh the WorldEntity projection.
-///
-/// State survives evade because that resets Engagement rather than creature lifecycle. A canonical
-/// lifecycle reset clears it before the next spawn rule, and definition adoption clears the state
-/// owned by the previous revision. Respawn starts from the creature template.
 pub(crate) fn apply_eventai_instruction(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -162,7 +155,6 @@ pub(crate) fn apply_eventai_instruction(
     true
 }
 
-/// Clear all effects at the lifecycle boundary and restore the static creature projection.
 pub(crate) fn clear_eventai_presentation(ctx: &ReducerContext, creature_guid: u64) {
     ctx.db
         .game_creature_relay_temporary_faction()
@@ -171,7 +163,6 @@ pub(crate) fn clear_eventai_presentation(ctx: &ReducerContext, creature_guid: u6
     clear_if(ctx, creature_guid, |_| true);
 }
 
-/// A definition replacement removes only presentation that belongs to the old definition.
 pub(crate) fn clear_for_definition_revision(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -188,9 +179,6 @@ pub(crate) fn apply_relay_faction(
     faction_template: u32,
     restore_on_combat_stop: bool,
 ) -> Result<(), String> {
-    // Fall back to the spawn point's current life, not a constant: a creature that has not built
-    // EventAI state yet still belongs to a definite life, and tagging it 1 would let a row written
-    // before a respawn match the creature standing here now.
     let lifecycle_id = ctx
         .db
         .game_creature_ai_state()
@@ -369,9 +357,6 @@ pub(crate) fn apply_relay_unit_flags(
         .guid()
         .find(creature_guid)
         .ok_or_else(|| format!("relay unit-flag subject {creature_guid} is unavailable"))?;
-    // Fall back to the spawn point's current life, not a constant: a creature that has not built
-    // EventAI state yet still belongs to a definite life, and tagging it 1 would let a row written
-    // before a respawn match the creature standing here now.
     let lifecycle_id = ctx
         .db
         .game_creature_ai_state()

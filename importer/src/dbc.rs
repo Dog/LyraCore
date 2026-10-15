@@ -1,25 +1,3 @@
-//! Stream 1 (client DBC) — extract `DBFilesClient/*.dbc` from the operator's OWN client MPQ archives
-//! (`wow-mpq`) and parse them (gtker `wow_dbc`), emitting only derived `game_*` values.
-//!
-//! LICENSING FIREWALL (the firewall is this code's behavior, not just `.gitignore`): Blizzard client
-//! data is copyrighted. The invariant is **never REDISTRIBUTE Blizzard data** — we hold extracted bytes
-//! IN MEMORY ONLY and NEVER write a `.dbc` (or any Blizzard file) to the repo tree. The READ path here
-//! only reads. The client-patch packager (`pack_client.rs`) DOES use `wow-mpq`'s builder, but only to
-//! emit a patch MPQ into the operator's OWN client install (a local build artifact, never committed and
-//! never shipped by us), built from the operator's own base bytes + our additions. The operator's MPQs
-//! live outside the repo (their client install). Native-only, like the whole importer.
-//!
-//! One derived file IS written into the repo tree, and only when the operator asks for it by name:
-//! the Base Snapshot (`--spell-snapshot <path>`, `spell_snapshot.rs`). It holds the mapped `game_*`
-//! values — our own taxonomy, the same rows the import would load — and never a client record, a
-//! client field name or a client byte. It exists because a Datascript author needs base data to
-//! clone from without a shard, and its author-facing target `datascripts/generated/` is git-ignored.
-//! The rule is unchanged in substance: derived values may be written where the operator points them;
-//! client bytes still never touch disk.
-//!
-//! `wow_dbc::T::read` hard-asserts the build-5875 `record_size`/`field_count` for each table, so a
-//! wrong-version / heavily-patched client surfaces as a clear parse error here (the version guard).
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
@@ -52,13 +30,9 @@ use wow_world_base::vanilla::LockType;
 
 use crate::{push_insert, sql_text, Args};
 
-/// Open the operator's DBC patch chain in client load order — base `dbc.MPQ` < `patch.MPQ` <
-/// `patch-2.MPQ` (higher priority wins, so a table re-shipped in a patch overrides the base). Only
-/// archives that actually exist are added (a fresh install may lack `patch-2.MPQ`). READ-ONLY.
 pub(crate) fn open_chain(data_dir: &Path) -> Result<PatchChain> {
     let mut chain = PatchChain::new();
     let mut added = 0u32;
-    // (filename, priority) — higher priority overrides lower.
     for (name, prio) in [("dbc.MPQ", 0i32), ("patch.MPQ", 100), ("patch-2.MPQ", 200)] {
         let path = data_dir.join(name);
         if path.exists() {
@@ -77,17 +51,6 @@ pub(crate) fn open_chain(data_dir: &Path) -> Result<PatchChain> {
     Ok(chain)
 }
 
-/// The archives that hold the stock FrameXML and GlueXML sources, in client load order (later
-/// entries override earlier ones). Only archives that exist are listed, so the result doubles as
-/// the "where we looked" list in a not-found message.
-///
-/// On a 1.12.1 client `interface.MPQ` carries the `Interface\` tree and the locale archive under
-/// `Data/<locale>/` carries the localised `.lua`, `.xml` and `.toc` sources; the numbered patches
-/// re-ship both, and a locale patch outranks the matching generic one.
-///
-/// `patch-3.MPQ` is deliberately absent, in both its generic and its locale spelling. It is the
-/// client packer's OWN previous output, so reading it as a baseline would compose a UI Transform
-/// onto an already-transformed file and drift further on every run.
 pub(crate) fn ui_baseline_archives(data_dir: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![data_dir.join("interface.MPQ")];
     if let Some(locale) = client_locale(data_dir) {
@@ -105,9 +68,6 @@ pub(crate) fn ui_baseline_archives(data_dir: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-/// The client's locale, read off the one `Data/<locale>/locale-<locale>.MPQ` that exists. A client
-/// carries exactly one; if an operator kept several, the alphabetically first wins so two runs on
-/// the same install never compose against different baselines.
 fn client_locale(data_dir: &Path) -> Option<String> {
     let mut found: Vec<String> = fs::read_dir(data_dir)
         .ok()?
@@ -124,8 +84,6 @@ fn client_locale(data_dir: &Path) -> Option<String> {
     found.into_iter().next()
 }
 
-/// Open [`ui_baseline_archives`] as a read-only chain, for composing UI Transforms against the
-/// operator's own client. READ-ONLY, and never a write target.
 pub(crate) fn open_ui_baseline_chain(data_dir: &Path) -> Result<PatchChain> {
     let archives = ui_baseline_archives(data_dir);
     if archives.is_empty() {
@@ -143,10 +101,6 @@ pub(crate) fn open_ui_baseline_chain(data_dir: &Path) -> Result<PatchChain> {
     Ok(chain)
 }
 
-/// Read + parse one DBC table by its `DbcTable::FILENAME`, resolved through the patch chain. The
-/// archive stores it at `DBFilesClient\<name>` (backslash path; MPQ lookup is by name-hash, so the
-/// hash-encrypted filename table is a non-issue — we request the known path). Bytes are decompressed
-/// transparently and held in memory only — never written to disk.
 pub(crate) fn read_table<T: DbcTable>(chain: &mut PatchChain) -> Result<T> {
     let in_archive = format!("DBFilesClient\\{}", T::FILENAME);
     let bytes = chain
@@ -160,8 +114,6 @@ pub(crate) fn read_table<T: DbcTable>(chain: &mut PatchChain) -> Result<T> {
     })
 }
 
-/// Build the DBC catalogues from the operator's client and taxi mount dump.
-/// Dry runs print the plan; `--apply` clears and reloads the derived tables.
 pub fn run(data_dir: &str, args: &Args) -> Result<()> {
     let mount_dump = crate::read_dump(args.taxi_mounts.as_deref().context(
         "standalone --dbc requires --taxi-mounts <classic-db .sql[.gz]> to resolve taxi mount displays",
@@ -169,7 +121,6 @@ pub fn run(data_dir: &str, args: &Args) -> Result<()> {
     run_from_dump(data_dir, args, &mount_dump)
 }
 
-/// A complete world import shares its source dump with the client catalogues.
 pub(crate) fn run_from_dump(data_dir: &str, args: &Args, mount_dump: &str) -> Result<()> {
     let statements = catalogue_statements(data_dir, mount_dump)?;
     if args.apply {
@@ -192,7 +143,6 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
     let mut chain = open_chain(dir)?;
     eprintln!("dbc: opened MPQ chain from {}", dir.display());
 
-    // ChrRaces: race 1 = Human; its male_display is a CreatureDisplayInfo key (== 49 for human male).
     let races: ChrRaces = read_table(&mut chain)?;
     let human = races
         .get(ChrRacesKey::new(1))
@@ -203,7 +153,6 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
         human.male_display.id
     );
 
-    // CreatureDisplayInfo: the demo chicken uses display 304; its creature_model_scale feeds entity scale.
     let cdi: CreatureDisplayInfo = read_table(&mut chain)?;
     match cdi.get(CreatureDisplayInfoKey::new(304)) {
         Some(row) => println!(
@@ -219,8 +168,6 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
 
     eprintln!("dbc: toolchain OK — read + parsed real client DBCs, wrote no .dbc to the tree.");
 
-    // Load game_faction_template (hostility data) + game_faction (reputation metadata) + game_race_info
-    // (P1: per-race display + faction). All no-Timestamp → plain SQL.
     let (faction_stmts, fn_count) = faction_template_sql(&mut chain)?;
     let (gf_stmts, gf_count) = faction_sql(&mut chain)?;
     let auction_houses: DbcAuctionHouse = read_table(&mut chain)?;
@@ -239,9 +186,6 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
     let safe_locs: DbcWorldSafeLocs = read_table(&mut chain)?;
     let (graveyard_stmts, graveyard_count) = graveyard_sql(&safe_locs);
 
-    // Creature families: CreatureFamily.dbc → game_creature_family. Small table (no
-    // map filtering — same "load ALL rows" convention as the other DBC-backed lookups above). No
-    // Timestamp → plain SQL, same clear+reload shape.
     let creature_families: DbcCreatureFamily = read_table(&mut chain)?;
     let (family_stmts, family_count) = creature_family_sql(&creature_families);
     let tameable_family_count = creature_families
@@ -250,16 +194,9 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
         .filter(|r| r.pet_talent_type != -1)
         .count();
 
-    // Locks: Lock.dbc → game_lock, the DATA half of open-lock; the Module's lock gate enforces it.
-    // Small table (a few hundred rows in vanilla) — load ALL, same "load ALL rows" convention as the
-    // other DBC-backed lookups above. No Timestamp → plain SQL, same clear+reload shape.
     let locks: DbcLock = read_table(&mut chain)?;
     let (lock_stmts, lock_count, lock_unmapped) = lock_sql(&locks);
 
-    // Taxi catalogue: all three tables are read from the same in-memory operator-owned MPQ chain,
-    // checked as one graph, and emitted as one recoverable clear+reload family. Isolated points for
-    // absent paths and paths without geometry are omitted with warnings; every other malformed
-    // catalogue fails before the first DELETE.
     let taxi_nodes: DbcTaxiNodes = read_table(&mut chain)?;
     let taxi_paths: DbcTaxiPath = read_table(&mut chain)?;
     let taxi_path_nodes: DbcTaxiPathNode = read_table(&mut chain)?;
@@ -278,19 +215,13 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
         eprintln!("{warning}");
     }
 
-    // Load game_skill_line + game_skill_ability + game_skill_availability from SkillLine.dbc /
-    // SkillLineAbility.dbc / SkillRaceClassInfo.dbc (the skill fabric as data, see
-    // module/src/skilldata.rs). All no-Timestamp → plain SQL, same clear+reload shape as the blocks
-    // above. `SkillTiers.dbc` is NOT loaded here (no `game_*` table of its own) — it only feeds
-    // `profession_tier_values` below, which `importer/src/main.rs` uses for the profession trainer
-    // tier-cap parity guard.
     let skill_lines: DbcSkillLine = read_table(&mut chain)?;
     let skill_abilities: DbcSkillLineAbility = read_table(&mut chain)?;
     let skill_availability: DbcSkillRaceClassInfo = read_table(&mut chain)?;
     let autolearn_count = skill_abilities
         .rows()
         .iter()
-        // real AcquireMethod lives in the mis-named `trivial_skill_line_rank_high` (see skill_ability_sql).
+        // wow_dbc misnames the real AcquireMethod column.
         .filter(|r| r.trivial_skill_line_rank_high == AUTOLEARN_ACQUIRE_METHOD)
         .count();
     let (sl_stmts, sl_count) = skill_line_sql(&skill_lines);
@@ -299,21 +230,15 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
 
     println!("FactionTemplate: {fn_count} templates; Faction: {gf_count} factions");
     println!("CharBaseInfo: {cbi_count} combinations; ChrRaces: {race_count} races; CharStartOutfit: {si_count} items");
-    // Skill-import coverage prints (always printed — informational, not gated on --apply like the
-    // SQL-preview lines above).
     println!("SkillLine: {sl_count} lines");
     println!("SkillLineAbility: {sa_count} abilities ({autolearn_count} autolearn)");
     println!("SkillRaceClassInfo: {sav_count} availability rows");
     println!("AuctionHouse: {auction_house_count} houses");
     println!("MailTemplate: {mail_template_count} templates");
-    // Coverage prints (always printed, like the skill lines above).
     println!("AreaTable: {area_count} areas");
     println!("AreaTrigger: {trigger_count} triggers");
     println!("WorldSafeLocs: {graveyard_count} graveyards");
-    // Coverage print (always printed, like the ones above).
     println!("CreatureFamily: {family_count} families ({tameable_family_count} tameable)");
-    // Coverage print (always printed, like the ones above). Loud about any Lock.dbc
-    // LocktypeReference id `LOCKTYPE_TO_SKILL_LINE` doesn't cover — see that const's doc comment.
     if lock_unmapped.is_empty() {
         println!("Lock: {lock_count} lock indices");
     } else {
@@ -352,11 +277,6 @@ pub(crate) fn catalogue_statements(data_dir: &str, mount_dump: &str) -> Result<V
     .collect())
 }
 
-/// Clear+reload SQL for `game_auction_house` from `AuctionHouse.dbc`. The DBC owns the house id,
-/// parent faction, listing deposit percentage, sale consignment percentage, and localized name.
-/// Validate the complete catalogue before returning its first DELETE so malformed or truncated
-/// client data cannot replace a working catalogue. Output is ordered by id rather than DBC record
-/// order to keep dry runs and imports reproducible.
 fn auction_house_sql(table: &DbcAuctionHouse) -> Result<(Vec<String>, usize)> {
     if table.rows().is_empty() {
         bail!("AuctionHouse.dbc contains no rows");
@@ -419,11 +339,6 @@ fn auction_house_sql(table: &DbcAuctionHouse) -> Result<(Vec<String>, usize)> {
     Ok((stmts, count))
 }
 
-/// Clear+reload SQL for `game_mail_template` from `MailTemplate.dbc`. In 1.12 the DBC holds only the
-/// letter body (`wow_dbc`'s `vanilla_tables::mail_template::MailTemplateRow { id, body }`); cmangos
-/// sends the template id with an empty subject and lets the client render the stored text. Validate
-/// before returning the first DELETE, like `auction_house_sql`. Output is ordered by id rather than
-/// DBC record order to keep dry runs and imports reproducible.
 fn mail_template_sql(table: &DbcMailTemplate) -> Result<(Vec<String>, usize)> {
     if table.rows().is_empty() {
         bail!("MailTemplate.dbc contains no rows");
@@ -450,11 +365,6 @@ fn mail_template_sql(table: &DbcMailTemplate) -> Result<(Vec<String>, usize)> {
     Ok((stmts, count))
 }
 
-/// Clear+reload SQL for `game_faction` from `Faction.dbc` (Elwynn faction system): each parent faction's
-/// reputation index + the player's starting standing. `reputation_index` 0xFFFFFFFF (no rep bar) → -1.
-/// `base_standing` = the primary race-group's base reputation (group 0), reinterpreted as signed (a Hated
-/// faction stores a wrapped negative like 4294925296 == -42000); correct for our Human test character.
-/// Per-race resolution via `reputation_race_mask` is a follow-up. No Timestamp → plain SQL.
 fn faction_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     let factions: DbcFaction = read_table(chain)?;
     let rows: Vec<String> = factions
@@ -478,8 +388,6 @@ fn faction_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     Ok((stmts, n))
 }
 
-/// Clear+reload SQL for `game_char_base_info` from `CharBaseInfo.dbc` (importer P1): the legal
-/// (race, class) combos. No PK in the DBC — iterate. No Timestamp → plain SQL. PK packs `(race<<8)|class`.
 fn char_base_info_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     let cbi: DbcCharBaseInfo = read_table(chain)?;
     let rows: Vec<String> = cbi
@@ -505,12 +413,6 @@ fn char_base_info_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     Ok((stmts, n))
 }
 
-/// The `CharStartOutfit.dbc` (race_class, item) set — shared by `start_item_sql` (the outfit's own
-/// clear+reload) AND `main.rs`'s `build_createinfo_item_sql`: the cmangos dump's
-/// `playercreateinfo_item` EXTRAS are deduped against this SAME set, so an item CharStartOutfit
-/// already grants for a (race, class) is never double-listed. `race == 0 || class == 0` rows are
-/// skipped (not a real playable combo) and `item == 0` slots (empty) are skipped, matching
-/// `start_item_sql`'s own filtering exactly.
 pub(crate) fn outfit_item_set(
     chain: &mut PatchChain,
 ) -> Result<std::collections::HashSet<(u32, i32)>> {
@@ -560,43 +462,11 @@ fn start_item_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     Ok((stmts, n))
 }
 
-/// `SkillLineAbility.dbc`'s `acquire_method` value meaning "automatically learned once the
-/// race/class/skill conditions are met" (as opposed to 2 = learned from a trainer, 0 = not learnable
-/// this way). The DBC carries no strings for this enum, so this is sourced from community DBC
-/// documentation (wowdev.wiki), not something verified against our own client dump — it's informational
-/// only HERE (it only drives the "N autolearn" coverage-print count); a future AUTOLEARN consumer
-/// Automatic spell learning at level thresholds is what needs this value truly
-/// load-bearing-correct, and can re-derive/correct it against a real client at that point.
 const AUTOLEARN_ACQUIRE_METHOD: i32 = 1;
 
-/// The profession `SkillLine.dbc` ids whose Apprentice→Artisan tier caps `profession_tier_values`
-/// resolves — mirrors `module/src/skill.rs::skill_line`'s profession consts. Duplicated here, not
-/// shared, because the wasm `module` crate is never a dependency of this native importer (same
-/// reasoning as `spell.rs`'s taxonomy duplication) — keep the two lists in lockstep. NOTE: this is 12
-/// lines, not 13 — `module/src/skill.rs`'s own doc comment says "completing the 13" but only ever
-/// defines 12 profession consts (a pre-existing, harmless comment miscount noticed while wiring this
-/// item; out of scope to fix here).
-const PROFESSION_SKILL_LINES: &[u32] = &[
-    186, // Mining
-    182, // Herbalism
-    393, // Skinning
-    185, // Cooking
-    129, // First Aid
-    171, // Alchemy
-    164, // Blacksmithing
-    197, // Tailoring
-    165, // Leatherworking
-    202, // Engineering
-    333, // Enchanting
-    356, // Fishing
-];
+const PROFESSION_SKILL_LINES: &[u32] =
+    &[186, 182, 393, 185, 129, 171, 164, 197, 165, 202, 333, 356];
 
-/// Clear+reload SQL for `game_skill_line` from `SkillLine.dbc` — one row per skill line (weapon lines,
-/// Defense, the 12 professions, and a long tail of NPC-only/deprecated lines the client never shows a
-/// player; ~135 total in vanilla). `category` is `SkillLineCategory.dbc`'s raw id (not separately
-/// imported, kept as the plain foreign key — same "store the raw key" convention as
-/// `race_info_sql`/`faction_sql`). Name via `.en_gb` + `sql_text` (apostrophe-escaped), matching
-/// `talent.rs`'s `LocalizedString` convention. No Timestamp → plain SQL.
 fn skill_line_sql(table: &DbcSkillLine) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
@@ -621,25 +491,16 @@ fn skill_line_sql(table: &DbcSkillLine) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_skill_ability` from `SkillLineAbility.dbc` — a `(spell, skill_line)`
-/// pairing plus its race/class gate, `acquire_method` (0=trained/learned-from-item, 1/2=autolearn
-/// at a skill threshold), and recipe skill-up band `green`(TrivialLow)..`gray`(TrivialHigh) (~9-10k
-/// rows in vanilla). ⚠ 282: wow_dbc 0.3's `SkillLineAbilityRow` MIS-NAMES every field from position
-/// 8 (it omits the real `MinSkillLineRank` column), so this reads by CONTENT, not by wow_dbc's field
-/// names — real `AcquireMethod` lives in `trivial_skill_line_rank_high`, real `TrivialHigh` in
-/// `trivial_skill_line_rank_low`, real `TrivialLow` in `character_points[0]`, real `MinSkillLineRank`
-/// in `superseded_by`. Ids are assigned sequentially (1-based) — the DBC's own `id` isn't reused
-/// (mirrors `start_item_sql`). No Timestamp → plain SQL.
 fn skill_ability_sql(table: &DbcSkillLineAbility) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let min_skill = r.superseded_by.id; // real MinSkillLineRank
-            let acquire_method = r.trivial_skill_line_rank_high; // real AcquireMethod (0/1/2)
-            let gray = r.trivial_skill_line_rank_low; // real TrivialSkillLineRankHigh
-            let green = r.character_points[0]; // real TrivialSkillLineRankLow
+            let min_skill = r.superseded_by.id; // Real MinSkillLineRank.
+            let acquire_method = r.trivial_skill_line_rank_high; // Real AcquireMethod.
+            let gray = r.trivial_skill_line_rank_low; // Real TrivialSkillLineRankHigh.
+            let green = r.character_points[0]; // Real TrivialSkillLineRankLow.
             format!(
                 "({},{},{},{},{},{},{},{},{})",
                 i as u64 + 1,
@@ -665,7 +526,7 @@ fn skill_ability_sql(table: &DbcSkillLineAbility) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// The pinned reader calls the vanilla SupercededBySpell column `acquire_method`.
+// The pinned reader calls vanilla SupercededBySpell acquire_method.
 pub(crate) fn read_spell_rank_links(data_dir: &str) -> Result<Vec<(u32, u32)>> {
     let mut chain = open_chain(Path::new(data_dir))?;
     let abilities: DbcSkillLineAbility = read_table(&mut chain)?;
@@ -682,10 +543,6 @@ fn spell_rank_links(abilities: &DbcSkillLineAbility) -> Result<Vec<(u32, u32)>> 
     Ok(links)
 }
 
-/// Clear+reload SQL for `game_skill_availability` from `SkillRaceClassInfo.dbc` — which (race, class)
-/// combos a skill line is available to, its availability flags, and the minimum character level to
-/// pick it up (~700-800 rows in vanilla). Ids assigned sequentially, same convention as
-/// `skill_ability_sql`. No Timestamp → plain SQL.
 fn skill_availability_sql(table: &DbcSkillRaceClassInfo) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
@@ -714,9 +571,6 @@ fn skill_availability_sql(table: &DbcSkillRaceClassInfo) -> (Vec<String>, usize)
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_race_info` from `ChrRaces.dbc` (importer P1): per-race male/female
-/// display models + faction. No Timestamp → plain SQL. Skips race 0 (the "none" row). Returns
-/// (statements, row_count). Keys (`.id`) expose the raw u32.
 fn race_info_sql(races: &ChrRaces) -> (Vec<String>, usize) {
     let rows: Vec<String> = races
         .rows()
@@ -740,9 +594,6 @@ fn race_info_sql(races: &ChrRaces) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_faction_template` from `FactionTemplate.dbc`. No Timestamp columns, so
-/// plain `spacetime sql` (the Timestamp-reducer rule doesn't apply). Chunked under a conservative row
-/// count per INSERT. Returns (statements, row_count). Keys expose their raw id via `.id`.
 fn faction_template_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> {
     let ft: DbcFactionTemplate = read_table(chain)?;
     let rows: Vec<String> = ft
@@ -768,7 +619,6 @@ fn faction_template_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> 
         })
         .collect();
     let n = rows.len();
-    // `id >= 0` matches every u32 → clears the whole table before reload (clear+reload is idempotent).
     let mut stmts = vec!["DELETE FROM game_faction_template WHERE id >= 0".to_string()];
     for chunk in rows.chunks(500) {
         stmts.push(format!(
@@ -779,12 +629,6 @@ fn faction_template_sql(chain: &mut PatchChain) -> Result<(Vec<String>, usize)> 
     Ok((stmts, n))
 }
 
-/// Clear+reload SQL for `game_area` from `AreaTable.dbc`: every zone AND subzone row
-/// (id, map, parent, area_bit, flags, exploration level, faction group, name). `flags` is the raw
-/// `AreaFlags` bitmask reinterpreted as `u32` (`as_int()` widened) — undecoded here, a consumer
-/// decodes what it needs (rest-state city detection is left to the consumer). Name via `.en_gb` + `sql_text`
-/// (apostrophe-escaping), matching `skill_line_sql`'s convention. Loads ALL rows (small table — map
-/// filtering is a verify-time concern, not an import-time one). No Timestamp → plain SQL.
 fn area_sql(table: &DbcAreaTable) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
@@ -814,12 +658,6 @@ fn area_sql(table: &DbcAreaTable) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_area_trigger` from `AreaTrigger.dbc`: the geometric
-/// half of inn triggers, dungeon entrances, and quest explore objectives — a trigger
-/// volume is either a sphere (`radius`) or a box (`box_length`/`box_width`/`box_height`/`box_yaw`);
-/// the DBC carries both fields for every row regardless of which shape a given trigger actually
-/// uses. Loads ALL rows (small table — map filtering is a verify-time concern). No Timestamp →
-/// plain SQL.
 fn area_trigger_sql(table: &DbcAreaTrigger) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
@@ -851,19 +689,13 @@ fn area_trigger_sql(table: &DbcAreaTrigger) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// Clear+reload SQL for `game_graveyard` from `WorldSafeLocs.dbc`: a graveyard's
-/// fixed position, replacing the hand-coded `world::graveyard::{NORTHSHIRE, GOLDSHIRE, ...}` consts
-/// as the primary data source (those consts — and `seed.rs`'s row-seeded twins — remain the
-/// no-import fallback). No orientation column — the DBC carries none. Name via `.en_gb` +
-/// `sql_text`. Loads ALL rows (small table). No Timestamp → plain SQL.
 fn graveyard_sql(table: &DbcWorldSafeLocs) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
         .iter()
         .map(|r| {
             format!(
-                // o = 0.0: WorldSafeLocs.dbc carries no orientation — the seed rows are the only
-                // source of a real facing (the Northshire 2.72271 case).
+                // WorldSafeLocs.dbc has no orientation.
                 "({},{},{},{},{},0,{})",
                 r.id.id,
                 r.map.id,
@@ -899,7 +731,6 @@ struct TaxiCatalogueSql {
     warnings: Vec<String>,
 }
 
-/// Resolve from the full dump, since taxi mounts need not have a spawn in the imported area.
 fn taxi_mount_displays(dump: &str, display_ids: &HashSet<u32>) -> Result<HashMap<u32, u32>> {
     let rows = crate::parse_complete_table(dump, "creature_template")?;
     if rows.is_empty() {
@@ -920,8 +751,6 @@ fn taxi_mount_displays(dump: &str, display_ids: &HashSet<u32>) -> Result<HashMap
                 .trim()
                 .parse()
                 .with_context(|| format!("taxi mount creature {entry} has an invalid model"))?;
-            // A catalogue has one display per faction. Choose the first nonzero template model
-            // deterministically, rather than rerolling the template's model on each flight.
             if display == 0 {
                 display = model;
             }
@@ -936,12 +765,7 @@ fn taxi_mount_displays(dump: &str, display_ids: &HashSet<u32>) -> Result<HashMap
     Ok(mounts)
 }
 
-/// Validate and emit the three-table taxi catalogue as one deterministic clear+reload family.
-/// All validation happens before SQL is returned: a path must resolve both endpoint nodes,
-/// costs/indices must be non-negative, and the operator's data may not enter the reserved fixture
-/// namespace. A point for an absent path or a path without geometry is omitted with a stable warning.
-/// Any other malformed client extract fails before `run_sql_statements` can execute the first DELETE.
-#[allow(clippy::too_many_lines)] // One validated statement per taxi table.
+#[allow(clippy::too_many_lines)]
 fn taxi_catalogue_sql(
     nodes: &DbcTaxiNodes,
     paths: &DbcTaxiPath,
@@ -984,7 +808,7 @@ fn taxi_catalogue_sql(
         {
             bail!("TaxiNodes.dbc node {id} has a non-finite position");
         }
-        // Despite wow_dbc's field name, vanilla TaxiNodes stores creature-template entries.
+        // Vanilla TaxiNodes stores creature-template entries despite the reader field name.
         let entries = row.mount_creature_display_info;
         let displays = [0, 1].map(|faction| {
             let entry = if entries[faction] == 0 {
@@ -1209,7 +1033,6 @@ fn taxi_catalogue_sql(
         ));
     }
 
-    // Stable ordering makes dry-run output and applied row sets independent of DBC record order.
     node_rows.sort_by_key(|(id, _)| *id);
     path_rows.sort_by_key(|(id, _)| *id);
     point_rows.sort_by_key(|(key, _)| *key);
@@ -1255,14 +1078,6 @@ fn taxi_catalogue_sql(
     })
 }
 
-/// Clear+reload SQL for `game_creature_family` from `CreatureFamily.dbc`: the pet
-/// system's data half — `CreatureTemplate.creature_family`/`type_flags` already import via
-/// `main.rs`'s `ct::FAMILY`/`ct::CREATURE_TYPE_FLAGS`, and the Wolf faction fixup already reads
-/// `family_id` off the dump; this is the last missing piece, the family lookup table itself. Name
-/// via `.en_gb` + `sql_text` (apostrophe-escaping), matching `skill_line_sql`'s convention.
-/// `pet_food_mask`/`pet_talent_type`/`category` are the raw DBC `int32` fields, signed — see
-/// `game_creature_family`'s doc comment (`module/src/creatures/spawn.rs`) for their meaning. Loads
-/// ALL rows (small table, ~30-40 in vanilla). No Timestamp → plain SQL.
 fn creature_family_sql(table: &DbcCreatureFamily) -> (Vec<String>, usize) {
     let rows: Vec<String> = table
         .rows()
@@ -1289,16 +1104,8 @@ fn creature_family_sql(table: &DbcCreatureFamily) -> (Vec<String>, usize) {
     (stmts, n)
 }
 
-/// `LockType.dbc` id -> module SkillLine id, for a Lock.dbc index whose `ty == LocktypeReference`
-/// (there `property` is a LockType.dbc id, NOT a SkillLine — see `lock_sql`). REPO-VERIFIED: 1
-/// Lockpicking, 2 Herbalism, 3 Mining (cmangos's `SkillByLockType[]` is the live-check reference for
-/// any OTHER LockType id — [V] not extended here; an id outside this list resolves to `None` and
-/// `lock_sql` surfaces it as an unmapped count in the coverage print rather than guessing).
-const LOCKTYPE_TO_SKILL_LINE: &[(u32, u32)] = &[
-    (1, 633), // Lockpicking
-    (2, 182), // Herbalism
-    (3, 186), // Mining
-];
+// LockType.dbc ids require conversion to SkillLine ids.
+const LOCKTYPE_TO_SKILL_LINE: &[(u32, u32)] = &[(1, 633), (2, 182), (3, 186)];
 
 fn locktype_skill_line(locktype_id: u32) -> Option<u32> {
     LOCKTYPE_TO_SKILL_LINE
@@ -1307,19 +1114,7 @@ fn locktype_skill_line(locktype_id: u32) -> Option<u32> {
         .map(|&(_, skill)| skill)
 }
 
-/// Clear+reload SQL for `game_lock` from `Lock.dbc`, the DATA half of open-lock; the Module's
-/// lock gate enforces it. Each Lock.dbc row packs FOUR parallel `[;8]` arrays: `ty`/`property`/
-/// `required_skill`/`action` — up to 8 ALTERNATIVE ways to open the SAME lock (e.g. "the right key OR
-/// enough Lockpicking"). Only the non-`LockType::None` indices are real; a lock with 1 requirement
-/// emits exactly 1 `game_lock` row (see the module's `GameLock` doc, `module/src/gameobject.rs`).
-/// `ty == ItemRequired` → `kind` 1, `property` IS the required key item entry, verbatim. `ty ==
-/// LocktypeReference` → `kind` 2, `property` is a LockType.dbc id (NOT a SkillLine) resolved via
-/// `locktype_skill_line` at IMPORT time, so the module never needs LockType.dbc itself — an
-/// unmapped id resolves to SkillLine 0 (unknown) and is counted in the returned unmapped-id set so
-/// `run()`'s coverage print can surface it loudly instead of silently miscoding a lock. `required_skill`
-/// is the DBC's own signed value, floored at 0 (never negative in a real table). No Timestamp → plain
-/// SQL, same clear+reload shape as `creature_family_sql`. Returns (statements, row count, unmapped
-/// LockType ids encountered).
+// The eight Lock.dbc indices are alternative ways to open one lock.
 fn lock_sql(table: &DbcLock) -> (Vec<String>, usize, std::collections::BTreeSet<u32>) {
     let mut rows: Vec<String> = Vec::new();
     let mut row_id: u64 = 1;
@@ -1360,10 +1155,6 @@ fn lock_sql(table: &DbcLock) -> (Vec<String>, usize, std::collections::BTreeSet<
     (stmts, n, unmapped_locktype_ids)
 }
 
-/// `display_id -> creature_model_scale` from CreatureDisplayInfo.dbc. The cmangos creature ETL uses
-/// this to resolve `creature_template.Scale == 0` (vanilla's "use the DBC display scale" sentinel) at
-/// import time — otherwise those creatures load with `scale_x = 0` and the client renders them at
-/// scale 0. In-memory only (no `.dbc` written). The map is built once; lookups are O(1).
 pub fn load_display_scales(data_dir: &str) -> Result<HashMap<u32, f32>> {
     let mut chain = open_chain(Path::new(data_dir))?;
     let cdi: CreatureDisplayInfo = read_table(&mut chain)?;
@@ -1374,12 +1165,6 @@ pub fn load_display_scales(data_dir: &str) -> Result<HashMap<u32, f32>> {
     Ok(scales)
 }
 
-/// `skill_line -> [Apprentice, Journeyman, Expert, Artisan]` tier caps for the 12 profession lines
-/// (`PROFESSION_SKILL_LINES`), resolved via `SkillRaceClassInfo.dbc` (the first row matching that
-/// `skill_line`'s `skill_tier` foreign key) → `SkillTiers.dbc`'s `value[0..4]`. This is the DATA half
-/// of `importer/src/main.rs`'s `PROFESSION_LEARN` byte-parity guard: the hardcoded 75/150/225/300
-/// literals it always used must equal what the real client's tables actually carry — this function is
-/// what lets `main.rs` check that. In-memory only, like the rest of `dbc.rs` (no `.dbc` written).
 pub fn profession_tier_values(data_dir: &str) -> Result<HashMap<u32, [u16; 4]>> {
     let mut chain = open_chain(Path::new(data_dir))?;
     let availability: DbcSkillRaceClassInfo = read_table(&mut chain)?;
@@ -1387,10 +1172,6 @@ pub fn profession_tier_values(data_dir: &str) -> Result<HashMap<u32, [u16; 4]>> 
     Ok(resolve_profession_tier_values(&availability, &tiers))
 }
 
-/// Chain-free core of `profession_tier_values` — fixture-tested directly (constructed
-/// `SkillRaceClassInfoRow`/`SkillTiersRow`s, no MPQ needed). A profession line absent from
-/// `availability` (shouldn't happen with a real client) is silently skipped; the caller's parity guard
-/// (`main.rs`'s `assert_profession_tier_parity`) catches the gap by failing to find it in the map.
 fn resolve_profession_tier_values(
     availability: &DbcSkillRaceClassInfo,
     tiers: &DbcSkillTiers,
@@ -1413,10 +1194,6 @@ fn resolve_profession_tier_values(
     }
     out
 }
-
-// ===========================================================================================
-//  Tests
-// ===========================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1454,8 +1231,6 @@ mod tests {
     use wow_dbc::LocalizedString;
     use wow_world_base::vanilla::AreaFlags;
 
-    /// A scratch `Data/` tree of empty placeholder archives. [`ui_baseline_archives`] only tests
-    /// for existence, so no archive here needs real MPQ bytes.
     fn placeholder_data_dir(tag: &str, names: &[&str]) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("dbc-ui-baseline-{}-{tag}", std::process::id()));
@@ -1785,10 +1560,7 @@ mod tests {
                 rows: vec![taxi_path_row(70, 10, 20, 125)],
             },
             DbcTaxiPathNode {
-                // Deliberately shuffled: output must use path/node-index order, not record order.
                 rows: vec![
-                    // The DBC field is a signed int32 container. Preserve its complete bit pattern,
-                    // including the sign bit, rather than narrowing the public catalogue value.
                     taxi_point_row(703, 70, 2, 30.0, i32::MIN, 900),
                     taxi_point_row(701, 70, 0, 10.0, 1, 0),
                     taxi_point_row(702, 70, 1, 20.0, 2, 450),
@@ -2229,7 +2001,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_area "))
             .unwrap();
-        // id,map_id,parent_area_id,area_bit,flags,exploration_level,faction_group,name
         assert!(
             insert.contains("(12,0,0,4479,64,1,1,'Elwynn Forest')"),
             "{insert}"
@@ -2241,16 +2012,11 @@ mod tests {
         assert!(
             insert.contains("(999,0,0,1,0,0,0,'O''Ryan''s Rest')"),
             "{insert}"
-        ); // apostrophe escaping
+        );
     }
 
     #[test]
     fn area_trigger_sql_shape_goldshire_inn_fixture() {
-        // A CONSTRUCTED fixture (not client-verified — this sandbox has no real client MPQ to read a
-        // real trigger id from) shaped like Goldshire's Lion's Pride Inn entrance trigger, proving
-        // the emitted tuple's column order — id,map_id,x,y,z,radius,box_length,box_width,box_height,
-        // box_yaw, is exactly what the rest-state system will read a real inn
-        // AreaTrigger row as.
         let table = DbcAreaTrigger {
             rows: vec![area_trigger_row(
                 1524, 0, -9454.5, 39.8, 64.0, 0.0, 6.0, 4.0, 6.0, 1.55,
@@ -2325,8 +2091,8 @@ mod tests {
     fn creature_family_sql_shape_escaping_and_tameable_count() {
         let table = DbcCreatureFamily {
             rows: vec![
-                creature_family_row(1, "Wolf", 1, 0, 8), // tameable pet family
-                creature_family_row(3, "O'Ryan's Beast", 6, -1, 8), // non-pet family + apostrophe escaping
+                creature_family_row(1, "Wolf", 1, 0, 8),
+                creature_family_row(3, "O'Ryan's Beast", 6, -1, 8),
             ],
         };
         let (stmts, n) = creature_family_sql(&table);
@@ -2339,10 +2105,8 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_creature_family "))
             .unwrap();
-        // family_id,name,pet_food_mask,pet_talent_type,category
         assert!(insert.contains("(1,'Wolf',1,0,8)"), "{insert}");
-        assert!(insert.contains("(3,'O''Ryan''s Beast',6,-1,8)"), "{insert}"); // apostrophe escaping
-                                                                               // tameable = pet_talent_type != -1 (mirrors run()'s coverage-print filter).
+        assert!(insert.contains("(3,'O''Ryan''s Beast',6,-1,8)"), "{insert}");
         let tameable = table
             .rows()
             .iter()
@@ -2354,9 +2118,6 @@ mod tests {
         );
     }
 
-    /// Build a `LockRow` with `entries` filling indices `0..entries.len()` (each `(LockType, property,
-    /// required_skill)`); the remaining indices up to 8 are `LockType::None` (padding, matching a real
-    /// Lock.dbc row that rarely uses all 8 alternatives).
     fn lock_row(id: u32, entries: &[(LockType, u32, i32)]) -> LockRow {
         let mut ty = [LockType::None; 8];
         let mut property = [0u32; 8];
@@ -2379,12 +2140,7 @@ mod tests {
     fn lock_sql_emits_only_non_none_indices_with_item_and_skill_kinds() {
         let table = DbcLock {
             rows: vec![
-                // Lock 1: index 0 = ITEM (a real key, item entry 12345); indices 1..8 unused (None,
-                // skipped) — a lock with exactly ONE real requirement emits exactly ONE row.
                 lock_row(1, &[(LockType::ItemRequired, 12345, 0)]),
-                // Lock 2: index 0 = SKILL via a MAPPED LockType id (1 = Lockpicking -> SkillLine 633),
-                // required value 100 (a hard pick). index 1 = SKILL via LockType 3 (Mining -> 186),
-                // required value 1.
                 lock_row(
                     2,
                     &[
@@ -2392,24 +2148,20 @@ mod tests {
                         (LockType::LocktypeReference, 3, 1),
                     ],
                 ),
-                // Lock 3: an UNMAPPED LockType id (999) — must NOT be guessed; resolves to SkillLine 0
-                // and is surfaced via the returned unmapped-id set.
                 lock_row(3, &[(LockType::LocktypeReference, 999, 50)]),
             ],
         };
         let (stmts, n, unmapped) = lock_sql(&table);
-        // 1 (lock 1) + 2 (lock 2) + 1 (lock 3) = 4 rows total; NONE of the padding (None) indices emit.
         assert_eq!(n, 4);
         assert_eq!(stmts[0], "DELETE FROM game_lock WHERE id >= 0");
         let insert = stmts
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_lock "))
             .unwrap();
-        // id,lock_id,index,kind,property,required_skill
-        assert!(insert.contains("(1,1,0,1,12345,0)"), "{insert}"); // item lock, kind 1, property=item entry
-        assert!(insert.contains("(2,2,0,2,633,100)"), "{insert}"); // Lockpicking (LockType 1 -> SkillLine 633)
-        assert!(insert.contains("(3,2,1,2,186,1)"), "{insert}"); // Mining (LockType 3 -> SkillLine 186)
-        assert!(insert.contains("(4,3,0,2,0,50)"), "{insert}"); // unmapped LockType 999 -> property 0
+        assert!(insert.contains("(1,1,0,1,12345,0)"), "{insert}");
+        assert!(insert.contains("(2,2,0,2,633,100)"), "{insert}");
+        assert!(insert.contains("(3,2,1,2,186,1)"), "{insert}");
+        assert!(insert.contains("(4,3,0,2,0,50)"), "{insert}");
         assert_eq!(
             unmapped,
             std::collections::BTreeSet::from([999u32]),
@@ -2419,8 +2171,6 @@ mod tests {
 
     #[test]
     fn lock_sql_all_none_lock_emits_no_rows() {
-        // A lock with every index LockType::None (shouldn't happen in a real table, but the parser
-        // must not crash or emit a bogus row) contributes 0 rows and 0 unmapped ids.
         let table = DbcLock {
             rows: vec![lock_row(9, &[])],
         };
@@ -2431,10 +2181,10 @@ mod tests {
 
     #[test]
     fn locktype_skill_line_covers_the_three_repo_verified_ids_only() {
-        assert_eq!(locktype_skill_line(1), Some(633)); // Lockpicking
-        assert_eq!(locktype_skill_line(2), Some(182)); // Herbalism
-        assert_eq!(locktype_skill_line(3), Some(186)); // Mining
-        assert_eq!(locktype_skill_line(4), None); // [V] not yet mapped — must NOT silently guess
+        assert_eq!(locktype_skill_line(1), Some(633));
+        assert_eq!(locktype_skill_line(2), Some(182));
+        assert_eq!(locktype_skill_line(3), Some(186));
+        assert_eq!(locktype_skill_line(4), None);
         assert_eq!(locktype_skill_line(0), None);
     }
 
@@ -2452,10 +2202,6 @@ mod tests {
         }
     }
 
-    // Params are REAL SkillLineAbility semantics; they're placed into the wow_dbc fields the
-    // corrected `skill_ability_sql` reads for each (see the off-by-one remap there): real
-    // min_skill → superseded_by, real acquire_method → trivial_high, real gray → trivial_low,
-    // real green → character_points[0].
     #[allow(clippy::too_many_arguments)]
     fn skill_ability_row(
         id: u32,
@@ -2476,11 +2222,11 @@ mod tests {
             class_mask: ChrClassesKey::new(class_mask),
             exclude_race: SkillChrRacesKey::new(0),
             exclude_class: ChrClassesKey::new(0),
-            superseded_by: SpellKey::new(min_skill), // corrected reads real MinSkillLineRank here
-            acquire_method: 0,                       // real SupercededBySpell
-            trivial_skill_line_rank_high: acquire_method, // corrected reads real AcquireMethod here
-            trivial_skill_line_rank_low: gray,       // corrected reads real TrivialHigh here
-            character_points: [green, 0],            // corrected reads real TrivialLow here
+            superseded_by: SpellKey::new(min_skill),
+            acquire_method: 0,
+            trivial_skill_line_rank_high: acquire_method,
+            trivial_skill_line_rank_low: gray,
+            character_points: [green, 0],
             num_skills_up: 1,
             unknown_padding: 0,
         }
@@ -2538,7 +2284,7 @@ mod tests {
             rows: vec![
                 skill_line_row(185, 11, "Cooking"),
                 skill_line_row(44, 7, "Axes"),
-                skill_line_row(999, 0, "O'Ryan's Line"), // apostrophe escaping
+                skill_line_row(999, 0, "O'Ryan's Line"),
             ],
         };
         let (stmts, n) = skill_line_sql(&table);
@@ -2558,14 +2304,10 @@ mod tests {
 
     #[test]
     fn skill_ability_sql_remaps_off_by_one_dbc_fields() {
-        // Params are REAL semantics (min_skill, acquire_method, gray, green); the builder places
-        // them into the mis-named wow_dbc fields the corrected importer reads. Row 1: a
-        // trained recipe (min 25, acquire 0, gray 75, green 30). Row 2: an autolearn ability
-        // (acquire 1) with a trained-with-skill min.
         let table = DbcSkillLineAbility {
             rows: vec![
                 skill_ability_row(1, 185, 2550, 0xFFFF_FFFF, 0xFFFF_FFFF, 25, 0, 75, 30),
-                skill_ability_row(2, 333, 13262, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 1, 0, 0), // autolearn (disenchant-shaped)
+                skill_ability_row(2, 333, 13262, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 1, 0, 0),
             ],
         };
         let (stmts, n) = skill_ability_sql(&table);
@@ -2575,7 +2317,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_skill_ability "))
             .unwrap();
-        // id,spell_id,skill_line,race_mask,class_mask,min_skill,acquire_method,gray,green
         assert!(
             insert.contains("(1,2550,185,4294967295,4294967295,25,0,75,30)"),
             "{insert}"
@@ -2584,7 +2325,6 @@ mod tests {
             insert.contains("(2,13262,333,4294967295,4294967295,0,1,0,0)"),
             "{insert}"
         );
-        // autolearn count reads the CORRECTED field (real AcquireMethod in trivial_high).
         let autolearn = table
             .rows()
             .iter()
@@ -2595,14 +2335,9 @@ mod tests {
 
     #[test]
     fn skill_ability_sql_pairs_riding_mount_spells_with_the_skill_line_and_tiers() {
-        // Verifies the EXISTING skill_ability_sql plumbing — no rewrite — correctly pairs each mount
-        // spell with the Riding skill line (762) and carries the 75/150 tiers + race/class masks
-        // through untouched. Row 1: a race-specific Apprentice mount (Human only, min_skill 75, trained
-        // from the trainer — acquire_method 0). Row 2: a Journeyman-tier mount available to every race
-        // (min_skill 150).
         const RIDING_SKILL_LINE: u32 = 762;
         const RACE_HUMAN: u32 = 0x1;
-        const CLASS_ALL: u32 = 0xFFFF_FFFF; // riding is not class-restricted
+        const CLASS_ALL: u32 = 0xFFFF_FFFF;
         let table = DbcSkillLineAbility {
             rows: vec![
                 skill_ability_row(
@@ -2635,7 +2370,6 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("INSERT INTO game_skill_ability "))
             .unwrap();
-        // id,spell_id,skill_line,race_mask,class_mask,min_skill,acquire_method,gray,green
         assert!(
             insert.contains(&format!(
                 "(1,458,{RIDING_SKILL_LINE},1,{CLASS_ALL},75,0,0,0)"
@@ -2680,7 +2414,7 @@ mod tests {
         let availability = DbcSkillRaceClassInfo {
             rows: vec![skill_availability_row(
                 1,
-                186, /* Mining */
+                186,
                 0xFFFF_FFFF,
                 0xFFFF_FFFF,
                 0,
@@ -2699,8 +2433,8 @@ mod tests {
     fn profession_tier_values_skips_past_a_non_tier_variant_row_to_the_resolving_one() {
         let availability = DbcSkillRaceClassInfo {
             rows: vec![
-                skill_availability_row(1, 186 /* Mining */, 0x1, 0x1, 0, 1, 0), // variant: tier FK 0 → unresolvable
-                skill_availability_row(2, 186, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 1, 42), // the real tier row
+                skill_availability_row(1, 186, 0x1, 0x1, 0, 1, 0),
+                skill_availability_row(2, 186, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 1, 42),
             ],
         };
         let tiers = DbcSkillTiers {
@@ -2712,19 +2446,12 @@ mod tests {
 
     #[test]
     fn profession_tier_values_skips_an_unresolvable_line() {
-        // No SkillRaceClassInfo row at all for line 356 (Fishing) — resolves to nothing, not a panic.
         let availability = DbcSkillRaceClassInfo { rows: vec![] };
         let tiers = DbcSkillTiers { rows: vec![] };
         let map = resolve_profession_tier_values(&availability, &tiers);
         assert!(map.is_empty());
     }
 
-    /// The byte-parity proof (in-sandbox, no real client available): construct a `SkillRaceClassInfo`/
-    /// `SkillTiers` fixture for all 12 profession lines carrying the well-known 75/150/225/300
-    /// progression, resolve it, and check it against BOTH `main.rs`'s `LEGACY_TIER_CAPS` (via the exact
-    /// `PROFESSION_LEARN` tier_index each entry uses) AND `main.rs`'s own
-    /// `assert_profession_tier_parity` guard directly — proving the plumbing a real client run would
-    /// exercise is wired correctly, even though we can't check it against Blizzard's actual bytes here.
     #[test]
     fn profession_tier_values_matches_the_legacy_literals_for_every_profession_learn_line() {
         let mut availability_rows = Vec::new();

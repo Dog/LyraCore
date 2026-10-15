@@ -1,18 +1,3 @@
-// The whole path, end to end: run the Fire Nova Datascript the way `lyracore packages build` runs
-// it, and compare the bytes it writes with the frozen artifact.
-//
-// The frozen artifact is `fixtures/fire-nova.expected.json`. The Rust interop test in
-// `crates/lyracore-package-delta/tests/datascript_interop.rs` parses the SAME file, so these bytes
-// are the contract between the two languages. Regenerate it whenever the Datascript changes:
-//
-//   LYRACORE_BASE_SNAPSHOT=datascripts/tests/fixtures/base-snapshot.json \
-//   LYRACORE_PACKAGES_ROOT=<scratch dir> \
-//   bun run datascripts/tests/fixtures/fire_nova.ts
-//
-// The Datascript is run as a SUBPROCESS rather than imported, because the source hash it records is
-// the entry script's own digest — which only means what it says when the entry script is the
-// Datascript.
-
 import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +8,6 @@ const DATASCRIPT = join(import.meta.dir, "fixtures", "fire_nova.ts");
 const SNAPSHOT = join(import.meta.dir, "fixtures", "base-snapshot.json");
 const FROZEN = join(import.meta.dir, "fixtures", "fire-nova.expected.json");
 
-/// Run the Datascript against the synthetic snapshot, into a scratch Packages root.
 function emit(): { code: number; stderr: string; artifact?: string } {
   const root = mkdtempSync(join(tmpdir(), "lyracore-datascript-"));
   try {
@@ -76,7 +60,7 @@ test("the artifact claims five ranks, each with its cloned effects", () => {
   );
 
   expect(spells).toHaveLength(5);
-  expect(effects).toHaveLength(10); // the source's two effects, cloned onto each rank
+  expect(effects).toHaveLength(10);
   expect(spells.every((c: { operation: string }) => c.operation === "insert")).toBe(true);
   expect(
     spells.map((c: { key: { spell_id: number } }) => c.key.spell_id),

@@ -1,9 +1,5 @@
-//! Duel-specific sparse player descriptor updates.
-
 use super::*;
 
-/// Set only the Duel descriptor fields that changed. `arbiter` occupies two u32 slots; `team` is
-/// one. Neither update carries `OBJECT_FIELD_TYPE`, preserving the vanilla partial-VALUES rule.
 pub fn build_duel_player_values(
     guid: u64,
     arbiter: Option<u64>,

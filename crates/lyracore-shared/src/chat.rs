@@ -1,14 +1,8 @@
-//! The Realm Chat wire contract both crates import: Chat Kind codes, chat tags, language codes,
-//! the language Gate and the typed [`ChatRefusal`] the Gateway maps to client feedback.
-
 use crate::channel::ChannelRefusal;
 use crate::constants::player_flags;
 
-/// Chat Kinds: the 1.12 `ChatMsg` wire values (cm:SharedDefines.h:1545-1582). A Realm Chat Line
-/// stores the wire value itself, so neither tier keeps a translation table.
+// ChatMsg wire values, cm:SharedDefines.h:1545-1582.
 pub mod chat_kind {
-    /// Say, yell and `/e` are proximity chat and never Realm Chat Lines. They are here so the
-    /// language Gate judges every player line by its wire kind.
     pub const SAY: u8 = 0x00;
     pub const PARTY: u8 = 0x01;
     pub const RAID: u8 = 0x02;
@@ -26,25 +20,18 @@ pub mod chat_kind {
     pub const RAID_WARNING: u8 = 0x58;
 }
 
-/// The last byte of `SMSG_MESSAGECHAT` (cm:Chat.h:70-74). The client prints `<AFK>` or `<DND>`
-/// before the speaker's name.
+// Last byte of SMSG_MESSAGECHAT, cm:Chat.h:70-74.
 pub mod chat_tag {
     pub const NONE: u8 = 0;
     pub const AFK: u8 = 1;
     pub const DND: u8 = 2;
 }
 
-/// `game_chat_event.chat_type` discriminants: the World Shard's own broadcast chat table (say,
-/// yell, a creature's text emote, and a Character's `/e` custom emote). Not [`chat_kind`] above —
-/// that module names the 1.12 wire values a Realm Chat Line carries; this table predates it and
-/// keeps its own numbering.
+// game_chat_event uses its own numbering, distinct from ChatMsg wire values.
 pub mod broadcast_chat {
     pub const SAY: u8 = 0;
     pub const YELL: u8 = 1;
-    /// Creature-authored text emote (`CHAT_TYPE_TEXT_EMOTE` on the source wire). EventAI is its
-    /// only source.
     pub const CREATURE_TEXT_EMOTE: u8 = 2;
-    /// A Character's `/e` custom emote (cm:ChatHandler.cpp:172-226, cm:Player.cpp:16591-16599).
     pub const EMOTE: u8 = 3;
     pub const CREATURE_BOSS_EMOTE: u8 = 4;
     pub const CREATURE_WHISPER: u8 = 5;
@@ -55,12 +42,11 @@ pub mod broadcast_chat {
         matches!(chat_type, CREATURE_ZONE_YELL | CREATURE_ZONE_EMOTE)
     }
 
-    /// `/e` and text-emote (`/wave`, `/dance`, …) proximity range: `ListenRange.TextEmote`
-    /// (cm:mangosd.conf.dist.in:1092), same as `ListenRange.Say`.
+    // Text emotes use ListenRange.TextEmote, equal to ListenRange.Say.
     pub const TEXT_EMOTE_RANGE_YD: f32 = 25.0;
 }
 
-/// 1.12 `Language` wire values (gtker vanilla `language.rs`).
+// Build-5875 Language wire values.
 pub mod language {
     pub const UNIVERSAL: u32 = 0;
     pub const ORCISH: u32 = 1;
@@ -76,12 +62,9 @@ pub mod language {
     pub const GNOMISH: u32 = 13;
     pub const TROLL: u32 = 14;
     pub const GUTTERSPEAK: u32 = 33;
-    /// `SendAddonMessage` traffic. Never shown in a chat frame.
     pub const ADDON: u32 = 0xFFFF_FFFF;
 }
 
-/// The speaker's chat tag from the live entity's `PLAYER_FLAGS`. DND wins when both bits are set
-/// (vm:Player.cpp:1760-1770).
 pub fn chat_tag_for(flags: u32) -> u8 {
     if flags & player_flags::DND != 0 {
         chat_tag::DND
@@ -92,14 +75,6 @@ pub fn chat_tag_for(flags: u32) -> u8 {
     }
 }
 
-/// The language a line from `race` goes out in, or the Refusal.
-///
-/// - The addon language passes only for the kinds `SendAddonMessage` can reach
-///   (vm:ChatHandler.cpp:78-118). Guild and officer keep it rather than forcing Universal.
-/// - Whisper, guild, officer and the notice kinds always go out in Universal
-///   (cm:Player.cpp:16603-16604, cm:ChatHandler.cpp:369, cm:ChatHandler.cpp:409).
-/// - Universal passes for every kind.
-/// - Any other language passes only when the race knows it (cm:ChatHandler.cpp:100-111).
 pub fn speakable_language(kind: u8, race: u8, language: u32) -> Result<u32, ChatRefusal> {
     use chat_kind::*;
     if language == language::ADDON {
@@ -122,51 +97,34 @@ pub fn speakable_language(kind: u8, race: u8, language: u32) -> Result<u32, Chat
     }
 }
 
-/// The languages a player race speaks: dbc:SkillRaceClassInfo.dbc rows 40, 42, 44, 46, 48, 50, 52
-/// and 741 (flags 0x80), language skills from cm:ObjectMgr.cpp:89-106. Players never learn another
-/// language, and Realm-core holds no skill rows, so the race is the whole answer.
+// Racial languages derive from SkillRaceClassInfo.dbc language skill rows.
 fn racial_languages(race: u8) -> &'static [u32] {
     use language::*;
     match race {
-        1 => &[COMMON],              // Human
-        2 => &[ORCISH],              // Orc
-        3 => &[COMMON, DWARVISH],    // Dwarf
-        4 => &[COMMON, DARNASSIAN],  // Night Elf
-        5 => &[ORCISH, GUTTERSPEAK], // Undead
-        6 => &[ORCISH, TAURAHE],     // Tauren
-        7 => &[COMMON, GNOMISH],     // Gnome
-        8 => &[ORCISH, TROLL],       // Troll
+        1 => &[COMMON],
+        2 => &[ORCISH],
+        3 => &[COMMON, DWARVISH],
+        4 => &[COMMON, DARNASSIAN],
+        5 => &[ORCISH, GUTTERSPEAK],
+        6 => &[ORCISH, TAURAHE],
+        7 => &[COMMON, GNOMISH],
+        8 => &[ORCISH, TROLL],
         _ => &[],
     }
 }
 
-/// Why the Module refused a Realm Chat Line. The tag is the whole reducer error text, so neither
-/// tier matches on human prose. Vanilla answers most of these with silence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRefusal {
-    /// A party or raid line from a Character in no Group.
     NotInGroup,
-    /// A raid, raid leader or raid warning line from a Character whose Group is a Party.
     NotRaid,
-    /// A raid leader line from a Raid member who does not lead it.
     NotRaidLeader,
-    /// A raid warning from a Raid member who neither leads it nor assists.
     NotRaidLeaderOrAssistant,
-    /// The speaker's race does not know the language.
     UnknownLanguage,
-    /// The Chat Kind has no audience rule, or cannot carry the addon language.
     UnsupportedKind,
-    /// Nothing is left after trimming.
     EmptyMessage,
-    /// A guild or officer line from a Character in no Guild (`cm:ChatHandler.cpp:367-369`).
     NotInGuild,
-    /// A guild or officer line from a member whose Guild Rank lacks the speak right
-    /// (`cm:Guild.cpp:559-561,580-582`).
     NoGuildChatRight,
-    /// A channel line the channel refused. Answered with the channel's notice.
     Channel(ChannelRefusal),
-    /// A whisper to a Character of the other team (cm:ChatHandler.cpp:268-275). Answered with
-    /// `SMSG_CHAT_WRONG_FACTION`.
     WrongFaction,
 }
 
@@ -224,7 +182,6 @@ impl ChatRefusal {
 mod tests {
     use super::*;
 
-    /// cm:SharedDefines.h:1545-1582, `enum ChatMsg`.
     #[test]
     fn chat_kinds_are_the_vanilla_chat_msg_values() {
         assert_eq!(chat_kind::SAY, 0);
@@ -244,20 +201,15 @@ mod tests {
         assert_eq!(chat_kind::RAID_WARNING, 88);
     }
 
-    /// `game_chat_event.chat_type` discriminants + the shared text-emote range, pinned so a
-    /// later edit shows up as a failing assertion instead of a silent drift between the two crates
-    /// that both read them.
     #[test]
     fn broadcast_chat_discriminants_and_text_emote_range_are_pinned() {
         assert_eq!(broadcast_chat::SAY, 0);
         assert_eq!(broadcast_chat::YELL, 1);
         assert_eq!(broadcast_chat::CREATURE_TEXT_EMOTE, 2);
         assert_eq!(broadcast_chat::EMOTE, 3);
-        assert_eq!(broadcast_chat::TEXT_EMOTE_RANGE_YD, 25.0); // cm:mangosd.conf.dist.in:1092
+        assert_eq!(broadcast_chat::TEXT_EMOTE_RANGE_YD, 25.0);
     }
 
-    /// Every player race against every language that a race can know, written out from the dbc
-    /// rows: true where SkillRaceClassInfo grants the language skill.
     #[test]
     fn a_race_speaks_exactly_its_racial_languages() {
         const COMMON: u32 = 7;
@@ -278,7 +230,6 @@ mod tests {
             GNOMISH,
             TROLL,
         ];
-        // Common, Orcish, Dwarvish, Darnassian, Gutterspeak, Taurahe, Gnomish, Troll
         let rows: [(&str, u8, [bool; 8]); 8] = [
             (
                 "Human",
@@ -337,7 +288,6 @@ mod tests {
         }
     }
 
-    /// No player race knows the NPC and GM languages.
     #[test]
     fn nobody_speaks_the_languages_no_race_learns() {
         for race in 1..=8 {
@@ -365,7 +315,6 @@ mod tests {
         }
     }
 
-    /// Whisper, guild, officer and the notice kinds go out in Universal whatever the client sent.
     #[test]
     fn forced_universal_kinds_ignore_the_requested_language() {
         for kind in [6, 7, 3, 4, 20, 21, 22] {
@@ -374,7 +323,6 @@ mod tests {
         }
     }
 
-    /// vm:ChatHandler.cpp:78-118: party, raid, raid leader, raid warning, guild, officer and channel.
     #[test]
     fn the_addon_language_passes_only_for_addon_kinds() {
         for kind in [1, 2, 87, 88, 3, 4, 14] {
@@ -404,8 +352,6 @@ mod tests {
         }
     }
 
-    /// cm:ChatHandler.cpp:100-111 checks the language skill before it reads the kind, so say, yell
-    /// and `/e` refuse a language the race does not know, and never carry the addon language.
     #[test]
     fn proximity_kinds_refuse_a_language_the_race_does_not_know() {
         for kind in [0, 5, 8] {
@@ -424,7 +370,6 @@ mod tests {
         }
     }
 
-    /// cm:Player.h:370-371 bits; vm:Player.cpp:1760-1770 lets DND win.
     #[test]
     fn the_chat_tag_follows_the_away_bits() {
         assert_eq!(chat_tag_for(0), 0);
