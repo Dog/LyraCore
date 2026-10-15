@@ -271,6 +271,13 @@ and a resist for a magic one. The caster of an instant cast already holds a GO, 
 interrupted player cast get `SMSG_SPELL_FAILED_OTHER`. Mount refusals name the vanilla cast
 failure: dead, in combat, indoors or in deep water.
 
+Imported gossip conditions retain source references and operands. Supported rules
+cover quest state, level, team, race and class, plus compound conditions and negation.
+Unknown, dangling or cyclic conditions make an option unavailable. The Module repeats
+the eligibility check when the client selects an option, before running its hook.
+Existing imported rows need a gossip reimport to recover information the previous
+importer discarded. No reimport is performed by these tests.
+
 ## Missing gameplay and deliberate responses
 
 These features remain unavailable. The responses below apply to valid requests

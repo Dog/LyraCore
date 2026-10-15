@@ -753,6 +753,9 @@ parity_test!(parity_game_corpse_loot, "game_corpse_loot", lyracore_module::Corps
 parity_test!(parity_game_npc_vendor, "game_npc_vendor", lyracore_module::NpcVendor, bindings::npc_vendor_type::NpcVendor, {
     id, creature_entry, item_entry, slot, max_count,
 });
+parity_test!(parity_game_gossip_condition, "game_gossip_condition", lyracore_module::GossipCondition, bindings::gossip_condition_type::GossipCondition, {
+    condition_id, kind, value_1, value_2, value_3, value_4, flags,
+}, renames: { value1 => value_1, value2 => value_2, value3 => value_3, value4 => value_4 });
 parity_test!(parity_game_gossip_menu, "game_gossip_menu", lyracore_module::GossipMenu, bindings::gossip_menu_type::GossipMenu, {
     entry, text_id,
 });
@@ -1072,6 +1075,7 @@ const MANIFEST_TABLES: &[&str] = &[
     "game_corpse_loot",
     "game_npc_vendor",
     "game_gossip_menu",
+    "game_gossip_condition",
     "game_gossip_option",
     "game_gossip_menu_profile",
     "game_gossip_menu_profile_option",

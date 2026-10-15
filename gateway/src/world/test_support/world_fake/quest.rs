@@ -11,6 +11,8 @@ pub(crate) struct QuestState {
     pub(crate) turned_in: std::sync::Mutex<Vec<(u64, u64, u32, u32)>>,
     pub(crate) turn_in_reward_letter: Option<crate::world::mail::HeldEscrow>,
     pub(crate) quest_log: std::sync::Mutex<Vec<(u32, bool)>>,
+    pub(crate) repeatable_quests: std::collections::HashSet<u32>,
+    pub(crate) missing_quests: std::collections::HashSet<u32>,
 }
 
 impl QuestActionStore for WorldFake {
@@ -77,20 +79,6 @@ impl QuestActionStore for WorldFake {
 
     fn push_quest(&self, _actor: Actor, _quest_id: u32) -> Result<()> {
         Ok(())
-    }
-
-    fn quest_status(&self, _player_guid: u64, quest_id: u32) -> (bool, bool) {
-        match self
-            .quest
-            .quest_log
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, _)| *id == quest_id)
-        {
-            Some((_, rewarded)) => (true, *rewarded),
-            None => (false, false),
-        }
     }
 
     fn turn_in_quest(
@@ -166,5 +154,21 @@ impl QuestActionStore for WorldFake {
                 .map_err(|_| anyhow!("reward item relay writer is gone"))?;
         }
         Ok(())
+    }
+}
+
+impl WorldFake {
+    pub(crate) fn quest_status(&self, _player_guid: u64, quest_id: u32) -> (bool, bool) {
+        match self
+            .quest
+            .quest_log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == quest_id)
+        {
+            Some((_, rewarded)) => (true, *rewarded),
+            None => (false, false),
+        }
     }
 }

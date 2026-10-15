@@ -34,16 +34,27 @@ pub(crate) trait NpcStore: Send + Sync {
 
     fn npc_text_for_id(&self, text_id: u32) -> Option<codec::NpcTextView>;
 
-    fn gossip_options(&self, npc_guid: u64) -> Result<Vec<codec::GossipOptionView>>;
+    /// Returns options sorted by option_index, unfiltered; empty menus retain their source id.
+    fn gossip_options(&self, npc_guid: u64) -> Result<codec::GossipMenuView>;
+
+    /// Unknown conditions are unavailable.
+    fn gossip_option_available(
+        &self,
+        character_guid: u64,
+        option: &codec::GossipOptionView,
+    ) -> Result<bool>;
 
     fn inspect(&self, actor: Actor, target_guid: u64) -> Result<()>;
 
+    /// Apply the Module Gate and hook before the Gateway executes the selected action.
     fn gossip_select(
         &self,
         actor: Actor,
         npc_guid: u64,
         option_id: u32,
         option_row_id: u32,
+        source_menu_id: u32,
+        selected_action: u32,
     ) -> Result<()>;
 }
 
@@ -53,7 +64,9 @@ fn filtered_gossip_options<
     store: &St,
     npc_guid: u64,
     player_guid: u64,
-) -> Result<Vec<codec::GossipOptionView>> {
+    is_vendor: bool,
+    is_innkeeper: bool,
+) -> Result<codec::GossipMenuView> {
     use lyracore_shared::constants::{gossip_option, MIN_TALENT_LEVEL};
     let level = store
         .character_by_guid(player_guid)?
@@ -61,21 +74,38 @@ fn filtered_gossip_options<
         .unwrap_or(0);
     let serves_class = store.trainer_serves(player_guid, npc_guid).unwrap_or(true);
     let raw = store.gossip_options(npc_guid)?;
-    Ok(raw
-        .into_iter()
-        .filter(|opt| {
-            let (taken, rewarded) = quest::quest_gate_state(store, player_guid, opt.cond_value1);
-            codec::option_condition_holds(opt.cond_type, taken, rewarded)
-        })
-        .filter(|opt| opt.action != gossip_option::UNLEARNTALENTS || level >= MIN_TALENT_LEVEL)
-        .filter(|opt| {
-            serves_class
-                || !matches!(
-                    opt.action,
-                    gossip_option::TRAINER | gossip_option::UNLEARNTALENTS
-                )
-        })
-        .collect())
+    let synthesize_vendor = is_vendor
+        && !raw
+            .options
+            .iter()
+            .any(|option| option.action == gossip_option::VENDOR);
+    let synthesize_innkeeper = is_innkeeper
+        && !raw
+            .options
+            .iter()
+            .any(|option| option.action == gossip_option::INNKEEPER);
+    let mut available = Vec::new();
+    for option in raw.options {
+        if !store.gossip_option_available(player_guid, &option)? {
+            continue;
+        }
+        if option.action == gossip_option::UNLEARNTALENTS && level < MIN_TALENT_LEVEL {
+            continue;
+        }
+        if !serves_class
+            && matches!(
+                option.action,
+                gossip_option::TRAINER | gossip_option::UNLEARNTALENTS
+            )
+        {
+            continue;
+        }
+        available.push(option);
+    }
+    Ok(codec::GossipMenuView {
+        source_menu_id: raw.source_menu_id,
+        options: codec::gossip_menu_options(available, synthesize_vendor, synthesize_innkeeper),
+    })
 }
 
 fn speak_nearby<St: SpeechStore + ?Sized>(
@@ -245,15 +275,13 @@ impl<
                 };
                 let is_vendor = vendor_has_stock(store, npc)?;
                 let is_innkeeper = store.npc_is_innkeeper(npc)?;
-                let options = codec::gossip_menu_options(
-                    filtered_gossip_options(store, npc, player_guid)?,
-                    is_vendor,
-                    is_innkeeper,
-                );
+                let menu =
+                    filtered_gossip_options(store, npc, player_guid, is_vendor, is_innkeeper)?;
                 // Refiltering can change which option a client list position names.
                 session.gossip_menu = Some(GossipMenuSnapshot {
                     npc_guid: npc,
-                    options: options.iter().map(|o| (o.row_id, o.action)).collect(),
+                    source_menu_id: menu.source_menu_id,
+                    options: menu.options.iter().map(|o| (o.row_id, o.action)).collect(),
                 });
                 let title_text_id = store.npc_gossip_text_id(npc);
                 outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(
@@ -261,7 +289,7 @@ impl<
                         npc,
                         title_text_id,
                         quests,
-                        &options,
+                        &menu.options,
                     )),
                 )));
             }
@@ -278,32 +306,52 @@ impl<
                     .gossip_menu
                     .as_ref()
                     .filter(|snap| snap.npc_guid == npc)
-                    .and_then(|snap| snap.options.get(c.gossip_list_id as usize))
-                    .copied();
-                // A filtered list position is viewer-local; Package hooks need the durable row_id.
-                let option_row_id = clicked.map_or(codec::SYNTHESIZED_ROW_ID, |(row_id, _)| row_id);
-                if let Some(actor) = actor {
-                    settle_per_action(
-                        "gossip_select",
-                        session.account_id,
-                        store.gossip_select(actor, npc, c.gossip_list_id, option_row_id),
-                    )?;
+                    .and_then(|snap| {
+                        snap.options
+                            .get(c.gossip_list_id as usize)
+                            .map(|&(row_id, action)| (row_id, action, snap.source_menu_id))
+                    });
+                let (Some(actor), Some((option_row_id, action, source_menu_id))) = (actor, clicked)
+                else {
+                    session.gossip_menu = None;
+                    return Ok(
+                        vec![Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)].into(),
+                    );
+                };
+                if let Err(error) = store.gossip_select(
+                    actor,
+                    npc,
+                    c.gossip_list_id,
+                    option_row_id,
+                    source_menu_id,
+                    action,
+                ) {
+                    match classify(&error) {
+                        DurableFailure::Refusal { .. } => {
+                            session.gossip_menu = None;
+                            return Ok(vec![Outbound::One(
+                                ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE,
+                            )]
+                            .into());
+                        }
+                        DurableFailure::TransportLoss => return Err(error),
+                    }
                 }
                 use lyracore_shared::constants::gossip_option;
-                match clicked.map(|(_, action)| action) {
-                    Some(gossip_option::VENDOR) => {
+                match action {
+                    gossip_option::VENDOR => {
                         for message in vendor_open_outbound(store, npc)? {
                             outbound.push(message);
                         }
                     }
-                    Some(gossip_option::INNKEEPER) => {
+                    gossip_option::INNKEEPER => {
                         outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
                         outbound.push(Outbound::Raw {
                             opcode: 0x02eb,
                             body: npc.to_le_bytes().to_vec(),
                         });
                     }
-                    Some(gossip_option::TRAINER) => {
+                    gossip_option::TRAINER => {
                         let spells = store.trainer_list(player_guid, npc)?;
                         let list = codec::build_trainer_list(
                             npc,
@@ -314,7 +362,7 @@ impl<
                             Box::new(list),
                         )));
                     }
-                    Some(gossip_option::UNLEARNTALENTS) => {
+                    gossip_option::UNLEARNTALENTS => {
                         outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
                         if let Some(cost) = store.talent_reset_cost(player_guid) {
                             let mut body = npc.to_le_bytes().to_vec();
@@ -331,17 +379,17 @@ impl<
                             )));
                         }
                     }
-                    Some(gossip_option::TAXI) => {
-                        for message in open_taxi_outbound(store, actor, npc)? {
+                    gossip_option::TAXI => {
+                        for message in open_taxi_outbound(store, Some(actor), npc)? {
                             outbound.push(message);
                         }
                     }
-                    Some(gossip_option::BANKER) => outbound.push(super::show_bank(npc)),
-                    Some(gossip_option::TABARDDESIGNER) => {
+                    gossip_option::BANKER => outbound.push(super::show_bank(npc)),
+                    gossip_option::TABARDDESIGNER => {
                         outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
                         outbound.push(super::guild::tabard_designer_window(npc));
                     }
-                    Some(gossip_option::PETITIONER) => {
+                    gossip_option::PETITIONER => {
                         outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
                         outbound.push(super::guild::petition_showlist(npc));
                     }

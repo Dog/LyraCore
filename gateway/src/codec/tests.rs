@@ -1968,33 +1968,6 @@ fn gossip_menu_options_appends_only_the_missing_flag_lines() {
 }
 
 #[test]
-fn option_condition_holds_gates_on_quest_status_and_fails_open_for_unknown_types() {
-    use lyracore_shared::constants::gossip_condition;
-    assert!(option_condition_holds(gossip_condition::NONE, false, false));
-    assert!(option_condition_holds(
-        gossip_condition::QUEST_TAKEN,
-        true,
-        false
-    ));
-    assert!(!option_condition_holds(
-        gossip_condition::QUEST_TAKEN,
-        false,
-        false
-    ));
-    assert!(option_condition_holds(
-        gossip_condition::QUEST_REWARDED,
-        false,
-        true
-    ));
-    assert!(!option_condition_holds(
-        gossip_condition::QUEST_REWARDED,
-        true,
-        false
-    ));
-    assert!(option_condition_holds(99, false, false));
-}
-
-#[test]
 fn cast_result_failed_body_and_reason_map() {
     assert_eq!(
         build_cast_result_failed(100, 0x4D),

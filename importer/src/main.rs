@@ -4,6 +4,7 @@ mod dbc;
 mod eventai;
 mod eventai_presentation;
 mod go_model;
+mod gossip_conditions;
 mod instance_vmap;
 mod item_property;
 mod m2_collision;
@@ -110,14 +111,7 @@ mod gmo {
     pub const NCOLS_WITH_INLINE_COND: usize = 14;
     pub const INLINE_COND_TYPE: usize = 11;
     pub const INLINE_COND_VALUE1: usize = 12;
-}
-mod cond {
-    pub const ENTRY: usize = 0;
-    pub const TYPE: usize = 1;
-    pub const VALUE1: usize = 2;
-    pub const MANGOS_QUESTREWARDED: u64 = 8;
-    pub const MANGOS_QUESTTAKEN: u64 = 9;
-    pub const MANGOS_ACTIVE_GAME_EVENT: u64 = 12;
+    pub const INLINE_COND_VALUE2: usize = 13;
 }
 mod cts {
     pub const ENTRY: usize = 0;
@@ -1746,71 +1740,6 @@ fn slots_first_nonempty(slots: &[NpcTextSlot; 8]) -> String {
     String::new()
 }
 
-fn resolve_gossip_option_condition(
-    row: &[String],
-    conditions: &HashMap<u64, (u64, u64)>,
-) -> (u32, u32, u32) {
-    use lyracore_shared::constants::gossip_condition;
-    let map = |mangos_type: u64, value1: u64| -> (u32, u32, u32) {
-        match mangos_type {
-            cond::MANGOS_QUESTTAKEN => (gossip_condition::QUEST_TAKEN, value1 as u32, 0),
-            cond::MANGOS_QUESTREWARDED => (gossip_condition::QUEST_REWARDED, value1 as u32, 0),
-            cond::MANGOS_ACTIVE_GAME_EVENT => (gossip_condition::NEVER, 0, 0),
-            _ => (gossip_condition::NONE, 0, 0),
-        }
-    };
-    // Check the 15-column layout first; its column 11 is box_money, not an inline condition.
-    if row.len() >= gmo::NCOLS_15_CONDITION_FK {
-        let cond_id: u64 = field(row, gmo::CONDITION_ID_15).parse().unwrap_or(0);
-        if cond_id == 0 {
-            return (lyracore_shared::constants::gossip_condition::NONE, 0, 0);
-        }
-        let Some(&(t, v1)) = conditions.get(&cond_id) else {
-            eprintln!(
-                "gossip option: dangling condition_id {cond_id} on menu {} option {} — fail-open",
-                field(row, gmo::MENU_ID),
-                field(row, gmo::ID)
-            );
-            return (lyracore_shared::constants::gossip_condition::NONE, 0, 0);
-        };
-        let resolved = map(t, v1);
-        if resolved.0 == lyracore_shared::constants::gossip_condition::NONE {
-            eprintln!(
-                "gossip option: unsupported condition type {t} (id {cond_id}) on menu {} option {} — fail-open",
-                field(row, gmo::MENU_ID), field(row, gmo::ID)
-            );
-        }
-        return resolved;
-    }
-    if row.len() >= gmo::NCOLS_WITH_INLINE_COND {
-        let t: u64 = field(row, gmo::INLINE_COND_TYPE).parse().unwrap_or(0);
-        let v1: u64 = field(row, gmo::INLINE_COND_VALUE1).parse().unwrap_or(0);
-        let resolved = map(t, v1);
-        if t != 0 && resolved.0 == gossip_condition::NONE {
-            eprintln!(
-                "gossip option: unsupported inline condition type {t} on menu {} option {} — fail-open (always shown)",
-                field(row, gmo::MENU_ID), field(row, gmo::ID)
-            );
-        }
-        return resolved;
-    }
-    if row.len() >= gmo::NCOLS_WITH_CONDITION_FK {
-        let cond_id: u64 = field(row, gmo::CONDITION_ID).parse().unwrap_or(0);
-        if cond_id != 0 {
-            if let Some(&(t, v1)) = conditions.get(&cond_id) {
-                let resolved = map(t, v1);
-                if resolved.0 == gossip_condition::NONE {
-                    eprintln!(
-                        "gossip option: unsupported condition type {t} (condition_entry {cond_id}) — fail-open (always shown)"
-                    );
-                }
-                return resolved;
-            }
-        }
-    }
-    (gossip_condition::NONE, 0, 0)
-}
-
 fn resolve_gossip_option_text(
     row: &[String],
     broadcast: &HashMap<u64, (String, String)>,
@@ -1844,6 +1773,7 @@ struct GossipEtl {
     option_rows: Vec<String>,
     profile_rows: Vec<String>,
     profile_option_rows: Vec<String>,
+    condition_rows: Vec<String>,
 }
 
 fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64>) -> GossipEtl {
@@ -1950,16 +1880,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         }
     }
 
-    let mut conditions: HashMap<u64, (u64, u64)> = HashMap::new();
-    for row in parse_table(dump, "conditions") {
-        let id: u64 = field(&row, cond::ENTRY).parse().unwrap_or(0);
-        if id == 0 {
-            continue;
-        }
-        let t: u64 = field(&row, cond::TYPE).parse().unwrap_or(0);
-        let v1: u64 = field(&row, cond::VALUE1).parse().unwrap_or(0);
-        conditions.insert(id, (t, v1));
-    }
+    let conditions = gossip_conditions::read(dump);
     let mut menu_to_options: HashMap<u64, Vec<Vec<String>>> = HashMap::new();
     for row in parse_table(dump, "gossip_menu_option") {
         let menu_id: u64 = field(&row, gmo::MENU_ID).parse().unwrap_or(0);
@@ -1992,7 +1913,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
             }
             let action_menu_id: u32 = field(row, gmo::ACTION_MENU_ID).parse().unwrap_or(0);
             let (cond_type, cond_value1, cond_value2) =
-                resolve_gossip_option_condition(row, &conditions);
+                gossip_conditions::resolve(row, &conditions);
             option_rows.push(format!(
                 "({next_row_id},{entry},{option_index},{icon},{},{action},{action_menu_id},{cond_type},{cond_value1},{cond_value2})",
                 sql_text(&text),
@@ -2023,7 +1944,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
             }
             let action_menu_id: u32 = field(row, gmo::ACTION_MENU_ID).parse().unwrap_or(0);
             let (cond_type, cond_value1, cond_value2) =
-                resolve_gossip_option_condition(row, &conditions);
+                gossip_conditions::resolve(row, &conditions);
             profile_option_rows.push(format!(
                 "({profile_row_id},{menu_id},{option_index},{icon},{},{action},{action_menu_id},{cond_type},{cond_value1},{cond_value2})",
                 sql_text(&text),
@@ -2045,6 +1966,7 @@ fn build_gossip_sql(dump: &str, creature_entries: &std::collections::HashSet<u64
         option_rows,
         profile_rows,
         profile_option_rows,
+        condition_rows: gossip_conditions::sql_rows(&conditions),
     }
 }
 
@@ -4361,7 +4283,14 @@ fn push_world_content_statements(args: &Args, content: MappedContent, stmts: &mu
     }
 
     if family_active(args, "gossip") {
-        // Base gossip reloads preserve menu entries >= 1_000_000 and row/text ids >= 50_000.
+        // Entry menus >= 1_000_000 and default option/text row ids >= 50_000 survive reloads.
+        stmts.push("DELETE FROM game_gossip_condition WHERE condition_id > 0".into());
+        push_insert(
+            stmts,
+            "game_gossip_condition",
+            "condition_id,kind,value1,value2,value3,value4,flags",
+            &gossip.condition_rows,
+        );
         stmts.push("DELETE FROM game_gossip_menu_profile_option WHERE row_id > 0".into());
         stmts.push("DELETE FROM game_gossip_menu_profile WHERE menu_id > 0".into());
         stmts.push("DELETE FROM game_gossip_menu WHERE entry > 0 AND entry < 1000000".into());
@@ -4692,7 +4621,8 @@ fn family_stamps(
                 + gossip.npc_text_slot_rows.len()
                 + gossip.option_rows.len()
                 + gossip.profile_rows.len()
-                + gossip.profile_option_rows.len()) as u64,
+                + gossip.profile_option_rows.len()
+                + gossip.condition_rows.len()) as u64,
         ));
     }
     if family_active(args, "quests") {
@@ -5957,7 +5887,7 @@ mod tests {
         );
         assert_eq!(
             etl.profile_option_rows[1],
-            "(2,6688,0,1,'Second option',1,12,1,777,0)"
+            "(2,6688,0,1,'Second option',1,12,7,501,0)"
         );
         assert_eq!(etl.npc_text_rows.len(), 4);
     }
@@ -6071,11 +6001,11 @@ mod tests {
     }
 
     #[test]
-    fn build_gossip_sql_folds_an_inline_quest_taken_condition() {
+    fn build_gossip_sql_preserves_an_inline_quest_completion_operand() {
         let entry = 302u64;
         let menu_id = 902u64;
         let option =
-            format!("({menu_id},0,0,'Have you started my quest?',1,0,0,0,0,0,'NULL',9,777,0)");
+            format!("({menu_id},0,0,'Have you started my quest?',1,0,0,0,0,0,'NULL',9,777,2)");
         let dump = format!(
             "x INSERT INTO `creature_template` VALUES {}; \
              INSERT INTO `gossip_menu_option` VALUES {option}; y",
@@ -6085,38 +6015,53 @@ mod tests {
         let etl = build_gossip_sql(&dump, &entries);
         assert_eq!(etl.option_rows.len(), 1);
         assert!(
-            etl.option_rows[0].ends_with("1,777,0)"),
+            etl.option_rows[0].ends_with("1,777,2)"),
             "{}",
             etl.option_rows[0]
         );
     }
 
     #[test]
-    fn build_gossip_sql_resolves_condition_via_the_generic_conditions_table_and_fails_open_when_unmapped(
-    ) {
+    fn build_gossip_sql_retains_source_conditions_and_dangling_references() {
         let entry = 303u64;
         let menu_id = 903u64;
         let dump = format!(
-            "x INSERT INTO `creature_template` VALUES {}; \
+            "INSERT INTO `creature_template` VALUES {}; \
              INSERT INTO `gossip_menu_option` VALUES \
-                ({menu_id},0,0,'Turn in reward.',1,0,0,0,0,'NULL',501), \
-                ({menu_id},1,0,'Unsupported gate.',1,0,0,0,0,'NULL',502); \
-             INSERT INTO `conditions` VALUES (501,8,555,0), (502,5,1,0); y",
+                ({menu_id},0,0,'Finished quest.',0,1,0,0,0,0,0,0,'',0,501), \
+                ({menu_id},1,0,'Unsupported gate.',0,1,0,0,0,0,0,0,'',0,502), \
+                ({menu_id},2,0,'Dangling gate.',0,1,0,0,0,0,0,0,'',0,599); \
+             INSERT INTO `conditions` VALUES \
+                (501,9,777,2,0,0,0),(502,-3,503,0,0,0,0),(503,5,1,4,0,0,1);",
             creature_template_row(entry, menu_id),
         );
-        let entries: std::collections::HashSet<u64> = [entry].into_iter().collect();
+        let entries = [entry].into_iter().collect();
         let etl = build_gossip_sql(&dump, &entries);
-        assert_eq!(etl.option_rows.len(), 2);
-        assert!(
-            etl.option_rows[0].ends_with("2,555,0)"),
-            "{}",
-            etl.option_rows[0]
+        assert_eq!(etl.option_rows.len(), 3);
+        for (option, id) in etl.option_rows.iter().zip([501, 502, 599]) {
+            assert!(option.ends_with(&format!("7,{id},0)")), "{option}");
+        }
+        assert_eq!(
+            etl.condition_rows,
+            [
+                "(501,9,777,2,0,0,0)",
+                "(502,-3,503,0,0,0,0)",
+                "(503,5,1,4,0,0,1)"
+            ]
         );
-        assert!(
-            etl.option_rows[1].ends_with("0,0,0)"),
-            "{}",
-            etl.option_rows[1]
-        );
+        let conditions = gossip_conditions::read(&dump);
+        use lyracore_shared::gossip::{evaluate_reference, CharacterFacts, QuestState};
+        let facts = CharacterFacts {
+            level: 20,
+            race: 1,
+            class: 1,
+        };
+        let evaluate =
+            |id, state| evaluate_reference(id, facts, |_| state, |id| conditions.get(&id).copied());
+        assert_eq!(evaluate(501, QuestState::Complete), Ok(true));
+        assert_eq!(evaluate(501, QuestState::Incomplete), Ok(false));
+        assert!(evaluate(502, QuestState::Complete).is_err());
+        assert!(evaluate(599, QuestState::Complete).is_err());
     }
 
     #[test]

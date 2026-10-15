@@ -35,6 +35,13 @@ pub fn build_creature_query_response(c: &CreatureView) -> SMSG_CREATURE_QUERY_RE
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct GossipMenuView {
+    /// Zero selects the entry-owned menu; any other value names a runtime menu profile.
+    pub source_menu_id: u32,
+    pub options: Vec<GossipOptionView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GossipOptionView {
     pub row_id: u32,
     pub icon: u32,
@@ -46,17 +53,7 @@ pub struct GossipOptionView {
     pub cond_value2: u32,
 }
 
-pub fn option_condition_holds(cond_type: u32, quest_taken: bool, quest_rewarded: bool) -> bool {
-    use lyracore_shared::constants::gossip_condition;
-    match cond_type {
-        gossip_condition::NONE => true,
-        gossip_condition::QUEST_TAKEN => quest_taken,
-        gossip_condition::QUEST_REWARDED => quest_rewarded,
-        gossip_condition::NEVER => false,
-        _ => true,
-    }
-}
-
+/// Synthesized options have no durable row; Package hooks must not treat this as a row id.
 pub const SYNTHESIZED_ROW_ID: u32 = u32::MAX;
 
 pub fn gossip_menu_options(

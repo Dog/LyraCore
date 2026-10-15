@@ -33,8 +33,6 @@ pub(crate) trait QuestActionStore: Send + Sync {
     fn abandon_quest(&self, actor: Actor, quest_id: u32) -> Result<()>;
 
     fn push_quest(&self, actor: Actor, quest_id: u32) -> Result<()>;
-
-    fn quest_status(&self, player_guid: u64, quest_id: u32) -> (bool, bool);
 }
 
 fn ignore_refusal(result: Result<()>, operation: &str, account_id: u64) -> Result<()> {
@@ -163,14 +161,6 @@ pub(crate) fn gossip_quest_items<St: QuestActionStore + ?Sized>(
     Ok(codec::quest_menu_items(
         &store.giver_quest_evals(npc, self_guid)?,
     ))
-}
-
-pub(crate) fn quest_gate_state<St: QuestActionStore + ?Sized>(
-    store: &St,
-    player_guid: u64,
-    quest_id: u32,
-) -> (bool, bool) {
-    store.quest_status(player_guid, quest_id)
 }
 
 fn quest_reward_screen<St: QuestActionStore + ?Sized>(
@@ -368,7 +358,6 @@ mod tests {
         turn_in_calls: Mutex<Vec<TurnInCall>>,
         abandon_requests: Mutex<Vec<(u64, u32)>>,
         push_requests: Mutex<Vec<(u64, u32)>>,
-        status_requests: Mutex<Vec<(u64, u32)>>,
         evals: Vec<codec::GiverQuestEval>,
         details: Vec<codec::QuestDetailView>,
         refuses: bool,
@@ -378,7 +367,6 @@ mod tests {
         quest_log: Vec<codec::update_mask::QuestLogSlot>,
         abandon_error: Option<String>,
         push_error: Option<String>,
-        quest_status: (bool, bool),
         transport_lost: bool,
     }
 
@@ -483,14 +471,6 @@ mod tests {
                 .unwrap()
                 .push((actor.guid(), quest_id));
             self.answer("gw_push_quest_to_party", &self.push_error)
-        }
-
-        fn quest_status(&self, player_guid: u64, quest_id: u32) -> (bool, bool) {
-            self.status_requests
-                .lock()
-                .unwrap()
-                .push((player_guid, quest_id));
-            self.quest_status
         }
     }
 
@@ -1380,27 +1360,6 @@ mod tests {
         assert!(gossip_quest_items(&actions, GIVER, SELF_GUID)
             .unwrap()
             .is_empty());
-    }
-
-    #[test]
-    fn quest_gate_state_answers_untaken_for_a_quest_never_seen() {
-        let actions = InMemoryQuestActions::default();
-
-        assert_eq!(quest_gate_state(&actions, SELF_GUID, QUEST), (false, false));
-    }
-
-    #[test]
-    fn quest_gate_state_answers_taken_once_the_quest_is_in_the_log() {
-        let actions = InMemoryQuestActions {
-            quest_status: (true, false),
-            ..Default::default()
-        };
-
-        assert_eq!(quest_gate_state(&actions, SELF_GUID, QUEST), (true, false));
-        assert_eq!(
-            actions.status_requests.lock().unwrap().as_slice(),
-            &[(SELF_GUID, QUEST)]
-        );
     }
 }
 

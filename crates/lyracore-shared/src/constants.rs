@@ -233,12 +233,23 @@ pub mod gossip_option {
 
 pub const MIN_TALENT_LEVEL: u8 = 10;
 
-// Unsupported conditions map to NONE; nonexistent subjects map to NEVER.
+// Persisted encodings: retain values 0–3 when adding condition kinds.
 pub mod gossip_condition {
     pub const NONE: u32 = 0;
+    /// An active quest: value2 is 0 for either state, 1 incomplete, or 2 complete.
     pub const QUEST_TAKEN: u32 = 1;
     pub const QUEST_REWARDED: u32 = 2;
+    /// An explicitly unavailable option, including unsupported inline source conditions.
     pub const NEVER: u32 = 3;
+    /// value1 is the level; value2 is 0 equal, 1 at least, or 2 at most.
+    pub const LEVEL: u32 = 4;
+    /// value1 is the source team id, 469 Alliance or 67 Horde.
+    pub const TEAM: u32 = 5;
+    /// value1 and value2 are race and class masks; a zero mask is unrestricted.
+    pub const RACE_CLASS: u32 = 6;
+    /// value1 names a retained source row in game_gossip_condition.
+    pub const REFERENCE: u32 = 7;
+    pub const QUEST_NONE: u32 = 8;
 }
 
 #[cfg(test)]
@@ -320,11 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn gossip_condition_none_is_the_fail_open_zero_value() {
-        assert_eq!(gossip_condition::NONE, 0);
-        assert_ne!(
-            gossip_condition::QUEST_TAKEN,
-            gossip_condition::QUEST_REWARDED
+    fn gossip_condition_keeps_existing_persisted_values() {
+        assert_eq!(
+            (
+                gossip_condition::NONE,
+                gossip_condition::QUEST_TAKEN,
+                gossip_condition::QUEST_REWARDED,
+                gossip_condition::NEVER
+            ),
+            (0, 1, 2, 3),
         );
     }
 }

@@ -191,6 +191,18 @@ pub(crate) fn warrior_entity() -> codec::EntityView {
 pub(crate) fn quest_store() -> WorldFake {
     let base = tester_store(7);
     WorldFake {
+        characters: vec![codec::CharacterView {
+            guid: 1,
+            name: "Tester".into(),
+            race: 1,
+            class: 1,
+            level: 1,
+            zone_id: 12,
+            x: -8949.95,
+            y: -132.493,
+            z: 83.5312,
+            ..Default::default()
+        }],
         session: SessionState {
             login_entity: Some(warrior_entity()),
             ..base.session

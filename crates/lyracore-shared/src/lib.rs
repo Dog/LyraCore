@@ -8,6 +8,7 @@ pub mod constants;
 pub mod duel;
 pub mod env;
 pub mod faction;
+pub mod gossip;
 pub mod group;
 pub mod guild;
 pub mod instance;

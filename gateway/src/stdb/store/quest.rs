@@ -25,20 +25,6 @@ impl QuestActionStore for Coordinator {
         hit
     }
 
-    fn quest_status(&self, guid: u64, quest_id: u32) -> (bool, bool) {
-        let guard = self.0.coord();
-        let db = &guard.conn.db;
-        let found = db
-            .game_character_quest()
-            .iter()
-            .find(|q| q.character_guid == guid && q.quest_entry == quest_id)
-            .map(|row| row.rewarded);
-        match found {
-            Some(rewarded) => (true, rewarded),
-            None => (false, false),
-        }
-    }
-
     fn giver_quest_evals(
         &self,
         giver_guid: u64,

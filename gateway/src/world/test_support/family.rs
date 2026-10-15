@@ -89,8 +89,16 @@ macro_rules! npc_store_refusing_by {
                 unimplemented!("npc_text_for_id")
             }
 
-            fn gossip_options(&self, _npc_guid: u64) -> Result<Vec<codec::GossipOptionView>> {
+            fn gossip_options(&self, _npc_guid: u64) -> Result<codec::GossipMenuView> {
                 unimplemented!("gossip_options")
+            }
+
+            fn gossip_option_available(
+                &self,
+                _character_guid: u64,
+                _option: &codec::GossipOptionView,
+            ) -> Result<bool> {
+                unimplemented!("gossip_option_available")
             }
 
             fn inspect(&self, _actor: Actor, _target_guid: u64) -> Result<()> {
@@ -103,6 +111,8 @@ macro_rules! npc_store_refusing_by {
                 _npc_guid: u64,
                 _option_id: u32,
                 _option_row_id: u32,
+                _source_menu_id: u32,
+                _selected_action: u32,
             ) -> Result<()> {
                 unimplemented!("gossip_select")
             }

@@ -268,8 +268,16 @@ impl NpcStore for HandleLootFake {
         unreachable!("no test reaches the NPC family")
     }
 
-    fn gossip_options(&self, _npc_guid: u64) -> Result<Vec<codec::GossipOptionView>> {
+    fn gossip_options(&self, _npc_guid: u64) -> Result<codec::GossipMenuView> {
         unreachable!("no test reaches the NPC family")
+    }
+
+    fn gossip_option_available(
+        &self,
+        _character_guid: u64,
+        _option: &codec::GossipOptionView,
+    ) -> Result<bool> {
+        unreachable!("no test reaches the NPC Protocol Family")
     }
 
     fn inspect(&self, _actor: Actor, _target_guid: u64) -> Result<()> {
@@ -282,6 +290,8 @@ impl NpcStore for HandleLootFake {
         _npc_guid: u64,
         _option_id: u32,
         _option_row_id: u32,
+        _source_menu_id: u32,
+        _selected_action: u32,
     ) -> Result<()> {
         unreachable!("no test reaches the NPC family")
     }

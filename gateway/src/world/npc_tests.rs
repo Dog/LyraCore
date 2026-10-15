@@ -349,6 +349,10 @@ fn gossip_select_on_an_innkeeper_binds_home_and_completes() {
     wow_world_messages::vanilla::CMSG_BINDER_ACTIVATE { guid: confirm.guid }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0158, vec![81, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0])
+    );
     assert!(matches!(
         ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
         ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
@@ -479,6 +483,8 @@ fn gossip_select_on_an_imported_innkeeper_option_binds_home() {
         opt(0, "Chat.", gossip_option::GOSSIP),
         opt(0, "Stay here.", gossip_option::INNKEEPER),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
@@ -505,6 +511,10 @@ fn gossip_select_on_an_imported_innkeeper_option_binds_home() {
     wow_world_messages::vanilla::CMSG_BINDER_ACTIVATE { guid: confirm.guid }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0158, vec![90, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0])
+    );
     assert!(matches!(
         ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
         ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
@@ -533,6 +543,7 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
         vec![gated, always]
     };
     let mut a = quest_store();
+    a.npc.innkeeper = true;
     a.npc.gossip_opts = menu();
     let a = std::sync::Arc::new(a);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(a.clone(), 1);
@@ -554,6 +565,7 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
     server.join().unwrap();
 
     let mut b = quest_store();
+    b.npc.innkeeper = true;
     b.npc.gossip_opts = menu();
     b.quest.quest_log = vec![(60, false)].into();
     let b = std::sync::Arc::new(b);
@@ -625,6 +637,10 @@ fn a_quest_taken_while_the_window_is_open_does_not_shift_the_click() {
     wow_world_messages::vanilla::CMSG_BINDER_ACTIVATE { guid: confirm.guid }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0158, vec![90, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0])
+    );
     assert!(matches!(
         ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
         ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
@@ -670,10 +686,9 @@ fn a_select_with_no_open_menu_just_closes_the_window() {
         .npc
         .home_bound
         .load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(
-        store.npc.gossip_selects.lock().unwrap()[0].1,
-        codec::SYNTHESIZED_ROW_ID,
-        "no imported row was selected"
+    assert!(
+        store.npc.gossip_selects.lock().unwrap().is_empty(),
+        "a click outside the open menu must not fire a hook"
     );
 }
 
@@ -741,6 +756,10 @@ fn an_imported_menu_missing_its_bind_row_still_offers_the_hearth() {
     wow_world_messages::vanilla::CMSG_BINDER_ACTIVATE { guid: confirm.guid }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0158, vec![90, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0])
+    );
     assert!(matches!(
         ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
         ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
@@ -754,15 +773,10 @@ fn an_imported_menu_missing_its_bind_row_still_offers_the_hearth() {
 }
 
 fn quest_store_at_level(level: u8) -> WorldFake {
-    let base = quest_store();
-    WorldFake {
-        characters: vec![codec::CharacterView {
-            guid: 1,
-            level,
-            ..Default::default()
-        }],
-        ..base
-    }
+    let mut store = quest_store();
+    store.characters[0].level = level;
+    store.session.login_entity.as_mut().unwrap().level = u32::from(level);
+    store
 }
 
 #[test]
@@ -813,6 +827,8 @@ fn gossip_hello_shows_unlearn_talents_at_level_10_and_select_routes_to_reset_tal
             gossip_option::UNLEARNTALENTS,
         ),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     CMSG_GOSSIP_HELLO {
@@ -905,6 +921,9 @@ fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() 
         opt(0, "Hidden favor.", gossip_option::GOSSIP),
         opt(0, "Stay here.", gossip_option::INNKEEPER),
     ];
+    s.npc.gossip_opts[0].row_id = 4001;
+    s.npc.gossip_opts[1].row_id = 4002;
+    s.npc.gossip_opts[2].row_id = 4003;
     s.npc.gossip_opts[1].cond_type = gossip_condition::QUEST_TAKEN;
     s.npc.gossip_opts[1].cond_value1 = 60;
     let store = std::sync::Arc::new(s);
@@ -945,6 +964,10 @@ fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() 
     wow_world_messages::vanilla::CMSG_BINDER_ACTIVATE { guid: confirm.guid }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0158, vec![90, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0])
+    );
     assert!(matches!(
         ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
         ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
@@ -1127,4 +1150,438 @@ fn gossip_keeps_the_train_and_unlearn_options_for_a_class_the_trainer_serves() {
     }
     drop(client);
     server.join().unwrap();
+}
+
+#[test]
+fn a_quest_rewarded_after_hello_refuses_the_vendor_click_before_its_action() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    let mut fixture = quest_store();
+    let mut option = opt(1, "Quest supplies.", gossip_option::VENDOR);
+    option.row_id = 509_9001;
+    option.cond_type = gossip_condition::QUEST_TAKEN;
+    option.cond_value1 = 60;
+    fixture.npc.gossip_opts = vec![option];
+    fixture.quest.quest_log = vec![(60, false)].into();
+    fixture.vendor.vendor_stock = vec![codec::VendorItemView {
+        item_entry: 4540,
+        ..Default::default()
+    }];
+    let store = std::sync::Arc::new(fixture);
+    let (mut client, mut c_enc, mut c_dec, world) = enter_world(store.clone(), 1);
+    let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    assert_eq!(menu.gossips[0].message, "Quest supplies.");
+    store.quest.quest_log.lock().unwrap()[0].1 = true;
+    CMSG_GOSSIP_SELECT_OPTION {
+        guid: Guid::new(90),
+        gossip_list_id: 0,
+        unknown: None,
+    }
+    .write_encrypted_client(&mut client, &mut c_enc)
+    .unwrap();
+    assert!(matches!(
+        ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
+        ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
+    ));
+    CMSG_NPC_TEXT_QUERY {
+        text_id: 1,
+        guid: Guid::new(90),
+    }
+    .write_encrypted_client(&mut client, &mut c_enc)
+    .unwrap();
+    assert!(
+        matches!(
+            ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
+            ServerOpcodeMessage::SMSG_NPC_TEXT_UPDATE(_)
+        ),
+        "the refused click must not queue a vendor window"
+    );
+    drop(client);
+    world.join().unwrap();
+    assert!(
+        store.npc.gossip_selects.lock().unwrap().is_empty(),
+        "the refused click must not fire the hook"
+    );
+}
+
+#[test]
+fn a_condition_hidden_service_option_is_not_recreated_by_synthesis() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    let mut fixture = quest_store();
+    fixture.npc.innkeeper = true;
+    fixture.vendor.vendor_stock = vec![codec::VendorItemView {
+        item_entry: 4540,
+        ..Default::default()
+    }];
+    fixture.npc.gossip_opts = [gossip_option::VENDOR, gossip_option::INNKEEPER]
+        .into_iter()
+        .map(|action| {
+            let mut option = opt(0, "Unavailable service.", action);
+            option.cond_type = gossip_condition::REFERENCE;
+            option.cond_value1 = 509_9001;
+            option
+        })
+        .collect();
+    let store = std::sync::Arc::new(fixture);
+    let (mut client, mut c_enc, mut c_dec, world) = enter_world(store, 1);
+    let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    assert_eq!(menu.gossips.len(), 1);
+    assert_eq!(menu.gossips[0].message, "Farewell.");
+    drop(client);
+    world.join().unwrap();
+}
+
+#[test]
+fn gossip_menu_distinguishes_complete_and_incomplete_quest_options() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    let mut fixture = quest_store();
+    fixture.quest.quest_log = vec![(60, false)].into();
+    fixture.quest.quest_log_slots = vec![codec::update_mask::QuestLogSlot {
+        slot: 0,
+        quest_id: 60,
+        counts: vec![],
+        state: 1,
+        timer: 0,
+    }];
+    fixture.npc.gossip_opts = [(1, "Still working."), (2, "Ready to report.")]
+        .into_iter()
+        .map(|(state, text)| {
+            let mut option = opt(0, text, gossip_option::GOSSIP);
+            option.cond_type = gossip_condition::QUEST_TAKEN;
+            option.cond_value1 = 60;
+            option.cond_value2 = state;
+            option
+        })
+        .collect();
+    let store = std::sync::Arc::new(fixture);
+    let (mut client, mut c_enc, mut c_dec, world) = enter_world(store, 1);
+    let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    assert_eq!(menu.gossips.len(), 2);
+    assert_eq!(menu.gossips[0].message, "Ready to report.");
+    drop(client);
+    world.join().unwrap();
+}
+
+#[test]
+fn a_menu_source_switch_refuses_colliding_and_synthesized_clicks_before_service_actions() {
+    use lyracore_shared::constants::gossip_option;
+    use std::sync::atomic::Ordering;
+
+    for (before, after) in [(0, 509_9001), (509_9001, 509_9002), (509_9001, 0)] {
+        for synthesized in [false, true] {
+            let mut fixture = quest_store();
+            let mut option = opt(1, "Supplies.", gossip_option::VENDOR);
+            option.row_id = 509_9001;
+            let options = if synthesized {
+                Vec::new()
+            } else {
+                vec![option]
+            };
+            fixture.npc.gossip_opts = options.clone();
+            fixture.npc.gossip_profiles = [(509_9001, options.clone()), (509_9002, options)].into();
+            fixture
+                .npc
+                .gossip_source_menu_id
+                .store(before, Ordering::SeqCst);
+            fixture.vendor.vendor_stock = vec![codec::VendorItemView {
+                item_entry: 4540,
+                ..Default::default()
+            }];
+            let store = std::sync::Arc::new(fixture);
+            let (mut client, mut c_enc, mut c_dec, world) = enter_world(store.clone(), 1);
+            let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+            assert_eq!(menu.gossips.len(), 2);
+            store
+                .npc
+                .gossip_source_menu_id
+                .store(after, Ordering::SeqCst);
+            CMSG_GOSSIP_SELECT_OPTION {
+                guid: Guid::new(90),
+                gossip_list_id: 0,
+                unknown: None,
+            }
+            .write_encrypted_client(&mut client, &mut c_enc)
+            .unwrap();
+            assert!(matches!(
+                ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
+                ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE
+            ));
+            CMSG_NPC_TEXT_QUERY {
+                text_id: 1,
+                guid: Guid::new(90),
+            }
+            .write_encrypted_client(&mut client, &mut c_enc)
+            .unwrap();
+            assert!(
+                matches!(
+                    ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap(),
+                    ServerOpcodeMessage::SMSG_NPC_TEXT_UPDATE(_)
+                ),
+                "menu {before} to {after} must not queue a vendor window"
+            );
+            drop(client);
+            world.join().unwrap();
+            assert!(
+                store.npc.gossip_selects.lock().unwrap().is_empty(),
+                "menu {before} to {after} must not fire the hook"
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_actions_and_new_authored_services_close_the_stale_menu_without_a_service_reply() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+
+    for source in [0, 509_9001] {
+        for synthesized in [false, true] {
+            let mut store = quest_store();
+            let mut option = opt(1, "Supplies.", gossip_option::VENDOR);
+            option.row_id = 509_9001;
+            let options = if synthesized {
+                Vec::new()
+            } else {
+                vec![option.clone()]
+            };
+            if source == 0 {
+                store.npc.gossip_opts = options;
+            } else {
+                store.npc.gossip_profiles.insert(source, options);
+                store
+                    .npc
+                    .gossip_source_menu_id
+                    .store(source, std::sync::atomic::Ordering::SeqCst);
+            }
+            store.vendor.vendor_stock = vec![codec::VendorItemView {
+                item_entry: 4540,
+                ..Default::default()
+            }];
+            let mut session = ProtocolSession::in_world(7, 1);
+            let hello = handlers::Query::handle(
+                &store,
+                &mut session,
+                ProtocolRequest::Message(
+                    CMSG_GOSSIP_HELLO {
+                        guid: Guid::new(90),
+                    }
+                    .into(),
+                ),
+            )
+            .unwrap();
+            let messages = outbound_messages(hello.outbound);
+            let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+                panic!("expected the service menu");
+            };
+            assert_eq!(menu.gossips.len(), 2);
+            let current = if source == 0 {
+                &mut store.npc.gossip_opts
+            } else {
+                store.npc.gossip_profiles.get_mut(&source).unwrap()
+            };
+            if synthesized {
+                option.cond_type = gossip_condition::NEVER;
+                current.push(option);
+            } else {
+                current[0].action = gossip_option::GOSSIP;
+            }
+            let reply = handlers::Query::handle(
+                &store,
+                &mut session,
+                ProtocolRequest::Message(
+                    CMSG_GOSSIP_SELECT_OPTION {
+                        guid: Guid::new(90),
+                        gossip_list_id: 0,
+                        unknown: None,
+                    }
+                    .into(),
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                outbound_messages(reply.outbound).as_slice(),
+                [ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE]
+            ));
+            assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+            assert!(session.gossip_menu.is_none());
+        }
+    }
+}
+
+#[test]
+fn rewarded_repeatable_quests_show_only_the_source_eligible_options() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    use lyracore_shared::gossip::Condition;
+
+    let mut store = quest_store();
+    store.quest.quest_log = vec![(60, true)].into();
+    store.quest.repeatable_quests.insert(60);
+    for (id, kind, flags, text) in [
+        (1, 8, 0, "Rewarded"),
+        (2, 8, 1, "Not rewarded"),
+        (3, 22, 0, "No current or rewarded quest"),
+        (4, 22, 1, "Current or rewarded quest"),
+        (5, 9, 0, "Current quest"),
+        (6, 9, 1, "No current quest"),
+    ] {
+        store.npc.gossip_conditions.insert(
+            id,
+            Condition {
+                kind,
+                values: [60, 0, 0, 0],
+                flags,
+            },
+        );
+        let mut option = opt(0, text, gossip_option::GOSSIP);
+        option.row_id = id;
+        option.cond_type = gossip_condition::REFERENCE;
+        option.cond_value1 = id;
+        store.npc.gossip_opts.push(option);
+    }
+    let reply = handlers::Query::handle(
+        &store,
+        &mut ProtocolSession::in_world(7, 1),
+        ProtocolRequest::Message(
+            CMSG_GOSSIP_HELLO {
+                guid: Guid::new(90),
+            }
+            .into(),
+        ),
+    )
+    .unwrap();
+    let messages = outbound_messages(reply.outbound);
+    let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+        panic!("expected the quest-conditioned menu");
+    };
+    assert_eq!(
+        menu.gossips
+            .iter()
+            .map(|option| option.message.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Not rewarded",
+            "No current or rewarded quest",
+            "No current quest",
+            "Farewell."
+        ]
+    );
+}
+
+#[test]
+fn gossip_selection_transport_loss_ends_the_world_session_without_a_service_reply() {
+    use lyracore_shared::constants::gossip_option;
+    use std::io::Read;
+
+    let mut fixture = quest_store();
+    fixture.npc.gossip_opts = vec![opt(1, "Supplies.", gossip_option::VENDOR)];
+    fixture.npc.gossip_select_error =
+        Some(|| crate::stdb::ReducerCallError::transport_lost("gw_gossip_select").into());
+    let store = std::sync::Arc::new(fixture);
+    let (mut client, mut c_enc, mut c_dec, world) = enter_world_unjoined(store.clone(), 1);
+    gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    CMSG_GOSSIP_SELECT_OPTION {
+        guid: Guid::new(90),
+        gossip_list_id: 0,
+        unknown: None,
+    }
+    .write_encrypted_client(&mut client, &mut c_enc)
+    .unwrap();
+    assert_eq!(client.read(&mut [0u8; 1]).unwrap(), 0);
+    assert!(world.join().unwrap().is_err());
+    assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+}
+
+#[test]
+fn authored_services_that_become_unavailable_close_the_menu_without_a_service_reply() {
+    use lyracore_shared::constants::gossip_option;
+
+    for action in [gossip_option::VENDOR, gossip_option::INNKEEPER] {
+        let mut store = quest_store();
+        store.npc.innkeeper = true;
+        store.npc.gossip_opts = vec![opt(0, "Service.", action)];
+        store.vendor.vendor_stock = vec![codec::VendorItemView {
+            item_entry: 4540,
+            ..Default::default()
+        }];
+        let mut session = ProtocolSession::in_world(7, 1);
+        handlers::Query::handle(
+            &store,
+            &mut session,
+            ProtocolRequest::Message(
+                CMSG_GOSSIP_HELLO {
+                    guid: Guid::new(90),
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        store.npc.innkeeper = false;
+        store.vendor.vendor_stock.clear();
+        let reply = handlers::Query::handle(
+            &store,
+            &mut session,
+            ProtocolRequest::Message(
+                CMSG_GOSSIP_SELECT_OPTION {
+                    guid: Guid::new(90),
+                    gossip_list_id: 0,
+                    unknown: None,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            outbound_messages(reply.outbound).as_slice(),
+            [ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE]
+        ));
+        assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+        assert!(session.gossip_menu.is_none());
+    }
+}
+
+#[test]
+fn missing_quest_subjects_hide_options_even_when_progress_rows_remain() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    use lyracore_shared::gossip::Condition;
+
+    let mut store = quest_store();
+    store.quest.quest_log = vec![(60, true)].into();
+    store.quest.missing_quests.insert(60);
+    for (id, kind, flags) in [
+        (1, 8, 0),
+        (2, 8, 1),
+        (3, 9, 0),
+        (4, 9, 1),
+        (5, 22, 0),
+        (6, 22, 1),
+    ] {
+        store.npc.gossip_conditions.insert(
+            id,
+            Condition {
+                kind,
+                values: [60, 0, 0, 0],
+                flags,
+            },
+        );
+        let mut option = opt(0, "Missing quest.", gossip_option::GOSSIP);
+        option.row_id = id;
+        option.cond_type = gossip_condition::REFERENCE;
+        option.cond_value1 = id;
+        store.npc.gossip_opts.push(option);
+    }
+    let reply = handlers::Query::handle(
+        &store,
+        &mut ProtocolSession::in_world(7, 1),
+        ProtocolRequest::Message(
+            CMSG_GOSSIP_HELLO {
+                guid: Guid::new(90),
+            }
+            .into(),
+        ),
+    )
+    .unwrap();
+    let messages = outbound_messages(reply.outbound);
+    let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+        panic!("expected the quest-conditioned menu");
+    };
+    assert_eq!(menu.gossips.len(), 1);
+    assert_eq!(menu.gossips[0].message, "Farewell.");
 }

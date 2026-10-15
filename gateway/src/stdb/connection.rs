@@ -954,6 +954,7 @@ fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
         "SELECT * FROM game_corpse_loot",
         "SELECT * FROM game_npc_vendor",
         "SELECT * FROM game_gossip_menu",
+        "SELECT * FROM game_gossip_condition",
         "SELECT * FROM game_gossip_option",
         "SELECT * FROM game_gossip_menu_profile",
         "SELECT * FROM game_gossip_menu_profile_option",

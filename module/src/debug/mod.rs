@@ -1106,17 +1106,18 @@ pub fn debug_gossip_select(
     npc_guid: u64,
     option_id: u32,
     option_row_id: u32,
+    source_menu_id: u32,
+    selected_action: u32,
 ) -> Result<(), String> {
-    crate::hooks::fire_on_gossip_select(
+    crate::world::apply_gossip_select(
         ctx,
-        &crate::hooks::GossipSelectPayload {
-            character_guid,
-            npc_guid,
-            option_id,
-            option_row_id,
-        },
-    );
-    Ok(())
+        character_guid,
+        npc_guid,
+        option_id,
+        option_row_id,
+        source_menu_id,
+        selected_action,
+    )
 }
 
 #[reducer]
