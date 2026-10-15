@@ -691,7 +691,8 @@ pub(crate) fn death_durability_loss(max_durability: u32, durability: u32) -> u32
     durability.saturating_sub(loss)
 }
 
-pub(crate) fn apply_death_durability_loss(ctx: &ReducerContext, player_guid: u64) {
+pub(crate) fn apply_death_durability_loss(ctx: &ReducerContext, player_guid: u64) -> bool {
+    let mut any_lost = false;
     let instances = ctx.db.game_item_instance();
     let templates = ctx.db.game_item_template();
     let equipped: Vec<_> = instances
@@ -705,9 +706,11 @@ pub(crate) fn apply_death_durability_loss(ctx: &ReducerContext, player_guid: u64
             if new_durability != inst.durability {
                 inst.durability = new_durability;
                 instances.guid().update(inst);
+                any_lost = true;
             }
         }
     }
+    any_lost
 }
 
 pub(crate) fn request_take_loot(

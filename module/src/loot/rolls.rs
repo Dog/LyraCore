@@ -461,6 +461,15 @@ fn resolve_roll(ctx: &ReducerContext, roll: &LootRoll, votes: &[LootRollVote], r
     let tier = contending_tier(&kinds);
     if tier.is_empty() {
         unlock_row_ffa(ctx, roll.corpse_guid, roll.slot);
+        let payload = lyracore_shared::loot_roll::encode_all_passed(
+            roll.corpse_guid,
+            roll.slot,
+            roll.item_entry,
+            roll.random_property_id,
+        );
+        for &guid in recipients {
+            crate::group::push_event(ctx, guid, roll_event_kind::ALL_PASSED, 0, payload.clone());
+        }
         cleanup_roll(ctx, roll.id);
         return;
     }

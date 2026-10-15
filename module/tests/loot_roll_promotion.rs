@@ -352,3 +352,41 @@ fn votes(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     rows.sort_by(|a, b| a["id"].cmp(&b["id"]));
     rows
 }
+
+/// `(recipient, payload)` of every event of `kind`, in recipient order.
+fn events_of(standalone: &Standalone, kind: u8) -> Vec<(String, String)> {
+    let mut events: Vec<_> = standalone
+        .query_rows(&format!(
+            "SELECT recipient_guid, payload FROM game_group_event WHERE kind = {kind}"
+        ))
+        .into_iter()
+        .map(|row| (row["recipient_guid"].clone(), row["payload"].clone()))
+        .collect();
+    events.sort_unstable();
+    events
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn an_all_pass_resolution_tells_every_roller_and_a_win_does_not() {
+    use lyracore_shared::loot_roll::event_kind::{ALL_PASSED, ROLL_WON};
+    let standalone = fixture("loot-roll-all-passed");
+    let mut promotion = Promotion::default();
+    promotion.send(&standalone);
+    resolve(&standalone);
+    let payload = format!("{CORPSE},0,{ITEM},117");
+    assert_eq!(
+        events_of(&standalone, ALL_PASSED),
+        ["5090003", "5090004", "5090005"].map(|roller| (roller.to_string(), payload.clone()))
+    );
+    assert!(events_of(&standalone, ROLL_WON).is_empty());
+
+    // A contested roll announces its winner and adds no all-passed notice.
+    promotion.source_roll_id = 11;
+    promotion.send(&standalone);
+    vote(&standalone, "5090003", "1");
+    vote(&standalone, "5090004", "0");
+    vote(&standalone, "5090005", "0");
+    assert_eq!(events_of(&standalone, ALL_PASSED).len(), 3);
+    assert_eq!(events_of(&standalone, ROLL_WON).len(), 3);
+}

@@ -706,7 +706,15 @@ pub(crate) fn kill_player(ctx: &ReducerContext, victim_guid: u64, killer_guid: u
     crate::spell::record_self_resurrect_option(ctx, victim_guid);
     crate::spell::remove_auras_on_death(ctx, victim_guid);
     crate::trade::cancel_trade_for(ctx, victim_guid);
-    crate::items::apply_death_durability_loss(ctx, victim_guid);
+    if crate::items::apply_death_durability_loss(ctx, victim_guid) {
+        crate::group::push_event(
+            ctx,
+            victim_guid,
+            lyracore_shared::group::event_kind::DEATH_DURABILITY,
+            0,
+            String::new(),
+        );
+    }
     crate::hooks::fire_on_death(
         ctx,
         &crate::hooks::DeathPayload {

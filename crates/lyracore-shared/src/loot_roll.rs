@@ -6,6 +6,10 @@ pub mod event_kind {
     pub const ROLL_WON: u8 = 6;
     pub const MASTER_LIST: u8 = 7;
     pub const MONEY_SHARE: u8 = 8;
+    /// Every eligible member passed on one item → `SMSG_LOOT_ALL_PASSED`, to every roller. Outside
+    /// the reserved `4..=8` block (kind 9 is retired); the byte space is listed in
+    /// `crate::group::event_kind`.
+    pub const ALL_PASSED: u8 = 12;
 }
 
 // START preserves the World Shard deadline so promotion does not restart the roll clock.
@@ -119,6 +123,29 @@ pub fn decode_won(payload: &str) -> Option<(u64, u8, u32, u8, u8, u32)> {
         winning_vote,
         random_property_id,
     ))
+}
+
+/// Encode an `ALL_PASSED` payload: `corpse_guid,slot,item_entry,random_property_id`.
+pub fn encode_all_passed(
+    corpse_guid: u64,
+    slot: u8,
+    item_entry: u32,
+    random_property_id: u32,
+) -> String {
+    format!("{corpse_guid},{slot},{item_entry},{random_property_id}")
+}
+
+/// Decode an `ALL_PASSED` payload back to `(corpse_guid, slot, item_entry, random_property_id)`.
+pub fn decode_all_passed(payload: &str) -> Option<(u64, u8, u32, u32)> {
+    let mut p = payload.split(',');
+    let corpse_guid: u64 = p.next()?.parse().ok()?;
+    let slot: u8 = p.next()?.parse().ok()?;
+    let item_entry: u32 = p.next()?.parse().ok()?;
+    let random_property_id: u32 = p.next()?.parse().ok()?;
+    if p.next().is_some() {
+        return None;
+    }
+    Some((corpse_guid, slot, item_entry, random_property_id))
 }
 
 pub fn encode_master_list(corpse_guid: u64, eligible: &[u64]) -> String {
@@ -250,6 +277,17 @@ mod tests {
         kinds.sort_unstable();
         kinds.dedup();
         assert_eq!(kinds, (0u8..=8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn all_passed_round_trips_and_fails_closed() {
+        assert_eq!(
+            decode_all_passed(&encode_all_passed(555, 2, 1234, 117)),
+            Some((555, 2, 1234, 117))
+        );
+        assert!(decode_all_passed("555,2,1234").is_none());
+        assert!(decode_all_passed("555,2,1234,0,9").is_none());
+        assert!(decode_all_passed("x,2,1234,0").is_none());
     }
 
     #[test]
