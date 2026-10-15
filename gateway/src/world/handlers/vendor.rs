@@ -149,17 +149,34 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 let Some(actor) = actor else {
                     return Ok(ProtocolReply::from(Vec::new()));
                 };
-                let Some(slot) = store.vendor_item_slot(c.item.guid()) else {
-                    return Ok(ProtocolReply::from(Vec::new()));
+                let (vendor_guid, item_guid) = (c.vendor.guid(), c.item.guid());
+                let sell_refused = |result| {
+                    vec![Outbound::One(ServerOpcodeMessage::SMSG_SELL_ITEM(
+                        Box::new(codec::build_sell_item_refusal(
+                            vendor_guid,
+                            item_guid,
+                            result,
+                        )),
+                    ))]
                 };
-                match store.vendor_sell(actor, c.vendor.guid(), slot) {
+                if item_guid == 0 {
+                    return Ok(ProtocolReply::from(Vec::new()));
+                }
+                let Some(slot) = store.vendor_item_slot(item_guid) else {
+                    return Ok(ProtocolReply::from(sell_refused(
+                        codec::SellItemResult::CantFindItem,
+                    )));
+                };
+                match store.vendor_sell(actor, vendor_guid, slot) {
                     Ok(()) => Ok(ProtocolReply::from(build_buyback_view(store, actor.guid()))),
                     Err(e) if is_refusal(&e) => {
                         log::debug!(
-                            "world: sell_item ignored (account {}): {e}",
+                            "world: sell_item refused (account {}): {e}",
                             player.account_id
                         );
-                        Ok(ProtocolReply::from(Vec::new()))
+                        Ok(ProtocolReply::from(sell_refused(
+                            codec::sell_refusal_result(&e.to_string()),
+                        )))
                     }
                     Err(e) => Err(e),
                 }
@@ -722,35 +739,69 @@ pub(super) mod tests {
         assert_renders_ring(&outcome.outbound, &ring);
     }
 
+    /// The one SMSG_SELL_ITEM a refused sale must answer, as (vendor, item, result byte).
+    fn sell_refusal(outcome: ProtocolReply) -> (u64, u64, u8) {
+        let [Outbound::One(ServerOpcodeMessage::SMSG_SELL_ITEM(reply))] =
+            outcome.outbound.as_slice()
+        else {
+            panic!(
+                "expected one SMSG_SELL_ITEM, got {} packets",
+                outcome.outbound.len()
+            );
+        };
+        (reply.guid.guid(), reply.item.guid(), reply.result.as_int())
+    }
+
     #[test]
-    fn selling_an_unknown_item_guid_is_a_harmless_no_op() {
+    fn selling_an_unknown_item_guid_answers_cant_find_item_without_a_durable_request() {
         let actions = InMemoryVendorActions::default();
 
         let outcome = Vendor::handle(&actions, &mut player(), sell_item(0x99).into()).unwrap();
 
-        assert!(matches!(
-            outcome,
-            ProtocolReply { outbound, .. } if outbound.is_empty()
-        ));
+        assert_eq!(sell_refusal(outcome), (VENDOR, 0x99, 1));
         assert!(actions.sell_requests.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_rejected_sale_is_silent_and_non_fatal() {
-        let actions = InMemoryVendorActions {
-            item_slots: vec![(ITEM, 30)],
-            sell_error: Some(|| {
-                ReducerCallError::refused("gw_sell_item", "that item cannot be sold")
-            }),
-            ..Default::default()
-        };
+    fn selling_a_zero_item_guid_is_silent() {
+        let actions = InMemoryVendorActions::default();
 
-        let outcome = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+        let outcome = Vendor::handle(&actions, &mut player(), sell_item(0).into()).unwrap();
 
-        assert!(matches!(
-            outcome,
-            ProtocolReply { outbound, .. } if outbound.is_empty()
-        ));
+        assert!(outcome.outbound.is_empty());
+        assert!(actions.sell_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rejected_sale_answers_the_matching_sell_error_and_stays_non_fatal() {
+        for (reason, code) in [
+            ("that item cannot be sold", 2),
+            ("item has no sell value", 2),
+            ("vendor out of range", 3),
+            ("no item in slot 30", 1),
+        ] {
+            let sell_error: Failure = match reason {
+                "that item cannot be sold" => {
+                    || ReducerCallError::refused("gw_sell_item", "that item cannot be sold")
+                }
+                "item has no sell value" => {
+                    || ReducerCallError::refused("gw_sell_item", "item has no sell value")
+                }
+                "vendor out of range" => {
+                    || ReducerCallError::refused("gw_sell_item", "vendor out of range")
+                }
+                _ => || ReducerCallError::refused("gw_sell_item", "no item in slot 30"),
+            };
+            let actions = InMemoryVendorActions {
+                item_slots: vec![(ITEM, 30)],
+                sell_error: Some(sell_error),
+                ..Default::default()
+            };
+
+            let outcome = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+
+            assert_eq!(sell_refusal(outcome), (VENDOR, ITEM, code), "{reason}");
+        }
     }
 
     #[test]

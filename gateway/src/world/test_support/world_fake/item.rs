@@ -1,6 +1,19 @@
 use super::super::*;
 
 impl ItemActionStore for WorldFake {
+    fn item_name(&self, entry: u32) -> Result<Option<String>> {
+        Ok(self
+            .cast
+            .item_templates
+            .iter()
+            .find(|template| template.entry == entry)
+            .map(|template| template.name.clone()))
+    }
+
+    fn readable_item(&self, _owner_guid: u64, _slot: u8) -> Result<ReadableItem> {
+        Ok(ReadableItem::Missing)
+    }
+
     fn destroy_item(&self, _actor: Actor, _slot: u8, _count: u32) -> Result<ItemActionResult> {
         Ok(lyracore_shared::item::ItemRefusal::ItemNotFound.into())
     }

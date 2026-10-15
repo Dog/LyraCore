@@ -57,7 +57,7 @@ pub(crate) use handlers::{
     AuctionHousePolicy, AuctionInteraction, AuctionPage, AuctionQuery, CancelAuctionOutcome,
     CancelAuctionRequest, ChannelOutcome, ChannelRequest, ChannelRoster, CharacterFacts,
     ChatOutcome, CreateAuctionOutcome, CreateAuctionRequest, GuildEventSnapshot, GuildOutcome,
-    GuildRequest, ItemActionResult, LootActionStatus, LootWindowRefusal, LootWindowRequestStatus,
+    GuildRequest, ItemActionResult, ReadableItem, LootActionStatus, LootWindowRefusal, LootWindowRequestStatus,
     MeetingStoneOutcome, MemberPresence, MemberStatsRecord, MemberStatsStore, PlaceBidOutcome,
     PlaceBidRequest, RealmChatRequest, ResolvedTarget, SeekerFacts, SpeakerFacts,
     TrainerBuyOutcome, WeatherStore, WhisperRequest, WhisperTargetFacts,

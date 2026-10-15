@@ -17,7 +17,21 @@ impl From<ItemRefusal> for ItemActionResult {
     }
 }
 
+/// What a bag position holds, as `CMSG_READ_ITEM` needs to know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadableItem {
+    /// The position holds no item.
+    Missing,
+    /// The item has no page text to read.
+    NoPages,
+    /// The item opens page text. The realm has no page text catalog.
+    Pages { item_guid: u64 },
+}
+
 pub(crate) trait ItemActionStore: Send + Sync {
+    /// The template name for `CMSG_ITEM_NAME_QUERY`, from the catalog `CMSG_ITEM_QUERY_SINGLE` reads.
+    fn item_name(&self, entry: u32) -> Result<Option<String>>;
+    fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem>;
     fn destroy_item(&self, actor: Actor, slot: u8, count: u32) -> Result<ItemActionResult>;
     fn equip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult>;
     fn unequip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult>;
@@ -150,6 +164,44 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                     None => act(player, "use_item", |actor| store.use_item(actor, slot)),
                 }
             }
+            // An entry the catalog lacks gets no reply, as in vmangos.
+            ClientOpcodeMessage::CMSG_ITEM_NAME_QUERY(c) => Ok(ProtocolReply::from(
+                store
+                    .item_name(c.item)?
+                    .map(|name| {
+                        Outbound::One(ServerOpcodeMessage::SMSG_ITEM_NAME_QUERY_RESPONSE(
+                            Box::new(codec::build_item_name_query_response(c.item, name)),
+                        ))
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )),
+            // vmangos `HandleReadItemOpcode`: an item without page text is not found. Page text
+            // has no catalog here, so a readable item gets the failure reply, never the OK.
+            ClientOpcodeMessage::CMSG_READ_ITEM(c) => {
+                let (Some(slot), Some(owner)) = (
+                    codec::inventory_slot(c.bag_index, c.slot),
+                    player.self_guid(),
+                ) else {
+                    return Ok(refuse(player, "read_item", ItemRefusal::ItemNotFound));
+                };
+                match store.readable_item(owner, slot)? {
+                    ReadableItem::Pages { item_guid } => {
+                        let (opcode, body) = codec::build_read_item_failed_raw(item_guid);
+                        Ok(ProtocolReply::from(vec![
+                            Outbound::Raw { opcode, body },
+                            Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(Box::new(
+                                codec::build_gm_system_message(
+                                    "Item page text is not available on this realm.".to_string(),
+                                ),
+                            ))),
+                        ]))
+                    }
+                    ReadableItem::Missing | ReadableItem::NoPages => {
+                        Ok(refuse(player, "read_item", ItemRefusal::ItemNotFound))
+                    }
+                }
+            }
             other => Err(anyhow!("opcode routed to wrong Protocol Family: {other}")),
         }
     }
@@ -161,8 +213,8 @@ pub(super) mod tests {
     use crate::stdb::{classify, DurableFailure, ReducerCallError};
     use std::sync::Mutex;
     use wow_world_messages::vanilla::{
-        ItemSlot, CMSG_AUTOEQUIP_ITEM, CMSG_AUTOSTORE_BAG_ITEM, CMSG_SWAP_INV_ITEM, CMSG_SWAP_ITEM,
-        CMSG_USE_ITEM,
+        Guid, ItemSlot, CMSG_AUTOEQUIP_ITEM, CMSG_AUTOSTORE_BAG_ITEM, CMSG_ITEM_NAME_QUERY,
+        CMSG_READ_ITEM, CMSG_SWAP_INV_ITEM, CMSG_SWAP_ITEM, CMSG_USE_ITEM,
     };
 
     #[derive(Default)]
@@ -178,6 +230,9 @@ pub(super) mod tests {
         pub(crate) transport_lost: bool,
         pub(crate) start_quest: Option<(u64, u32)>,
         pub(crate) quest_detail: Option<codec::QuestDetailView>,
+        pub(crate) names: Vec<(u32, String)>,
+        pub(crate) readable: Option<ReadableItem>,
+        pub(crate) read_requests: Mutex<Vec<(u64, u8)>>,
     }
 
     impl InMemoryItemActions {
@@ -194,6 +249,22 @@ pub(super) mod tests {
     }
 
     impl ItemActionStore for InMemoryItemActions {
+        fn item_name(&self, entry: u32) -> Result<Option<String>> {
+            if self.transport_lost {
+                return Err(ReducerCallError::transport_lost("item_name").into());
+            }
+            Ok(self
+                .names
+                .iter()
+                .find(|(known, _)| *known == entry)
+                .map(|(_, name)| name.clone()))
+        }
+
+        fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem> {
+            self.read_requests.lock().unwrap().push((owner_guid, slot));
+            Ok(self.readable.unwrap_or(ReadableItem::Missing))
+        }
+
         fn destroy_item(&self, _actor: Actor, _slot: u8, _count: u32) -> Result<ItemActionResult> {
             Ok(ItemRefusal::ItemNotFound.into())
         }
@@ -771,5 +842,106 @@ pub(super) mod tests {
             ..Default::default()
         };
         inventory_failure(Item::handle(&refusing, &mut player(), equip(MAIN_BAG).into()).unwrap());
+    }
+
+    fn name_query(item: u32) -> ClientOpcodeMessage {
+        ClientOpcodeMessage::CMSG_ITEM_NAME_QUERY(Box::new(CMSG_ITEM_NAME_QUERY {
+            item,
+            guid: Guid::new(0),
+        }))
+    }
+
+    fn read(bag_index: u8, slot: u8) -> ClientOpcodeMessage {
+        ClientOpcodeMessage::CMSG_READ_ITEM(CMSG_READ_ITEM { bag_index, slot })
+    }
+
+    #[test]
+    fn name_query_answers_the_catalog_name() {
+        let actions = InMemoryItemActions {
+            names: vec![(25, "Worn Shortsword".into())],
+            ..Default::default()
+        };
+
+        let outbound =
+            handled_outbound(Item::handle(&actions, &mut player(), name_query(25).into()).unwrap());
+
+        let [Outbound::One(ServerOpcodeMessage::SMSG_ITEM_NAME_QUERY_RESPONSE(reply))] =
+            outbound.as_slice()
+        else {
+            panic!("expected one name response, got {} packets", outbound.len());
+        };
+        assert_eq!(
+            (reply.item, reply.item_name.as_str()),
+            (25, "Worn Shortsword")
+        );
+    }
+
+    #[test]
+    fn name_query_for_an_unknown_entry_stays_silent() {
+        let actions = InMemoryItemActions::default();
+
+        handled_without_outbound(
+            Item::handle(&actions, &mut player(), name_query(99).into()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn name_query_transport_loss_ends_the_session() {
+        let actions = InMemoryItemActions {
+            transport_lost: true,
+            ..Default::default()
+        };
+
+        assert!(Item::handle(&actions, &mut player(), name_query(25).into()).is_err());
+    }
+
+    #[test]
+    fn reading_an_item_with_page_text_fails_with_the_raw_layout_and_a_notice() {
+        let actions = InMemoryItemActions {
+            readable: Some(ReadableItem::Pages {
+                item_guid: 0x4000_0000_0000_0009,
+            }),
+            ..Default::default()
+        };
+
+        let outbound = handled_outbound(
+            Item::handle(&actions, &mut player(), read(MAIN_BAG, 24).into()).unwrap(),
+        );
+
+        assert_eq!(
+            actions.read_requests.lock().unwrap().as_slice(),
+            &[(42, 24)]
+        );
+        let [Outbound::Raw { opcode, body }, Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(_))] =
+            outbound.as_slice()
+        else {
+            panic!(
+                "expected a read failure and a notice, got {} packets",
+                outbound.len()
+            );
+        };
+        assert_eq!(*opcode, 0x00AF);
+        assert_eq!(body.as_slice(), [9, 0, 0, 0, 0, 0, 0, 0x40, 2]);
+    }
+
+    #[test]
+    fn reading_a_missing_or_plain_item_is_an_item_not_found_failure() {
+        for readable in [ReadableItem::Missing, ReadableItem::NoPages] {
+            let actions = InMemoryItemActions {
+                readable: Some(readable),
+                ..Default::default()
+            };
+            inventory_failure(
+                Item::handle(&actions, &mut player(), read(MAIN_BAG, 24).into()).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn reading_from_an_unmapped_position_asks_the_store_nothing() {
+        let actions = InMemoryItemActions::default();
+
+        inventory_failure(Item::handle(&actions, &mut player(), read(7, 3).into()).unwrap());
+        assert!(actions.read_requests.lock().unwrap().is_empty());
     }
 }

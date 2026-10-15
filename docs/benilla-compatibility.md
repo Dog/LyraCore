@@ -250,6 +250,9 @@ feature once per World Session. Repeated requests do not add chat lines.
 | Pet controls | Specific System Messages for bar changes, autocast, aura cancellation, stop-attack, naming, abandonment and unlearning. | These operations and their durable state. Existing pet action commands and progression remain separate. |
 | Item containers and gifts | Inventory Refusal 39. | Item-container loot, wrapping and unwrapping. |
 | Readable pages | A terminal page names the unavailable text service. | Page-text catalog import and page chains. |
+| Reading items | Read failure with the close reason and a System Message, for an item with page text. An item without page text gets Inventory Refusal 23. | Page-text catalog import, then the read-OK reply. |
+| Limited vendor stock, item timers and item cooldowns | No `SMSG_BUY_ITEM`, `SMSG_ITEM_TIME_UPDATE`, `SMSG_ITEM_ENCHANT_TIME_UPDATE` or `SMSG_ITEM_COOLDOWN`. | Stock depletion and restock, item duration and the equip cooldown. |
+| Skill points, ground-item and loot-slot stores, lottery | Ignored without a reply, as vmangos and cmangos do. | Nothing in 1.12. |
 | Explicit vendor destination | Inventory Refusal 39. | An atomic purchase into the requested bag and slot. Ordinary vendor purchase uses the existing path. |
 | Automatic bag placement | Equipment-to-backpack uses the existing path; other requests receive Inventory Refusal 39. | Automatic placement into a chosen bag and movement of nonempty equipped bags. Explicit supported slot moves work. |
 | Character presentation | Specific System Messages. | Stand state, mount flourish, helm and cloak visibility preferences. |

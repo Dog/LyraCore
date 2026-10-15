@@ -60,7 +60,7 @@ pub(crate) use guild::{
 };
 #[cfg(test)]
 pub(crate) use item::tests::InMemoryItemActions;
-pub(crate) use item::{Item, ItemActionResult, ItemActionStore};
+pub(crate) use item::{Item, ItemActionResult, ItemActionStore, ReadableItem};
 pub(crate) use loot::{
     Loot, LootActionStatus, LootWindow, LootWindowRefusal, LootWindowRequestStatus,
     LootWindowStore, OpenLootState,

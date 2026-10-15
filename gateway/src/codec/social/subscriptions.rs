@@ -140,6 +140,24 @@ pub(crate) fn group_event_outbound<
                 None
             }
         },
+        roll_kind::ALL_PASSED => {
+            match lyracore_shared::loot_roll::decode_all_passed(&row.payload) {
+                Some((corpse, slot, entry, property_id)) => {
+                    Some(ServerOpcodeMessage::SMSG_LOOT_ALL_PASSED(Box::new(
+                        codec::build_loot_all_passed(corpse, slot, entry, property_id),
+                    )))
+                }
+                None => {
+                    log::warn!(
+                        "loot ALL_PASSED relay: unparseable payload {:?} (event {})",
+                        row.payload,
+                        row.id
+                    );
+                    None
+                }
+            }
+        }
+        group_kind::DEATH_DURABILITY => Some(ServerOpcodeMessage::SMSG_DURABILITY_DAMAGE_DEATH),
         roll_kind::MASTER_LIST => {
             match lyracore_shared::loot_roll::decode_master_list(&row.payload) {
                 Some((_corpse_guid, eligible)) => Some(ServerOpcodeMessage::SMSG_LOOT_MASTER_LIST(

@@ -1,7 +1,7 @@
 use super::*;
 use lyracore_shared::loot_roll::vote_kind;
 use wow_world_messages::vanilla::{
-    LootMethodError, SMSG_LOOT_RESPONSE_LootMethod, SMSG_LOOT_RESPONSE,
+    LootMethodError, SMSG_LOOT_RESPONSE_LootMethod, SMSG_LOOT_ALL_PASSED, SMSG_LOOT_RESPONSE,
 };
 
 const SMSG_LOOT_RESPONSE_OPCODE: u16 = 0x0160;
@@ -126,5 +126,47 @@ pub fn build_loot_roll_won(
 pub fn build_loot_master_list(eligible: &[u64]) -> SMSG_LOOT_MASTER_LIST {
     SMSG_LOOT_MASTER_LIST {
         guids: eligible.iter().map(|&g| Guid::new(g)).collect(),
+    }
+}
+
+/// Build `SMSG_LOOT_ALL_PASSED` — every roller passed, so the item stays in the corpse. The
+/// suffix is always 0 here (vmangos `Group::SendLootAllPassed`).
+pub fn build_loot_all_passed(
+    corpse_guid: u64,
+    loot_slot: u8,
+    item_entry: u32,
+    random_property_id: u32,
+) -> SMSG_LOOT_ALL_PASSED {
+    SMSG_LOOT_ALL_PASSED {
+        looted_target: Guid::new(corpse_guid),
+        loot_slot: loot_slot as u32,
+        item: item_entry,
+        item_random_property_id: random_property_id,
+        item_random_suffix_id: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_passed_is_the_corpse_slot_item_property_and_suffix_under_its_header() {
+        let reply = build_loot_all_passed(0xF130_0000_0000_0007, 3, 1234, 117);
+        let mut wire = Vec::new();
+        ServerOpcodeMessage::SMSG_LOOT_ALL_PASSED(Box::new(reply))
+            .write_unencrypted_server(&mut wire)
+            .unwrap();
+        assert_eq!(
+            wire,
+            [
+                0x00, 0x1A, 0x9E, 0x02, // size 26 (big endian), opcode 0x029E
+                0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xF1, // corpse guid
+                0x03, 0x00, 0x00, 0x00, // loot slot
+                0xD2, 0x04, 0x00, 0x00, // item entry 1234
+                0x75, 0x00, 0x00, 0x00, // random property id 117
+                0x00, 0x00, 0x00, 0x00, // random suffix id
+            ]
+        );
     }
 }

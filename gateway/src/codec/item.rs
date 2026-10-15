@@ -1,5 +1,7 @@
 use super::*;
 use lyracore_shared::item::{item_class, weapon_subclass, ItemRefusal, Proficiency};
+pub use wow_world_messages::vanilla::SellItemResult;
+use wow_world_messages::vanilla::{SMSG_ITEM_NAME_QUERY_RESPONSE, SMSG_SELL_ITEM};
 
 pub fn inventory_slot(bag: u8, slot: u8) -> Option<u8> {
     match (bag, slot) {
@@ -332,6 +334,53 @@ pub fn build_buy_failed(vendor_guid: u64, item_entry: u32, err: &str) -> SMSG_BU
     }
 }
 
+/// Build `SMSG_SELL_ITEM`, the vendor's refusal of a sale (vmangos `SendSellError`: vendor guid,
+/// item guid, result byte). The client prints the matching sale error and keeps the item.
+pub fn build_sell_item_refusal(
+    vendor_guid: u64,
+    item_guid: u64,
+    result: SellItemResult,
+) -> SMSG_SELL_ITEM {
+    SMSG_SELL_ITEM {
+        guid: Guid::new(vendor_guid),
+        item: Guid::new(item_guid),
+        result,
+    }
+}
+
+/// Map the Module's sale Refusal text to the closest vanilla sale error. Vendor and range
+/// Gates come first, a missing item next, and every other Gate means the vendor will not
+/// take the item.
+pub fn sell_refusal_result(err: &str) -> SellItemResult {
+    if err.contains("vendor") || err.contains("dead players") {
+        SellItemResult::CantFindVendor
+    } else if err.contains("no item in slot") {
+        SellItemResult::CantFindItem
+    } else {
+        SellItemResult::CantSellItem
+    }
+}
+
+/// Build `SMSG_ITEM_NAME_QUERY_RESPONSE` (vanilla: item entry, name; cmangos `HandleItemNameQueryOpcode`).
+pub fn build_item_name_query_response(
+    item: u32,
+    item_name: String,
+) -> SMSG_ITEM_NAME_QUERY_RESPONSE {
+    SMSG_ITEM_NAME_QUERY_RESPONSE { item, item_name }
+}
+
+/// `SMSG_READ_ITEM_FAILED` opcode (vanilla 5875).
+pub const SMSG_READ_ITEM_FAILED_OPCODE: u16 = 0x00AF;
+
+/// Build a raw `SMSG_READ_ITEM_FAILED`. gtker's typed message stops at the item guid, but the 5875
+/// client reads a reason byte after it (benilla-re objectlayer/inventory, Reading items): 0 and 1
+/// open the text, any other value closes it. Reason 2 refuses the read.
+pub fn build_read_item_failed_raw(item_guid: u64) -> (u16, Vec<u8>) {
+    let mut body = item_guid.to_le_bytes().to_vec();
+    body.push(2);
+    (SMSG_READ_ITEM_FAILED_OPCODE, body)
+}
+
 pub fn build_show_bank(banker_guid: u64) -> SMSG_SHOW_BANK {
     SMSG_SHOW_BANK {
         guid: Guid::new(banker_guid),
@@ -479,6 +528,69 @@ fn weapon_subclass_mask(player_class: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn framed(message: ServerOpcodeMessage) -> Vec<u8> {
+        let mut wire = Vec::new();
+        message.write_unencrypted_server(&mut wire).unwrap();
+        wire
+    }
+
+    #[test]
+    fn sell_refusal_is_a_seventeen_byte_body_under_its_size_header() {
+        let reply = build_sell_item_refusal(
+            0xF130_0000_0000_0001,
+            0x4000_0000_0000_0007,
+            SellItemResult::CantSellItem,
+        );
+        assert_eq!(
+            framed(ServerOpcodeMessage::SMSG_SELL_ITEM(Box::new(reply))),
+            [
+                0x00, 0x13, 0xA1, 0x01, // size 19 (big endian), opcode 0x01A1
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xF1, // vendor guid
+                0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // item guid
+                0x02, // CantSellItem
+            ]
+        );
+    }
+
+    #[test]
+    fn sale_refusals_map_to_the_vendor_item_or_sellable_errors() {
+        for (text, expected) in [
+            ("no such vendor", SellItemResult::CantFindVendor),
+            ("target is not a vendor", SellItemResult::CantFindVendor),
+            ("vendor out of range", SellItemResult::CantFindVendor),
+            ("vendor on another map", SellItemResult::CantFindVendor),
+            ("dead players cannot sell", SellItemResult::CantFindVendor),
+            ("no item in slot 40", SellItemResult::CantFindItem),
+            ("cannot sell an equipped item", SellItemResult::CantSellItem),
+            ("cannot sell a banked item", SellItemResult::CantSellItem),
+            ("item has no sell value", SellItemResult::CantSellItem),
+        ] {
+            assert_eq!(sell_refusal_result(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn item_name_response_is_the_entry_then_a_terminated_name() {
+        let reply = build_item_name_query_response(25, "Axe".into());
+        assert_eq!(
+            framed(ServerOpcodeMessage::SMSG_ITEM_NAME_QUERY_RESPONSE(
+                Box::new(reply)
+            )),
+            [
+                0x00, 0x0A, 0xC5, 0x02, // size 10, opcode 0x02C5
+                0x19, 0x00, 0x00, 0x00, // item entry 25
+                b'A', b'x', b'e', 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn read_item_failure_carries_the_guid_and_a_closing_reason() {
+        let (opcode, body) = build_read_item_failed_raw(0x4000_0000_0000_0009);
+        assert_eq!(opcode, 0x00AF);
+        assert_eq!(body, [0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x02]);
+    }
 
     #[test]
     fn hearthstone_query_names_the_client_use_spell() {
