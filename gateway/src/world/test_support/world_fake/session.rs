@@ -14,6 +14,7 @@ pub(crate) struct SessionState {
     pub(crate) session: Option<WorldSession>,
     pub(crate) login_entity: Option<codec::EntityView>,
     pub(crate) moves: std::sync::Mutex<Vec<MoveRecord>>,
+    pub(crate) move_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
     pub(crate) client_commands: std::sync::Mutex<Vec<(u64, String, String)>>,
     pub(crate) client_command_error: Option<fn(&str) -> ReducerCallError>,
     pub(crate) turn_in_reward_item: Option<codec::ItemInstanceView>,
@@ -85,6 +86,11 @@ impl SessionStore for WorldFake {
             info.orientation,
             info.timestamp,
         ));
+        self.session
+            .move_bodies
+            .lock()
+            .unwrap()
+            .push(codec::movement_info_to_bytes(info)?);
         if let Some(world) = &self.session.movement_world {
             world.update(actor.guid(), opcode, info)?;
         }

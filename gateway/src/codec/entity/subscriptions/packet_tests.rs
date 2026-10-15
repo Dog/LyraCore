@@ -753,6 +753,41 @@ fn peer_create_uses_the_remaining_ghost_speed_and_restores_baseline_after_remova
     }
 }
 
+// A 40% slow: 7.0 * 0.6 = 4.2 forward and 4.5 * 0.6 = 2.7 backward.
+#[test]
+fn peer_create_carries_a_slowed_backward_speed() {
+    use lyracore_shared::spell::taxonomy::{A_MOD_SPEED, SPEED_MOVE};
+    use wow_world_messages::vanilla::{MovementBlock_UpdateFlag_Living, Object};
+    let mut entity = player_entity();
+    entity.unit_bytes_0 = 0x0000_0101;
+    let view = entity_view(entity, 0);
+    let slow = aura(
+        view.guid,
+        A_MOD_SPEED,
+        i32::from(SPEED_MOVE),
+        -40,
+        0,
+        i64::MAX,
+    );
+    let out = peer_create_outbound(&view, &[], &[slow], None).unwrap();
+    let Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(create)) = &out[0] else {
+        panic!("peer CREATE");
+    };
+    let Object::CreateObject2 { movement2, .. } = &create.objects[0] else {
+        panic!("Character CREATE");
+    };
+    let MovementBlock_UpdateFlag_Living::Living {
+        running_speed,
+        backwards_running_speed,
+        ..
+    } = movement2.update_flag.get_living().unwrap()
+    else {
+        panic!("living movement");
+    };
+    assert!((*running_speed - 4.2).abs() < 1e-5);
+    assert!((*backwards_running_speed - 2.7).abs() < 1e-5);
+}
+
 #[test]
 fn peer_create_preserves_gm_run_speed_without_movement_auras() {
     use wow_world_messages::vanilla::{MovementBlock_UpdateFlag_Living, Object};

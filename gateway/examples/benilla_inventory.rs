@@ -241,7 +241,13 @@ fn row(
     let dispatch = lyra_name.and_then(|name| lyra.dispatch.get(name));
     let status = if direction == "gateway_to_client" {
         "source_evidence_only"
-    } else if lyra_name.is_some_and(|name| lyra.ignored.contains(name)) {
+    } else if lyra_name.is_some_and(|name| lyra.ignored.contains(name))
+        // The reader drops these by number before decoding: `is_silent_movement_request`.
+        || matches!(
+            opcode,
+            0x0008 | 0x0009 | 0x00c6 | 0x00d9 | 0x00e1 | 0x02ad | 0x02ca | 0x02f8
+        )
+    {
         "explicitly_ignored"
     } else if dispatch.is_some() {
         "dispatch_pattern_present"
@@ -381,6 +387,15 @@ mod tests {
             missing.is_empty(),
             "requests need protocol review: {missing:?}"
         );
+    }
+
+    #[test]
+    fn requests_dropped_by_number_are_explicitly_ignored() {
+        let none = SourceScan::default();
+        for opcode in [0x0008, 0x02ca, 0x02f8] {
+            let row = row("client_to_gateway", opcode, &[], &none, &none);
+            assert_eq!(row["handling"], "explicitly_ignored", "0x{opcode:04X}");
+        }
     }
 
     #[test]

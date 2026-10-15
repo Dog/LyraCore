@@ -723,6 +723,39 @@ fn benilla_durable_bag_contents_remain_addressable_after_reconnect() {
 
 #[test]
 #[ignore = "requires SpacetimeDB 2.7.1 and the Wasm toolchain"]
+fn benilla_durable_a_stun_roots_the_client_across_reconnect_until_it_ends() {
+    use messages::MoveMode;
+    let root = |apply: bool| move |packet: &ServerPacket| matches!(packet, ServerPacket::MoveMode { guid: 1, mode: MoveMode::Root, apply: actual, .. } if *actual == apply);
+    let realm = Realm::start("benilla-stun-root");
+    let (mut client, gateway) = realm.connect("TEST");
+    client.enter_world();
+    realm
+        .standalone
+        .assert_call("debug_spawn_at_feet", &["1", "51000", "2"]);
+    let creature = client.created_entry(51000);
+    // Test Stun (50020) holds for ten minutes.
+    realm.standalone.assert_call(
+        "debug_force_cast_at",
+        &[&creature.to_string(), "50020", "1"],
+    );
+    client.until("root from the stun", root(true));
+    client.finish();
+    gateway.join().unwrap().unwrap();
+
+    // Auras outlive the World Session.
+    let (mut client, gateway) = realm.connect("TEST");
+    client.enter_world();
+    client.until("root at world entry", root(true));
+    realm
+        .standalone
+        .assert_sql("DELETE FROM game_aura WHERE target_guid = 1 AND spell_id = 50020");
+    client.until("unroot when the stun ends", root(false));
+    client.finish();
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "requires SpacetimeDB 2.7.1 and the Wasm toolchain"]
 fn benilla_durable_cancel_channelling_stops_the_active_channel() {
     let realm = Realm::start("benilla-channel-cancel");
     realm.standalone.assert_sql(

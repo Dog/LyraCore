@@ -65,7 +65,7 @@ pub(crate) fn motion_outbound(
             MOTION_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             vec![Outbound::Raw { opcode, body }]
         }
-        None if lyracore_shared::opcodes::movement::is_slice_move(row.opcode as u32) => {
+        None if lyracore_shared::opcodes::movement::is_relayed_move(row.opcode as u32) => {
             log::warn!(
                 "motion relay: malformed movement_info ({} bytes) for mover {}",
                 row.movement_info.len(),
@@ -75,6 +75,191 @@ pub(crate) fn motion_outbound(
         }
         None => Vec::new(),
     }
+}
+
+/// The Module's movement gate uses the same rule.
+fn holds_in_place(aura: &Aura) -> bool {
+    lyracore_shared::aura::holds_in_place(aura.eff_kind, aura.eff_p_0)
+}
+
+fn moves_speed(aura: &Aura, speed: u8) -> bool {
+    aura.eff_kind == lyracore_shared::spell::taxonomy::A_MOD_SPEED
+        && aura.eff_p_0 == i32::from(speed)
+}
+
+/// cmangos: a slow lowers backward running too.
+fn slows(aura: &Aura) -> bool {
+    moves_speed(aura, lyracore_shared::spell::taxonomy::SPEED_MOVE)
+        && lyracore_shared::aura::stacked_amount(aura.amount, aura.stacks) < 0
+}
+
+fn aura_amounts(auras: &[Aura]) -> impl Iterator<Item = lyracore_shared::aura::AuraAmount> + '_ {
+    auras.iter().map(|aura| lyracore_shared::aura::AuraAmount {
+        kind: aura.eff_kind,
+        parameter: aura.eff_p_0,
+        amount: aura.amount,
+        stacks: aura.stacks,
+    })
+}
+
+/// Only slows apply to backward running, with the run fold's floor.
+pub(crate) fn run_back_speed(
+    auras: impl IntoIterator<Item = lyracore_shared::aura::AuraAmount>,
+) -> f32 {
+    use lyracore_shared::spell::taxonomy::{A_MOD_SPEED, SPEED_MOVE};
+    let slow = auras
+        .into_iter()
+        .filter(|aura| aura.kind == A_MOD_SPEED && aura.parameter == i32::from(SPEED_MOVE))
+        .map(|aura| lyracore_shared::aura::stacked_amount(aura.amount, aura.stacks))
+        .filter(|amount| *amount < 0)
+        .sum();
+    lyracore_shared::aura::move_speed_with_pct(lyracore_shared::constants::speeds::RUN_BACK, slow)
+}
+
+/// Controls the owner's client must hold; see docs/benilla-compatibility.md#movement-controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MoverControl {
+    pub(crate) rooted: bool,
+    pub(crate) water_walk: bool,
+}
+
+impl MoverControl {
+    pub(crate) fn of(entity: Option<&WorldEntity>, auras: &[Aura]) -> Self {
+        const GHOST: u32 = lyracore_shared::constants::player_flags::GHOST;
+        let ghost = entity.is_some_and(|e| e.player_flags & GHOST != 0);
+        let body = entity.is_some_and(|e| e.dead) && !ghost;
+        Self {
+            rooted: body || auras.iter().any(holds_in_place),
+            water_walk: ghost,
+        }
+    }
+}
+
+fn root_outbound(guid: u64, rooted: bool, own_mover: bool) -> Outbound {
+    let (opcode, body) = if own_mover {
+        codec::build_force_move_root_raw(guid, rooted)
+    } else {
+        codec::build_spline_move_root_raw(guid, rooted)
+    };
+    Outbound::Raw { opcode, body }
+}
+
+/// `changed` holds the changed rows (all rows on reconnect); `current` is the post-change set.
+pub(crate) fn aura_movement_outbound(
+    entity: Option<&WorldEntity>,
+    current: &[Aura],
+    changed: &[&Aura],
+    target_guid: u64,
+    self_guid: u64,
+) -> Vec<Outbound> {
+    const RUN: f32 = 7.0; // the base `run_speed_packet` and the CREATE speed block use
+    let touched = |rule: fn(&Aura) -> bool| changed.iter().any(|aura| rule(aura));
+    let mut out = Vec::new();
+    if target_guid == self_guid {
+        if touched(holds_in_place) {
+            let rooted = MoverControl::of(entity, current).rooted;
+            out.push(root_outbound(self_guid, rooted, true));
+        }
+        if touched(slows) {
+            out.push(Outbound::One(
+                ServerOpcodeMessage::SMSG_FORCE_RUN_BACK_SPEED_CHANGE(Box::new(
+                    codec::build_force_run_back_speed(
+                        self_guid,
+                        run_back_speed(aura_amounts(current)),
+                    ),
+                )),
+            ));
+        }
+        return out;
+    }
+    if touched(holds_in_place) && matches!(target_guid >> 48, 0xF130 | 0xF140) {
+        let rooted = current.iter().any(holds_in_place);
+        out.push(root_outbound(target_guid, rooted, false));
+    }
+    let spline = |kind, speed| Outbound::One(codec::build_spline_speed(target_guid, kind, speed));
+    if touched(|aura| lyracore_shared::aura::moves_run_speed(aura.eff_kind, aura.eff_p_0)) {
+        let speed = lyracore_shared::aura::run_speed(RUN, aura_amounts(current));
+        out.push(spline(codec::ObservedSpeed::Run, speed));
+    }
+    if touched(slows) {
+        out.push(spline(
+            codec::ObservedSpeed::RunBack,
+            run_back_speed(aura_amounts(current)),
+        ));
+    }
+    if touched(|aura| moves_speed(aura, lyracore_shared::spell::taxonomy::SPEED_SWIM)) {
+        let speed = lyracore_shared::aura::swim_speed(
+            lyracore_shared::constants::speeds::SWIM,
+            aura_amounts(current),
+        );
+        out.push(spline(codec::ObservedSpeed::Swim, speed));
+    }
+    out
+}
+
+pub(crate) fn aura_movement_from_cache(
+    coord: &crate::stdb::Coordinator,
+    current: &[Aura],
+    changed: &[&Aura],
+    target_guid: u64,
+    self_guid: u64,
+) -> Vec<Outbound> {
+    let entity = (target_guid == self_guid)
+        .then(|| {
+            coord
+                .0
+                .coord()
+                .conn
+                .db
+                .game_world_entity()
+                .guid()
+                .find(&target_guid)
+        })
+        .flatten();
+    aura_movement_outbound(entity.as_ref(), current, changed, target_guid, self_guid)
+}
+
+pub(crate) fn self_entity_movement_outbound(
+    old: &WorldEntity,
+    new: &WorldEntity,
+    auras: &[Aura],
+) -> Vec<Outbound> {
+    let before = MoverControl::of(Some(old), auras);
+    let after = MoverControl::of(Some(new), auras);
+    let mut out = Vec::new();
+    if old.dead != new.dead || before.rooted != after.rooted {
+        out.push(root_outbound(new.guid, after.rooted, true));
+    }
+    if before.water_walk != after.water_walk {
+        out.push(Outbound::One(codec::build_move_water_walk(
+            new.guid,
+            after.water_walk,
+        )));
+    }
+    out
+}
+
+/// The self CREATE starts unrooted, on land and at base backward speed.
+pub(crate) fn world_entry_movement_outbound(entity: &WorldEntity, auras: &[Aura]) -> Vec<Outbound> {
+    let control = MoverControl::of(Some(entity), auras);
+    let mut out = Vec::new();
+    if control.rooted {
+        out.push(root_outbound(entity.guid, true, true));
+    }
+    if control.water_walk {
+        out.push(Outbound::One(codec::build_move_water_walk(
+            entity.guid,
+            true,
+        )));
+    }
+    if auras.iter().any(slows) {
+        out.push(Outbound::One(
+            ServerOpcodeMessage::SMSG_FORCE_RUN_BACK_SPEED_CHANGE(Box::new(
+                codec::build_force_run_back_speed(entity.guid, run_back_speed(aura_amounts(auras))),
+            )),
+        ));
+    }
+    out
 }
 
 pub(crate) fn creature_leg_outbound(
@@ -293,7 +478,10 @@ pub(crate) fn teleport_appeared(view: &WorldView, shard: ShardId, row: &Teleport
         return;
     };
     let row = row.clone();
-    enqueue(viewer.clone(), move |_| {
+    enqueue(viewer.clone(), move |viewer| {
+        if !row.cross_map {
+            viewer.gates.teleport_pending.store(true, Ordering::Release);
+        }
         crate::codec::movement::subscriptions::teleport_event_outbound(&row)
     });
 }
@@ -311,6 +499,9 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event, _old, row| creature_leg(&context.view, context.shard, row);
     }
 }
+
+#[cfg(test)]
+mod control_tests;
 
 #[cfg(test)]
 mod packet_tests;

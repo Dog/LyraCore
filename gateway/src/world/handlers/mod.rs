@@ -18,6 +18,7 @@ mod mail;
 mod meeting_stone;
 mod melee;
 mod member_stats;
+mod movement;
 mod query;
 mod quest;
 mod taxi;
@@ -76,6 +77,7 @@ pub(crate) use member_stats::MemberSnapshot;
 pub(crate) use member_stats::{
     member_stats_tick, MemberPresence, MemberStats, MemberStatsRecord, MemberStatsStore,
 };
+pub(crate) use movement::is_silent_movement_request;
 pub(crate) use query::{NpcStore, Query};
 pub(crate) use quest::{quest_giver_menu, Quest, QuestActionStore};
 #[cfg(test)]

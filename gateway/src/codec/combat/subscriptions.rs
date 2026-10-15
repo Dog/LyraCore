@@ -12,7 +12,6 @@ use spacetimedb_sdk::Table;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
-use wow_world_messages::vanilla::{SMSG_FORCE_MOVE_ROOT, SMSG_FORCE_MOVE_UNROOT};
 
 pub(crate) use lyracore_shared::spell::taxonomy::A_STEALTH;
 
@@ -440,9 +439,7 @@ pub(crate) fn aura_insert_outbound(
         out.push(o);
     }
     if let Some(current) = current {
-        if let Some(o) = root_packet(current.iter().cloned(), row, self_guid) {
-            out.push(o);
-        }
+        out.extend(movement_outbound(coord, &current, row, self_guid));
         if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
             out.push(o);
         }
@@ -492,9 +489,7 @@ pub(crate) fn aura_update_outbound(
         }
     }
     if let Some(current) = current {
-        if let Some(o) = root_packet(current.iter().cloned(), row, self_guid) {
-            out.push(o);
-        }
+        out.extend(movement_outbound(coord, &current, row, self_guid));
         if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
             out.push(o);
         }
@@ -529,9 +524,7 @@ pub(crate) fn aura_delete_outbound(
     if visible {
         let current = view.auras.on_target(shard, row.target_guid);
         out.push(aura_sync(current.iter().cloned(), row.target_guid));
-        if let Some(o) = root_packet(current.iter().cloned(), row, self_guid) {
-            out.push(o);
-        }
+        out.extend(movement_outbound(coord, &current, row, self_guid));
         if let Some(o) = swim_speed_packet(current.iter().cloned(), row, self_guid) {
             out.push(o);
         }
@@ -598,6 +591,16 @@ pub(crate) fn aura_snapshot_outbound(
         return out;
     }
     out.push(aura_sync(current.iter().cloned(), target_guid));
+    let changed: Vec<&Aura> = current.iter().chain(previous).collect();
+    out.extend(
+        crate::codec::movement::subscriptions::aura_movement_from_cache(
+            coord,
+            &current,
+            &changed,
+            target_guid,
+            viewer.self_guid,
+        ),
+    );
     if target_guid != viewer.self_guid {
         return out;
     }
@@ -605,12 +608,6 @@ pub(crate) fn aura_snapshot_outbound(
         current
             .iter()
             .filter_map(|row| aura_duration_packet(row, viewer.self_guid)),
-    );
-    out.extend(
-        current
-            .iter()
-            .chain(previous)
-            .find_map(|row| root_packet(current.iter().cloned(), row, viewer.self_guid)),
     );
     out.extend(
         current
@@ -701,6 +698,21 @@ pub(crate) fn aura_duration_packet(row: &Aura, self_guid: u64) -> Option<Outboun
     ))
 }
 
+fn movement_outbound(
+    coord: &Coordinator,
+    current: &[Aura],
+    changed: &Aura,
+    self_guid: u64,
+) -> Vec<Outbound> {
+    crate::codec::movement::subscriptions::aura_movement_from_cache(
+        coord,
+        current,
+        &[changed],
+        changed.target_guid,
+        self_guid,
+    )
+}
+
 pub(crate) fn run_speed_packet(
     auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
     changed: &Aura,
@@ -728,35 +740,6 @@ pub(crate) fn run_speed_packet(
             self_guid, speed,
         ))),
     ))
-}
-
-/// The client moves independently; overlapping holds must not send an early unroot.
-pub(crate) fn root_packet(
-    mut auras: impl Iterator<Item = crate::stdb::bindings::Aura>,
-    changed: &Aura,
-    self_guid: u64,
-) -> Option<Outbound> {
-    if changed.target_guid != self_guid
-        || !lyracore_shared::aura::holds_in_place(changed.eff_kind, changed.eff_p_0)
-    {
-        return None;
-    }
-    let guid = wow_world_messages::Guid::new(self_guid);
-    let held = auras.any(|aura| {
-        aura.target_guid == self_guid
-            && lyracore_shared::aura::holds_in_place(aura.eff_kind, aura.eff_p_0)
-    });
-    Some(Outbound::One(if held {
-        ServerOpcodeMessage::SMSG_FORCE_MOVE_ROOT(Box::new(SMSG_FORCE_MOVE_ROOT {
-            guid,
-            counter: 0,
-        }))
-    } else {
-        ServerOpcodeMessage::SMSG_FORCE_MOVE_UNROOT(Box::new(SMSG_FORCE_MOVE_UNROOT {
-            guid,
-            counter: 0,
-        }))
-    }))
 }
 
 pub(crate) fn swim_speed_packet(
@@ -1133,33 +1116,6 @@ pub(crate) mod tests {
         assert!(aura_duration_packet(&toggle, self_guid).is_none());
         let expired = aura(self_guid, 0xA1, 1, 10, 5_000_000, 5_000_000);
         assert!(aura_duration_packet(&expired, self_guid).is_none());
-    }
-
-    #[test]
-    fn root_packet_holds_the_owner_until_the_last_hold_ends() {
-        use lyracore_shared::spell::taxonomy::{A_CONTROL, M_FEAR, M_ROOT, M_STUN};
-        let guid = 1;
-        let root = aura(guid, A_CONTROL, M_ROOT, 0, 0, 8_000_000);
-        let stun = aura(guid, A_CONTROL, M_STUN, 0, 0, 4_000_000);
-        let rooted = |current: Vec<Aura>, changed: &Aura| match root_packet(
-            current.into_iter(),
-            changed,
-            guid,
-        ) {
-            Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_MOVE_ROOT(_))) => true,
-            Some(Outbound::One(ServerOpcodeMessage::SMSG_FORCE_MOVE_UNROOT(_))) => false,
-            _ => panic!("expected a root or unroot packet"),
-        };
-        assert!(rooted(vec![root.clone()], &root));
-        assert!(
-            rooted(vec![root.clone()], &stun),
-            "the root outlives the stun"
-        );
-        assert!(!rooted(vec![], &root));
-
-        let fear = aura(guid, A_CONTROL, M_FEAR, 0, 0, 8_000_000);
-        assert!(root_packet(vec![fear.clone()].into_iter(), &fear, guid).is_none());
-        assert!(root_packet(vec![root.clone()].into_iter(), &root, guid + 1).is_none());
     }
 
     #[test]

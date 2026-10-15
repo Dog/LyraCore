@@ -89,6 +89,21 @@ impl PlayerSubscriptions {
         self.viewer.as_ref().map(|viewer| &viewer.member_stats)
     }
 
+    pub(crate) fn teleport_pending(&self) -> bool {
+        self.viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.gates.teleport_pending.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn teleport_acknowledged(&self) {
+        if let Some(viewer) = &self.viewer {
+            viewer
+                .gates
+                .teleport_pending
+                .store(false, Ordering::Release);
+        }
+    }
+
     pub fn aoi_update(&mut self, x: f32, y: f32) {
         let (Some(viewer), Some(view)) = (self.viewer.as_ref(), self.view.as_ref()) else {
             return;
@@ -417,6 +432,22 @@ impl Coordinator {
                 let _ = tx.send(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
                     Box::new(codec::build_sheet_stats_values(self_guid, &st)),
                 )));
+            }
+        }
+        {
+            let guard = self.0.coord();
+            let db = &guard.conn.db;
+            let entity = db.game_world_entity().guid().find(&self_guid);
+            let auras: Vec<Aura> = db
+                .game_aura()
+                .iter()
+                .filter(|aura| aura.target_guid == self_guid)
+                .collect();
+            drop(guard);
+            for out in entity.iter().flat_map(|entity| {
+                crate::codec::movement::subscriptions::world_entry_movement_outbound(entity, &auras)
+            }) {
+                let _ = tx.send(out);
             }
         }
         {

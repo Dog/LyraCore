@@ -114,6 +114,7 @@ pub(crate) fn peer_create_outbound(
             if let Some(mut living) = movement2.update_flag.get_living().cloned() {
                 if let wow_world_messages::vanilla::MovementBlock_UpdateFlag_Living::Living {
                     running_speed,
+                    backwards_running_speed,
                     swimming_speed,
                     ..
                 } = &mut living
@@ -126,6 +127,8 @@ pub(crate) fn peer_create_outbound(
                     }
                     *swimming_speed =
                         lyracore_shared::aura::swim_speed(speeds::SWIM, speed_auras.clone());
+                    *backwards_running_speed =
+                        crate::codec::movement::subscriptions::run_back_speed(speed_auras.clone());
                 }
                 movement2.update_flag = movement2.update_flag.clone().set_living(living);
             }
@@ -398,9 +401,17 @@ pub(crate) fn relay_entity_update(
     let mut out: Vec<Outbound> =
         entity_update_to_outbound_with_dynamic_flags(old, new, dynamic_flags)
             .into_iter()
+            .map(|message| observed_speed(message, viewer.self_guid))
             .map(Outbound::One)
             .collect();
     if new.guid == viewer.self_guid {
+        out.extend(
+            crate::codec::movement::subscriptions::self_entity_movement_outbound(
+                old,
+                new,
+                &view.auras.on_target(shard, new.guid),
+            ),
+        );
         if let Some(is_ghost) =
             ghost_transition(old.player_flags, new.player_flags, GHOST_PLAYER_FLAG)
         {
@@ -431,6 +442,18 @@ pub(crate) fn relay_entity_update(
         }
     }
     out
+}
+
+/// Observers get the spline speed form; see docs/benilla-compatibility.md#movement-controls.
+fn observed_speed(message: ServerOpcodeMessage, self_guid: u64) -> ServerOpcodeMessage {
+    match message {
+        ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(change)
+            if change.guid.guid() != self_guid =>
+        {
+            codec::build_spline_speed(change.guid.guid(), codec::ObservedSpeed::Run, change.speed)
+        }
+        message => message,
+    }
 }
 
 pub(crate) fn loot_tag_flags_after_membership_change(
@@ -1074,6 +1097,20 @@ pub(crate) mod tests {
         let mut entity = creature_entity();
         entity.dynamic_flags = 0x42;
         assert_eq!(project_flags(7, &entity, None, None, &[], &[], &[]), 0x42);
+    }
+
+    #[test]
+    fn a_peer_speed_change_reaches_observers_in_spline_form() {
+        let forced = || {
+            ServerOpcodeMessage::SMSG_FORCE_RUN_SPEED_CHANGE(Box::new(
+                codec::build_force_run_speed(2, 11.2),
+            ))
+        };
+        assert_eq!(
+            observed_speed(forced(), 1),
+            codec::build_spline_speed(2, codec::ObservedSpeed::Run, 11.2)
+        );
+        assert_eq!(observed_speed(forced(), 2), forced());
     }
 }
 

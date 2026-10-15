@@ -1220,18 +1220,20 @@ fn raw_movement_relay_is_byte_identical_to_the_typed_path() {
     }
     assert_eq!(
         compared,
-        6 * 17 * 5,
+        6 * 21 * 5,
         "every case × opcode × guid must have been compared"
     );
 }
 
+/// The acknowledged relays have no vanilla library type, so only the raw path writes them.
 #[test]
 fn raw_and_typed_movement_relays_accept_exactly_the_same_opcodes() {
     let info = movement_info_cases()[0].1.clone();
     let stored = movement_info_to_bytes(&info).unwrap();
     for opcode in 0u32..=0xFFFF {
         assert_eq!(
-            build_movement_relay(opcode, 7, info.clone()).is_some(),
+            build_movement_relay(opcode, 7, info.clone()).is_some()
+                || movement_opcodes::ACKNOWLEDGED_MOVE_OPCODES.contains(&opcode),
             build_movement_relay_raw(opcode, 7, &stored).is_some(),
             "the typed and raw movement relays disagree about opcode 0x{opcode:04X}"
         );
@@ -2950,16 +2952,18 @@ fn visible_item_index_boundary_stops_after_equipment_slot_18() {
 }
 
 #[test]
-fn relayed_move_opcode_maps_all_seventeen_client_variants() {
+fn relayed_move_opcode_maps_every_relayed_client_variant() {
     use movement_opcodes as m;
     use wow_world_messages::vanilla::{
         MSG_MOVE_FALL_LAND_Client, MSG_MOVE_JUMP_Client, MSG_MOVE_SET_FACING_Client,
-        MSG_MOVE_SET_RUN_MODE_Client, MSG_MOVE_SET_WALK_MODE_Client,
+        MSG_MOVE_SET_PITCH_Client, MSG_MOVE_SET_RUN_MODE_Client, MSG_MOVE_SET_WALK_MODE_Client,
         MSG_MOVE_START_BACKWARD_Client, MSG_MOVE_START_FORWARD_Client,
+        MSG_MOVE_START_PITCH_DOWN_Client, MSG_MOVE_START_PITCH_UP_Client,
         MSG_MOVE_START_STRAFE_LEFT_Client, MSG_MOVE_START_STRAFE_RIGHT_Client,
         MSG_MOVE_START_SWIM_Client, MSG_MOVE_START_TURN_LEFT_Client,
-        MSG_MOVE_START_TURN_RIGHT_Client, MSG_MOVE_STOP_Client, MSG_MOVE_STOP_STRAFE_Client,
-        MSG_MOVE_STOP_SWIM_Client, MSG_MOVE_STOP_TURN_Client, MovementInfo_MovementFlags,
+        MSG_MOVE_START_TURN_RIGHT_Client, MSG_MOVE_STOP_Client, MSG_MOVE_STOP_PITCH_Client,
+        MSG_MOVE_STOP_STRAFE_Client, MSG_MOVE_STOP_SWIM_Client, MSG_MOVE_STOP_TURN_Client,
+        MovementInfo_MovementFlags,
     };
     let info = MovementInfo {
         flags: MovementInfo_MovementFlags::empty(),
@@ -3034,6 +3038,30 @@ fn relayed_move_opcode_maps_all_seventeen_client_variants() {
             m::MSG_MOVE_STOP_TURN,
         ),
         (
+            ClientOpcodeMessage::MSG_MOVE_START_PITCH_UP(Box::new(
+                MSG_MOVE_START_PITCH_UP_Client { info: info.clone() },
+            )),
+            m::MSG_MOVE_START_PITCH_UP,
+        ),
+        (
+            ClientOpcodeMessage::MSG_MOVE_START_PITCH_DOWN(Box::new(
+                MSG_MOVE_START_PITCH_DOWN_Client { info: info.clone() },
+            )),
+            m::MSG_MOVE_START_PITCH_DOWN,
+        ),
+        (
+            ClientOpcodeMessage::MSG_MOVE_STOP_PITCH(Box::new(MSG_MOVE_STOP_PITCH_Client {
+                info: info.clone(),
+            })),
+            m::MSG_MOVE_STOP_PITCH,
+        ),
+        (
+            ClientOpcodeMessage::MSG_MOVE_SET_PITCH(Box::new(MSG_MOVE_SET_PITCH_Client {
+                info: info.clone(),
+            })),
+            m::MSG_MOVE_SET_PITCH,
+        ),
+        (
             ClientOpcodeMessage::MSG_MOVE_SET_RUN_MODE(Box::new(MSG_MOVE_SET_RUN_MODE_Client {
                 info: info.clone(),
             })),
@@ -3078,8 +3106,8 @@ fn relayed_move_opcode_maps_all_seventeen_client_variants() {
     ];
     assert_eq!(
         cases.len(),
-        17,
-        "the relayed opcode table has exactly 17 entries"
+        m::SLICE_MOVE_OPCODES.len(),
+        "every relayed client opcode has a case"
     );
     for (msg, expected) in &cases {
         assert_eq!(

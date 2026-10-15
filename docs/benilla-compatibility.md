@@ -97,21 +97,59 @@ enabled in the normal suite.
 
 The real Module scenario also checks late-observer transport attachment. Speed,
 root, hover, feather-fall, water-walk, knockback, teleport and spline completion
-acknowledgements keep the World Session usable. This does not establish boat
-simulation, transport membership or acknowledgement counter enforcement.
+acknowledgements keep the World Session usable. The Gateway reads the speed,
+root, knockback, hover, feather-fall and water-walk acknowledgements with the
+build-5875 layout too, so a transport tail does not end the session. This does
+not establish boat simulation, transport membership or acknowledgement counter
+enforcement.
+
+## Movement controls
+
+Pitch changes (`MSG_MOVE_START_PITCH_UP`, `_DOWN`, `MSG_MOVE_STOP_PITCH` and
+`MSG_MOVE_SET_PITCH`) relay to observers like other movement.
+
+A stun, root or polymorph aura, and a dead body before release, root the
+Character's own client with `SMSG_FORCE_MOVE_ROOT`. The last of them to end sends
+`SMSG_FORCE_MOVE_UNROOT`. A ghost walks on water. World entry restores both
+states. When the client acknowledges a root, unroot or water walk, observers
+receive `MSG_MOVE_ROOT`, `MSG_MOVE_UNROOT` or `MSG_MOVE_WATER_WALK` with the
+acknowledged pose. Observers see a creature's stun, root or polymorph as
+`SMSG_SPLINE_MOVE_ROOT` and its end as `SMSG_SPLINE_MOVE_UNROOT`.
+
+An acknowledgement that arrives after a same-map teleport and before the
+client's `MSG_MOVE_TELEPORT_ACK` is not relayed. Its pose may be the old
+position: a release acknowledges the unroot at the corpse.
+
+Root, stun and polymorph follow `lyracore_shared::aura::holds_in_place`, the
+rule the Module's movement gate also uses. The importer gives confuse, pacify
+and charm the polymorph mechanic, so they root the client too. Telling them
+apart needs a distinct mechanic in the imported spell data.
+
+A slow also lowers backward running, through
+`SMSG_FORCE_RUN_BACK_SPEED_CHANGE`, at world entry and in a peer's CREATE.
+Observers receive another unit's run, backward run and swim speeds as
+`SMSG_SPLINE_SET_*_SPEED`, players included. cmangos relays a player's
+`MSG_MOVE_SET_*_SPEED` after the owner's acknowledgement instead. The motion
+row holds only a MovementInfo body, so it cannot carry that relay's speed.
+
+Cheat, Game Master and minigame movement requests and `CMSG_MOVE_FALL_RESET`
+are ignored without decoding. They never move the Character.
 
 ### Root receipts
 
 The client moves independently of the Module. The Gateway sends a root packet for a root, stun or
-polymorph and sends an unroot packet only after the last hold ends. The Module drops steering
-samples while held, but accepts stop receipts, turns and landings so fall damage still applies.
+polymorph and sends an unroot packet only after the last hold ends. The library writes
+`SMSG_FORCE_MOVE_ROOT` and `SMSG_SPLINE_MOVE_ROOT` with a full guid, which the client misreads, so
+the Gateway writes the packed guid itself. The Module drops steering samples while held, but accepts
+root receipts, stops, turns and landings so fall damage still applies.
 
-`gateway/src/world/mod.rs::root_receipt_stop` relays the current Character's root or unroot receipt
-as a stop. Peers otherwise retain the last run. A root receipt clears steering flags so the Module
-accepts the reported stop position. The pinned library's `clear_*` methods mask with
-`reverse_bits`, so the Gateway clears the bits in the encoded bytes instead. The typed reader skips
-the build-5875 transport tail; the encoder refuses that incomplete value, so receipts on a
-transport are not relayed.
+`gateway/src/codec/movement.rs::acknowledged_move` turns the current Character's root, unroot and
+water-walk receipts into `MSG_MOVE_ROOT`, `MSG_MOVE_UNROOT` and `MSG_MOVE_WATER_WALK` relays for
+peers, as cmangos does. Peers otherwise retain the last run. A root receipt clears steering flags
+so the Module accepts the reported position. The pinned library's `clear_*` methods mask with
+`reverse_bits`, so the Gateway clears the bits in the encoded bytes instead. The Gateway reads the
+receipts with the build-5875 layout, so receipts on a transport relay too. A receipt between a
+same-map teleport and the client's `MSG_MOVE_TELEPORT_ACK` is not relayed.
 
 Movement interruption uses client flags, including jumping, rather than a change in stored
 position. A delayed stop can update the stored position after Shadowmeld begins without ending
