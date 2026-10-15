@@ -13,7 +13,8 @@ pub(crate) trait VendorActionStore: Send + Sync {
 
     fn random_property_enchant_ids(&self, random_property_id: u32) -> [u32; 3];
 
-    fn vendor_item_slot(&self, item_guid: u64) -> Option<u8>;
+    /// Slot of `item_guid` when `owner_guid` holds it; another Character's item is `None`.
+    fn vendor_item_slot(&self, owner_guid: u64, item_guid: u64) -> Option<u8>;
 
     fn vendor_repair(&self, actor: Actor, npc_guid: u64, slot: u8) -> Result<()>;
 
@@ -124,7 +125,7 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 let slot = if item_guid == 0 {
                     Some(u8::MAX)
                 } else {
-                    store.vendor_item_slot(item_guid)
+                    store.vendor_item_slot(actor.guid(), item_guid)
                 };
                 let Some(slot) = slot else {
                     return Ok(ProtocolReply::from(Vec::new()));
@@ -149,17 +150,32 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 let Some(actor) = actor else {
                     return Ok(ProtocolReply::from(Vec::new()));
                 };
-                let Some(slot) = store.vendor_item_slot(c.item.guid()) else {
+                let (vendor_guid, item_guid) = (c.vendor.guid(), c.item.guid());
+                let sell_refused = |result| {
+                    vec![Outbound::One(ServerOpcodeMessage::SMSG_SELL_ITEM(
+                        Box::new(codec::build_sell_item_refusal(
+                            vendor_guid,
+                            item_guid,
+                            result,
+                        )),
+                    ))]
+                };
+                if item_guid == 0 {
+                    return Ok(ProtocolReply::from(Vec::new()));
+                }
+                let Some(slot) = store.vendor_item_slot(actor.guid(), item_guid) else {
                     return Ok(ProtocolReply::from(Vec::new()));
                 };
-                match store.vendor_sell(actor, c.vendor.guid(), slot) {
+                match store.vendor_sell(actor, vendor_guid, slot) {
                     Ok(()) => Ok(ProtocolReply::from(build_buyback_view(store, actor.guid()))),
                     Err(e) if is_refusal(&e) => {
                         log::debug!(
-                            "world: sell_item ignored (account {}): {e}",
+                            "world: sell_item refused (account {}): {e}",
                             player.account_id
                         );
-                        Ok(ProtocolReply::from(Vec::new()))
+                        Ok(ProtocolReply::from(sell_refused(
+                            codec::sell_refusal_result(&e.to_string()),
+                        )))
                     }
                     Err(e) => Err(e),
                 }
@@ -292,6 +308,7 @@ pub(super) mod tests {
         pub(crate) ring: Mutex<Vec<(u32, u32, u32, u32)>>,
         pub(crate) random_properties: Vec<(u32, [u32; 3])>,
         pub(crate) item_slots: Vec<(u64, u8)>,
+        pub(crate) foreign_items: Vec<u64>,
         pub(crate) repair_error: Option<Failure>,
         pub(crate) sell_error: Option<Failure>,
         pub(crate) buyback_requests: Mutex<Vec<(u64, u64, u8)>>,
@@ -348,7 +365,10 @@ pub(super) mod tests {
                 .map_or([0; 3], |&(_, enchant_ids)| enchant_ids)
         }
 
-        fn vendor_item_slot(&self, item_guid: u64) -> Option<u8> {
+        fn vendor_item_slot(&self, _owner_guid: u64, item_guid: u64) -> Option<u8> {
+            if self.foreign_items.contains(&item_guid) {
+                return None;
+            }
             self.item_slots
                 .iter()
                 .find(|(g, _)| *g == item_guid)
@@ -722,35 +742,84 @@ pub(super) mod tests {
         assert_renders_ring(&outcome.outbound, &ring);
     }
 
+    fn sell_refusal(outcome: ProtocolReply) -> (u64, u64, u8) {
+        let [Outbound::One(ServerOpcodeMessage::SMSG_SELL_ITEM(reply))] =
+            outcome.outbound.as_slice()
+        else {
+            panic!(
+                "expected one SMSG_SELL_ITEM, got {} packets",
+                outcome.outbound.len()
+            );
+        };
+        (reply.guid.guid(), reply.item.guid(), reply.result.as_int())
+    }
+
     #[test]
-    fn selling_an_unknown_item_guid_is_a_harmless_no_op() {
+    fn selling_an_unknown_item_guid_is_silent_without_a_durable_request() {
         let actions = InMemoryVendorActions::default();
 
         let outcome = Vendor::handle(&actions, &mut player(), sell_item(0x99).into()).unwrap();
 
-        assert!(matches!(
-            outcome,
-            ProtocolReply { outbound, .. } if outbound.is_empty()
-        ));
+        assert!(outcome.outbound.is_empty());
         assert!(actions.sell_requests.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_rejected_sale_is_silent_and_non_fatal() {
+    fn selling_or_repairing_another_characters_item_asks_the_module_nothing() {
         let actions = InMemoryVendorActions {
             item_slots: vec![(ITEM, 30)],
-            sell_error: Some(|| {
-                ReducerCallError::refused("gw_sell_item", "that item cannot be sold")
-            }),
+            foreign_items: vec![ITEM],
             ..Default::default()
         };
 
-        let outcome = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+        let sold = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+        let repaired = Vendor::handle(&actions, &mut player(), repair_item(ITEM).into()).unwrap();
 
-        assert!(matches!(
-            outcome,
-            ProtocolReply { outbound, .. } if outbound.is_empty()
-        ));
+        assert!(sold.outbound.is_empty() && repaired.outbound.is_empty());
+        assert!(actions.sell_requests.lock().unwrap().is_empty());
+        assert!(actions.repair_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn selling_a_zero_item_guid_is_silent() {
+        let actions = InMemoryVendorActions::default();
+
+        let outcome = Vendor::handle(&actions, &mut player(), sell_item(0).into()).unwrap();
+
+        assert!(outcome.outbound.is_empty());
+        assert!(actions.sell_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rejected_sale_answers_the_matching_sell_error_and_stays_non_fatal() {
+        for (reason, code) in [
+            ("that item cannot be sold", 2),
+            ("item has no sell value", 2),
+            ("vendor out of range", 3),
+            ("no item in slot 30", 1),
+        ] {
+            let sell_error: Failure = match reason {
+                "that item cannot be sold" => {
+                    || ReducerCallError::refused("gw_sell_item", "that item cannot be sold")
+                }
+                "item has no sell value" => {
+                    || ReducerCallError::refused("gw_sell_item", "item has no sell value")
+                }
+                "vendor out of range" => {
+                    || ReducerCallError::refused("gw_sell_item", "vendor out of range")
+                }
+                _ => || ReducerCallError::refused("gw_sell_item", "no item in slot 30"),
+            };
+            let actions = InMemoryVendorActions {
+                item_slots: vec![(ITEM, 30)],
+                sell_error: Some(sell_error),
+                ..Default::default()
+            };
+
+            let outcome = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+
+            assert_eq!(sell_refusal(outcome), (VENDOR, ITEM, code), "{reason}");
+        }
     }
 
     #[test]

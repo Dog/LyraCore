@@ -42,7 +42,8 @@ pub(crate) trait CastStore: MeleeActionStore + Send + Sync {
 
     fn start_ranged_attack(&self, actor: Actor, target_guid: u64, spell_id: u32) -> Result<()>;
 
-    fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8>;
+    /// Slot of `item_guid` when `owner_guid` holds it; another Character's item is `None`.
+    fn item_slot_by_guid(&self, owner_guid: u64, item_guid: u64) -> Option<u8>;
 
     fn disenchant_item(&self, actor: Actor, slot: u8) -> Result<()>;
 
@@ -185,7 +186,7 @@ fn ordinary_cast<St: CastStore + ?Sized>(
             break 'request Some(NO_ACTOR.to_string());
         };
         let result = if item_guid != 0 {
-            let Some(slot) = store.item_slot_by_guid(item_guid) else {
+            let Some(slot) = store.item_slot_by_guid(actor.guid(), item_guid) else {
                 break 'request Some(format!(
                     "item target {item_guid} is not in the Character's bag"
                 ));
@@ -354,7 +355,7 @@ pub(super) mod tests {
             self.answer("gw_cast_item_target", &self.cast_error)
         }
 
-        fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8> {
+        fn item_slot_by_guid(&self, _owner_guid: u64, item_guid: u64) -> Option<u8> {
             self.item_slots
                 .iter()
                 .find(|(g, _)| *g == item_guid)

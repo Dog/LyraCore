@@ -141,6 +141,7 @@ pub mod event_kind {
     pub const LOOT_ROLL_RESERVED_START: u8 = 4;
     // Send SMSG_GROUP_SET_LEADER before the LIST naming the new leader.
     pub const SET_LEADER: u8 = 20;
+    pub const DEATH_DURABILITY: u8 = 13;
     pub const READY_CHECK: u8 = 21;
     pub const READY_CHECK_ANSWER: u8 = 22;
     pub const TARGET_ICON_UPDATE: u8 = 23;
@@ -464,6 +465,8 @@ mod tests {
             roll::ROLL_WON,
             roll::MASTER_LIST,
             roll::MONEY_SHARE,
+            roll::ALL_PASSED,
+            event_kind::DEATH_DURABILITY,
             share::QUEST_SHARE,
             share::QUEST_PUSH_RESULT,
             event_kind::SET_LEADER,
@@ -482,7 +485,10 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(
             sorted,
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                30
+            ]
         );
         assert_eq!(event_kind::LOOT_ROLL_RESERVED_START, roll::ROLL_START);
     }

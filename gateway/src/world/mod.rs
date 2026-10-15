@@ -59,7 +59,7 @@ pub(crate) use handlers::{
     ChatOutcome, CreateAuctionOutcome, CreateAuctionRequest, GuildEventSnapshot, GuildOutcome,
     GuildRequest, ItemActionResult, LootActionStatus, LootWindowRefusal, LootWindowRequestStatus,
     MeetingStoneOutcome, MemberPresence, MemberStatsRecord, MemberStatsStore, PlaceBidOutcome,
-    PlaceBidRequest, RealmChatRequest, ResolvedTarget, SeekerFacts, SpeakerFacts,
+    PlaceBidRequest, ReadableItem, RealmChatRequest, ResolvedTarget, SeekerFacts, SpeakerFacts,
     TrainerBuyOutcome, WeatherStore, WhisperRequest, WhisperTargetFacts,
 };
 pub(crate) use handlers::{

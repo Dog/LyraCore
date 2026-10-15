@@ -86,6 +86,8 @@ protocol_families! {
         CMSG_SWAP_INV_ITEM,
         CMSG_SWAP_ITEM,
         CMSG_USE_ITEM,
+        CMSG_ITEM_NAME_QUERY,
+        CMSG_READ_ITEM,
     ],
     Quest => [
         CMSG_QUESTGIVER_STATUS_QUERY,

@@ -89,6 +89,8 @@ fn fixture(name: &str) -> Standalone {
     standalone.publish_module();
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
+    // The reaper would delete the events under test.
+    standalone.assert_sql("DELETE FROM game_event_reaper_schedule");
     standalone
 }
 
@@ -351,4 +353,50 @@ fn votes(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     let mut rows = standalone.query_rows("SELECT * FROM game_loot_roll_vote");
     rows.sort_by(|a, b| a["id"].cmp(&b["id"]));
     rows
+}
+
+fn newest_event(standalone: &Standalone) -> u64 {
+    standalone
+        .query_rows("SELECT id FROM game_group_event")
+        .iter()
+        .map(|row| row["id"].parse::<u64>().unwrap())
+        .max()
+        .unwrap_or(0)
+}
+
+fn events_of(standalone: &Standalone, kind: u8, after: u64) -> Vec<(String, String)> {
+    let mut events: Vec<_> = standalone
+        .query_rows(&format!(
+            "SELECT recipient_guid, payload FROM game_group_event WHERE kind = {kind} AND id > {after}"
+        ))
+        .into_iter()
+        .map(|row| (row["recipient_guid"].clone(), row["payload"].clone()))
+        .collect();
+    events.sort_unstable();
+    events
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn an_all_pass_resolution_tells_every_roller_and_a_win_does_not() {
+    use lyracore_shared::loot_roll::event_kind::{ALL_PASSED, ROLL_WON};
+    let standalone = fixture("loot-roll-all-passed");
+    let mut promotion = Promotion::default();
+    promotion.send(&standalone);
+    resolve(&standalone);
+    let payload = format!("{CORPSE},0,{ITEM},117");
+    assert_eq!(
+        events_of(&standalone, ALL_PASSED, 0),
+        ["5090003", "5090004", "5090005"].map(|roller| (roller.to_string(), payload.clone()))
+    );
+    assert!(events_of(&standalone, ROLL_WON, 0).is_empty());
+
+    let before = newest_event(&standalone);
+    promotion.source_roll_id = 11;
+    promotion.send(&standalone);
+    vote(&standalone, "5090003", "1");
+    vote(&standalone, "5090004", "0");
+    vote(&standalone, "5090005", "0");
+    assert!(events_of(&standalone, ALL_PASSED, before).is_empty());
+    assert_eq!(events_of(&standalone, ROLL_WON, before).len(), 3);
 }

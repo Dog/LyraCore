@@ -41,14 +41,15 @@ impl Coordinator {
             .collect()
     }
 
-    pub fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8> {
+    /// Slot of `item_guid` when `owner_guid` holds it; another Character's item is `None`.
+    pub fn item_slot_by_guid(&self, owner_guid: u64, item_guid: u64) -> Option<u8> {
         let guard = self.0.coord();
         let slots: Vec<u8> = guard
             .conn
             .db
             .game_item_instance()
             .iter()
-            .filter(|i| i.guid == item_guid)
+            .filter(|i| i.guid == item_guid && i.owner_guid == owner_guid)
             .map(|i| i.slot)
             .collect();
         slots.into_iter().next()

@@ -197,6 +197,8 @@ pub(crate) fn raw_unavailable_outbound(opcode: u32, body: &[u8]) -> Result<Optio
             );
             Ok(Some(vec![unavailable("Reputation display preferences")]))
         }
+        // Unhandled in vmangos and cmangos: ground-item and loot-slot stores, skill-point purchases, lottery.
+        0x0107 | 0x0109 | 0x021f | 0x0220 | 0x0336 => Ok(Some(vec![])),
         0x005a => {
             anyhow::ensure!(body.len() == 12, "invalid CMSG_PAGE_TEXT_QUERY body");
             Ok(Some(vec![page_unavailable(u32::from_le_bytes(
@@ -249,6 +251,16 @@ pub(crate) fn is_control_receipt(msg: &ClientOpcodeMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::raw_unavailable_outbound;
+
+    #[test]
+    fn unhandled_vanilla_requests_are_ignored_without_a_reply() {
+        for opcode in [0x0107, 0x0109, 0x021f, 0x0220, 0x0336] {
+            assert!(raw_unavailable_outbound(opcode, &[0; 8])
+                .unwrap()
+                .unwrap()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn ticket_refusals_require_complete_packet_framing() {

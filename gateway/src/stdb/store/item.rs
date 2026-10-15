@@ -4,9 +4,46 @@ use lyracore_shared::item::ItemRefusal;
 use crate::stdb::bindings::*;
 use crate::stdb::connection::{call_reducer, classify, DurableFailure};
 use crate::stdb::Coordinator;
-use crate::world::{Actor, ItemActionResult, ItemActionStore};
+use crate::world::{Actor, ItemActionResult, ItemActionStore, ReadableItem};
+use spacetimedb_sdk::Table;
 
 impl ItemActionStore for Coordinator {
+    fn item_name(&self, entry: u32) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .coord()
+            .conn
+            .db
+            .game_item_template()
+            .entry()
+            .find(&entry)
+            .map(|template| template.name))
+    }
+
+    fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem> {
+        let guard = self.0.coord();
+        let db = &guard.conn.db;
+        let Some(item) = db
+            .game_item_instance()
+            .iter()
+            .find(|i| i.owner_guid == owner_guid && i.slot == slot)
+        else {
+            return Ok(ReadableItem::Missing);
+        };
+        let has_pages = db
+            .game_item_template()
+            .entry()
+            .find(&item.entry)
+            .is_some_and(|template| template.page_text != 0);
+        Ok(if has_pages {
+            ReadableItem::Pages {
+                item_guid: item.guid,
+            }
+        } else {
+            ReadableItem::NoPages
+        })
+    }
+
     fn equip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(

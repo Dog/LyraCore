@@ -1442,3 +1442,57 @@ mod tests {
         assert!(store.item_take_requests.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn relayed(kind: u8, payload: String) -> Vec<Outbound> {
+        let row = crate::stdb::bindings::GroupEvent {
+            id: 1,
+            recipient_identity: spacetimedb_sdk::Identity::ZERO,
+            kind,
+            other_guid: 0,
+            other_name: String::new(),
+            created_at: spacetimedb_sdk::Timestamp::UNIX_EPOCH,
+            payload,
+            recipient_guid: 42,
+        };
+        crate::codec::social::subscriptions::group_event_outbound(
+            &crate::world::test_support::WorldFake::default(),
+            42,
+            &row,
+        )
+    }
+
+    #[test]
+    fn an_all_passed_event_relays_the_loot_notice() {
+        use lyracore_shared::loot_roll::{encode_all_passed, event_kind::ALL_PASSED};
+        let packets = relayed(ALL_PASSED, encode_all_passed(7, 3, 1234, 117));
+        let [Outbound::One(ServerOpcodeMessage::SMSG_LOOT_ALL_PASSED(notice))] = packets.as_slice()
+        else {
+            panic!(
+                "expected one SMSG_LOOT_ALL_PASSED, got {} packets",
+                packets.len()
+            );
+        };
+        assert_eq!(
+            notice.as_ref(),
+            &codec::build_loot_all_passed(7, 3, 1234, 117),
+            "slot, item and property come from the payload"
+        );
+        assert!(relayed(ALL_PASSED, "garbled".into()).is_empty());
+    }
+
+    #[test]
+    fn a_death_durability_event_relays_the_empty_notice_under_its_header() {
+        use lyracore_shared::group::event_kind::DEATH_DURABILITY;
+        let packets = relayed(DEATH_DURABILITY, String::new());
+        let [Outbound::One(notice)] = packets.as_slice() else {
+            panic!("expected one notice, got {} packets", packets.len());
+        };
+        let mut wire = Vec::new();
+        notice.write_unencrypted_server(&mut wire).unwrap();
+        assert_eq!(wire, [0x00, 0x02, 0xBD, 0x02]);
+    }
+}
