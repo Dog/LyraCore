@@ -6,9 +6,6 @@ pub mod event_kind {
     pub const ROLL_WON: u8 = 6;
     pub const MASTER_LIST: u8 = 7;
     pub const MONEY_SHARE: u8 = 8;
-    /// Every eligible member passed on one item → `SMSG_LOOT_ALL_PASSED`, to every roller. Outside
-    /// the reserved `4..=8` block (kind 9 is retired); the byte space is listed in
-    /// `crate::group::event_kind`.
     pub const ALL_PASSED: u8 = 12;
 }
 
@@ -125,7 +122,6 @@ pub fn decode_won(payload: &str) -> Option<(u64, u8, u32, u8, u8, u32)> {
     ))
 }
 
-/// Encode an `ALL_PASSED` payload: `corpse_guid,slot,item_entry,random_property_id`.
 pub fn encode_all_passed(
     corpse_guid: u64,
     slot: u8,
@@ -135,7 +131,6 @@ pub fn encode_all_passed(
     format!("{corpse_guid},{slot},{item_entry},{random_property_id}")
 }
 
-/// Decode an `ALL_PASSED` payload back to `(corpse_guid, slot, item_entry, random_property_id)`.
 pub fn decode_all_passed(payload: &str) -> Option<(u64, u8, u32, u32)> {
     let mut p = payload.split(',');
     let corpse_guid: u64 = p.next()?.parse().ok()?;

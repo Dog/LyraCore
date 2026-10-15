@@ -89,8 +89,7 @@ fn fixture(name: &str) -> Standalone {
     standalone.publish_module();
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
-    // The event reaper deletes group events older than a second, which would empty the
-    // assertions below.
+    // The reaper would delete the events under test.
     standalone.assert_sql("DELETE FROM game_event_reaper_schedule");
     standalone
 }
@@ -356,7 +355,6 @@ fn votes(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     rows
 }
 
-/// The newest group event id, 0 when none exists.
 fn newest_event(standalone: &Standalone) -> u64 {
     standalone
         .query_rows("SELECT id FROM game_group_event")
@@ -366,7 +364,6 @@ fn newest_event(standalone: &Standalone) -> u64 {
         .unwrap_or(0)
 }
 
-/// `(recipient, payload)` of every event of `kind` newer than `after`, in recipient order.
 fn events_of(standalone: &Standalone, kind: u8, after: u64) -> Vec<(String, String)> {
     let mut events: Vec<_> = standalone
         .query_rows(&format!(
@@ -394,7 +391,6 @@ fn an_all_pass_resolution_tells_every_roller_and_a_win_does_not() {
     );
     assert!(events_of(&standalone, ROLL_WON, 0).is_empty());
 
-    // A contested roll announces its winner and adds no all-passed notice.
     let before = newest_event(&standalone);
     promotion.source_roll_id = 11;
     promotion.send(&standalone);

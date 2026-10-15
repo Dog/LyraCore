@@ -197,10 +197,7 @@ pub(crate) fn raw_unavailable_outbound(opcode: u32, body: &[u8]) -> Result<Optio
             );
             Ok(Some(vec![unavailable("Reputation display preferences")]))
         }
-        // vmangos and cmangos mark these unhandled and answer nothing: ground-item and loot-slot
-        // stores (CMSG_AUTOSTORE_GROUND_ITEM, CMSG_STORE_LOOT_IN_SLOT; autostore is the loot path),
-        // skill-point purchases (CMSG_SKILL_BUY_STEP, CMSG_SKILL_BUY_RANK; trainers teach skills
-        // as spells) and the obsolete lottery (CMSG_BUY_LOTTERY_TICKET_OBSOLETE).
+        // Unhandled in vmangos and cmangos: ground-item and loot-slot stores, skill-point purchases, lottery.
         0x0107 | 0x0109 | 0x021f | 0x0220 | 0x0336 => Ok(Some(vec![])),
         0x005a => {
             anyhow::ensure!(body.len() == 12, "invalid CMSG_PAGE_TEXT_QUERY body");

@@ -129,8 +129,6 @@ pub fn build_loot_master_list(eligible: &[u64]) -> SMSG_LOOT_MASTER_LIST {
     }
 }
 
-/// Build `SMSG_LOOT_ALL_PASSED` — every roller passed, so the item stays in the corpse. The
-/// suffix is always 0 here (vmangos `Group::SendLootAllPassed`).
 pub fn build_loot_all_passed(
     corpse_guid: u64,
     loot_slot: u8,

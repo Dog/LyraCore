@@ -1443,7 +1443,6 @@ mod tests {
     }
 }
 
-/// The Group event relay for loot notices, through the shared Fake.
 #[cfg(test)]
 mod relay_tests {
     use super::*;

@@ -17,19 +17,14 @@ impl From<ItemRefusal> for ItemActionResult {
     }
 }
 
-/// What a bag position holds, as `CMSG_READ_ITEM` needs to know it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadableItem {
-    /// The position holds no item.
     Missing,
-    /// The item has no page text to read.
     NoPages,
-    /// The item opens page text. The realm has no page text catalog.
     Pages { item_guid: u64 },
 }
 
 pub(crate) trait ItemActionStore: Send + Sync {
-    /// The template name for `CMSG_ITEM_NAME_QUERY`, from the catalog `CMSG_ITEM_QUERY_SINGLE` reads.
     fn item_name(&self, entry: u32) -> Result<Option<String>>;
     fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem>;
     fn destroy_item(&self, actor: Actor, slot: u8, count: u32) -> Result<ItemActionResult>;
@@ -164,7 +159,7 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                     None => act(player, "use_item", |actor| store.use_item(actor, slot)),
                 }
             }
-            // An entry the catalog lacks gets no reply, as in vmangos.
+            // An unknown entry gets no reply, as in vmangos.
             ClientOpcodeMessage::CMSG_ITEM_NAME_QUERY(c) => Ok(ProtocolReply::from(
                 store
                     .item_name(c.item)?
@@ -176,8 +171,7 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                     .into_iter()
                     .collect::<Vec<_>>(),
             )),
-            // vmangos `HandleReadItemOpcode`: an item without page text is not found. Page text
-            // has no catalog here, so a readable item gets the failure reply, never the OK.
+            // No page text catalog: a readable item gets the failure reply, never the OK.
             ClientOpcodeMessage::CMSG_READ_ITEM(c) => {
                 let (Some(slot), Some(owner)) = (
                     codec::inventory_slot(c.bag_index, c.slot),

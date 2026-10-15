@@ -1,6 +1,3 @@
-//! A player death that damages worn gear queues the one-recipient notice the Gateway relays as
-//! `SMSG_DURABILITY_DAMAGE_DEATH`. A death with nothing to damage queues none.
-
 mod support;
 
 use support::Standalone;
@@ -16,8 +13,7 @@ fn fixture(name: &str) -> Standalone {
     shard.assert_call("debug_seed_scenario_fixtures", &[]);
     shard.assert_call("debug_spawn_player_entity", &["1"]);
     shard.assert_sql("DELETE FROM game_item_instance");
-    // The event reaper deletes group events older than a second, which would make the
-    // no-notice test pass vacuously.
+    // The reaper would delete the events under test.
     shard.assert_sql("DELETE FROM game_event_reaper_schedule");
     shard
 }

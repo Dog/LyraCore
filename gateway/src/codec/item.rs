@@ -334,8 +334,6 @@ pub fn build_buy_failed(vendor_guid: u64, item_entry: u32, err: &str) -> SMSG_BU
     }
 }
 
-/// Build `SMSG_SELL_ITEM`, the vendor's refusal of a sale (vmangos `SendSellError`: vendor guid,
-/// item guid, result byte). The client prints the matching sale error and keeps the item.
 pub fn build_sell_item_refusal(
     vendor_guid: u64,
     item_guid: u64,
@@ -348,9 +346,6 @@ pub fn build_sell_item_refusal(
     }
 }
 
-/// Map the Module's sale Refusal text to the closest vanilla sale error. Vendor and range
-/// Gates come first, a missing item next, and every other Gate means the vendor will not
-/// take the item.
 pub fn sell_refusal_result(err: &str) -> SellItemResult {
     if err.contains("vendor") || err.contains("dead players") {
         SellItemResult::CantFindVendor
@@ -361,7 +356,6 @@ pub fn sell_refusal_result(err: &str) -> SellItemResult {
     }
 }
 
-/// Build `SMSG_ITEM_NAME_QUERY_RESPONSE` (vanilla: item entry, name; cmangos `HandleItemNameQueryOpcode`).
 pub fn build_item_name_query_response(
     item: u32,
     item_name: String,
@@ -369,12 +363,9 @@ pub fn build_item_name_query_response(
     SMSG_ITEM_NAME_QUERY_RESPONSE { item, item_name }
 }
 
-/// `SMSG_READ_ITEM_FAILED` opcode (vanilla 5875).
 pub const SMSG_READ_ITEM_FAILED_OPCODE: u16 = 0x00AF;
 
-/// Build a raw `SMSG_READ_ITEM_FAILED`. gtker's typed message stops at the item guid, but the 5875
-/// client reads a reason byte after it (benilla-re objectlayer/inventory, Reading items): 0 and 1
-/// open the text, any other value closes it. Reason 2 refuses the read.
+/// 5875 body: item guid, then a reason byte; gtker omits the byte. Reasons above 1 close the text.
 pub fn build_read_item_failed_raw(item_guid: u64) -> (u16, Vec<u8>) {
     let mut body = item_guid.to_le_bytes().to_vec();
     body.push(2);

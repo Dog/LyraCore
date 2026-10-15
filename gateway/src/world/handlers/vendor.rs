@@ -308,7 +308,6 @@ pub(super) mod tests {
         pub(crate) ring: Mutex<Vec<(u32, u32, u32, u32)>>,
         pub(crate) random_properties: Vec<(u32, [u32; 3])>,
         pub(crate) item_slots: Vec<(u64, u8)>,
-        /// Guids in `item_slots` that another Character holds.
         pub(crate) foreign_items: Vec<u64>,
         pub(crate) repair_error: Option<Failure>,
         pub(crate) sell_error: Option<Failure>,
@@ -743,7 +742,6 @@ pub(super) mod tests {
         assert_renders_ring(&outcome.outbound, &ring);
     }
 
-    /// The one SMSG_SELL_ITEM a refused sale must answer, as (vendor, item, result byte).
     fn sell_refusal(outcome: ProtocolReply) -> (u64, u64, u8) {
         let [Outbound::One(ServerOpcodeMessage::SMSG_SELL_ITEM(reply))] =
             outcome.outbound.as_slice()
