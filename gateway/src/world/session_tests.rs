@@ -1408,23 +1408,16 @@ fn a_world_port_whose_transfer_cannot_be_driven_aborts_the_clients_loading_scree
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    let aborted = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).expect(
-        "the client must receive SMSG_TRANSFER_ABORTED — silence here is the loading-screen hang this fixes",
+    assert_eq!(
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0040, vec![0x02]),
+        "SMSG_TRANSFER_ABORTED must contain only the NotFound reason"
     );
-    match aborted {
-        ServerOpcodeMessage::SMSG_TRANSFER_ABORTED(m) => {
-            assert_eq!(
-                m.map,
-                Map::Deadmines,
-                "the abort must name the map the client is loading"
-            );
-        }
-        other => panic!("expected SMSG_TRANSFER_ABORTED, got {other}"),
-    }
     drop(client);
-    let err = server.join().unwrap().expect_err(
-        "a half-driven transfer must still end the session rather than enter the world",
-    );
+    let err = server
+        .join()
+        .unwrap()
+        .expect_err("a failed Transfer must end the World Session");
     assert!(
         format!("{err:#}").contains("instances shard unreachable"),
         "{err:#}"
@@ -1432,7 +1425,7 @@ fn a_world_port_whose_transfer_cannot_be_driven_aborts_the_clients_loading_scree
     assert!(
         view.viewer_of_owner(crate::stdb::world_view::OwnerGuid(1))
             .is_none(),
-        "a failed transfer terminates the session and must not restore its source viewer"
+        "a failed Transfer ends the World Session and must not restore its source viewer"
     );
     assert!(
         store
@@ -1483,27 +1476,17 @@ fn a_world_port_whose_world_entry_fails_also_aborts_the_clients_loading_screen()
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
 
-    let mut aborted = None;
-    while let Ok(msg) = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec) {
-        if let ServerOpcodeMessage::SMSG_TRANSFER_ABORTED(m) = msg {
-            aborted = Some(m);
-            break;
-        }
-    }
-    let m = aborted.expect(
-        "a world-port whose ENTRY fails must still abort the client's loading screen — silence \
-         here is the infinite loading bar this abort exists to kill",
-    );
+    // World entry fails before it queues any arrival messages.
     assert_eq!(
-        m.map,
-        Map::Deadmines,
-        "the abort must name the map the client is loading"
+        read_raw_frame(&mut client, &mut c_dec),
+        (0x0040, vec![0x02]),
+        "SMSG_TRANSFER_ABORTED must contain only the NotFound reason"
     );
     drop(client);
     let err = server
         .join()
         .unwrap()
-        .expect_err("a half-entered world-port must still end the session");
+        .expect_err("a failed world-port must end the World Session");
     assert!(format!("{err:#}").contains("stranded"), "{err:#}");
 }
 

@@ -68,45 +68,21 @@ pub(super) fn world_port_ack(
         ported = enter_world(tx, &*home, conn, character, codec::WorldEntry::WorldPort);
     }
     if let Err(error) = ported {
-        abort_pending_transfer(tx, store, character_guid, &error);
+        abort_pending_transfer(tx, character_guid, &error);
         return Err(error);
     }
     Ok(())
 }
 
-fn abort_pending_transfer<St: TransferStore + ?Sized>(
-    tx: &SessionTx,
-    store: &St,
-    character_guid: u64,
-    cause: &anyhow::Error,
-) {
-    let dest_map = store
-        .character_destination(character_guid)
-        .map(|p| p.dest_map_id);
+fn abort_pending_transfer(tx: &SessionTx, character_guid: u64, cause: &anyhow::Error) {
     log::error!(
         "world: world-port for guid {character_guid} cannot complete ({cause:#}); aborting the \
-         client's transfer to map {dest_map:?}. The character is unharmed: the escrow is idempotent \
+         client's Transfer. The Character is unharmed: the Escrow is idempotent \
          and the next login re-drives it."
     );
-    let Some(map_id) = dest_map else {
-        log::warn!(
-            "world: no durable destination for guid {character_guid}; the client gets no \
-             SMSG_TRANSFER_ABORTED and will need to reconnect"
-        );
-        return;
-    };
     use wow_world_messages::vanilla::TransferAbortReason;
-    match codec::build_transfer_aborted(map_id, TransferAbortReason::NotFound) {
-        Ok(msg) => {
-            let _ = send(
-                tx,
-                Outbound::One(ServerOpcodeMessage::SMSG_TRANSFER_ABORTED(msg)),
-            );
-        }
-        Err(e) => {
-            log::warn!("world: could not build SMSG_TRANSFER_ABORTED for map {map_id}: {e:#}")
-        }
-    }
+    let (opcode, body) = codec::build_transfer_aborted(TransferAbortReason::NotFound);
+    let _ = send(tx, Outbound::Raw { opcode, body });
 }
 
 // Queue self CREATE before registration so initial AOI Relays follow it.

@@ -202,6 +202,11 @@ runs them in CI. They cover:
 
 ## Additional protocol corrections
 
+`SMSG_TRANSFER_ABORTED` carries one reason byte in build 5875. The Gateway sends it
+even when the failed Transfer has no usable destination map. A Benilla scenario checks
+the failure path for known, unknown and missing destinations, including full body
+consumption. The retail client's loading-screen recovery still needs Verification.
+
 The Gateway owns these build-5875 layouts where the protocol library differs:
 
 | Request | Benilla layout |
