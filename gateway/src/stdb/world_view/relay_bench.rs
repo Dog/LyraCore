@@ -230,6 +230,9 @@ impl SyntheticRealm {
             grid_y: gy,
             failure_reason: 0,
             kind: 2,
+            miss_info: 0,
+            energized: 0,
+            power_type: 0,
         }
     }
 

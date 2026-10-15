@@ -878,13 +878,13 @@ parity_test!(parity_game_combat_event, "game_combat_event", lyracore_module::Com
 });
 parity_test!(parity_game_melee_attack, "game_melee_attack", lyracore_module::MeleeAttack, bindings::melee_attack_type::MeleeAttack, {
     attacker_guid, target_guid, last_swing_ms, ranged_spell_id, last_offhand_swing_ms, rout_ends_ms,
-    pursuit_ends_ms, leash_x, leash_y,
+    pursuit_ends_ms, leash_x, leash_y, swing_error,
 });
 parity_test!(parity_game_spell_cast_event, "game_spell_cast_event", lyracore_module::SpellCastEvent, bindings::spell_cast_event_type::SpellCastEvent, {
     id, caster_guid, spell_id, created_at, target_guid, cast_time_ms, is_completion, damage,
     school, is_crit, resisted, absorbed, is_interrupted, cooldown_ms, delay_ms, healed,
     is_proc_log, swing_hit_info, client_initiated, map_id, instance_id, grid_x, grid_y,
-    failure_reason, kind,
+    failure_reason, kind, miss_info, energized, power_type,
 });
 parity_test!(parity_game_spell_impact_event, "game_spell_impact_event", lyracore_module::SpellImpactEvent, bindings::spell_impact_event_type::SpellImpactEvent, {
     id, caster_guid, target_guid, spell_id, created_at, damage, school, is_crit, resisted,

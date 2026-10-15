@@ -1,4 +1,5 @@
 use super::*;
+use wow_world_messages::vanilla::{AiReaction, SMSG_AI_REACTION, SMSG_SPELL_FAILED_OTHER};
 
 /// The client manages the GCD from Spell.dbc; send this only for spell cooldowns.
 pub fn build_spell_cooldown(
@@ -136,8 +137,20 @@ pub fn cast_failure_reason_for(es: &str) -> u8 {
     const TARGETS_DEAD: u8 = 0x65;
     const BAD_TARGETS: u8 = 0x0A;
     const DONT_REPORT: u8 = 0x17;
+    const AFFECTING_COMBAT: u8 = 0x00;
+    const CASTER_DEAD: u8 = 0x13;
+    const ONLY_ABOVEWATER: u8 = 0x50;
+    const ONLY_OUTDOORS: u8 = 0x55;
     if es.contains("not enough power") {
         NO_POWER
+    } else if es.contains("cannot mount while dead") {
+        CASTER_DEAD
+    } else if es.contains("cannot mount while in combat") {
+        AFFECTING_COMBAT
+    } else if es.contains("cannot mount indoors") {
+        ONLY_OUTDOORS
+    } else if es.contains("cannot mount in deep water") {
+        ONLY_ABOVEWATER
     } else if es.contains("cooldown") {
         NOT_READY
     } else if es.contains("out of range") || es.contains("another map") {
@@ -295,6 +308,115 @@ pub fn build_spell_go_outcome(
     }
 }
 
+pub const SMSG_PERIODICAURALOG_OPCODE: u16 = 0x024E;
+pub const SMSG_SPELLENERGIZELOG_OPCODE: u16 = 0x0151;
+pub const SMSG_SPELLLOGMISS_OPCODE: u16 = 0x024B;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeriodicTick {
+    Damage {
+        damage: u32,
+        school: u8,
+        absorbed: u32,
+        resisted: u32,
+    },
+    Heal {
+        amount: u32,
+    },
+    Energize {
+        power_type: u8,
+        amount: u32,
+    },
+}
+
+/// Packed target, packed caster, spell, count 1, aura type, then u32 fields. Raw: gtker writes the
+/// damage school as a u8; the client reads a u32.
+pub fn build_periodic_aura_log(
+    target_guid: u64,
+    caster_guid: u64,
+    spell_id: u32,
+    tick: PeriodicTick,
+) -> Vec<u8> {
+    const SPELL_AURA_PERIODIC_DAMAGE: u32 = 3;
+    const SPELL_AURA_PERIODIC_HEAL: u32 = 8;
+    const SPELL_AURA_PERIODIC_ENERGIZE: u32 = 24;
+    let mut body = Vec::with_capacity(40);
+    write_packed_guid_u64(&mut body, target_guid);
+    write_packed_guid_u64(&mut body, caster_guid);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    let fields: Vec<u32> = match tick {
+        PeriodicTick::Damage {
+            damage,
+            school,
+            absorbed,
+            resisted,
+        } => vec![
+            SPELL_AURA_PERIODIC_DAMAGE,
+            damage,
+            u32::from(school),
+            absorbed,
+            resisted,
+        ],
+        PeriodicTick::Heal { amount } => vec![SPELL_AURA_PERIODIC_HEAL, amount],
+        PeriodicTick::Energize { power_type, amount } => {
+            vec![SPELL_AURA_PERIODIC_ENERGIZE, u32::from(power_type), amount]
+        }
+    };
+    for field in fields {
+        body.extend_from_slice(&field.to_le_bytes());
+    }
+    body
+}
+
+/// Packed target, packed caster, spell, power type as u32, amount.
+pub fn build_spell_energize_log(
+    target_guid: u64,
+    caster_guid: u64,
+    spell_id: u32,
+    power_type: u8,
+    amount: u32,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(30);
+    write_packed_guid_u64(&mut body, target_guid);
+    write_packed_guid_u64(&mut body, caster_guid);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.extend_from_slice(&u32::from(power_type).to_le_bytes());
+    body.extend_from_slice(&amount.to_le_bytes());
+    body
+}
+
+/// Spell, full caster guid, extended-info flag 0, count 1, full target guid, `SpellMissInfo` byte.
+pub fn build_spell_log_miss(
+    caster_guid: u64,
+    spell_id: u32,
+    target_guid: u64,
+    miss_info: u8,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(26);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.extend_from_slice(&caster_guid.to_le_bytes());
+    body.push(0);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&target_guid.to_le_bytes());
+    body.push(miss_info);
+    body
+}
+
+pub fn build_spell_failed_other(caster_guid: u64, spell_id: u32) -> SMSG_SPELL_FAILED_OTHER {
+    SMSG_SPELL_FAILED_OTHER {
+        caster: Guid::new(caster_guid),
+        id: spell_id,
+    }
+}
+
+pub fn build_ai_reaction_hostile(creature_guid: u64) -> SMSG_AI_REACTION {
+    SMSG_AI_REACTION {
+        guid: Guid::new(creature_guid),
+        reaction: AiReaction::Hostile,
+    }
+}
+
 pub fn build_attack_start(attacker_guid: u64, victim_guid: u64) -> SMSG_ATTACKSTART {
     SMSG_ATTACKSTART {
         attacker: Guid::new(attacker_guid),
@@ -432,6 +554,19 @@ mod tests {
             cast_failure_reason_for("ground point is not in line of sight"),
             0x2A
         );
+    }
+
+    #[test]
+    fn mount_refusals_map_to_the_vanilla_cast_failures() {
+        // module/src/mount.rs `check_mount_cast` wording; gtker vanilla CastFailureReason values.
+        for (refusal, reason) in [
+            ("you cannot mount while dead", 0x13),
+            ("you cannot mount while in combat", 0x00),
+            ("you cannot mount indoors", 0x55),
+            ("you cannot mount in deep water", 0x50),
+        ] {
+            assert_eq!(cast_failure_reason_for(refusal), reason, "{refusal}");
+        }
     }
 
     #[test]

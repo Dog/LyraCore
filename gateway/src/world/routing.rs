@@ -55,6 +55,8 @@ protocol_families! {
         CMSG_PET_ACTION,
         CMSG_FORCE_RUN_SPEED_CHANGE_ACK,
         CMSG_SETSHEATHED,
+        CMSG_CANCEL_GROWTH_AURA,
+        CMSG_REQUEST_PET_INFO,
     ],
     Auction => [
         MSG_AUCTION_HELLO_Client,

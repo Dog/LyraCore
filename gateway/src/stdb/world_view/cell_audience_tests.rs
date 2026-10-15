@@ -209,6 +209,7 @@ fn melee(attacker: u64, target: u64) -> MeleeAttack {
         pursuit_ends_ms: 0,
         leash_x: 0.0,
         leash_y: 0.0,
+        swing_error: 0,
     }
 }
 
@@ -240,6 +241,9 @@ fn cast(realm: &Realm, caster: u64, target: u64) -> SpellCastEvent {
         grid_y,
         failure_reason: 0,
         kind: 2,
+        miss_info: 0,
+        energized: 0,
+        power_type: 0,
     }
 }
 
@@ -376,7 +380,7 @@ fn melee_candidates_gate_to_exactly_the_whole_shard_recipients() {
         let gate = |v: &Viewer| created_contains(v, attacker);
 
         let candidates = sessions(melee_audience(&realm.view, 0, &row));
-        melee_engaged(&realm.view, 0, &row);
+        melee_engaged(&realm.view, 0, &row, true);
         assert_eq!(realm.jobs_landed(), candidates);
         melee_disengaged(&realm.view, 0, &row);
         assert_eq!(realm.jobs_landed(), candidates);
@@ -881,7 +885,7 @@ fn jobs_selected_before_worldport_cannot_reach_the_replacement_world_session() {
     );
     let selected = view.viewer_of_owner(OwnerGuid(PLAYER_BASE)).unwrap();
     let row = melee(PLAYER_BASE, CREATURE_BASE);
-    melee_engaged(&view, 0, &row);
+    melee_engaged(&view, 0, &row, true);
     drop(old_registration);
 
     tx.send(Outbound::Raw {
@@ -897,9 +901,13 @@ fn jobs_selected_before_worldport_cannot_reach_the_replacement_world_session() {
     );
     let delayed_row = row.clone();
     enqueue(selected, move |viewer| {
-        crate::codec::combat::subscriptions::melee_engage_outbound(&viewer.created, &delayed_row)
+        crate::codec::combat::subscriptions::melee_engage_outbound(
+            &viewer.created,
+            &delayed_row,
+            true,
+        )
     });
-    melee_engaged(&view, 0, &row);
+    melee_engaged(&view, 0, &row, true);
 
     let Outbound::Job(before_entry) = rx.try_recv().unwrap() else {
         panic!("old Relay job");

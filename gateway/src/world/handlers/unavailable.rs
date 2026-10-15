@@ -86,6 +86,18 @@ pub(crate) fn unavailable_outbound(
         ClientOpcodeMessage::CMSG_PET_CANCEL_AURA(_) => unavailable("Pet aura cancellations"),
         ClientOpcodeMessage::CMSG_PET_UNLEARN(_) => unavailable("Pet talent resets"),
         ClientOpcodeMessage::CMSG_PET_SPELL_AUTOCAST(_) => unavailable("Pet autocast changes"),
+        // SMSG_PET_CAST_FAILED: status 2 (failed), reason 0x17 (not reported).
+        ClientOpcodeMessage::CMSG_PET_CAST_SPELL(request) => {
+            let mut body = request.id.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0x02, 0x17]);
+            return Some(vec![
+                Outbound::Raw {
+                    opcode: 0x0138,
+                    body,
+                },
+                unavailable("Pet spell casts"),
+            ]);
+        }
         ClientOpcodeMessage::CMSG_UNLEARN_SKILL(_) => unavailable("Skill unlearning requests"),
         ClientOpcodeMessage::CMSG_SET_AMMO(_) => unavailable("Ammunition selections"),
         ClientOpcodeMessage::CMSG_MOUNTSPECIAL_ANIM => unavailable("Mount flourishes"),

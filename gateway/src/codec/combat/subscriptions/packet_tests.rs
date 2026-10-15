@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
+const BYSTANDER: u64 = 99;
+
 fn swing_event() -> CombatEvent {
     CombatEvent {
         id: 1,
@@ -38,13 +40,13 @@ fn ranged_launch_relays_one_spell_go_for_a_hit_or_miss() {
             impact_delay_ms: 500,
             ..swing_event()
         };
-        let out = combat_event_outbound(&created, &row);
+        let out = combat_event_outbound(&created, BYSTANDER, &row);
         let [Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(go))] = out.as_slice() else {
             panic!("a ranged launch must emit exactly one SPELL_GO");
         };
         assert_eq!((go.caster.guid(), go.spell), (7, 75));
         assert_eq!((go.hits.len(), go.misses.len()), (hits, misses));
-        assert!(combat_event_outbound(&Mutex::new(HashSet::new()), &row).is_empty());
+        assert!(combat_event_outbound(&Mutex::new(HashSet::new()), BYSTANDER, &row).is_empty());
     }
 }
 
@@ -76,6 +78,9 @@ fn ranged_impact_relays_only_its_authoritative_damage() {
         grid_y: 0,
         failure_reason: 0,
         kind: 5,
+        miss_info: 0,
+        energized: 0,
+        power_type: 0,
     };
     let out = cast_event_outbound(7, &row);
     let [Outbound::One(ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(log))] = out.as_slice()
@@ -97,7 +102,7 @@ fn ranged_impact_relays_only_its_authoritative_damage() {
 fn melee_swing_relays_damage_then_stops_on_a_killing_blow() {
     let created = Mutex::new(HashSet::from([7]));
     let mut row = swing_event();
-    let out = combat_event_outbound(&created, &row);
+    let out = combat_event_outbound(&created, BYSTANDER, &row);
     assert!(matches!(
         out.as_slice(),
         [Outbound::One(
@@ -106,7 +111,7 @@ fn melee_swing_relays_damage_then_stops_on_a_killing_blow() {
     ));
 
     row.killing_blow = true;
-    let out = combat_event_outbound(&created, &row);
+    let out = combat_event_outbound(&created, BYSTANDER, &row);
     assert!(matches!(
         out.as_slice(),
         [
@@ -147,6 +152,9 @@ fn spell_cast_event(kind: u8) -> SpellCastEvent {
         grid_y: 0,
         failure_reason: 0,
         kind,
+        miss_info: 0,
+        energized: 0,
+        power_type: 0,
     }
 }
 
@@ -314,12 +322,22 @@ fn a_deferred_power_failure_relays_the_teardown_then_the_failed_cast_result() {
 }
 
 #[test]
-fn a_bystander_sees_neither_half_of_a_deferred_power_failure() {
+fn a_bystander_sees_only_the_observer_teardown_of_a_deferred_power_failure() {
     let out = cast_event_outbound(
         HEROIC_STRIKE_CASTER + 1,
         &interrupted_cast(78, NO_POWER_CODE),
     );
-    assert!(out.is_empty(), "both messages are caster-private");
+    let [Outbound::One(message @ ServerOpcodeMessage::SMSG_SPELL_FAILED_OTHER(_))] = out.as_slice()
+    else {
+        panic!("expected the observer teardown alone");
+    };
+    let mut bytes = Vec::new();
+    message.write_unencrypted_server(&mut bytes).unwrap();
+    // Size 14 (opcode + 12-byte body), opcode 0x02A6, full caster guid, spell 78.
+    let mut want = vec![0x00, 0x0E, 0xA6, 0x02];
+    want.extend_from_slice(&HEROIC_STRIKE_CASTER.to_le_bytes());
+    want.extend_from_slice(&78u32.to_le_bytes());
+    assert_eq!(bytes, want);
 }
 
 #[test]
