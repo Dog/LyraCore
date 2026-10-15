@@ -73,6 +73,7 @@ pub(crate) fn group_event_outbound<
             ),
         ))),
         group_kind::DESTROYED => Some(ServerOpcodeMessage::SMSG_GROUP_DESTROYED),
+        group_kind::UNINVITED => Some(ServerOpcodeMessage::SMSG_GROUP_UNINVITE),
         group_kind::SET_LEADER => other_character_name(store, row, "SET_LEADER").map(|name| {
             ServerOpcodeMessage::SMSG_GROUP_SET_LEADER(Box::new(codec::build_group_set_leader(
                 name,

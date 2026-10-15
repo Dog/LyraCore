@@ -147,6 +147,8 @@ pub mod event_kind {
     pub const TARGET_ICON_LIST: u8 = 24;
     pub const MINIMAP_PING: u8 = 25;
     pub const RANDOM_ROLL: u8 = 26;
+    /// Empty `SMSG_GROUP_UNINVITE` to a member kicked from a surviving Group, before [`DESTROYED`].
+    pub const UNINVITED: u8 = 31;
 }
 
 pub mod realm_op {

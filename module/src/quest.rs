@@ -519,7 +519,7 @@ pub(crate) fn accept_gates(
     player: &crate::WorldEntity,
     tmpl: &QuestTemplate,
 ) -> Result<Option<CharacterQuest>, String> {
-    use lyracore_shared::quest::{acceptance, AcceptanceRefusal, AcceptanceRequirements, Attempt};
+    use lyracore_shared::quest::{acceptance, AcceptanceRequirements, Attempt};
     let existing = character_quest_row(ctx, player.guid, tmpl.entry);
     acceptance(
         AcceptanceRequirements {
@@ -537,13 +537,7 @@ pub(crate) fn accept_gates(
             failed: row.failed,
         }),
     )
-    .map_err(|refusal| match refusal {
-        AcceptanceRefusal::Level => format!("requires level {}", tmpl.min_level),
-        AcceptanceRefusal::Race => "quest not available to your race".to_string(),
-        AcceptanceRefusal::Class => "quest not available to your class".to_string(),
-        AcceptanceRefusal::Prerequisite => "must complete the prerequisite quest first".to_string(),
-        AcceptanceRefusal::AlreadyTaken => "already on or completed that quest".to_string(),
-    })?;
+    .map_err(|refusal| refusal.text(tmpl.min_level))?;
     Ok(existing)
 }
 
@@ -583,6 +577,13 @@ pub(crate) fn request_accept_quest(
         .find(quest_entry)
         .ok_or_else(|| format!("no such quest {quest_entry}"))?;
     let existing = accept_gates(ctx, &player, &tmpl)?;
+    if existing.as_ref().is_none_or(|row| row.rewarded)
+        && quest_slots_used(ctx, player_guid) >= MAX_QUEST_LOG_SIZE
+    {
+        return Err(lyracore_shared::quest::QUEST_LOG_FULL_TEXT
+            .to_string()
+            .into());
+    }
     let deadline_micros = if tmpl.limit_time > 0 {
         ctx.timestamp.to_micros_since_unix_epoch() + (tmpl.limit_time as i64) * 1_000_000
     } else {
@@ -2693,7 +2694,7 @@ fn evaluate_share(
     let existing = character_quest_row(ctx, member_guid, tmpl.entry);
     let member_active = existing.as_ref().is_some_and(|q| !q.rewarded && !q.failed);
     let member_finished = existing.as_ref().is_some_and(|q| q.rewarded) && !tmpl.repeatable;
-    let log_full = active_quest_count(ctx, member_guid) >= MAX_QUEST_LOG_SIZE;
+    let log_full = quest_slots_used(ctx, member_guid) >= MAX_QUEST_LOG_SIZE;
     let gates_ok = member_entity
         .as_ref()
         .is_some_and(|e| accept_gates(ctx, e, tmpl).is_ok());
@@ -2708,12 +2709,13 @@ fn evaluate_share(
     )
 }
 
-fn active_quest_count(ctx: &ReducerContext, character_guid: u64) -> usize {
+/// Every un-rewarded row, failed ones included, because the client log shows them.
+fn quest_slots_used(ctx: &ReducerContext, character_guid: u64) -> usize {
     ctx.db
         .game_character_quest()
         .by_character()
         .filter(&character_guid)
-        .filter(|q| !q.rewarded && !q.failed)
+        .filter(|q| !q.rewarded)
         .count()
 }
 

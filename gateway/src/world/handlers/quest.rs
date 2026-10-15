@@ -48,6 +48,44 @@ fn ignore_refusal(result: Result<()>, operation: &str, account_id: u64) -> Resul
     }
 }
 
+/// vmangos closes the gossip after every accept refusal, so the quest message is followed by it.
+fn accept_refusal_outbound(quest_id: u32, reason: &str) -> Vec<Outbound> {
+    let mut outbound = accept_refusal_message(quest_id, reason);
+    outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
+    outbound
+}
+
+fn accept_refusal_message(quest_id: u32, reason: &str) -> Vec<Outbound> {
+    use lyracore_shared::quest::{AcceptanceRefusal, QUEST_LOG_FULL_TEXT};
+    use wow_world_messages::vanilla::QuestFailedReason as Reason;
+    if reason == QUEST_LOG_FULL_TEXT {
+        return vec![Outbound::One(ServerOpcodeMessage::SMSG_QUESTLOG_FULL)];
+    }
+    if let Some(refusal) = AcceptanceRefusal::parse(reason) {
+        let reason = match refusal {
+            AcceptanceRefusal::Level => Reason::QuestFailedLowLevel,
+            AcceptanceRefusal::Race => Reason::QuestFailedWrongRace,
+            AcceptanceRefusal::AlreadyTaken => Reason::QuestAlreadyOn,
+            AcceptanceRefusal::Class | AcceptanceRefusal::Prerequisite => Reason::DontHaveReq,
+        };
+        return vec![Outbound::One(
+            ServerOpcodeMessage::SMSG_QUESTGIVER_QUEST_INVALID(
+                codec::build_questgiver_quest_invalid(reason),
+            ),
+        )];
+    }
+    if lyracore_shared::item::ItemRefusal::parse_tag(reason)
+        == Some(lyracore_shared::item::ItemRefusal::InventoryFull)
+    {
+        return vec![Outbound::One(
+            ServerOpcodeMessage::SMSG_QUESTGIVER_QUEST_FAILED(
+                codec::build_questgiver_quest_failed(quest_id, Reason::QuestFailedInventoryFull),
+            ),
+        )];
+    }
+    Vec::new()
+}
+
 pub(crate) fn quest_giver_menu<St: QuestActionStore + ?Sized>(
     store: &St,
     giver: u64,
@@ -210,12 +248,26 @@ impl<St: QuestActionStore + ?Sized> ProtocolFamily<St> for Quest {
                 Ok(ProtocolReply::from(outbound))
             }
             ClientOpcodeMessage::CMSG_QUESTGIVER_ACCEPT_QUEST(a) => {
-                ignore_refusal(
-                    store.accept_quest(actor, a.guid.guid(), a.quest_id),
-                    "accept_quest",
-                    session.account_id,
-                )?;
-                Ok(ProtocolReply::from(Vec::new()))
+                match store.accept_quest(actor, a.guid.guid(), a.quest_id) {
+                    Ok(()) => Ok(ProtocolReply::default()),
+                    Err(e) => match classify(&e) {
+                        DurableFailure::Refusal { reason } => {
+                            log::debug!(
+                                "world: accept_quest refused (account {}): {e}",
+                                session.account_id
+                            );
+                            Ok(ProtocolReply::from(accept_refusal_outbound(
+                                a.quest_id, reason,
+                            )))
+                        }
+                        DurableFailure::TransportLoss => Err(e),
+                    },
+                }
+            }
+            ClientOpcodeMessage::CMSG_QUESTGIVER_CANCEL => {
+                Ok(ProtocolReply::from(vec![Outbound::One(
+                    ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE,
+                )]))
             }
             ClientOpcodeMessage::CMSG_QUESTGIVER_COMPLETE_QUEST(c) => {
                 quest_reward_screen(store, c.guid.guid(), self_guid, c.quest_id)
@@ -771,16 +823,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_refused_accept_answers_nothing_and_does_not_end_the_session() {
+    fn refused_accept(reason: &str) -> Vec<Outbound> {
         let actions = InMemoryQuestActions {
-            accept_error: Some("quest requires level 10".into()),
+            accept_error: Some(reason.into()),
             ..loaded_quest()
         };
+        outbound(run_quest(&actions, session(), accept(GIVER, QUEST)).unwrap())
+    }
 
-        let batch = outbound(run_quest(&actions, session(), accept(GIVER, QUEST)).unwrap());
+    #[test]
+    fn a_refused_accept_names_the_unmet_requirement_to_the_client() {
+        use wow_world_messages::vanilla::QuestFailedReason as Reason;
+        for (text, expected) in [
+            ("requires level 10", Reason::QuestFailedLowLevel),
+            (
+                "quest not available to your race",
+                Reason::QuestFailedWrongRace,
+            ),
+            ("quest not available to your class", Reason::DontHaveReq),
+            (
+                "must complete the prerequisite quest first",
+                Reason::DontHaveReq,
+            ),
+            ("already on or completed that quest", Reason::QuestAlreadyOn),
+        ] {
+            match refused_accept(text).as_slice() {
+                [Outbound::One(ServerOpcodeMessage::SMSG_QUESTGIVER_QUEST_INVALID(m)), Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)] =>
+                {
+                    assert_eq!(m.msg, expected, "{text}")
+                }
+                other => panic!("{text}: unexpected {} replies", other.len()),
+            }
+        }
+    }
 
-        assert!(batch.is_empty());
+    #[test]
+    fn a_refused_accept_with_a_full_log_answers_quest_log_full() {
+        assert!(matches!(
+            refused_accept(lyracore_shared::quest::QUEST_LOG_FULL_TEXT).as_slice(),
+            [
+                Outbound::One(ServerOpcodeMessage::SMSG_QUESTLOG_FULL),
+                Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_refused_accept_with_full_bags_answers_quest_failed_with_inventory_full() {
+        match refused_accept("item:inventory_full").as_slice() {
+            [Outbound::One(ServerOpcodeMessage::SMSG_QUESTGIVER_QUEST_FAILED(m)), Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)] =>
+            {
+                assert_eq!(m.quest_id, QUEST);
+                assert_eq!(
+                    m.reason,
+                    wow_world_messages::vanilla::QuestFailedReason::QuestFailedInventoryFull
+                );
+            }
+            _ => panic!("expected SMSG_QUESTGIVER_QUEST_FAILED"),
+        }
+    }
+
+    #[test]
+    fn a_refused_accept_for_a_giver_gate_only_closes_the_gossip() {
+        assert!(matches!(
+            refused_accept("quest giver is out of range").as_slice(),
+            [Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)]
+        ));
+    }
+
+    #[test]
+    fn cancelling_the_quest_window_closes_the_gossip() {
+        let batch = outbound(
+            run_quest(
+                &loaded_quest(),
+                session(),
+                ClientOpcodeMessage::CMSG_QUESTGIVER_CANCEL,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            batch.as_slice(),
+            [Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)]
+        ));
     }
 
     #[test]

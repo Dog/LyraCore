@@ -57,6 +57,19 @@ pub(crate) fn quest_update_feedback(
                 )))
             })
             .collect::<Vec<_>>();
+    let explored = objectives.iter().any(|&(kind, index, _, required)| {
+        let count = |counts: &[u32]| counts.get(index as usize).copied().unwrap_or(0);
+        kind == lyracore_shared::quest::objective_kind::EXPLORE_AREATRIGGER
+            && count(&old.counts) < required
+            && count(&row.counts) >= required
+    });
+    if explored {
+        outbound.push(Outbound::One(
+            ServerOpcodeMessage::SMSG_QUESTUPDATE_COMPLETE(codec::build_questupdate_complete(
+                row.quest_entry,
+            )),
+        ));
+    }
     if !old.failed && row.failed {
         outbound.push(Outbound::One(
             ServerOpcodeMessage::SMSG_QUESTUPDATE_FAILEDTIMER(
@@ -145,7 +158,7 @@ crate::stdb::relays::declare_relays! {
         delete(Snapshot) => |context, _event, row| quest_deleted(&context.view, &context.coord, context.shard, row);
     }
     game_character_quest_event_credit [false] {
-        insert(Snapshot) => |context, _event,  row| quest_credit_changed(&context.view, &context.coord, context.shard, row);
+        insert(Live) => |context, _event,  row| quest_credit_granted(&context.view, &context.coord, context.shard, row);
         update(Snapshot) => |context, _event,  _old, row| quest_credit_changed(&context.view, &context.coord, context.shard, row);
         delete(Snapshot) => |context, _event,  row| quest_credit_changed(&context.view, &context.coord, context.shard, row);
     }
@@ -154,6 +167,36 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event,  _old, _row| quest_requirements_changed(&context.view, &context.coord, context.shard);
         delete(Snapshot) => |context, _event,  _row| quest_requirements_changed(&context.view, &context.coord, context.shard);
     }
+}
+
+/// `Live` insert: a login replay of old credits stays silent.
+fn quest_credit_granted(
+    view: &WorldView,
+    coord: &Coordinator,
+    shard: ShardId,
+    row: &CharacterQuestEventCredit,
+) {
+    let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
+        return;
+    };
+    let (coord, quest_entry) = (coord.clone(), row.quest_entry);
+    enqueue(viewer, move |viewer| {
+        let guard = coord.0.coord();
+        event_credit_packets(
+            quest_entry,
+            quest_log_outbound(&guard.conn.db, viewer.self_guid),
+        )
+    });
+}
+
+pub(crate) fn event_credit_packets(quest_entry: u32, quest_log: Option<Outbound>) -> Vec<Outbound> {
+    let mut outbound = vec![Outbound::One(
+        ServerOpcodeMessage::SMSG_QUESTUPDATE_COMPLETE(codec::build_questupdate_complete(
+            quest_entry,
+        )),
+    )];
+    outbound.extend(quest_log);
+    outbound
 }
 
 fn quest_credit_changed(

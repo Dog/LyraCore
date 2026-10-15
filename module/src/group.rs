@@ -1551,6 +1551,16 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
     let group_id = m.group_id;
     crate::loot::tag::revoke_group_member(ctx, group_id, character_guid);
     ctx.db.game_group_member().id().delete(m.id);
+    let remaining = members_of(ctx, group_id);
+    if departure == Departure::Kicked && remaining.len() >= 2 {
+        push_event(
+            ctx,
+            character_guid,
+            group_event_kind::UNINVITED,
+            0,
+            String::new(),
+        );
+    }
     push_event(
         ctx,
         character_guid,
@@ -1559,7 +1569,6 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
         String::new(),
     );
 
-    let remaining = members_of(ctx, group_id);
     let group = ctx.db.game_group().group_id().find(group_id);
     let rematch = match leader_after_removal(
         group.as_ref().map_or(GroupKind::Party, group_kind_of),

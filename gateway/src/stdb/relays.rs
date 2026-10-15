@@ -242,6 +242,7 @@ mod tests {
             BTreeSet::from([
                 "game_addon_message",
                 "game_auction_notice",
+                "game_character_quest_event_credit",
                 "game_chat_channel_notice_event",
                 "game_duel_event",
                 "game_group_event",
