@@ -68,6 +68,11 @@ pub fn run_speed(base: f32, auras: impl IntoIterator<Item = AuraAmount>) -> f32 
     move_speed_with_pct(base, mounted_move_pct(movement + slow, mount, mounted)) * bonus
 }
 
+/// Stun, root and polymorph hold a unit in place. Fear moves it, so it is absent here.
+pub fn holds_in_place(kind: u8, parameter: i32) -> bool {
+    kind == A_CONTROL && matches!(parameter, M_STUN | M_ROOT | M_POLY)
+}
+
 pub fn moves_run_speed(kind: u8, parameter: i32) -> bool {
     kind == A_MOD_SPEED
         && [SPEED_MOVE, SPEED_MOVE_ALWAYS, SPEED_MOVE_NOT_STACK]
@@ -99,6 +104,15 @@ pub fn mounted_move_pct(movement: i32, mount: i32, mounted: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stun_root_and_polymorph_hold_in_place_but_fear_does_not() {
+        for mechanic in [M_STUN, M_ROOT, M_POLY] {
+            assert!(holds_in_place(A_CONTROL, mechanic));
+        }
+        assert!(!holds_in_place(A_CONTROL, M_FEAR));
+        assert!(!holds_in_place(A_DISARM, M_ROOT));
+    }
 
     #[test]
     fn sheet_changes_include_crit_and_only_valid_stats() {

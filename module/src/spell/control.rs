@@ -263,15 +263,9 @@ pub(crate) fn is_action_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
 /// (stun/poly) *or* ROOTED — the three mechanics that pin a unit. (Fear is NOT here: a feared unit is not
 /// frozen, it is force-fled — see `is_self_movement_suppressed`.) The fear-flee pass uses this to know a
 /// stun/root/poly OUTRANKS fear and keeps the unit put. `false` for any un-CC'd unit (the common path), so
-/// movement is unaffected. [entity]
+/// movement is unaffected. One aura scan, since every moving Character heartbeat pays it. [entity]
 pub(crate) fn is_movement_blocked(ctx: &ReducerContext, unit_guid: u64) -> bool {
-    cc_blocks(
-        is_stunned(ctx, unit_guid),
-        is_rooted(ctx, unit_guid),
-        is_feared(ctx, unit_guid),
-        has_control_mechanic(ctx, unit_guid, M_POLY),
-    )
-    .1
+    auras_on(ctx, unit_guid).any(|a| lyracore_shared::aura::holds_in_place(a.eff_kind, a.eff_p0))
 }
 
 /// Is `unit_guid`'s NORMAL self-directed movement suppressed by crowd control — so the creature MOVEMENT
@@ -297,6 +291,48 @@ pub(crate) fn is_self_movement_suppressed(ctx: &ReducerContext, unit_guid: u64) 
 pub(crate) fn breaks_on_damage(aura_interrupt: u16) -> bool {
     const BREAK_ON_DAMAGE: u16 = 0x1; // game_spell.aura_interrupt bit 0
     aura_interrupt & BREAK_ON_DAMAGE != 0
+}
+
+/// Does a `game_spell.aura_interrupt` mask carry the BREAK_ON_MOVE bit (bit 1)? Shadowmeld carries
+/// it; Rogue Stealth does not, so a Rogue keeps stealth while moving.
+pub(crate) fn breaks_on_move(aura_interrupt: u16) -> bool {
+    const BREAK_ON_MOVE: u16 = 0x2; // game_spell.aura_interrupt bit 1
+    aura_interrupt & BREAK_ON_MOVE != 0
+}
+
+/// Remove `target_guid`'s auras whose spell header passes `breaks`, closing each CC aura's diminishing
+/// returns window. Auras applied in this reducer invocation survive: a cast that both applies an aura
+/// and triggers the interrupt must not remove its own aura. [entity]
+fn break_flagged_auras(ctx: &ReducerContext, target_guid: u64, breaks: fn(u16) -> bool) {
+    let spells = ctx.db.game_spell();
+    let to_break: Vec<_> = auras_on(ctx, target_guid)
+        .filter(|a| {
+            a.applied_at != ctx.timestamp
+                && spells
+                    .spell_id()
+                    .find(a.spell_id)
+                    .is_some_and(|s| breaks(s.aura_interrupt))
+        })
+        .collect();
+    let now_micros = ctx.timestamp.to_micros_since_unix_epoch();
+    for a in &to_break {
+        if let Some(category) = crate::spell::stacking::dr_category_for_effect(
+            ctx,
+            a.eff_kind,
+            a.eff_p0_kind,
+            a.eff_p0,
+            a.target_guid,
+        ) {
+            crate::spell::stacking::dr_window_on_removal(ctx, a.target_guid, category, now_micros);
+        }
+    }
+    shed_auras(ctx, target_guid, to_break);
+}
+
+/// A real translation by `mover_guid` removes its break-on-move auras (Shadowmeld). Turning in place
+/// does not reach here. NO-OP without such an aura. [entity]
+pub(crate) fn break_auras_on_move(ctx: &ReducerContext, mover_guid: u64) {
+    break_flagged_auras(ctx, mover_guid, breaks_on_move);
 }
 
 /// On real damage to `target_guid`, BOTH (a) break its "break on damage" auras — the iconic CC-breaks-when-hit
@@ -331,40 +367,10 @@ pub(crate) fn break_auras_on_damage(
             periodic,
         },
     );
-    let auras = ctx.db.game_aura();
-    let spells = ctx.db.game_spell();
-    let to_break: Vec<_> = auras
-        .by_target()
-        .filter(&target_guid)
-        .filter(|a| {
-            // SAME-TICK GUARD: an aura applied THIS reducer invocation (same frozen `ctx.timestamp`) is
-            // NEVER broken by THIS tick's damage. This makes a self-damaging incapacitate (Gouge: a damage
-            // effect + a break-on-damage A_CONTROL in ONE cast) order-INDEPENDENT — Gouge's own damage can't
-            // delete the incapacitate it just applied, but the NEXT (later, different-timestamp) hit will.
-            // No-op for the melee/DoT paths (they never apply a break-on-damage aura in the same tick they
-            // deal damage), so it's baseline-safe.
-            a.applied_at != ctx.timestamp
-                && spells
-                    .spell_id()
-                    .find(a.spell_id)
-                    .map(|s| breaks_on_damage(s.aura_interrupt))
-                    .unwrap_or(false)
-        })
-        .collect();
-
-    let now_micros = ctx.timestamp.to_micros_since_unix_epoch();
-    for a in &to_break {
-        if let Some(category) = crate::spell::stacking::dr_category_for_effect(
-            ctx,
-            a.eff_kind,
-            a.eff_p0_kind,
-            a.eff_p0,
-            a.target_guid,
-        ) {
-            crate::spell::stacking::dr_window_on_removal(ctx, a.target_guid, category, now_micros);
-        }
-    }
-    shed_auras(ctx, target_guid, to_break);
+    // SAME-TICK GUARD (inside `break_flagged_auras`): Gouge deals damage and applies a
+    // break-on-damage incapacitate in ONE cast, so its own damage must not remove that aura. The
+    // NEXT hit, at a later timestamp, does.
+    break_flagged_auras(ctx, target_guid, breaks_on_damage);
     // Stealth breaks on ANY real damage to the stealthed unit (melee/direct-spell/DoT, since this
     // chokepoint is called from all three) — vanilla's "getting hit reveals you" rule, independent of
     // the BREAK_ON_DAMAGE header bit above (A_STEALTH is never flagged with it). The attacker-side

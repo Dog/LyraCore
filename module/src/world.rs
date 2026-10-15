@@ -1358,6 +1358,18 @@ pub(crate) struct MovementPlan {
     pub moved: bool,
 }
 
+/// Forward, backward and strafe: the movement a root forbids.
+const STEERING_FLAGS: u32 = 0xF;
+/// Steering plus jumping and falling far: "any movement" for a break-on-move aura.
+const MOVING_FLAGS: u32 = STEERING_FLAGS | 0x2000 | 0x4000;
+
+/// Does this MovementInfo carry any of `mask`? Its leading u32 is the movement flags.
+pub(crate) fn carries_movement_flags(movement_info: &[u8], mask: u32) -> bool {
+    movement_info
+        .get(0..4)
+        .is_some_and(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & mask != 0)
+}
+
 /// Whether a movement sample may replace the actor's current motion snapshot.
 pub(crate) fn movement_is_accepted(
     last_move_ms: u32,
@@ -1432,6 +1444,19 @@ pub(crate) fn apply_movement_update(
     if mover.dead && mover.player_flags & lyracore_shared::constants::player_flags::GHOST == 0 {
         return Ok(());
     }
+
+    // A unit held in place (root, stun, polymorph) does not translate. Its client stops when the
+    // Gateway relays the root, and the root receipt reports where it stopped. A heartbeat that still
+    // steers was sent before the root landed. Turning and falling stay allowed, and a landing keeps
+    // its fall damage.
+    if carries_movement_flags(&movement_info, STEERING_FLAGS)
+        && opcode as u32 != lyracore_shared::opcodes::movement::MSG_MOVE_FALL_LAND
+        && crate::spell::is_movement_blocked(ctx, mover.guid)
+    {
+        return Ok(());
+    }
+
+    let breaks_on_move = carries_movement_flags(&movement_info, MOVING_FLAGS);
 
     // Drop stale / out-of-order heartbeats and non-finite coordinates. The decision is kept pure so
     // the gateway batch contract can exercise the exact admission rule without a ReducerContext.
@@ -1587,6 +1612,12 @@ pub(crate) fn apply_movement_update(
     // path), so the `plan.moved` guard is just to skip the table scan on a non-move heartbeat.
     if plan.moved {
         crate::spell::break_channel(ctx, mover_guid);
+    }
+    // Break-on-move auras (Shadowmeld) end when the client reports movement, a jump included. The
+    // stored row can lag the client, so a stop that lands after the cast would read as a move under
+    // `plan.moved`.
+    if breaks_on_move {
+        crate::spell::break_auras_on_move(ctx, mover_guid);
     }
 
     // Anti-cheat: score this delta for speed / teleport plausibility and LOG (never reject) any
