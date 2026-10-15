@@ -4688,6 +4688,19 @@ fn a_party_list_with_target_icons_sends_the_list_then_the_icons() {
 }
 
 #[test]
+fn a_kicked_member_gets_the_empty_uninvite_packet() {
+    use lyracore_shared::group::event_kind;
+    let (realm, _world, _instances, _calls) = party_topology();
+    let row = group_event(event_kind::UNINVITED, 0, "");
+
+    let packets =
+        crate::codec::social::subscriptions::group_event_outbound(realm.as_ref(), GINGER, &row);
+
+    assert_eq!(packets.len(), 1);
+    assert_eq!(wire(&packets[0]), (0x0077, Vec::new()));
+}
+
+#[test]
 fn world_entry_asks_for_a_partys_target_icons_after_the_list() {
     let (realm, world, instances, _calls) = party_topology();
     form_split_party(&world, &instances);

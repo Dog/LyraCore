@@ -192,7 +192,7 @@ fn events(realm: &Standalone) -> Vec<(u64, u64, Event)> {
     let mut rows: Vec<_> = realm
         .query_rows(&format!(
             "SELECT id, recipient_guid, kind, other_guid, payload FROM game_group_event \
-             WHERE kind = {LIST} OR kind >= {QUEUE}"
+             WHERE kind = {LIST} OR (kind >= {QUEUE} AND kind <= {COMPLETE})"
         ))
         .into_iter()
         .map(|row| {

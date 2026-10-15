@@ -142,6 +142,28 @@ pub fn build_questupdate_failedtimer(quest_id: u32) -> SMSG_QUESTUPDATE_FAILEDTI
     SMSG_QUESTUPDATE_FAILEDTIMER { quest_id }
 }
 
+/// `SMSG_QUESTGIVER_QUEST_INVALID` (0x018F): reason u32.
+pub fn build_questgiver_quest_invalid(
+    reason: wow_world_messages::vanilla::QuestFailedReason,
+) -> wow_world_messages::vanilla::SMSG_QUESTGIVER_QUEST_INVALID {
+    wow_world_messages::vanilla::SMSG_QUESTGIVER_QUEST_INVALID { msg: reason }
+}
+
+/// `SMSG_QUESTGIVER_QUEST_FAILED` (0x0192): quest id u32, reason u32.
+pub fn build_questgiver_quest_failed(
+    quest_id: u32,
+    reason: wow_world_messages::vanilla::QuestFailedReason,
+) -> wow_world_messages::vanilla::SMSG_QUESTGIVER_QUEST_FAILED {
+    wow_world_messages::vanilla::SMSG_QUESTGIVER_QUEST_FAILED { quest_id, reason }
+}
+
+/// `SMSG_QUESTUPDATE_COMPLETE` (0x0198): quest id u32.
+pub fn build_questupdate_complete(
+    quest_id: u32,
+) -> wow_world_messages::vanilla::SMSG_QUESTUPDATE_COMPLETE {
+    wow_world_messages::vanilla::SMSG_QUESTUPDATE_COMPLETE { quest_id }
+}
+
 pub fn build_quest_push_result(member_guid: u64, code: u8) -> MSG_QUEST_PUSH_RESULT {
     MSG_QUEST_PUSH_RESULT {
         guid: Guid::new(member_guid),
@@ -713,6 +735,44 @@ mod tests {
 
         let comp = build_quest_complete(&d);
         assert_eq!(comp.item_rewards.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod refusal_message_tests {
+    use super::*;
+    use wow_world_messages::vanilla::{QuestFailedReason, ServerMessage};
+
+    fn frame(message: impl ServerMessage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        message.write_unencrypted_server(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn quest_invalid_is_opcode_018f_with_one_reason_word() {
+        let bytes = frame(build_questgiver_quest_invalid(
+            QuestFailedReason::QuestFailedLowLevel,
+        ));
+        assert_eq!(bytes, [0x00, 0x06, 0x8F, 0x01, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn quest_failed_is_opcode_0192_with_quest_then_reason() {
+        let bytes = frame(build_questgiver_quest_failed(
+            0x0102,
+            QuestFailedReason::QuestFailedInventoryFull,
+        ));
+        assert_eq!(
+            bytes,
+            [0x00, 0x0A, 0x92, 0x01, 0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn quest_update_complete_is_opcode_0198_with_the_quest_id() {
+        let bytes = frame(build_questupdate_complete(0x0102));
+        assert_eq!(bytes, [0x00, 0x06, 0x98, 0x01, 0x02, 0x01, 0x00, 0x00]);
     }
 }
 
