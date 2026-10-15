@@ -598,6 +598,7 @@ pub fn debug_verify_loot_tag_fixture(ctx: &ReducerContext) -> Result<(), String>
         pursuit_ends_ms: 0,
         leash_x: 0.0,
         leash_y: 0.0,
+        swing_error: 0,
     });
     crate::combat::kill_player(
         ctx,

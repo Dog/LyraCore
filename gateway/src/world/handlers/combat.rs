@@ -54,6 +54,10 @@ impl<St: CombatStore + ?Sized> ProtocolFamily<St> for Combat {
                     ignore_refusal(&format!("set_sheathed({state})"), conn.account_id, result)?;
                 }
             }
+            // vmangos `HandleCancelGrowthAuraOpcode` is empty.
+            ClientOpcodeMessage::CMSG_CANCEL_GROWTH_AURA => {}
+            // No owner-to-pet read exists; the pet bar arrives with the pet's CREATE.
+            ClientOpcodeMessage::CMSG_REQUEST_PET_INFO => {}
             _ => return Err(anyhow!("opcode routed to the wrong Protocol Family")),
         }
         Ok(ProtocolReply::default())

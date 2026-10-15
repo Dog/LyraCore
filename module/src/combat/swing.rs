@@ -150,12 +150,12 @@ fn resolve_offhand_swing(
 
     let (dmg, _absorbed) = fold_incoming_damage(ctx, attacker_guid, target_guid, rolled);
     let damage = final_damage(ctx, target_guid, dmg);
-    let lethal = is_lethal(target.health, damage.amount);
+    let killing_blow = is_killing_blow(ctx, attacker_guid, &target, damage.amount);
 
     ctx.db.game_combat_event().insert(CombatEvent {
         damage: damage.amount,
         hit_info,
-        killing_blow: lethal,
+        killing_blow,
         blocked_amount: blocked,
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
     });
@@ -256,9 +256,13 @@ fn resolve_swing(ctx: &ReducerContext) {
             target.z - attacker.z,
         );
         let dist_sq = dx * dx + dy * dy + dz * dz;
-        if swing_blocked(ctx, &attacker, &target, ranged.is_some(), dist_sq, now_ms) {
+        if let Some(block) =
+            swing_blocked(ctx, &attacker, &target, ranged.is_some(), dist_sq, now_ms)
+        {
             if ranged_due {
                 melee.attacker_guid().delete(atk.attacker_guid);
+            } else if ranged.is_none() && attacker.is_player() {
+                record_swing_error(ctx, &atk, &attacker, block.swing_error(), now_ms);
             }
             continue;
         }
@@ -311,7 +315,7 @@ fn swing_blocked(
     is_ranged: bool,
     dist_sq: f32,
     now_ms: u32,
-) -> bool {
+) -> Option<SwingBlock> {
     let range_sq = if is_ranged {
         RANGED_RANGE_SQ
     } else {
@@ -328,10 +332,10 @@ fn swing_blocked(
         }
     };
     if dist_sq > range_sq {
-        return true;
+        return Some(SwingBlock::OutOfRange);
     }
     if is_ranged && dist_sq < MELEE_RANGE_SQ {
-        return true;
+        return Some(SwingBlock::TooClose);
     }
     if !crate::nav::has_los(
         ctx,
@@ -340,7 +344,7 @@ fn swing_blocked(
         (attacker.x, attacker.y, attacker.z),
         (target.x, target.y, target.z),
     ) {
-        return true;
+        return Some(SwingBlock::NoLineOfSight);
     }
     if attacker.is_player()
         && !crate::spell::is_facing(
@@ -351,9 +355,52 @@ fn swing_blocked(
             target.y,
         )
     {
-        return true;
+        return Some(SwingBlock::BadFacing);
     }
-    false
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwingBlock {
+    OutOfRange,
+    TooClose,
+    NoLineOfSight,
+    BadFacing,
+}
+
+impl SwingBlock {
+    /// 1.12 has no swing message for line of sight (vmangos `Unit::CanAutoAttackTarget`).
+    fn swing_error(self) -> u8 {
+        match self {
+            Self::OutOfRange => SWING_ERROR_NOT_IN_RANGE,
+            Self::BadFacing => SWING_ERROR_BAD_FACING,
+            Self::TooClose | Self::NoLineOfSight => SWING_ERROR_NONE,
+        }
+    }
+}
+
+/// Writes only on a change, and only when a hand is due: vmangos reports a ready attack only.
+fn record_swing_error(
+    ctx: &ReducerContext,
+    atk: &MeleeAttack,
+    attacker: &WorldEntity,
+    swing_error: u8,
+    now_ms: u32,
+) {
+    let hand_due = |last_ms: u32, interval_ms: u32| {
+        last_ms == 0 || now_ms.wrapping_sub(last_ms) >= interval_ms
+    };
+    let due = hand_due(atk.last_swing_ms, effective_swing_time(ctx, attacker))
+        || equipped_offhand_weapon_damage(ctx, atk.attacker_guid)
+            .is_some_and(|(_, _, delay)| hand_due(atk.last_offhand_swing_ms, delay));
+    if !due || atk.swing_error == swing_error {
+        return;
+    }
+    let melee = ctx.db.game_melee_attack();
+    if let Some(mut fresh) = melee.attacker_guid().find(atk.attacker_guid) {
+        fresh.swing_error = swing_error;
+        melee.attacker_guid().update(fresh);
+    }
 }
 
 fn fire_melee_swing(
@@ -428,13 +475,12 @@ fn fire_melee_swing(
 
     let (dmg, _absorbed) = fold_incoming_damage(ctx, attacker_guid, target_guid, rolled);
     let damage = final_damage(ctx, target_guid, dmg);
-    let lethal = is_lethal(target.health, damage.amount);
     let (projected_swing, projected_seal) = split_damage_projection(damage.amount, seal_portion);
 
     events.insert(CombatEvent {
         damage: projected_swing,
         hit_info,
-        killing_blow: lethal,
+        killing_blow: is_killing_blow(ctx, attacker_guid, target, damage.amount),
         blocked_amount: blocked,
         spell_swing: swing_is_spell,
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
@@ -494,6 +540,7 @@ fn fire_melee_swing(
     // Re-read before stamping; the off-hand may have updated its clock on this row.
     if let Some(mut fresh) = melee.attacker_guid().find(attacker_guid) {
         fresh.last_swing_ms = now_ms;
+        fresh.swing_error = SWING_ERROR_NONE;
         melee.attacker_guid().update(fresh);
     }
 

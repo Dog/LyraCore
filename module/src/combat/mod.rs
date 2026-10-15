@@ -6,7 +6,7 @@ mod tables;
 
 pub(crate) use death::{
     apply_hit, clear_lethal_damage_floor, clear_stale_lethal_damage_floor, commit_death_prevention,
-    final_damage, fold_incoming_damage, force_creature_death, is_lethal, kill_creature,
+    final_damage, fold_incoming_damage, force_creature_death, is_killing_blow, kill_creature,
     kill_player, lethal_floor_protects, set_lethal_damage_floor, Hit, HitSource,
     CORPSE_DECAY_MICROS, DRAIN_SOUL_SPELL_ID, RESPAWN_MICROS, SOUL_SHARD_ENTRY,
 };
@@ -19,7 +19,7 @@ pub(crate) use engage::{
     apply_start_attack, apply_start_ranged_attack, arm_creature_engagement, break_own_attacks,
     disengage, enter_combat, is_engaged, is_hostile_target, may_harm, may_help,
     melee_combatant_guids, refresh_leash, request_attack, stop_attack_for, stop_duel_combat,
-    validate_attack_target,
+    validate_attack_target, SWING_ERROR_BAD_FACING, SWING_ERROR_NONE, SWING_ERROR_NOT_IN_RANGE,
 };
 pub use engage::{
     game_combat_event, game_melee_attack, game_melee_schedule, game_ranged_impact_schedule,

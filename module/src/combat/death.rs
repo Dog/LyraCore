@@ -791,6 +791,24 @@ pub(crate) fn is_lethal(health: u32, dmg: u32) -> bool {
     dmg > 0 && health <= dmg
 }
 
+/// A lethal hit between active Duel opponents ends the Duel instead: `apply_hit` floors the loser.
+pub(crate) fn duel_takes_lethal_hit(
+    ctx: &ReducerContext,
+    attacker_guid: u64,
+    target: &WorldEntity,
+) -> bool {
+    target.is_player() && crate::duel::active_opponents(ctx, attacker_guid, target.guid)
+}
+
+pub(crate) fn is_killing_blow(
+    ctx: &ReducerContext,
+    attacker_guid: u64,
+    target: &WorldEntity,
+    dmg: u32,
+) -> bool {
+    is_lethal(target.health, dmg) && !duel_takes_lethal_hit(ctx, attacker_guid, target)
+}
+
 // Absorb before lethal checks and godmode so even a zeroed hit drains shields.
 pub(crate) fn fold_incoming_damage(
     ctx: &ReducerContext,
@@ -875,10 +893,7 @@ pub(crate) fn apply_hit(
         }
     }
 
-    if target_is_player
-        && is_lethal(target.health, dmg)
-        && crate::duel::active_opponents(ctx, attacker_guid, target_guid)
-    {
+    if is_lethal(target.health, dmg) && duel_takes_lethal_hit(ctx, attacker_guid, &target) {
         target.health = 1;
         entities.guid().update(target);
         if let Some(duel) = crate::duel::active_duel_between(ctx, attacker_guid, target_guid) {

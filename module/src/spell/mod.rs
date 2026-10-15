@@ -96,6 +96,7 @@ pub use tables::{
     DynamicObject, GroundArea, GroundAreaSchedule, PendingCast, PendingSpellImpact,
     ResurrectRequest, SchoolLockout, SelfResurrectOption, Spell, SpellCastEvent, SpellCd,
     SpellCooldown, SpellEffect, SpellImpactEvent, SpellProcEvent, SpellReagent, CAST_FAIL_NO_POWER,
+    CAST_MISS_MISS, CAST_MISS_NONE, CAST_MISS_RESIST,
 };
 
 pub(crate) use lyracore_shared::spell::taxonomy::{

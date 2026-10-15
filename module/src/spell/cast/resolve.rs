@@ -230,9 +230,15 @@ fn run_spell_effects(
     let mut total_healed: u32 = 0;
     let mut total_resisted: u32 = 0;
     let mut total_absorbed: u32 = 0;
+    let mut total_energized: u32 = 0;
+    let mut energized_power_type: u8 = 0;
+    let mut primary_missed = false;
     let mut any_crit = false;
     let mut item_grants = 0;
     let mut item_refused = false;
+    // One hit roll per target for the whole spell (CONTEXT.md "Cast Miss"); never the caster.
+    let rolls_hit = effects.iter().any(|e| e.kind == E_DAMAGE);
+    let mut missed_targets: std::collections::HashMap<u64, bool> = std::collections::HashMap::new();
     for e in effects {
         let points = effect_amount(
             e.base_points,
@@ -245,6 +251,15 @@ fn run_spell_effects(
         );
         for t in select_targets(ctx, caster_guid, target_guid, e, dest) {
             if triggered && !triggered_target_admitted(origin, caster_guid, t, is_alive(ctx, t)) {
+                continue;
+            }
+            if rolls_hit
+                && t != caster_guid
+                && *missed_targets
+                    .entry(t)
+                    .or_insert_with(|| super::targeting::spell_misses(ctx, level, t))
+            {
+                primary_missed |= t == target_guid;
                 continue;
             }
             // Combo finishers scale from the explicit enemy target, even for self-targeted effects.
@@ -271,6 +286,10 @@ fn run_spell_effects(
                 total_resisted = total_resisted.saturating_add(hit.resisted);
                 total_absorbed = total_absorbed.saturating_add(hit.absorbed);
                 total_healed = total_healed.saturating_add(hit.healed);
+                if hit.energized > 0 {
+                    total_energized = total_energized.saturating_add(hit.energized);
+                    energized_power_type = hit.power_type;
+                }
                 any_crit |= hit.crit;
             }
         }
@@ -307,10 +326,22 @@ fn run_spell_effects(
         is_crit: any_crit,
         resisted: total_resisted,
         absorbed: total_absorbed,
+        miss_info: cast_miss(primary_missed, hdr.school_mask),
+        energized: total_energized,
+        power_type: energized_power_type,
         cooldown_ms: hdr.cooldown_ms,
         client_initiated,
         ..SpellCastEvent::signal(ctx, caster_guid, hdr.spell_id, SpellCastEventKind::Go)
     });
+}
+
+fn cast_miss(missed: bool, school_mask: u8) -> u8 {
+    const SCHOOL_MASK_PHYSICAL: u8 = 0x01;
+    match (missed, school_mask) {
+        (false, _) => crate::spell::CAST_MISS_NONE,
+        (true, 0 | SCHOOL_MASK_PHYSICAL) => crate::spell::CAST_MISS_MISS,
+        (true, _) => crate::spell::CAST_MISS_RESIST,
+    }
 }
 
 fn is_alive(ctx: &ReducerContext, guid: u64) -> bool {
@@ -1432,5 +1463,20 @@ mod eventai_hit_tests {
         assert!(!caster_life_allows(false, true, false));
         assert!(!caster_life_allows(true, true, true));
         assert!(caster_life_allows(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod cast_miss_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_hit_roll_misses_a_physical_spell_and_resists_a_magic_one() {
+        // School masks: 0 none, 1 physical, 4 fire, 32 shadow.
+        assert_eq!(cast_miss(false, 4), crate::spell::CAST_MISS_NONE);
+        assert_eq!(cast_miss(true, 0), crate::spell::CAST_MISS_MISS);
+        assert_eq!(cast_miss(true, 1), crate::spell::CAST_MISS_MISS);
+        assert_eq!(cast_miss(true, 4), crate::spell::CAST_MISS_RESIST);
+        assert_eq!(cast_miss(true, 32), crate::spell::CAST_MISS_RESIST);
     }
 }

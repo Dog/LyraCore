@@ -247,6 +247,25 @@ race's opening cinematic. A second login in one World Session gets
 answer. The Gateway drops account-data uploads and zone reports before decoding,
 because the protocol library cannot read them safely.
 
+## Combat feedback
+
+A player's due melee swing that finds its target out of reach or behind the player records a
+Swing Error. The Gateway sends `SMSG_ATTACKSWING_NOTINRANGE` or `SMSG_ATTACKSWING_BADFACING` once
+when the error changes, and a landed swing clears it. A creature that starts an Engagement sends
+`SMSG_AI_REACTION` (hostile) before `SMSG_ATTACKSTART`; a reconnect replays only the attack start.
+The player who lands a melee killing blow gets `SMSG_PARTYKILLLOG`. A swing that ends a Duel is no
+killing blow. vmangos sends the line to the tagger or a pet's owner, and to the party. The tag
+is gone from the Coordinator cache when the relay runs, so those copies and spell kills are not
+sent.
+
+Each periodic damage, heal or energize tick sends `SMSG_PERIODICAURALOG`; a heal tick on a unit at
+full health logs nothing. A damage spell rolls its hit once per target, and a missed target takes
+none of its effects. The `SMSG_SPELL_GO` miss list names the target, as a miss for a physical spell
+and a resist for a magic one. The caster of an instant cast already holds a GO, so it gets
+`SMSG_SPELLLOGMISS` instead. A direct energize sends `SMSG_SPELLENERGIZELOG`. Bystanders of an
+interrupted player cast get `SMSG_SPELL_FAILED_OTHER`. Mount refusals name the vanilla cast
+failure: dead, in combat, indoors or in deep water.
+
 ## Missing gameplay and deliberate responses
 
 These features remain unavailable. The responses below apply to valid requests
@@ -260,7 +279,7 @@ per World Session. Repeated requests do not add chat lines.
 | Battleground spirit healers | System Message reporting unavailability. | Resurrection queues and timers. |
 | GM tickets | System disabled, no current ticket, creation and update refused. Deletion reports the already-absent ticket. | Durable tickets and GM workflow. |
 | Pet stables | Stable failure code 6 for listing, storing, retrieving, swapping and slot purchase. | Stable storage and purchases. |
-| Pet controls | Specific System Messages for bar changes, autocast, aura cancellation, stop-attack, naming, abandonment and unlearning. | These operations and their durable state. Existing pet action commands and progression remain separate. |
+| Pet controls | Specific System Messages for bar changes, autocast, aura cancellation, stop-attack, naming, abandonment and unlearning. A pet-bar spell cast gets `SMSG_PET_CAST_FAILED` with the unreported reason, then a System Message. A pet-info request is ignored; the pet bar arrives with the pet. | These operations and their durable state, and an owner-to-pet read to resend the pet bar. Existing pet action commands and progression remain separate. |
 | Item containers and gifts | Inventory Refusal 39. | Item-container loot, wrapping and unwrapping. |
 | Readable pages | A terminal page names the unavailable text service. | Page-text catalog import and page chains. |
 | Reading items | Read failure with the close reason and a System Message, for an item with page text. An item without page text gets Inventory Refusal 23. | Page-text catalog import, then the read-OK reply. |

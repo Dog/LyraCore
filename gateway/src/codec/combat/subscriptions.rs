@@ -33,6 +33,7 @@ pub(crate) fn stealth_action(is_insert: bool, post_change_count: usize) -> Steal
 
 pub(crate) fn combat_event_outbound(
     created: &Mutex<HashSet<u64>>,
+    self_guid: u64,
     row: &CombatEvent,
 ) -> Vec<Outbound> {
     if !created.lock().unwrap().contains(&row.attacker_guid) {
@@ -77,12 +78,23 @@ pub(crate) fn combat_event_outbound(
             Box::new(stop),
         )));
     }
+    // Killer only; docs/benilla-compatibility.md "Combat feedback" lists the missing audiences.
+    if row.killing_blow && row.attacker_guid == self_guid && !is_creature_guid(self_guid) {
+        use wow_world_messages::vanilla::SMSG_PARTYKILLLOG;
+        out.push(Outbound::One(ServerOpcodeMessage::SMSG_PARTYKILLLOG(
+            Box::new(SMSG_PARTYKILLLOG {
+                player_with_killing_blow: wow_world_messages::Guid::new(row.attacker_guid),
+                victim: wow_world_messages::Guid::new(row.target_guid),
+            }),
+        )));
+    }
     out
 }
 
 pub(crate) fn melee_engage_outbound(
     created: &Mutex<HashSet<u64>>,
     row: &MeleeAttack,
+    live: bool,
 ) -> Vec<Outbound> {
     if row.ranged_spell_id != 0 {
         return Vec::new();
@@ -90,10 +102,23 @@ pub(crate) fn melee_engage_outbound(
     if !created.lock().unwrap().contains(&row.attacker_guid) {
         return Vec::new();
     }
+    let mut out = Vec::new();
+    // Live inserts only: a reconnect replays the stance, not the aggro sound.
+    if live && is_creature_guid(row.attacker_guid) {
+        out.push(Outbound::One(ServerOpcodeMessage::SMSG_AI_REACTION(
+            Box::new(codec::build_ai_reaction_hostile(row.attacker_guid)),
+        )));
+    }
     let m = codec::build_attack_start(row.attacker_guid, row.target_guid);
-    vec![Outbound::One(ServerOpcodeMessage::SMSG_ATTACKSTART(
+    out.push(Outbound::One(ServerOpcodeMessage::SMSG_ATTACKSTART(
         Box::new(m),
-    ))]
+    )));
+    out
+}
+
+/// `HIGHGUID_UNIT` 0xF130 or `HIGHGUID_PET` 0xF140.
+fn is_creature_guid(guid: u64) -> bool {
+    matches!(guid >> 48, 0xF130 | 0xF140)
 }
 
 pub(crate) fn melee_disengage_outbound(self_guid: u64, row: &MeleeAttack) -> Vec<Outbound> {
@@ -116,10 +141,14 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
     };
     if kind == SpellCastEventKind::Interrupt {
         // SPELL_FAILURE must be caster-private or bystanders can lose their own cast state.
-        let is_creature = matches!(row.caster_guid >> 48, 0xF130 | 0xF140);
-        if is_creature || row.caster_guid == self_guid {
+        if is_creature_guid(row.caster_guid) || row.caster_guid == self_guid {
             let m = codec::build_spell_failure(row.caster_guid, row.spell_id);
             out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILURE(
+                Box::new(m),
+            )));
+        } else {
+            let m = codec::build_spell_failed_other(row.caster_guid, row.spell_id);
+            out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILED_OTHER(
                 Box::new(m),
             )));
         }
@@ -157,6 +186,10 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
                 ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(log)),
             ));
         }
+        return out;
+    }
+    if kind == SpellCastEventKind::PeriodicLog {
+        out.extend(periodic_log_outbound(row));
         return out;
     }
     if kind == SpellCastEventKind::Start {
@@ -199,9 +232,28 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
                 }];
             }
         }
+        if let Some(mi) = cast_miss_info(row.miss_info) {
+            use wow_world_messages::vanilla::SpellMiss;
+            go.hits.clear();
+            go.misses = vec![SpellMiss {
+                target: wow_world_messages::Guid::new(row.target_guid),
+                miss_info: mi,
+            }];
+        }
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(Box::new(
             go,
         ))));
+    } else if let Some(mi) = cast_miss_info(row.miss_info) {
+        // The cast handler already sent this caster a GO listing the target as hit.
+        out.push(Outbound::Raw {
+            opcode: codec::SMSG_SPELLLOGMISS_OPCODE,
+            body: codec::build_spell_log_miss(
+                row.caster_guid,
+                row.spell_id,
+                row.target_guid,
+                mi.as_int(),
+            ),
+        });
     }
 
     if row.damage > 0 {
@@ -233,6 +285,19 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         )));
     }
 
+    if row.energized > 0 {
+        out.push(Outbound::Raw {
+            opcode: codec::SMSG_SPELLENERGIZELOG_OPCODE,
+            body: codec::build_spell_energize_log(
+                row.target_guid,
+                row.caster_guid,
+                row.spell_id,
+                row.power_type,
+                row.energized,
+            ),
+        });
+    }
+
     // SMSG_SPELL_GO releases pending casts. A zero-duration cooldown can leave the button stuck.
     if row.cooldown_ms > 0 {
         let cd = codec::build_spell_cooldown(row.caster_guid, row.spell_id, row.cooldown_ms);
@@ -241,6 +306,42 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
         )));
     }
     out
+}
+
+/// Codes are lockstep with `CAST_MISS_*` in `module/src/spell/tables.rs`.
+fn cast_miss_info(code: u8) -> Option<wow_world_messages::vanilla::SpellMissInfo> {
+    use wow_world_messages::vanilla::SpellMissInfo;
+    const CAST_MISS_MISS: u8 = 1;
+    const CAST_MISS_RESIST: u8 = 2;
+    match code {
+        CAST_MISS_MISS => Some(SpellMissInfo::Miss),
+        CAST_MISS_RESIST => Some(SpellMissInfo::Resist),
+        _ => None,
+    }
+}
+
+fn periodic_log_outbound(row: &SpellCastEvent) -> Option<Outbound> {
+    let tick = if row.healed > 0 {
+        codec::PeriodicTick::Heal { amount: row.healed }
+    } else if row.energized > 0 {
+        codec::PeriodicTick::Energize {
+            power_type: row.power_type,
+            amount: row.energized,
+        }
+    } else if row.damage > 0 || row.absorbed > 0 || row.resisted > 0 {
+        codec::PeriodicTick::Damage {
+            damage: row.damage,
+            school: row.school,
+            absorbed: row.absorbed,
+            resisted: row.resisted,
+        }
+    } else {
+        return None;
+    };
+    Some(Outbound::Raw {
+        opcode: codec::SMSG_PERIODICAURALOG_OPCODE,
+        body: codec::build_periodic_aura_log(row.target_guid, row.caster_guid, row.spell_id, tick),
+    })
 }
 
 pub(crate) fn aura_sync(
@@ -815,7 +916,11 @@ pub(crate) fn combat_event_appeared(view: &WorldView, shard: ShardId, row: &Comb
     for viewer in combat_audience(view, shard, &row) {
         let row = row.clone();
         enqueue(viewer.clone(), move |viewer| {
-            crate::codec::combat::subscriptions::combat_event_outbound(&viewer.created, &row)
+            crate::codec::combat::subscriptions::combat_event_outbound(
+                &viewer.created,
+                viewer.self_guid,
+                &row,
+            )
         });
     }
 }
@@ -836,13 +941,13 @@ pub(crate) fn melee_audience(
     )
 }
 
-pub(crate) fn melee_engaged(view: &WorldView, shard: ShardId, row: &MeleeAttack) {
+pub(crate) fn melee_engaged(view: &WorldView, shard: ShardId, row: &MeleeAttack, live: bool) {
     let row = Arc::new(row.clone());
     for viewer in melee_audience(view, shard, &row) {
         let row = row.clone();
         let created = viewer.created.clone();
         enqueue(viewer.clone(), move |_| {
-            crate::codec::combat::subscriptions::melee_engage_outbound(&created, &row)
+            crate::codec::combat::subscriptions::melee_engage_outbound(&created, &row, live)
         });
     }
 }
@@ -856,6 +961,42 @@ pub(crate) fn melee_disengaged(view: &WorldView, shard: ShardId, row: &MeleeAtta
             crate::codec::combat::subscriptions::melee_disengage_outbound(self_guid, &row)
         });
     }
+}
+
+/// Swing Error codes are lockstep with `SWING_ERROR_*` in `module/src/combat/engage.rs`.
+pub(crate) fn swing_error_outbound(old: &MeleeAttack, row: &MeleeAttack) -> Option<Outbound> {
+    const NOT_IN_RANGE: u8 = 1;
+    const BAD_FACING: u8 = 2;
+    if old.swing_error == row.swing_error {
+        return None;
+    }
+    match row.swing_error {
+        NOT_IN_RANGE => Some(Outbound::One(
+            ServerOpcodeMessage::SMSG_ATTACKSWING_NOTINRANGE,
+        )),
+        BAD_FACING => Some(Outbound::One(
+            ServerOpcodeMessage::SMSG_ATTACKSWING_BADFACING,
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn melee_updated(
+    view: &WorldView,
+    shard: ShardId,
+    old: &MeleeAttack,
+    row: &MeleeAttack,
+) {
+    if swing_error_outbound(old, row).is_none() {
+        return;
+    }
+    let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.attacker_guid)) else {
+        return;
+    };
+    let (old, row) = (old.clone(), row.clone());
+    enqueue(viewer, move |_| {
+        swing_error_outbound(&old, &row).into_iter().collect()
+    });
 }
 
 pub(crate) fn aura_audience(view: &WorldView, shard: ShardId, row: &Aura) -> Vec<Arc<Viewer>> {
@@ -1002,7 +1143,8 @@ crate::stdb::relays::declare_relays! {
         insert(Snapshot) => |context, _event, row| combat_event_appeared(&context.view, context.shard, row);
     }
     game_melee_attack [false] {
-        insert(Snapshot) => |context, _event, row| melee_engaged(&context.view, context.shard, row);
+        insert(Snapshot) => |context, event, row| melee_engaged(&context.view, context.shard, row, !matches!(event.event, spacetimedb_sdk::Event::SubscribeApplied));
+        update(Snapshot) => |context, _event, old, row| melee_updated(&context.view, context.shard, old, row);
         delete(Snapshot) => |context, _event, row| melee_disengaged(&context.view, context.shard, row);
     }
     game_spell_cast_event [false] {
@@ -1025,6 +1167,7 @@ pub(crate) enum SpellCastEventKind {
     Interrupt,
     Pushback,
     ProcLog,
+    PeriodicLog,
 }
 
 impl SpellCastEventKind {
@@ -1041,6 +1184,7 @@ impl SpellCastEventKind {
             3 => Some(Self::Interrupt),
             4 => Some(Self::Pushback),
             5 => Some(Self::ProcLog),
+            6 => Some(Self::PeriodicLog),
             unknown => {
                 log::warn!(
                     "spell cast relay: unknown kind {unknown} (event {}, caster {}, spell {})",
@@ -1218,5 +1362,7 @@ pub(crate) mod tests {
     }
 }
 
+#[cfg(test)]
+mod log_tests;
 #[cfg(test)]
 mod packet_tests;

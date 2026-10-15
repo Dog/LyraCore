@@ -338,6 +338,12 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                     .unwrap_or(0);
                 let amount =
                     resist_magic_damage(ctx, a.target_guid, school, a.level as u32, a.amount);
+                ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                    damage: amount.max(0) as u32,
+                    school: crate::spell::school_index(school),
+                    resisted: a.amount.saturating_sub(amount).max(0) as u32,
+                    ..SpellCastEvent::periodic_log(ctx, a.caster_guid, a.spell_id, &target)
+                });
                 if amount > 0 {
                     dot_damaged.insert(a.target_guid);
                     if !target.is_player()
@@ -391,6 +397,12 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                     .unwrap_or(target.health);
                 let new_health = healed_value(cur, target.max_health, a.amount);
                 pending.insert(a.target_guid, new_health);
+                if cur < target.max_health {
+                    ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                        healed: a.amount.max(0) as u32,
+                        ..SpellCastEvent::periodic_log(ctx, a.caster_guid, a.spell_id, &target)
+                    });
+                }
                 let effective = new_health.saturating_sub(cur);
                 crate::threat::add_heal_threat(ctx, a.caster_guid, a.target_guid, effective);
             }
@@ -403,6 +415,11 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                     a.target_guid,
                     energized_value(cur, target.max_power, a.amount),
                 );
+                ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                    energized: a.amount.max(0) as u32,
+                    power_type: target.power_type(),
+                    ..SpellCastEvent::periodic_log(ctx, a.caster_guid, a.spell_id, &target)
+                });
                 if a.enters_combat {
                     crate::combat::enter_combat(ctx, a.caster_guid);
                 }

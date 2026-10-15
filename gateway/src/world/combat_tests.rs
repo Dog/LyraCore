@@ -122,3 +122,38 @@ fn refusal_is_ignored_and_the_world_session_continues() {
     assert!(reply.outbound.is_empty());
     assert_eq!(store.sheath_of(1), None);
 }
+
+#[test]
+fn growth_aura_cancel_and_pet_info_requests_are_ignored_without_a_durable_request() {
+    let store = CombatFake::failing(ReducerCallError::transport_lost("unexpected"));
+    run(&store, ClientOpcodeMessage::CMSG_CANCEL_GROWTH_AURA);
+    run(&store, ClientOpcodeMessage::CMSG_REQUEST_PET_INFO);
+    assert!(
+        store.answer().is_err(),
+        "neither request may reach the Store"
+    );
+}
+
+#[test]
+fn a_pet_cast_is_refused_with_the_silent_pet_cast_failure_and_a_notice() {
+    use wow_world_messages::vanilla::{SpellCastTargets, CMSG_PET_CAST_SPELL};
+    let request = ClientOpcodeMessage::CMSG_PET_CAST_SPELL(Box::new(CMSG_PET_CAST_SPELL {
+        guid: Guid::new(0xF140_0000_0000_0009),
+        id: 3110,
+        targets: SpellCastTargets::default(),
+    }));
+    let replies = handlers::unavailable_outbound(&request, &mut Default::default())
+        .expect("a pet cast must be answered");
+    let [Outbound::Raw { opcode, body }, Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(notice))] =
+        replies.as_slice()
+    else {
+        panic!("expected the pet cast failure, then the notice");
+    };
+    // SMSG_PET_CAST_FAILED: spell 3110 (Firebolt), status 2 (failed), reason 0x17 (not reported).
+    assert_eq!(*opcode, 0x0138);
+    assert_eq!(body, &[0x26, 0x0C, 0x00, 0x00, 0x02, 0x17]);
+    assert_eq!(
+        notice.message,
+        "Pet spell casts are not available on this realm."
+    );
+}
