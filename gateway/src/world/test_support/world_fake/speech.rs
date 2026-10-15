@@ -10,6 +10,7 @@ pub(crate) struct SpeechState {
     pub(crate) gm_authority_results: std::sync::Mutex<Vec<bool>>,
     pub(crate) gm_gameplay_changes: std::sync::Mutex<Vec<String>>,
     pub(crate) chats: std::sync::Mutex<Vec<(u8, u8, String)>>,
+    pub(crate) emotes: std::sync::Mutex<Vec<(u32, u32, u64)>>,
 }
 
 impl SpeechStore for WorldFake {
@@ -38,11 +39,16 @@ impl SpeechStore for WorldFake {
     fn send_emote(
         &self,
         _actor: Actor,
-        _text_emote: u32,
-        _emote_anim: u32,
-        _target_guid: u64,
+        text_emote: u32,
+        emote_anim: u32,
+        target_guid: u64,
     ) -> Result<()> {
         self.rec("send_emote");
+        self.speech
+            .emotes
+            .lock()
+            .unwrap()
+            .push((text_emote, emote_anim, target_guid));
         Ok(())
     }
 

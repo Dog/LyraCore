@@ -144,12 +144,25 @@ impl<
                 let Some(actor) = actor else {
                     return Ok(outbound.into());
                 };
-                if let InteractionOutcome::Refused(reason) =
-                    store.bind_home(actor, request.guid.guid())?
-                {
-                    outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(
-                        Box::new(codec::build_gm_system_message(reason)),
-                    )));
+                let innkeeper_guid = request.guid.guid();
+                match store.bind_home(actor, innkeeper_guid)? {
+                    InteractionOutcome::Refused(reason) => {
+                        outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(
+                            Box::new(codec::build_gm_system_message(reason)),
+                        )));
+                    }
+                    InteractionOutcome::Done => match store.character_by_guid(actor.guid()) {
+                        Ok(Some(character)) => {
+                            let (opcode, body) =
+                                codec::build_player_bound(innkeeper_guid, character.zone_id);
+                            outbound.push(Outbound::Raw { opcode, body });
+                        }
+                        Ok(None) => {}
+                        Err(error) => log::warn!(
+                            "world: bound-home read for guid {} failed: {error:#}",
+                            actor.guid()
+                        ),
+                    },
                 }
                 outbound.push(Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE));
             }

@@ -11,6 +11,9 @@ pub(crate) struct CharacterState {
     pub(crate) player_actions: Vec<(u8, u32, u8)>,
     pub(crate) learned_spells: Vec<u32>,
     pub(crate) durable_absence_checks: std::sync::atomic::AtomicUsize,
+    pub(crate) stand_states: std::sync::Mutex<Vec<(u64, u8)>>,
+    pub(crate) stand_state_error: Option<fn() -> anyhow::Error>,
+    pub(crate) stored_stand_state: u8,
 }
 
 impl CharacterStore for WorldFake {
@@ -139,5 +142,21 @@ impl CharacterStore for WorldFake {
 
     fn player_actions(&self, _player_guid: u64) -> Result<Vec<(u8, u32, u8)>> {
         Ok(self.character.player_actions.clone())
+    }
+
+    fn set_stand_state(&self, actor: Actor, state: u8) -> Result<()> {
+        if let Some(error) = self.character.stand_state_error {
+            return Err(error());
+        }
+        self.character
+            .stand_states
+            .lock()
+            .unwrap()
+            .push((actor.guid(), state));
+        Ok(())
+    }
+
+    fn stand_state(&self, _guid: u64) -> u8 {
+        self.character.stored_stand_state
     }
 }

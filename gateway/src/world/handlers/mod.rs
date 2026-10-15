@@ -44,7 +44,7 @@ pub(crate) use channel::{resolve_online_character, ResolvedTarget};
 pub(crate) use channel::{
     Channel, ChannelActionStore, ChannelOutcome, ChannelRequest, ChannelRoster,
 };
-pub(crate) use char::{Character, CharacterStore};
+pub(crate) use char::{is_ignored_raw_request, Character, CharacterStore};
 pub(crate) use chat::{
     Chat, ChatActionStore, ChatOutcome, RealmChatRequest, SpeakerFacts, SpeechStore,
     WhisperRequest, WhisperTargetFacts,

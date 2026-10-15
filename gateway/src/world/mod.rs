@@ -781,7 +781,9 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                 )?;
                 continue;
             }
-            if handlers::is_silent_movement_request(hdr.opcode) {
+            if handlers::is_silent_movement_request(hdr.opcode)
+                || handlers::is_ignored_raw_request(hdr.opcode)
+            {
                 continue;
             }
             if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {

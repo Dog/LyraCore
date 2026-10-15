@@ -242,6 +242,27 @@ fn levelup_is_exclusive_with_field_diffs() {
 }
 
 #[test]
+fn a_stand_state_change_relays_unit_bytes_1_to_every_viewer() {
+    let old = player_entity();
+    let mut new = old.clone();
+    new.unit_bytes_1 = (old.unit_bytes_1 & !0xFF) | 1;
+    let out = entity_update_to_outbound(&old, &new);
+    let [ServerOpcodeMessage::SMSG_UPDATE_OBJECT(update)] = out.as_slice() else {
+        panic!("expected one VALUES update, got {out:?}");
+    };
+    let mut wire = Vec::new();
+    wow_world_messages::vanilla::ServerMessage::write_unencrypted_server(&**update, &mut wire)
+        .unwrap();
+    let values = lyracore_shared::values_mask::parse_values_updates(&wire[4..]);
+    assert_eq!(values.len(), 1);
+    assert!(
+        values[0].fields.contains(&(138, new.unit_bytes_1)),
+        "UNIT_FIELD_BYTES_1 missing from {:?}",
+        values[0].fields
+    );
+}
+
+#[test]
 fn an_afk_toggle_relays_player_flags_to_every_viewer() {
     let old = player_entity();
     for (flags, label) in [(0x02, "AFK"), (0x04, "DND"), (0x00, "cleared")] {

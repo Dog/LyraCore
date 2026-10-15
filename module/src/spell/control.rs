@@ -263,6 +263,7 @@ pub(crate) fn break_auras_on_damage(
             periodic,
         },
     );
+    crate::world::stand_up_on_damage(ctx, target_guid);
     break_flagged_auras(ctx, target_guid, breaks_on_damage);
     super::break_stealth(ctx, target_guid);
     // Vanilla 1.12 periodic damage neither interrupts nor pushes back a cast.
