@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn unhandled_vanilla_requests_are_ignored_without_a_reply() {
         for opcode in [0x0107, 0x0109, 0x021f, 0x0220, 0x0336] {
-            assert!(raw_unavailable_outbound(opcode, &[0; 8]).unwrap().unwrap().is_empty());
+            assert!(raw_unavailable_outbound(opcode, &[0; 8])
+                .unwrap()
+                .unwrap()
+                .is_empty());
         }
     }
 
