@@ -16,6 +16,13 @@ pub(crate) fn drain_world_entry<S: Read>(
         let ends_batch = matches!(message, ServerOpcodeMessage::SMSG_WEATHER(_));
         frames.push(message);
         if ends_batch {
+            let world_states = ServerOpcodeMessage::read_encrypted(&mut *client, dec)
+                .unwrap_or_else(|e| panic!("world states did not follow the batch: {e}"));
+            assert!(
+                matches!(world_states, ServerOpcodeMessage::SMSG_INIT_WORLD_STATES(_)),
+                "expected SMSG_INIT_WORLD_STATES after the batch, got {world_states}"
+            );
+            frames.push(world_states);
             return frames;
         }
     }

@@ -93,6 +93,14 @@ impl CharacterStore for TrainerFake {
     fn player_actions(&self, _player_guid: u64) -> Result<Vec<(u8, u32, u8)>> {
         unimplemented!("player_actions")
     }
+
+    fn set_stand_state(&self, _actor: Actor, _state: u8) -> Result<()> {
+        unimplemented!("set_stand_state")
+    }
+
+    fn stand_state(&self, _guid: u64) -> u8 {
+        unimplemented!("stand_state")
+    }
 }
 
 impl TrainerStore for TrainerFake {

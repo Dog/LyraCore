@@ -637,6 +637,17 @@ fn player_login_emits_sequence_then_self_create() {
                 tags.push("weather");
                 weather = Some(*m);
             }
+            ServerOpcodeMessage::SMSG_INIT_WORLD_STATES(m) => {
+                tags.push("world_states");
+                assert_eq!(
+                    (m.map, m.area),
+                    (
+                        Map::EasternKingdoms,
+                        wow_world_messages::vanilla::Area::ElwynnForest
+                    )
+                );
+                assert!(m.states.is_empty());
+            }
             other => panic!("unexpected message in login sequence: {other}"),
         }
     }
@@ -657,6 +668,7 @@ fn player_login_emits_sequence_then_self_create() {
             "bindpoint",
             "update_object",
             "weather",
+            "world_states",
         ],
     );
     assert_eq!(create_guid, Some(1));

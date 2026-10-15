@@ -44,6 +44,22 @@ fn only_weather(out: Vec<Outbound>) -> wow_world_messages::vanilla::SMSG_WEATHER
     }
 }
 
+fn crossing_weather(out: Vec<Outbound>, zone_id: u32) -> wow_world_messages::vanilla::SMSG_WEATHER {
+    match out.as_slice() {
+        [Outbound::Raw { opcode, body }, Outbound::One(ServerOpcodeMessage::SMSG_WEATHER(m))] => {
+            assert_eq!(
+                (*opcode, body.clone()),
+                crate::codec::build_init_world_states(0, zone_id)
+            );
+            **m
+        }
+        other => panic!(
+            "expected world states then weather, got {} messages",
+            other.len()
+        ),
+    }
+}
+
 #[test]
 fn a_weather_row_reaches_its_own_zone_and_no_other() {
     let view = WorldView::new(true);
@@ -97,16 +113,16 @@ fn crossing_into_a_zone_sends_its_weather_once() {
     view.add_viewer_on_shard(resident.clone(), anchor, 0);
     let store = CannedWeather(Some((WESTFALL, 3, 0.9)));
 
-    zone_crossed(&view, &store, 0, walker.self_guid, ELWYNN, WESTFALL);
-    let m = only_weather(queued_job(&walker_rx));
+    zone_crossed(&view, &store, 0, walker.self_guid, 0, ELWYNN, WESTFALL);
+    let m = crossing_weather(queued_job(&walker_rx), WESTFALL);
     assert_eq!(m.weather_type, WeatherType::Storm);
     assert_eq!(m.grade, 0.9);
     assert_eq!(m.sound_id, 8558);
     assert_eq!(m.change, WeatherChangeType::Instant);
 
-    zone_crossed(&view, &store, 0, walker.self_guid, WESTFALL, WESTFALL);
-    zone_crossed(&view, &store, 0, walker.self_guid, WESTFALL, 0);
-    zone_crossed(&view, &store, 0, walker.self_guid, 0, WESTFALL);
+    zone_crossed(&view, &store, 0, walker.self_guid, 0, WESTFALL, WESTFALL);
+    zone_crossed(&view, &store, 0, walker.self_guid, 0, WESTFALL, 0);
+    zone_crossed(&view, &store, 0, walker.self_guid, 0, 0, WESTFALL);
     assert!(
         walker_rx.try_recv().is_err(),
         "staying inside a zone sends nothing, the unresolved zone is not a crossing, and a \
@@ -141,11 +157,12 @@ fn crossing_into_a_zone_with_no_weather_row_sends_fine_weather() {
         &CannedWeather(None),
         0,
         walker.self_guid,
+        0,
         ELWYNN,
         WESTFALL,
     );
 
-    let m = only_weather(queued_job(&rx));
+    let m = crossing_weather(queued_job(&rx), WESTFALL);
     assert_eq!(m.weather_type, WeatherType::Fine);
     assert_eq!(m.grade, 0.0);
     assert_eq!(m.sound_id, 0);

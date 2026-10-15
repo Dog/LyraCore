@@ -1,4 +1,7 @@
 use super::*;
+use wow_world_messages::vanilla::{
+    UnitStandState, SMSG_CHARACTER_LOGIN_FAILED, SMSG_CHAR_RENAME, SMSG_STANDSTATE_UPDATE,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct CharacterView {
@@ -142,6 +145,78 @@ pub fn logout_denied_in_combat() -> SMSG_LOGOUT_RESPONSE {
     }
 }
 
+/// The client shows CHAR_RENAME_FAILED for any result except 0 and 0x31.
+pub fn build_char_rename_refusal() -> SMSG_CHAR_RENAME {
+    SMSG_CHAR_RENAME::CharCreateError
+}
+
+pub fn build_character_login_failed() -> SMSG_CHARACTER_LOGIN_FAILED {
+    SMSG_CHARACTER_LOGIN_FAILED {
+        result: WorldResult::ResponseFailure,
+    }
+}
+
+/// u32 section, u32 size 0, no zlib stream. `None` past the client's eight sections.
+pub fn build_empty_account_data(section: u32) -> Option<(u16, Vec<u8>)> {
+    const SECTIONS: u32 = 8;
+    (section < SECTIONS).then(|| {
+        let mut body = section.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        (0x020c, body)
+    })
+}
+
+/// ChrRaces.dbc CinematicSequenceID (column 16), build 5875.
+pub fn opening_cinematic(race: u8) -> Option<u32> {
+    match race {
+        1 => Some(81),  // Human
+        2 => Some(21),  // Orc
+        3 => Some(41),  // Dwarf
+        4 => Some(61),  // Night Elf
+        5 => Some(2),   // Undead
+        6 => Some(141), // Tauren
+        7 => Some(101), // Gnome
+        8 => Some(121), // Troll
+        _ => None,
+    }
+}
+
+pub fn build_trigger_cinematic(sequence: u32) -> (u16, Vec<u8>) {
+    (0x00fa, sequence.to_le_bytes().to_vec())
+}
+
+/// u32 map, u32 zone, u16 count 0: the client clears its world-state table.
+pub fn build_init_world_states(map_id: u32, zone_id: u32) -> (u16, Vec<u8>) {
+    let mut body = map_id.to_le_bytes().to_vec();
+    body.extend_from_slice(&zone_id.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    (0x02c2, body)
+}
+
+pub fn build_stand_state_update(state: UnitStandState) -> SMSG_STANDSTATE_UPDATE {
+    SMSG_STANDSTATE_UPDATE { state }
+}
+
+/// `Some` when byte 0 of UNIT_FIELD_BYTES_1, the stand state, changed.
+pub fn stand_state_changed(
+    old_unit_bytes_1: u32,
+    new_unit_bytes_1: u32,
+) -> Option<SMSG_STANDSTATE_UPDATE> {
+    let state = (new_unit_bytes_1 & 0xFF) as u8;
+    if state == (old_unit_bytes_1 & 0xFF) as u8 {
+        return None;
+    }
+    UnitStandState::try_from(state)
+        .ok()
+        .map(build_stand_state_update)
+}
+
+pub fn build_player_bound(binder_guid: u64, area_id: u32) -> (u16, Vec<u8>) {
+    let mut body = binder_guid.to_le_bytes().to_vec();
+    body.extend_from_slice(&area_id.to_le_bytes());
+    (0x0158, body)
+}
+
 pub fn build_played_time(
     played_total_secs: u32,
     session_start_micros: u64,
@@ -162,6 +237,100 @@ pub fn build_played_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use wow_world_messages::vanilla::ServerMessage;
+
+    /// `[size:u16 BE][opcode:u16 LE][body]`, the plaintext frame the World Session writes.
+    fn typed_frame(message: &impl ServerMessage) -> Vec<u8> {
+        let mut framed = Vec::new();
+        message.write_unencrypted_server(&mut framed).unwrap();
+        framed
+    }
+
+    fn raw_frame((opcode, body): (u16, Vec<u8>)) -> Vec<u8> {
+        let mut framed = u16::try_from(body.len() + 2)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        framed.extend_from_slice(&opcode.to_le_bytes());
+        framed.extend(body);
+        framed
+    }
+
+    #[test]
+    fn rename_refusal_is_the_char_create_error_byte() {
+        assert_eq!(
+            typed_frame(&build_char_rename_refusal()),
+            [0x00, 0x03, 0xc8, 0x02, 0x2f]
+        );
+    }
+
+    #[test]
+    fn login_failure_is_response_failure() {
+        assert_eq!(
+            typed_frame(&build_character_login_failed()),
+            [0x00, 0x03, 0x41, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn empty_account_data_is_the_section_and_a_zero_size() {
+        assert_eq!(
+            raw_frame(build_empty_account_data(7).unwrap()),
+            [0x00, 0x0a, 0x0c, 0x02, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(build_empty_account_data(8), None);
+    }
+
+    #[test]
+    fn each_playable_race_has_its_opening_cinematic() {
+        let ids: Vec<_> = (1..=8).map(opening_cinematic).collect();
+        assert_eq!(ids, [81, 21, 41, 61, 2, 141, 101, 121].map(Some).to_vec());
+        assert_eq!(opening_cinematic(0), None);
+        assert_eq!(opening_cinematic(9), None);
+        assert_eq!(
+            raw_frame(build_trigger_cinematic(141)),
+            [0x00, 0x06, 0xfa, 0x00, 141, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn init_world_states_names_the_map_and_zone_with_no_states() {
+        assert_eq!(
+            raw_frame(build_init_world_states(0, 12)),
+            [0x00, 0x0c, 0xc2, 0x02, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn stand_state_update_is_the_state_byte() {
+        assert_eq!(
+            typed_frame(&build_stand_state_update(UnitStandState::Sit)),
+            [0x00, 0x03, 0x9d, 0x02, 0x01]
+        );
+    }
+
+    #[test]
+    fn only_a_changed_stand_byte_tells_the_character() {
+        let ghost = 0x0100_0000;
+        assert_eq!(
+            stand_state_changed(ghost | 1, ghost),
+            Some(build_stand_state_update(UnitStandState::Stand))
+        );
+        assert_eq!(
+            stand_state_changed(0, 3),
+            Some(build_stand_state_update(UnitStandState::Sleep))
+        );
+        assert_eq!(stand_state_changed(1, ghost | 1), None);
+    }
+
+    #[test]
+    fn player_bound_is_the_innkeeper_guid_then_the_area() {
+        assert_eq!(
+            raw_frame(build_player_bound(0xF130_0000_0000_1234, 87)),
+            [0x00, 0x0e, 0x58, 0x01, 0x34, 0x12, 0, 0, 0, 0, 0x30, 0xf1, 87, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn char_create_response_maps_every_outcome() {

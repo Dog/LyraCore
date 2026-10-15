@@ -28,7 +28,9 @@ fn rule(msg: &ClientOpcodeMessage) -> FloodRule {
                 FloodRule::Counted
             }
         }
-        ClientOpcodeMessage::CMSG_TEXT_EMOTE(_) => FloodRule::RefusedWhileMuted,
+        ClientOpcodeMessage::CMSG_TEXT_EMOTE(_) | ClientOpcodeMessage::CMSG_EMOTE(_) => {
+            FloodRule::RefusedWhileMuted
+        }
         _ => FloodRule::Free,
     }
 }

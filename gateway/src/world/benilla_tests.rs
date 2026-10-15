@@ -1114,10 +1114,6 @@ fn benilla_missing_gameplay_returns_a_specific_refusal_without_disconnect() {
         ),
         (opcode::CMSG_UNLEARN_SKILL, 164u32.to_le_bytes().to_vec()),
         (opcode::CMSG_SET_AMMO, messages::set_ammo(2512)),
-        (
-            opcode::CMSG_STANDSTATECHANGE,
-            messages::stand_state_change(1),
-        ),
         (opcode::CMSG_MOUNTSPECIAL_ANIM, vec![]),
         (opcode::CMSG_TOGGLE_PVP, vec![]),
         (opcode::CMSG_TOGGLE_HELM, vec![]),
@@ -1193,10 +1189,6 @@ fn benilla_automatic_requests_announce_missing_features_once_per_world_session()
     let (mut client, gateway) = client_in_world(gameplay_store(GameplayState::default()));
     for (opcode, body) in [
         (
-            opcode::CMSG_STANDSTATECHANGE,
-            messages::stand_state_change(1),
-        ),
-        (
             opcode::CMSG_SET_ACTIONBAR_TOGGLES,
             messages::set_actionbar_toggles(3),
         ),
@@ -1210,6 +1202,96 @@ fn benilla_automatic_requests_announce_missing_features_once_per_world_session()
     for opcode in [opcode::CMSG_TUTORIAL_CLEAR, opcode::CMSG_TUTORIAL_RESET] {
         client.send(opcode, &[]);
         client.ping(u32::from(opcode));
+    }
+    client.logout();
+    drop(client);
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+fn benilla_sitting_down_reaches_the_store() {
+    let store = gameplay_store(GameplayState::default());
+    let (mut client, gateway) = client_in_world(store.clone());
+    client.send(
+        opcode::CMSG_STANDSTATECHANGE,
+        &messages::stand_state_change(1),
+    );
+    client.ping(1);
+    assert_eq!(*store.character.stand_states.lock().unwrap(), [(1, 1)]);
+    client.logout();
+    drop(client);
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+fn benilla_requests_without_a_safe_reader_are_dropped_without_disconnect() {
+    let (mut client, gateway) = client_in_world(gameplay_store(GameplayState::default()));
+    let mut hostile_account_data = 0u32.to_le_bytes().to_vec();
+    hostile_account_data.extend_from_slice(&u32::MAX.to_le_bytes());
+    hostile_account_data.extend_from_slice(b"not zlib");
+    for (opcode, body) in [
+        (0x020b, hostile_account_data), // CMSG_UPDATE_ACCOUNT_DATA
+        (0x01f4, 0xffff_u32.to_le_bytes().to_vec()), // CMSG_ZONEUPDATE, an unnamed area
+        (0x000a, vec![]),               // CMSG_ZONE_MAP
+        (0x0020, vec![]),               // CMSG_UNDRESSPLAYER
+        (0x022f, vec![]),               // CMSG_GM_REQUEST_PLAYER_INFO
+        (0x0331, vec![]),               // CMSG_CHAT_FILTERED
+        (0x0334, vec![]),               // CMSG_LOTTERY_QUERY_OBSOLETE
+    ] {
+        client.send(opcode, &body);
+        client.ping(u32::from(opcode));
+    }
+    client.logout();
+    drop(client);
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+fn benilla_a_second_login_in_the_same_world_session_fails_without_disconnect() {
+    let (mut client, gateway) = client_in_world(gameplay_store(GameplayState::default()));
+    client.send(opcode::CMSG_PLAYER_LOGIN, &messages::full_guid(1));
+    assert!(matches!(
+        client.recv(),
+        ServerPacket::CharacterLoginFailed { result: 1 }
+    ));
+    client.ping(1);
+    client.logout();
+    drop(client);
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+fn benilla_a_first_login_plays_the_races_opening_cinematic() {
+    let mut store = gameplay_store(GameplayState::default());
+    Arc::get_mut(&mut store).unwrap().characters[0].first_login = true;
+    let (socket, gateway_socket) = world_session_socket_pair();
+    let gateway = std::thread::spawn(move || run_world_session(gateway_socket, store));
+    let mut client = Client::connect(socket, super::K);
+    client.enter_world();
+    client.until("the opening cinematic", |packet| {
+        matches!(packet, ServerPacket::TriggerCinematic { cinematic_id: 81 })
+    });
+    client.logout();
+    drop(client);
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+fn benilla_a_later_login_plays_no_cinematic() {
+    let (socket, gateway_socket) = world_session_socket_pair();
+    let store = gameplay_store(GameplayState::default());
+    let gateway = std::thread::spawn(move || run_world_session(gateway_socket, store));
+    let mut client = Client::connect(socket, super::K);
+    client.enter_world();
+    client.send(opcode::CMSG_QUERY_TIME, &messages::query_time());
+    loop {
+        match client.recv() {
+            ServerPacket::QueryTimeResponse { .. } => break,
+            ServerPacket::TriggerCinematic { cinematic_id } => {
+                panic!("a later login played cinematic {cinematic_id}")
+            }
+            _ => {}
+        }
     }
     client.logout();
     drop(client);
@@ -1264,6 +1346,11 @@ fn benilla_bind_and_respec_confirmations_reach_existing_gameplay() {
         .home_bound
         .load(std::sync::atomic::Ordering::SeqCst));
     client.send(opcode::CMSG_BINDER_ACTIVATE, &messages::binder_activate(99));
+    let area = store.characters[0].zone_id;
+    assert!(matches!(
+        client.recv(),
+        ServerPacket::PlayerBound { binder: 99, area: bound } if bound == area
+    ));
     assert!(matches!(client.recv(), ServerPacket::GossipComplete));
     assert!(store
         .npc

@@ -234,12 +234,25 @@ The selected innkeeper guid reaches the Module's interaction Gate.
 `CMSG_LOGOUT_CANCEL` returns its acknowledgement. Logout remains immediate when
 allowed; there is no twenty-second pending logout to cancel.
 
+Stand, sit, sleep and kneel requests reach the Module, which stores the stand
+state on the Character's unit bytes. A ghost can sit too. Damage stands a seated
+player who is not mounted. Each stored change sends the Character
+`SMSG_STANDSTATE_UPDATE`, and observers see it in the unit bytes. A refused
+request sends the stored state back. A completed bind also sends `SMSG_PLAYERBOUND`.
+Its confirmation line names the Character's zone; vmangos names the sub-area at
+the bind point. World entry and each zone
+crossing send an empty `SMSG_INIT_WORLD_STATES`. A first world entry plays the
+race's opening cinematic. A second login in one World Session gets
+`SMSG_CHARACTER_LOGIN_FAILED`. Debug, GM, Warden and lottery requests get no
+answer. The Gateway drops account-data uploads and zone reports before decoding,
+because the protocol library cannot read them safely.
+
 ## Missing gameplay and deliberate responses
 
 These features remain unavailable. The responses below apply to valid requests
 while in world. A decoded request or a refusal is not a working gameplay system.
-Automatic stand-state, action-bar and tutorial requests announce each missing
-feature once per World Session. Repeated requests do not add chat lines.
+Automatic action-bar and tutorial requests announce each missing feature once
+per World Session. Repeated requests do not add chat lines.
 
 | Feature | Protocol behavior | Missing work |
 | --- | --- | --- |
@@ -252,7 +265,10 @@ feature once per World Session. Repeated requests do not add chat lines.
 | Readable pages | A terminal page names the unavailable text service. | Page-text catalog import and page chains. |
 | Explicit vendor destination | Inventory Refusal 39. | An atomic purchase into the requested bag and slot. Ordinary vendor purchase uses the existing path. |
 | Automatic bag placement | Equipment-to-backpack uses the existing path; other requests receive Inventory Refusal 39. | Automatic placement into a chosen bag and movement of nonempty equipped bags. Explicit supported slot moves work. |
-| Character presentation | Specific System Messages. | Stand state, mount flourish, helm and cloak visibility preferences. |
+| Character presentation | Specific System Messages. | Mount flourish, helm and cloak visibility preferences. |
+| Stand-state rules | Stand state is stored and shown. | Auras that sitting or standing cancels, the automatic critical hit on a seated victim, the NOT_STANDING cast failure, 1.5x regeneration while seated, and the UNIT_FLAG_PREVENT_ANIM gate. |
+| Character renames | `SMSG_CHAR_RENAME` with CHAR_CREATE_ERROR. | An at-login rename flag and the rename itself. |
+| Account data | Every section reports empty at world entry. A section request gets an empty `SMSG_UPDATE_ACCOUNT_DATA`; uploads are dropped. | Durable macros, key bindings and settings per Account and per Character. |
 | Tutorials and display preferences | Specific System Messages. | Durable tutorial flags, action bar visibility, inactive and watched factions. Action buttons and At War use existing operations. |
 | Ammunition and skill unlearning | Specific System Messages. | Ammunition selection and removal of learned skills. |
 | Taxi chains | Activation failure code 1. | Chained flight state and charging. Single-hop taxis use the existing path. |

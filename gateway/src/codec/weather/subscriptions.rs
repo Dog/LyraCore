@@ -55,6 +55,7 @@ pub(crate) fn zone_crossed<St>(
     store: &St,
     shard: ShardId,
     guid: u64,
+    map_id: u32,
     old_zone: u32,
     zone_id: u32,
 ) where
@@ -71,11 +72,14 @@ pub(crate) fn zone_crossed<St>(
     }
     let store = store.clone();
     enqueue(viewer.clone(), move |_| {
-        crate::codec::weather::subscriptions::zone_weather_outbound(
+        let (opcode, body) = codec::build_init_world_states(map_id, zone_id);
+        let mut out = vec![Outbound::Raw { opcode, body }];
+        out.extend(zone_weather_outbound(
             &store,
             zone_id,
             WeatherChangeType::Instant,
-        )
+        ));
+        out
     });
 }
 

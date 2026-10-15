@@ -203,6 +203,25 @@ impl CharacterStore for Coordinator {
             .collect())
     }
 
+    fn set_stand_state(&self, actor: Actor, state: u8) -> Result<()> {
+        call_reducer!(
+            self.0.call_pipe().conn.reducers,
+            "gw_set_stand_state",
+            gw_set_stand_state_then(self.session_actor(actor), state)
+        )
+    }
+
+    fn stand_state(&self, guid: u64) -> u8 {
+        self.0
+            .coord()
+            .conn
+            .db
+            .game_world_entity()
+            .guid()
+            .find(&guid)
+            .map_or(0, |entity| (entity.unit_bytes_1 & 0xFF) as u8)
+    }
+
     fn player_reputations(&self, player_guid: u64) -> Result<Vec<(i32, i32, bool)>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;

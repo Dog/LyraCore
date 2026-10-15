@@ -9,7 +9,6 @@ fn word(opcode: u16, value: u32) -> Outbound {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum UnavailableNotice {
-    StandState,
     ActionBar,
     Tutorial,
 }
@@ -19,9 +18,6 @@ pub(crate) fn unavailable_outbound(
     notices: &mut std::collections::HashSet<UnavailableNotice>,
 ) -> Option<Vec<Outbound>> {
     let notice = match msg {
-        ClientOpcodeMessage::CMSG_STANDSTATECHANGE(_) => {
-            Some((UnavailableNotice::StandState, "Stand-state changes"))
-        }
         ClientOpcodeMessage::CMSG_SET_ACTIONBAR_TOGGLES(_) => Some((
             UnavailableNotice::ActionBar,
             "Action bar visibility preferences",

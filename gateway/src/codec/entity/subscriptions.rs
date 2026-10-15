@@ -412,6 +412,11 @@ pub(crate) fn relay_entity_update(
                 &view.auras.on_target(shard, new.guid),
             ),
         );
+        if let Some(update) = codec::stand_state_changed(old.unit_bytes_1, new.unit_bytes_1) {
+            out.push(Outbound::One(ServerOpcodeMessage::SMSG_STANDSTATE_UPDATE(
+                update,
+            )));
+        }
         if let Some(is_ghost) =
             ghost_transition(old.player_flags, new.player_flags, GHOST_PLAYER_FLAG)
         {
@@ -802,7 +807,7 @@ crate::stdb::relays::declare_relays! {
         insert(Snapshot) => |context, _event, row| entity_appeared(&context.view, context.shard, row);
         update(Snapshot) => |context, _event, old, new| {
                 entity_changed(&context.view, context.shard, old, new);
-                zone_crossed(&context.view, &context.coord, context.shard, new.guid, old.zone_id, new.zone_id);
+                zone_crossed(&context.view, &context.coord, context.shard, new.guid, new.map_id, old.zone_id, new.zone_id);
             };
         delete(Snapshot) => |context, _event, row| entity_vanished(&context.view, context.shard, row.guid, row.owner_guid);
     }

@@ -8,7 +8,12 @@ pub(super) fn login(
     character: Actor,
 ) -> Result<()> {
     if conn.session_claim.is_some() {
-        return Err(anyhow!("ACCOUNT_IN_USE"));
+        return send(
+            tx,
+            Outbound::One(ServerOpcodeMessage::SMSG_CHARACTER_LOGIN_FAILED(
+                codec::build_character_login_failed(),
+            )),
+        );
     }
     let character_guid = character.guid();
     let token = store.claim_session(conn.account_id, character_guid)?;
@@ -18,7 +23,26 @@ pub(super) fn login(
     }
     conn.route_home(character_guid)?;
     let home = conn.store.current();
-    enter_world(tx, &*home, conn, character, codec::WorldEntry::FreshLogin)
+    // Read before world entry, which clears the first-login flag.
+    let cinematic = opening_cinematic(&*home, character_guid);
+    enter_world(tx, &*home, conn, character, codec::WorldEntry::FreshLogin)?;
+    if let Some(sequence) = cinematic {
+        let (opcode, body) = codec::build_trigger_cinematic(sequence);
+        send(tx, Outbound::Raw { opcode, body })?;
+    }
+    Ok(())
+}
+
+fn opening_cinematic<St: CharacterStore + ?Sized>(store: &St, character_guid: u64) -> Option<u32> {
+    match store.character_by_guid(character_guid) {
+        Ok(character) => character
+            .filter(|character| character.first_login)
+            .and_then(|character| codec::opening_cinematic(character.race)),
+        Err(error) => {
+            log::warn!("world: first-login read for guid {character_guid} failed: {error:#}");
+            None
+        }
+    }
 }
 
 pub(super) fn world_port_ack(
@@ -133,6 +157,8 @@ fn enter_world(
         WeatherChangeType::Instant,
     ));
     send(tx, Outbound::Batch(batch))?;
+    let (opcode, body) = codec::build_init_world_states(entity.map_id, entity.zone_id);
+    send(tx, Outbound::Raw { opcode, body })?;
     for (opcode, body) in items.iter().filter_map(codec::build_random_property_values) {
         send(tx, Outbound::Raw { opcode, body })?;
     }
