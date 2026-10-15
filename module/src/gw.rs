@@ -320,6 +320,18 @@ pub fn gw_set_sheathed(
 }
 
 #[reducer]
+pub fn gw_set_stand_state(
+    ctx: &ReducerContext,
+    request_actor: crate::account_ownership::SessionActor,
+    state: u8,
+) -> Result<(), String> {
+    require_operator(ctx)?;
+    let actor_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
+    let actor = actor(ctx, actor_guid)?;
+    crate::world::apply_set_stand_state(ctx, actor, state)
+}
+
+#[reducer]
 pub fn gw_accept_quest(
     ctx: &ReducerContext,
     request_actor: crate::account_ownership::SessionActor,

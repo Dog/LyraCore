@@ -1174,6 +1174,47 @@ pub(crate) fn apply_set_sheathed(
     Ok(())
 }
 
+// The states a client may pick: stand, sit, sleep, kneel.
+const PLAYER_STAND_STATES: [u8; 4] = [0, 1, 3, 8];
+
+const STAND_STATE_DEAD: u32 = 7;
+
+// No alive check: the client sits a released ghost.
+pub(crate) fn apply_set_stand_state(
+    ctx: &ReducerContext,
+    mut actor: WorldEntity,
+    state: u8,
+) -> Result<(), String> {
+    if !PLAYER_STAND_STATES.contains(&state) {
+        return Err(format!("invalid stand state {state}"));
+    }
+    let packed = (actor.unit_bytes_1 & !0xFF) | u32::from(state);
+    if packed == actor.unit_bytes_1 {
+        return Ok(());
+    }
+    actor.unit_bytes_1 = packed;
+    ctx.db.game_world_entity().guid().update(actor);
+    Ok(())
+}
+
+// The client does not stand itself when hit.
+pub(crate) fn stand_up_on_damage(ctx: &ReducerContext, target_guid: u64) {
+    let entities = ctx.db.game_world_entity();
+    let Some(mut target) = entities.guid().find(target_guid) else {
+        return;
+    };
+    let state = target.unit_bytes_1 & 0xFF;
+    if !target.is_player()
+        || target.mount_display_id != 0
+        || state == 0
+        || state == STAND_STATE_DEAD
+    {
+        return;
+    }
+    target.unit_bytes_1 &= !0xFF;
+    entities.guid().update(target);
+}
+
 pub const RESURRECTION_SICKNESS_SPELL: u32 = 15007;
 
 fn spirit_res_vitals(max_health: u32, max_power: u32) -> (u32, u32) {
