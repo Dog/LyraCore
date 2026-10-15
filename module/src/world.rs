@@ -246,6 +246,11 @@ impl WorldEntity {
     pub(crate) fn class(&self) -> u8 {
         ((self.unit_bytes_0 >> 8) & 0xFF) as u8
     }
+
+    /// The pool `power` holds (`lyracore_shared::packing::power_type`) — byte 3 of `unit_bytes_0`.
+    pub(crate) fn power_type(&self) -> u8 {
+        ((self.unit_bytes_0 >> 24) & 0xFF) as u8
+    }
 }
 
 #[table(

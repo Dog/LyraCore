@@ -191,6 +191,7 @@ pub(crate) enum SpellCastEventKind {
     Interrupt = 3,
     Pushback = 4,
     ProcLog = 5,
+    PeriodicLog = 6,
 }
 
 #[table(
@@ -254,7 +255,20 @@ pub struct SpellCastEvent {
     // Zero selects legacy field decoding; new rows use nonzero codes.
     #[default(0u8)]
     pub kind: u8,
+    // `CAST_MISS_*` for the primary target on a GO row.
+    #[default(0u8)]
+    pub miss_info: u8,
+    // Power given to the primary target; `power_type` is the target's power byte.
+    #[default(0u32)]
+    pub energized: u32,
+    #[default(0u8)]
+    pub power_type: u8,
 }
+
+pub const CAST_MISS_NONE: u8 = 0;
+pub const CAST_MISS_MISS: u8 = 1;
+/// Vanilla reports a magic spell's failed hit roll as a full resist.
+pub const CAST_MISS_RESIST: u8 = 2;
 
 impl SpellCastEvent {
     pub(crate) fn signal(
@@ -285,6 +299,25 @@ impl SpellCastEvent {
             crate::helpers::entity_addr(caster),
             kind,
         )
+    }
+
+    /// Addressed at the target, since the caster may be far away or gone.
+    pub(crate) fn periodic_log(
+        ctx: &ReducerContext,
+        caster_guid: u64,
+        spell_id: u32,
+        target: &WorldEntity,
+    ) -> Self {
+        Self {
+            target_guid: target.guid,
+            ..Self::signal_addr(
+                ctx,
+                caster_guid,
+                spell_id,
+                crate::helpers::entity_addr(target),
+                SpellCastEventKind::PeriodicLog,
+            )
+        }
     }
 
     fn signal_addr(
@@ -321,6 +354,9 @@ impl SpellCastEvent {
             grid_y,
             failure_reason: CAST_FAIL_NONE,
             kind: kind as u8,
+            miss_info: CAST_MISS_NONE,
+            energized: 0,
+            power_type: 0,
         }
     }
 }

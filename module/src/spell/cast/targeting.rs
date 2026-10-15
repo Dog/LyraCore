@@ -26,6 +26,8 @@ pub(crate) struct EffectHit {
     pub absorbed: u32,
     pub crit: bool,
     pub healed: u32,
+    pub energized: u32,
+    pub power_type: u8,
 }
 impl EffectHit {
     fn none() -> Self {
@@ -44,6 +46,18 @@ impl EffectHit {
             ..Self::default()
         }
     }
+}
+
+/// An absent target counts as equal level.
+pub(crate) fn spell_misses(ctx: &ReducerContext, caster_level: u8, target_guid: u64) -> bool {
+    let target_level = ctx
+        .db
+        .game_world_entity()
+        .guid()
+        .find(target_guid)
+        .map(|t| t.level)
+        .unwrap_or(caster_level as u32);
+    (ctx.random::<u32>() % 10_000) < spell_miss_chance_bp(caster_level as u32, target_level)
 }
 
 pub(crate) fn recipe_reagents(ctx: &ReducerContext, spell_id: u32) -> Vec<(u32, u32)> {
@@ -587,16 +601,9 @@ pub(crate) fn apply_effect(
         EffectKind::Damage
         | EffectKind::WeaponStrike
         | EffectKind::Judgement
-        | EffectKind::FinisherDamage => apply_damage_effect(
-            ctx,
-            e,
-            hdr,
-            caster_guid,
-            target_guid,
-            level,
-            points,
-            triggered,
-        ),
+        | EffectKind::FinisherDamage => {
+            apply_damage_effect(ctx, e, hdr, caster_guid, target_guid, points, triggered)
+        }
         EffectKind::Heal
         | EffectKind::HealMaxHealth
         | EffectKind::Energize
@@ -756,29 +763,17 @@ fn hit_of(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_damage_effect(
     ctx: &ReducerContext,
     e: &SpellEffect,
     hdr: &Spell,
     caster_guid: u64,
     target_guid: u64,
-    level: u8,
     points: i32,
     triggered: bool,
 ) -> EffectHit {
     match e.kind {
         E_DAMAGE => {
-            let target_level = ctx
-                .db
-                .game_world_entity()
-                .guid()
-                .find(target_guid)
-                .map(|t| t.level)
-                .unwrap_or(level as u32);
-            if (ctx.random::<u32>() % 10_000) < spell_miss_chance_bp(level as u32, target_level) {
-                return EffectHit::none();
-            }
             let sp = spell_power(ctx, caster_guid, hdr.school_mask);
             let scaled = compose_magnitude(points, sp, SPELL_POWER_COEFF_PCT);
             let (dmg_flat, dmg_pct) =
@@ -922,14 +917,18 @@ fn apply_restore_effect(
             EffectHit::none()
         }
         E_ENERGIZE => {
+            let mut hit = EffectHit::none();
             if let Some(mut t) = ctx.db.game_world_entity().guid().find(target_guid) {
                 t.power = energized_value(t.power, t.max_power, points);
+                // vmangos `EnergizeBySpell` logs the full grant, not the gain.
+                hit.energized = points.max(0) as u32;
+                hit.power_type = t.power_type();
                 ctx.db.game_world_entity().guid().update(t);
             }
             if e.enters_combat {
                 crate::combat::enter_combat(ctx, caster_guid);
             }
-            EffectHit::none()
+            hit
         }
         E_CONVERT_RESOURCE => {
             convert_health_to_power(ctx, caster_guid, points);

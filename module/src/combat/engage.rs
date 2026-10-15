@@ -47,6 +47,7 @@ pub(crate) fn arm_creature_engagement(
         pursuit_ends_ms: 0,
         leash_x: 0.0,
         leash_y: 0.0,
+        swing_error: 0,
     });
     let entities = ctx.db.game_world_entity();
     if let Some(mut creature) = entities.guid().find(creature_guid) {
@@ -259,7 +260,14 @@ pub struct MeleeAttack {
     pub leash_x: f32,
     #[default(0.0)]
     pub leash_y: f32,
+    /// `SWING_ERROR_*`; the Gateway relays each change to the attacker.
+    #[default(0u8)]
+    pub swing_error: u8,
 }
+
+pub const SWING_ERROR_NONE: u8 = 0;
+pub const SWING_ERROR_NOT_IN_RANGE: u8 = 1;
+pub const SWING_ERROR_BAD_FACING: u8 = 2;
 
 #[table(
     accessor = game_combat_event,
@@ -528,6 +536,7 @@ fn start_attack(
         pursuit_ends_ms: 0,
         leash_x: 0.0,
         leash_y: 0.0,
+        swing_error: 0,
     };
     if melee.attacker_guid().find(attacker.guid).is_some() {
         melee.attacker_guid().update(row);
@@ -618,6 +627,7 @@ pub(crate) fn apply_start_ranged_attack(
         pursuit_ends_ms: 0,
         leash_x: 0.0,
         leash_y: 0.0,
+        swing_error: 0,
     };
     if melee.attacker_guid().find(attacker.guid).is_some() {
         melee.attacker_guid().update(row);
