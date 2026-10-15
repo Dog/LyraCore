@@ -241,6 +241,41 @@ fn a_hunter_renames_its_own_pet_once_and_the_name_outlives_logout() {
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn a_summoned_pet_cannot_be_renamed_as_a_hunter_pet() {
+    use lyracore_shared::spell::taxonomy::{E_SUMMON_PET, T_SELF};
+
+    let shard = hunter("summoned-pet-rename");
+    shard.assert_sql(&format!(
+        "UPDATE game_spell SET cast_flags = 0, duration_ms = 0 WHERE spell_id = {TAME}"
+    ));
+    shard.assert_sql(&format!(
+        "UPDATE game_spell_effect SET kind = {E_SUMMON_PET}, target = {T_SELF}, p0 = {BOAR} WHERE spell_id = {TAME}"
+    ));
+    shard.assert_call("debug_force_cast_at", &[HUNTER, TAME, HUNTER]);
+    let pet = pet_guid_for(1);
+    assert_eq!(
+        shard.query_rows(&format!(
+            "SELECT hunter_pet_id FROM game_live_pet_kind WHERE pet_guid = {pet}"
+        ))[0]["hunter_pet_id"],
+        "0"
+    );
+    for name in ["Fang", "Fang 2"] {
+        assert_refused(rename(&shard, HUNTER, pet, name), "not a Hunter pet");
+        assert!(shard.query_rows("SELECT * FROM game_hunter_pet").is_empty());
+        assert!(shard
+            .query_rows("SELECT * FROM game_hunter_pet_protocol")
+            .is_empty());
+        assert_eq!(
+            shard.query_rows(&format!(
+                "SELECT owner_guid FROM game_world_entity WHERE guid = {pet}"
+            ))[0]["owner_guid"],
+            HUNTER
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn existing_live_pet_recovers_rename_eligibility_without_losing_other_flags() {
     let shard = hunter("hunter-pet-name-upgrade");
     let wild = wild_boar(&shard);

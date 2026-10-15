@@ -44,7 +44,6 @@ impl CombatStore for Coordinator {
     }
 }
 
-/// Only PET_NAME_INVALID becomes a client-visible outcome; other failures stay Err.
 fn pet_rename_outcome(result: Result<()>) -> Result<PetRenameOutcome> {
     let Err(error) = result else {
         return Ok(PetRenameOutcome::Renamed);
