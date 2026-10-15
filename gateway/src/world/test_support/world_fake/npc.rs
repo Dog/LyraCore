@@ -216,21 +216,19 @@ impl NpcStore for WorldFake {
                 )
                 .into());
             }
-        } else {
-            if !matches!(
-                selected_action,
-                gossip_option::VENDOR | gossip_option::INNKEEPER
-            ) || menu
-                .options
-                .iter()
-                .any(|option| option.action == selected_action)
-            {
-                return Err(ReducerCallError::refused(
-                    "gw_gossip_select",
-                    "gossip service is no longer available",
-                )
-                .into());
-            }
+        } else if !matches!(
+            selected_action,
+            gossip_option::VENDOR | gossip_option::INNKEEPER
+        ) || menu
+            .options
+            .iter()
+            .any(|option| option.action == selected_action)
+        {
+            return Err(ReducerCallError::refused(
+                "gw_gossip_select",
+                "gossip service is no longer available",
+            )
+            .into());
         }
         self.npc
             .gossip_selects
