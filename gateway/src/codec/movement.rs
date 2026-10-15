@@ -238,15 +238,9 @@ pub fn build_cross_map_teleport(
     ])
 }
 
-pub fn build_transfer_aborted(
-    map_id: u32,
-    reason: TransferAbortReason,
-) -> Result<SMSG_TRANSFER_ABORTED> {
-    Ok(SMSG_TRANSFER_ABORTED {
-        map: Map::try_from(map_id).map_err(|_| anyhow!("invalid map {map_id}"))?,
-        reason,
-        argument: 0,
-    })
+/// Build-5875 aborts carry only a reason byte; the typed writer adds later fields.
+pub fn build_transfer_aborted(reason: TransferAbortReason) -> (u16, Vec<u8>) {
+    (0x0040, vec![reason.as_int()])
 }
 
 pub fn build_force_run_speed(guid: u64, speed: f32) -> SMSG_FORCE_RUN_SPEED_CHANGE {
@@ -437,6 +431,19 @@ pub fn build_monster_move_facing(
         spline_flags: SplineFlag::new(0),
         duration: 0,
         splines: vec![pos],
+    }
+}
+
+#[cfg(test)]
+mod transfer_abort_tests {
+    use super::*;
+
+    #[test]
+    fn vanilla_transfer_abort_contains_only_the_reason() {
+        assert_eq!(
+            build_transfer_aborted(TransferAbortReason::NotFound),
+            (0x0040, vec![0x02])
+        );
     }
 }
 

@@ -279,6 +279,52 @@ fn benilla_login_clock_ping_logout_and_reconnect() {
     }
 }
 
+#[test]
+fn benilla_failed_transfer_reports_reason_without_a_destination_map() {
+    for destination_map in [Some(36), Some(u32::MAX), None] {
+        let mut store = tester_store(7);
+        store.session.entity_in_world = false;
+        store.session.login_entity = Some(warrior_entity());
+        store.characters = vec![super::party_tests::character(1, "Tester")];
+        store.transfer.xdb = destination_map.map(|map_id| {
+            super::FakeShardDb::with_character(
+                1,
+                super::FakeChar {
+                    map_id,
+                    instance_id: 7,
+                    payload: "gear+spells".into(),
+                },
+            )
+        });
+        store.topology.settle_error = Some("destination Shard unreachable".into());
+        store.topology.settle_ok_calls = 1;
+        let store = Arc::new(store);
+        let (socket, gateway_socket) = world_session_socket_pair();
+        let gateway_store = store.clone();
+        let gateway = std::thread::spawn(move || run_world_session(gateway_socket, gateway_store));
+        let mut client = Client::connect(socket, super::K);
+        client.enter_world();
+        client.send(opcode::MSG_MOVE_WORLDPORT_ACK, &[]);
+
+        // Client::recv requires Benilla to consume every byte in each frame.
+        assert!(matches!(
+            client.until("Transfer abort", |packet| {
+                matches!(packet, ServerPacket::TransferAborted { .. })
+            }),
+            ServerPacket::TransferAborted { reason: 0x02 }
+        ));
+        let error = gateway
+            .join()
+            .unwrap()
+            .expect_err("a failed Transfer must end the World Session");
+        assert!(format!("{error:#}").contains("destination Shard unreachable"));
+        assert!(store
+            .session
+            .logout_called
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
 pub(crate) struct MovementWorld {
     view: Arc<crate::stdb::world_view::WorldView>,
     relay: fn(&crate::stdb::world_view::WorldView, &crate::stdb::bindings::EntityMotion),
