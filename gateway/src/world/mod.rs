@@ -215,6 +215,9 @@ pub enum WorldState {
 
 pub struct GossipMenuSnapshot {
     pub npc_guid: u64,
+    /// Zero for the entry-owned menu, otherwise the profile id checked by the Module at selection.
+    pub source_menu_id: u32,
+    /// Menu positions hold row ids and actions; synthesized rows use codec::SYNTHESIZED_ROW_ID.
     pub options: Vec<(u32, u32)>,
 }
 

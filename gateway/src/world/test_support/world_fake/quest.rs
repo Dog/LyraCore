@@ -79,20 +79,6 @@ impl QuestActionStore for WorldFake {
         Ok(())
     }
 
-    fn quest_status(&self, _player_guid: u64, quest_id: u32) -> (bool, bool) {
-        match self
-            .quest
-            .quest_log
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, _)| *id == quest_id)
-        {
-            Some((_, rewarded)) => (true, *rewarded),
-            None => (false, false),
-        }
-    }
-
     fn turn_in_quest(
         &self,
         actor: Actor,
@@ -166,5 +152,21 @@ impl QuestActionStore for WorldFake {
                 .map_err(|_| anyhow!("reward item relay writer is gone"))?;
         }
         Ok(())
+    }
+}
+
+impl WorldFake {
+    pub(crate) fn quest_status(&self, _player_guid: u64, quest_id: u32) -> (bool, bool) {
+        match self
+            .quest
+            .quest_log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == quest_id)
+        {
+            Some((_, rewarded)) => (true, *rewarded),
+            None => (false, false),
+        }
     }
 }

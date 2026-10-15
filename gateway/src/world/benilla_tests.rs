@@ -614,7 +614,6 @@ fn benilla_loots_money_and_an_item_then_moves_it_in_inventory() {
 
 #[test]
 fn benilla_accepts_a_quest_requests_its_reward_and_collects_it() {
-    use super::QuestActionStore;
     let mut detail = super::detail_view(1234, "A delivery");
     detail.money_reward = 50;
     detail.reward_xp = 40;
@@ -677,7 +676,6 @@ fn benilla_accepts_a_quest_requests_its_reward_and_collects_it() {
 
 #[test]
 fn benilla_reward_request_for_an_incomplete_quest_keeps_the_progress_screen() {
-    use super::QuestActionStore;
     let mut store = gameplay_store(GameplayState::default());
     let setup = Arc::get_mut(&mut store).unwrap();
     setup.quest.quest_details = vec![super::detail_view(1234, "An unfinished quest")];

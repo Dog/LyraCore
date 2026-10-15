@@ -1356,7 +1356,9 @@ pub(crate) fn apply_gossip_select(
     npc_guid: u64,
     option_id: u32,
     option_row_id: u32,
+    source_menu_id: u32,
 ) -> Result<(), String> {
+    crate::gossip::select_gate(ctx, character_guid, npc_guid, option_row_id, source_menu_id)?;
     crate::hooks::fire_on_gossip_select(
         ctx,
         &crate::hooks::GossipSelectPayload {

@@ -98,6 +98,7 @@ pub use crate::gc::{game_event_reaper_schedule, EventReaperSchedule};
 pub use crate::gm::{game_world_config, GmWorldConfig};
 pub use crate::go_collider::{game_go_collider, GoCollider};
 pub use crate::go_model::{game_go_model, GoModel};
+pub use crate::gossip::{game_gossip_condition, GossipCondition};
 pub use crate::graveyard::{game_graveyard, game_graveyard_zone, GraveyardLoc, GraveyardZone};
 pub use crate::group::{
     game_bot_invite_intent, game_group, game_group_event, game_group_invite, game_group_member,

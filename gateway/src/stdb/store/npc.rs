@@ -62,11 +62,11 @@ impl NpcStore for Coordinator {
         Some(view)
     }
 
-    fn gossip_options(&self, npc_guid: u64) -> Result<Vec<crate::codec::GossipOptionView>> {
+    fn gossip_options(&self, npc_guid: u64) -> Result<codec::GossipMenuView> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
         let Some(entity) = db.game_world_entity().guid().find(&npc_guid) else {
-            return Ok(Vec::new());
+            return Ok(codec::GossipMenuView::default());
         };
         if let Some(menu_id) = active_gossip_menu_id(db, &entity) {
             if db
@@ -81,19 +81,22 @@ impl NpcStore for Coordinator {
                     .filter(|option| option.menu_id == menu_id)
                     .collect();
                 rows.sort_by_key(|option| option.option_index);
-                return Ok(rows
-                    .into_iter()
-                    .map(|option| crate::codec::GossipOptionView {
-                        row_id: option.row_id,
-                        icon: option.icon,
-                        text: option.text,
-                        action: option.action,
-                        action_menu_id: option.action_menu_id,
-                        cond_type: option.cond_type,
-                        cond_value1: option.cond_value_1,
-                        cond_value2: option.cond_value_2,
-                    })
-                    .collect());
+                return Ok(codec::GossipMenuView {
+                    source_menu_id: menu_id,
+                    options: rows
+                        .into_iter()
+                        .map(|option| crate::codec::GossipOptionView {
+                            row_id: option.row_id,
+                            icon: option.icon,
+                            text: option.text,
+                            action: option.action,
+                            action_menu_id: option.action_menu_id,
+                            cond_type: option.cond_type,
+                            cond_value1: option.cond_value_1,
+                            cond_value2: option.cond_value_2,
+                        })
+                        .collect(),
+                });
             }
         }
         let mut rows: Vec<_> = db
@@ -102,19 +105,81 @@ impl NpcStore for Coordinator {
             .filter(|option| option.entry == entity.entry)
             .collect();
         rows.sort_by_key(|option| option.option_index);
-        Ok(rows
-            .into_iter()
-            .map(|option| crate::codec::GossipOptionView {
-                row_id: option.row_id,
-                icon: option.icon,
-                text: option.text,
-                action: option.action,
-                action_menu_id: option.action_menu_id,
-                cond_type: option.cond_type,
-                cond_value1: option.cond_value_1,
-                cond_value2: option.cond_value_2,
-            })
-            .collect())
+        Ok(codec::GossipMenuView {
+            source_menu_id: 0,
+            options: rows
+                .into_iter()
+                .map(|option| crate::codec::GossipOptionView {
+                    row_id: option.row_id,
+                    icon: option.icon,
+                    text: option.text,
+                    action: option.action,
+                    action_menu_id: option.action_menu_id,
+                    cond_type: option.cond_type,
+                    cond_value1: option.cond_value_1,
+                    cond_value2: option.cond_value_2,
+                })
+                .collect(),
+        })
+    }
+
+    fn gossip_option_available(
+        &self,
+        character_guid: u64,
+        option: &codec::GossipOptionView,
+    ) -> Result<bool> {
+        use lyracore_shared::gossip::{evaluate_option, CharacterFacts, Condition, QuestState};
+        let guard = self.0.coord();
+        let db = &guard.conn.db;
+        let Some(character) = db.game_character().guid().find(&character_guid) else {
+            return Ok(false);
+        };
+        let level = db
+            .game_world_entity()
+            .guid()
+            .find(&character_guid)
+            .map_or(u32::from(character.level), |entity| entity.level);
+        Ok(evaluate_option(
+            option.cond_type,
+            option.cond_value1,
+            option.cond_value2,
+            CharacterFacts {
+                level,
+                race: character.race,
+                class: character.class,
+            },
+            |quest_entry| {
+                let Some(quest) = db.game_character_quest().iter().find(|quest| {
+                    quest.character_guid == character_guid && quest.quest_entry == quest_entry
+                }) else {
+                    return QuestState::Absent;
+                };
+                if quest.rewarded {
+                    QuestState::Rewarded
+                } else if quest.failed {
+                    QuestState::Failed
+                } else if crate::stdb::reads::quest_objectives_complete(
+                    db,
+                    quest_entry,
+                    Some(&quest),
+                    character_guid,
+                ) {
+                    QuestState::Complete
+                } else {
+                    QuestState::Incomplete
+                }
+            },
+            |id| {
+                db.game_gossip_condition()
+                    .condition_id()
+                    .find(&id)
+                    .map(|row| Condition {
+                        kind: row.kind,
+                        values: [row.value_1, row.value_2, row.value_3, row.value_4],
+                        flags: row.flags,
+                    })
+            },
+        ) == Ok(true))
     }
 
     fn npc_is_innkeeper(&self, guid: u64) -> Result<bool> {
@@ -224,6 +289,7 @@ impl NpcStore for Coordinator {
         npc_guid: u64,
         option_id: u32,
         option_row_id: u32,
+        source_menu_id: u32,
     ) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(
@@ -233,7 +299,8 @@ impl NpcStore for Coordinator {
                 self.session_actor(actor),
                 npc_guid,
                 option_id,
-                option_row_id
+                option_row_id,
+                source_menu_id
             )
         )
     }

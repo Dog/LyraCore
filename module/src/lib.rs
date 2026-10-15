@@ -161,8 +161,9 @@ mod go_collider;
 #[cfg(feature = "debug_reducers")]
 mod go_collider_fixture;
 mod go_model;
-
+mod gossip;
 mod graveyard;
+pub use tables::{game_gossip_condition, GossipCondition};
 mod group;
 pub mod guild;
 mod gw;

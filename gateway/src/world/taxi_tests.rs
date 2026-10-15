@@ -250,6 +250,11 @@ fn taxi_gossip_transport_failure_ends_the_world_session() {
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
 
+    assert_eq!(
+        client.read(&mut [0u8; 1]).unwrap(),
+        0,
+        "the taxi Transport Loss must close the socket"
+    );
     server
         .join()
         .expect_err("a broken taxi reducer transport must end the world session");
