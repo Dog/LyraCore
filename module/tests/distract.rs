@@ -397,6 +397,8 @@ fn distract_turns_only_the_idle_creatures_near_the_point_and_keeps_the_rogue_hid
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement() {
     let (shard, line) = shard("distract-cycle");
+    shard.assert_sql("DELETE FROM game_creature_move_schedule");
+    shard.assert_call("claim_operator", &[]);
     let point = line.at(20.0, 3.0);
 
     let patroller = spawn_wolf(&shard, 16.0);
@@ -410,6 +412,9 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
              VALUES ({id}, {patroller}, {x}, {y}, {z})"
         ));
     }
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET wp_target = 5090702 WHERE guid = {patroller}"
+    ));
     let wanderer = spawn_wolf(&shard, 20.0);
     shard.assert_sql(&format!(
         "UPDATE game_creature_spawn SET movement_type = {MOVEMENT_RANDOM} WHERE guid = {wanderer}"
@@ -417,25 +422,46 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
     let idle = spawn_wolf(&shard, 17.0);
     let spawn_orientation = line.o;
 
-    let walking = |guid: u64| {
-        spline(&shard, guid).is_some_and(|leg| {
-            let ends_micros = number::<u64>(&leg, "start_micros")
-                + number::<u64>(&leg, "dur_ms") * 1_000
-                - 600_000;
-            leg["facing"] == "false" && now_ms() * 1_000 < ends_micros
-        })
-    };
-    assert!(
-        poll_until(Duration::from_secs(60), || walking(patroller)
-            && walking(wanderer)),
-        "the patroller and the wanderer must both walk a leg"
-    );
     shard.assert_call(
         "debug_set_power",
         &[&PLAYER.to_string(), &ENERGY.to_string()],
     );
+    let (x, y, z) = line.at(24.0, 0.0);
+    for guid in [patroller, wanderer] {
+        shard.assert_call(
+            "debug_encounter_move",
+            &[
+                &guid.to_string(),
+                &x.to_string(),
+                &y.to_string(),
+                &z.to_string(),
+                "false",
+            ],
+        );
+    }
+    shard.assert_sql(&format!(
+        "UPDATE game_creature_spline SET dur_ms = 600000 WHERE guid = {patroller} OR guid = {wanderer}"
+    ));
+    let walking = shard.query_rows(&format!(
+        "SELECT * FROM game_creature_spline WHERE guid = {patroller} OR guid = {wanderer}"
+    ));
+    assert_eq!(walking.len(), 2);
     let cast = cast_at(&shard, point);
     assert!(cast.status.success(), "{cast:?}");
+    for leg in walking {
+        assert_eq!(leg["facing"], "false", "{leg:?}");
+        assert!(
+            now_ms() * 1_000
+                < number::<u64>(&leg, "start_micros") + number::<u64>(&leg, "dur_ms") * 1_000,
+            "Distract must interrupt an unfinished leg: {leg:?}"
+        );
+    }
+    shard.assert_sql(&format!(
+        "UPDATE game_creature_distraction SET ends_ms = {} WHERE ends_ms > 0",
+        now_ms() + 600_000
+    ));
+    let instance_id = entity(&shard, PLAYER)["instance_id"].clone();
+    shard.assert_call("debug_arm_instance_tick", &[&instance_id, "500"]);
     let cursor: u64 = number(&entity(&shard, patroller), "wp_target");
     let mut held = Vec::new();
     for guid in [patroller, wanderer, idle] {
@@ -455,11 +481,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
         held.push((guid, x, y));
     }
     assert_orientation(&shard, idle, line.o + FRAC_PI_4, "after the cast");
-
-    shard.assert_sql(&format!(
-        "UPDATE game_creature_distraction SET ends_ms = {} WHERE ends_ms > 0",
-        now_ms() + 600_000
-    ));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
