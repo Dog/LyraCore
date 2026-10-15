@@ -781,6 +781,9 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
                 )?;
                 continue;
             }
+            if handlers::is_silent_movement_request(hdr.opcode) {
+                continue;
+            }
             if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {
                 if matches!(conn.state, WorldState::InWorld(_)) {
                     for reply in replies {
@@ -947,13 +950,22 @@ fn dispatch(
                 forward_movement(store, conn, fwd_opcode, &fwd_info)?;
             }
         }
-    } else {
-        if let Some(info) = root_receipt_stop(&msg, conn.self_guid()) {
-            let stop = lyracore_shared::opcodes::movement::MSG_MOVE_STOP;
-            for (fwd_opcode, fwd_info) in conn.move_coalesce.on_movement_now(stop, &info) {
+    } else if let Some((mover, opcode, info)) = codec::acknowledged_move(&msg) {
+        // A teleport outdates the pose; see docs/benilla-compatibility.md#root-receipts.
+        let teleporting = match &conn.state {
+            WorldState::InWorld(iw) => iw.subs.teleport_pending(),
+            _ => false,
+        };
+        if conn.self_guid() == Some(mover) && !teleporting {
+            for (fwd_opcode, fwd_info) in conn.move_coalesce.on_movement_now(opcode, &info) {
                 forward_movement(store, conn, fwd_opcode, &fwd_info)?;
             }
-            return Ok(());
+        }
+    } else {
+        if let (ClientOpcodeMessage::MSG_MOVE_TELEPORT_ACK(_), WorldState::InWorld(iw)) =
+            (&msg, &conn.state)
+        {
+            iw.subs.teleport_acknowledged();
         }
         if handlers::is_control_receipt(&msg) {
             return Ok(());
@@ -999,25 +1011,6 @@ fn complete_reply(
             Ok(())
         }
     })
-}
-
-/// For receipt and transport constraints, see docs/benilla-compatibility.md#root-receipts.
-fn root_receipt_stop(msg: &ClientOpcodeMessage, self_guid: Option<u64>) -> Option<MovementInfo> {
-    let (guid, info, rooted) = match msg {
-        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => (ack.guid, &ack.info, true),
-        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(ack) => (ack.guid, &ack.info, false),
-        _ => return None,
-    };
-    if Some(guid.guid()) != self_guid {
-        return None;
-    }
-    // The library clears flags with reverse_bits, so clear steering in the encoded bytes.
-    let mut bytes = codec::movement_info_to_bytes(info).ok()?;
-    if rooted {
-        const FORWARD_BACKWARD_STRAFE: u8 = 0xF;
-        bytes[0] &= !FORWARD_BACKWARD_STRAFE;
-    }
-    codec::bytes_to_movement_info(&bytes).ok()
 }
 
 fn forward_movement<St: SessionStore + ?Sized>(

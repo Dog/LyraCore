@@ -33,7 +33,7 @@ pub(crate) fn is_discrete(opcode: u16) -> bool {
     use lyracore_shared::opcodes::movement as m;
     !matches!(
         opcode as u32,
-        m::MSG_MOVE_HEARTBEAT | m::MSG_MOVE_SET_FACING
+        m::MSG_MOVE_HEARTBEAT | m::MSG_MOVE_SET_FACING | m::MSG_MOVE_SET_PITCH
     )
 }
 
@@ -251,14 +251,22 @@ mod tests {
     const STOP: u16 = m::MSG_MOVE_STOP as u16;
 
     #[test]
-    fn only_heartbeat_and_facing_are_coalescible() {
-        for &op in m::SLICE_MOVE_OPCODES {
+    fn only_heartbeat_facing_and_pitch_are_coalescible() {
+        for &op in m::SLICE_MOVE_OPCODES
+            .iter()
+            .chain(m::ACKNOWLEDGED_MOVE_OPCODES)
+        {
             let discrete = is_discrete(op as u16);
-            let expected = op != m::MSG_MOVE_HEARTBEAT && op != m::MSG_MOVE_SET_FACING;
+            let expected = ![
+                m::MSG_MOVE_HEARTBEAT,
+                m::MSG_MOVE_SET_FACING,
+                m::MSG_MOVE_SET_PITCH,
+            ]
+            .contains(&op);
             assert_eq!(
                 discrete, expected,
                 "0x{op:03X}: a discrete transition is anything a peer animates off; only \
-                 HEARTBEAT and SET_FACING carry nothing a later packet does not"
+                 HEARTBEAT, SET_FACING and SET_PITCH carry nothing a later packet does not"
             );
         }
     }

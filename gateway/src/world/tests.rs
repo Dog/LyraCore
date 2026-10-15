@@ -72,6 +72,8 @@ mod mail_tests;
 mod melee_tests;
 #[path = "member_stats_tests.rs"]
 mod member_stats_tests;
+#[path = "movement_tests.rs"]
+mod movement_tests;
 #[path = "npc_tests.rs"]
 mod npc_tests;
 #[path = "party_mirror_tests.rs"]
@@ -240,7 +242,7 @@ fn human_speaker() -> SpeakerFacts {
 }
 
 #[test]
-fn a_root_receipt_relays_a_stop_without_steering_flags() {
+fn a_root_receipt_relays_msg_move_root_without_steering_flags() {
     use wow_world_messages::vanilla::{
         MovementInfo_MovementFlags, Vector3d, CMSG_FORCE_MOVE_ROOT_ACK, CMSG_FORCE_MOVE_UNROOT_ACK,
     };
@@ -267,16 +269,14 @@ fn a_root_receipt_relays_a_stop_without_steering_flags() {
         let bytes = codec::movement_info_to_bytes(info).unwrap();
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     };
-    let stop = root_receipt_stop(&root(FORWARD_ROOT), Some(7)).expect("own root receipt");
+    use lyracore_shared::opcodes::movement::{MSG_MOVE_ROOT, MSG_MOVE_UNROOT};
+    let (mover, opcode, stop) =
+        codec::acknowledged_move(&root(FORWARD_ROOT)).expect("root receipt");
+    assert_eq!((mover, opcode), (7, MSG_MOVE_ROOT));
     assert_eq!(flags(&stop), 0x1000);
-    assert!(root_receipt_stop(&root(FORWARD_ROOT), Some(8)).is_none());
     assert!(
-        root_receipt_stop(
-            &root(lyracore_shared::env::MOVEMENT_FLAG_ON_TRANSPORT),
-            Some(7)
-        )
-        .is_none(),
-        "a build-5875 transport receipt has a tail the typed reader skipped"
+        codec::acknowledged_move(&root(lyracore_shared::env::MOVEMENT_FLAG_ON_TRANSPORT)).is_none(),
+        "a transport flag without its tail is refused"
     );
 
     let unroot =
@@ -285,6 +285,7 @@ fn a_root_receipt_relays_a_stop_without_steering_flags() {
             movement_counter: 0,
             info: info(0x1),
         }));
-    let resumed = root_receipt_stop(&unroot, Some(7)).expect("own unroot receipt");
+    let (_, opcode, resumed) = codec::acknowledged_move(&unroot).expect("unroot receipt");
+    assert_eq!(opcode, MSG_MOVE_UNROOT);
     assert_eq!(flags(&resumed), 0x1, "an unroot receipt keeps steering");
 }

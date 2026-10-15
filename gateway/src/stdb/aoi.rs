@@ -5,6 +5,8 @@ pub(crate) static AOI_RECENTERS: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 pub(crate) struct ViewerGates {
     pub(crate) is_ghost: AtomicBool,
+    /// Set by a same-map teleport relay; cleared by the client's `MSG_MOVE_TELEPORT_ACK`.
+    pub(crate) teleport_pending: AtomicBool,
 }
 
 impl ViewerGates {

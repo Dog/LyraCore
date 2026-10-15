@@ -1,5 +1,10 @@
 use super::*;
-use wow_world_messages::vanilla::SMSG_FORCE_SWIM_SPEED_CHANGE;
+use wow_world_messages::vanilla::{
+    MSG_MOVE_SET_PITCH_Server, MSG_MOVE_START_PITCH_DOWN_Server, MSG_MOVE_START_PITCH_UP_Server,
+    MSG_MOVE_STOP_PITCH_Server, SMSG_FORCE_RUN_BACK_SPEED_CHANGE, SMSG_FORCE_SWIM_SPEED_CHANGE,
+    SMSG_MOVE_LAND_WALK, SMSG_MOVE_WATER_WALK, SMSG_SPLINE_SET_RUN_BACK_SPEED,
+    SMSG_SPLINE_SET_RUN_SPEED, SMSG_SPLINE_SET_SWIM_SPEED,
+};
 
 pub fn relayed_move_opcode(msg: &ClientOpcodeMessage) -> Option<u32> {
     use movement_opcodes as m;
@@ -14,15 +19,43 @@ pub fn relayed_move_opcode(msg: &ClientOpcodeMessage) -> Option<u32> {
         ClientOpcodeMessage::MSG_MOVE_START_TURN_LEFT(_) => m::MSG_MOVE_START_TURN_LEFT,
         ClientOpcodeMessage::MSG_MOVE_START_TURN_RIGHT(_) => m::MSG_MOVE_START_TURN_RIGHT,
         ClientOpcodeMessage::MSG_MOVE_STOP_TURN(_) => m::MSG_MOVE_STOP_TURN,
+        ClientOpcodeMessage::MSG_MOVE_START_PITCH_UP(_) => m::MSG_MOVE_START_PITCH_UP,
+        ClientOpcodeMessage::MSG_MOVE_START_PITCH_DOWN(_) => m::MSG_MOVE_START_PITCH_DOWN,
+        ClientOpcodeMessage::MSG_MOVE_STOP_PITCH(_) => m::MSG_MOVE_STOP_PITCH,
         ClientOpcodeMessage::MSG_MOVE_SET_RUN_MODE(_) => m::MSG_MOVE_SET_RUN_MODE,
         ClientOpcodeMessage::MSG_MOVE_SET_WALK_MODE(_) => m::MSG_MOVE_SET_WALK_MODE,
         ClientOpcodeMessage::MSG_MOVE_FALL_LAND(_) => m::MSG_MOVE_FALL_LAND,
         ClientOpcodeMessage::MSG_MOVE_START_SWIM(_) => m::MSG_MOVE_START_SWIM,
         ClientOpcodeMessage::MSG_MOVE_STOP_SWIM(_) => m::MSG_MOVE_STOP_SWIM,
         ClientOpcodeMessage::MSG_MOVE_SET_FACING(_) => m::MSG_MOVE_SET_FACING,
+        ClientOpcodeMessage::MSG_MOVE_SET_PITCH(_) => m::MSG_MOVE_SET_PITCH,
         ClientOpcodeMessage::MSG_MOVE_HEARTBEAT(_) => m::MSG_MOVE_HEARTBEAT,
         _ => return None,
     })
+}
+
+/// Observer relay for an acknowledgement; see docs/benilla-compatibility.md#root-receipts.
+pub fn acknowledged_move(msg: &ClientOpcodeMessage) -> Option<(u64, u32, MovementInfo)> {
+    use movement_opcodes as m;
+    const FORWARD_BACKWARD_STRAFE: u8 = 0xF;
+    let (guid, opcode, info) = match msg {
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_ROOT_ACK(ack) => {
+            (ack.guid, m::MSG_MOVE_ROOT, &ack.info)
+        }
+        ClientOpcodeMessage::CMSG_FORCE_MOVE_UNROOT_ACK(ack) => {
+            (ack.guid, m::MSG_MOVE_UNROOT, &ack.info)
+        }
+        ClientOpcodeMessage::CMSG_MOVE_WATER_WALK_ACK(ack) => {
+            (ack.guid, m::MSG_MOVE_WATER_WALK, &ack.info)
+        }
+        _ => return None,
+    };
+    // The library clears flags with reverse_bits, so clear steering in the encoded bytes.
+    let mut bytes = movement_info_to_bytes(info).ok()?;
+    if opcode == m::MSG_MOVE_ROOT {
+        bytes[0] &= !FORWARD_BACKWARD_STRAFE;
+    }
+    Some((guid.guid(), opcode, bytes_to_movement_info(&bytes).ok()?))
 }
 
 /// The typed transport layout belongs to later clients; use the build-5875 codec.
@@ -77,6 +110,21 @@ pub fn build_movement_relay(
                 info,
             }))
         }
+        m::MSG_MOVE_START_PITCH_UP => {
+            ServerOpcodeMessage::MSG_MOVE_START_PITCH_UP(Box::new(MSG_MOVE_START_PITCH_UP_Server {
+                guid,
+                info,
+            }))
+        }
+        m::MSG_MOVE_START_PITCH_DOWN => ServerOpcodeMessage::MSG_MOVE_START_PITCH_DOWN(Box::new(
+            MSG_MOVE_START_PITCH_DOWN_Server { guid, info },
+        )),
+        m::MSG_MOVE_STOP_PITCH => {
+            ServerOpcodeMessage::MSG_MOVE_STOP_PITCH(Box::new(MSG_MOVE_STOP_PITCH_Server {
+                guid,
+                info,
+            }))
+        }
         m::MSG_MOVE_SET_RUN_MODE => {
             ServerOpcodeMessage::MSG_MOVE_SET_RUN_MODE(Box::new(MSG_MOVE_SET_RUN_MODE_Server {
                 guid,
@@ -113,6 +161,12 @@ pub fn build_movement_relay(
                 info,
             }))
         }
+        m::MSG_MOVE_SET_PITCH => {
+            ServerOpcodeMessage::MSG_MOVE_SET_PITCH(Box::new(MSG_MOVE_SET_PITCH_Server {
+                guid,
+                info,
+            }))
+        }
         m::MSG_MOVE_HEARTBEAT => {
             ServerOpcodeMessage::MSG_MOVE_HEARTBEAT(Box::new(MSG_MOVE_HEARTBEAT_Server {
                 guid,
@@ -131,7 +185,7 @@ pub fn build_movement_relay_raw(
     mover_guid: u64,
     info_bytes: &[u8],
 ) -> Option<(u16, Vec<u8>)> {
-    if !movement_opcodes::is_slice_move(opcode) || info_bytes.len() < MIN_MOVEMENT_INFO_LEN {
+    if !movement_opcodes::is_relayed_move(opcode) || info_bytes.len() < MIN_MOVEMENT_INFO_LEN {
         return None;
     }
     // 9 = the largest packed guid, including its mask byte.
@@ -208,6 +262,70 @@ pub fn build_force_swim_speed(guid: u64, speed: f32) -> SMSG_FORCE_SWIM_SPEED_CH
         guid: Guid::new(guid),
         move_event: 0,
         speed,
+    }
+}
+
+pub fn build_force_run_back_speed(guid: u64, speed: f32) -> SMSG_FORCE_RUN_BACK_SPEED_CHANGE {
+    SMSG_FORCE_RUN_BACK_SPEED_CHANGE {
+        guid: Guid::new(guid),
+        move_event: 0,
+        speed,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedSpeed {
+    Run,
+    RunBack,
+    Swim,
+}
+
+/// Observers get this form for players too; see docs/benilla-compatibility.md#movement-controls.
+pub fn build_spline_speed(guid: u64, kind: ObservedSpeed, speed: f32) -> ServerOpcodeMessage {
+    let guid = Guid::new(guid);
+    match kind {
+        ObservedSpeed::Run => {
+            ServerOpcodeMessage::SMSG_SPLINE_SET_RUN_SPEED(Box::new(SMSG_SPLINE_SET_RUN_SPEED {
+                guid,
+                speed,
+            }))
+        }
+        ObservedSpeed::RunBack => ServerOpcodeMessage::SMSG_SPLINE_SET_RUN_BACK_SPEED(Box::new(
+            SMSG_SPLINE_SET_RUN_BACK_SPEED { guid, speed },
+        )),
+        ObservedSpeed::Swim => {
+            ServerOpcodeMessage::SMSG_SPLINE_SET_SWIM_SPEED(Box::new(SMSG_SPLINE_SET_SWIM_SPEED {
+                guid,
+                speed,
+            }))
+        }
+    }
+}
+
+/// 0x00E8/0x00EA, packed guid and counter; the client misreads the library's full guid.
+pub fn build_force_move_root_raw(guid: u64, rooted: bool) -> (u16, Vec<u8>) {
+    let mut body = Vec::with_capacity(13);
+    super::values::write_packed_guid_u64(&mut body, guid);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    (if rooted { 0x00E8 } else { 0x00EA }, body)
+}
+
+/// 0x031A or 0x0304: packed guid only. The library writes a full guid for the root form.
+pub fn build_spline_move_root_raw(guid: u64, rooted: bool) -> (u16, Vec<u8>) {
+    let mut body = Vec::with_capacity(9);
+    super::values::write_packed_guid_u64(&mut body, guid);
+    (if rooted { 0x031A } else { 0x0304 }, body)
+}
+
+pub fn build_move_water_walk(guid: u64, water_walk: bool) -> ServerOpcodeMessage {
+    let guid = Guid::new(guid);
+    if water_walk {
+        ServerOpcodeMessage::SMSG_MOVE_WATER_WALK(Box::new(SMSG_MOVE_WATER_WALK {
+            guid,
+            counter: 0,
+        }))
+    } else {
+        ServerOpcodeMessage::SMSG_MOVE_LAND_WALK(Box::new(SMSG_MOVE_LAND_WALK { guid, counter: 0 }))
     }
 }
 
@@ -365,6 +483,138 @@ mod ground_path_tests {
         ] {
             assert!(build_ground_path_raw(1, start, &points, 1000, 1, true).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    /// The plaintext frame a client receives: big-endian size of opcode and body, then the opcode.
+    fn framed(opcode: u16, body: &[u8]) -> Vec<u8> {
+        let mut frame = ((2 + body.len()) as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&opcode.to_le_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn typed(message: ServerOpcodeMessage) -> Vec<u8> {
+        let mut frame = Vec::new();
+        message.write_unencrypted_server(&mut frame).unwrap();
+        frame
+    }
+
+    // Packed guid (mask 0x03, then 0x02 0x01) and a zero counter.
+    #[test]
+    fn forced_root_and_unroot_carry_a_packed_guid_and_the_counter() {
+        let body = [0x03, 0x02, 0x01, 0, 0, 0, 0];
+        let (opcode, raw) = build_force_move_root_raw(0x0102, true);
+        assert_eq!(
+            framed(opcode, &raw),
+            [0x00, 0x09, 0xE8, 0x00, 0x03, 0x02, 0x01, 0, 0, 0, 0]
+        );
+        let (opcode, raw) = build_force_move_root_raw(0x0102, false);
+        assert_eq!((opcode, raw.as_slice()), (0x00EA, body.as_slice()));
+    }
+
+    // A creature guid packs to mask 0xC1 and its three nonzero bytes.
+    #[test]
+    fn spline_root_and_unroot_carry_only_the_packed_guid() {
+        let (opcode, raw) = build_spline_move_root_raw(0xF130_0000_0000_0042, true);
+        assert_eq!(
+            framed(opcode, &raw),
+            [0x00, 0x06, 0x1A, 0x03, 0xC1, 0x42, 0x30, 0xF1]
+        );
+        let (opcode, raw) = build_spline_move_root_raw(0xF130_0000_0000_0042, false);
+        assert_eq!(
+            framed(opcode, &raw),
+            [0x00, 0x06, 0x04, 0x03, 0xC1, 0x42, 0x30, 0xF1]
+        );
+    }
+
+    #[test]
+    fn water_walk_and_land_walk_carry_a_packed_guid_and_the_counter() {
+        assert_eq!(
+            typed(build_move_water_walk(7, true)),
+            [0x00, 0x08, 0xDE, 0x00, 0x01, 0x07, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            typed(build_move_water_walk(7, false)),
+            [0x00, 0x08, 0xDF, 0x00, 0x01, 0x07, 0, 0, 0, 0]
+        );
+    }
+
+    // 2.25 is 0x40100000 and 3.5 is 0x40600000.
+    #[test]
+    fn speed_changes_carry_the_speed_after_the_packed_guid() {
+        assert_eq!(
+            typed(ServerOpcodeMessage::SMSG_FORCE_RUN_BACK_SPEED_CHANGE(
+                Box::new(build_force_run_back_speed(7, 2.25))
+            )),
+            [0x00, 0x0C, 0xE4, 0x00, 0x01, 0x07, 0, 0, 0, 0, 0x00, 0x00, 0x10, 0x40]
+        );
+        for (kind, opcode) in [
+            (ObservedSpeed::Run, [0xFE, 0x02]),
+            (ObservedSpeed::RunBack, [0xFF, 0x02]),
+            (ObservedSpeed::Swim, [0x00, 0x03]),
+        ] {
+            assert_eq!(
+                typed(build_spline_speed(7, kind, 3.5)),
+                [0x00, 0x08, opcode[0], opcode[1], 0x01, 0x07, 0x00, 0x00, 0x60, 0x40]
+            );
+        }
+    }
+
+    /// A pose on a transport, in the build-5875 layout the library cannot read.
+    fn transport_pose() -> Vec<u8> {
+        let mut pose = 0x0200_0000u32.to_le_bytes().to_vec();
+        pose.extend_from_slice(&5u32.to_le_bytes());
+        pose.extend_from_slice(&[0; 16]);
+        pose.extend_from_slice(&0xF120_0000_0000_0012u64.to_le_bytes());
+        pose.extend_from_slice(&[0; 16]);
+        pose.extend_from_slice(&0u32.to_le_bytes());
+        pose
+    }
+
+    #[test]
+    fn acknowledgements_read_the_build_5875_pose() {
+        let mut root = 9u64.to_le_bytes().to_vec();
+        root.extend_from_slice(&3u32.to_le_bytes());
+        root.extend_from_slice(&transport_pose());
+        let message = read_movement_client(0x00E9, &root).unwrap().unwrap();
+        let (mover, opcode, info) = acknowledged_move(&message).unwrap();
+        assert_eq!((mover, opcode), (9, movement_opcodes::MSG_MOVE_ROOT));
+        assert_eq!(movement_info_to_bytes(&info).unwrap(), transport_pose());
+
+        let mut run_back = root.clone();
+        run_back.extend_from_slice(&2.25f32.to_le_bytes());
+        match read_movement_client(0x00E5, &run_back).unwrap().unwrap() {
+            ClientOpcodeMessage::CMSG_FORCE_RUN_BACK_SPEED_CHANGE_ACK(ack) => {
+                assert_eq!((ack.guid.guid(), ack.movement_counter), (9, 3));
+                assert_eq!(ack.new_speed, 2.25);
+            }
+            other => panic!("expected the run-back acknowledgement, got {other}"),
+        }
+
+        let mut water_walk = root.clone();
+        water_walk.extend_from_slice(&1u32.to_le_bytes());
+        let message = read_movement_client(0x02D0, &water_walk).unwrap().unwrap();
+        assert_eq!(
+            acknowledged_move(&message).map(|(_, opcode, _)| opcode),
+            Some(movement_opcodes::MSG_MOVE_WATER_WALK)
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_padded_acknowledgement_is_refused() {
+        let mut root = 9u64.to_le_bytes().to_vec();
+        root.extend_from_slice(&3u32.to_le_bytes());
+        root.extend_from_slice(&transport_pose());
+        for end in 0..root.len() {
+            assert!(read_movement_client(0x00E9, &root[..end]).is_err());
+        }
+        root.push(0);
+        assert!(read_movement_client(0x00E9, &root).is_err());
     }
 }
 

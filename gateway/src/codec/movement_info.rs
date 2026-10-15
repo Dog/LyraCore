@@ -151,86 +151,140 @@ pub fn create_with_movement(
     Ok(body)
 }
 
+/// Vanilla acknowledgements: full mover guid, counter, pose, then `trailing` fixed bytes.
+fn acknowledgement(body: &[u8], trailing: usize) -> Result<(Guid, u32, MovementInfo, [u8; 4])> {
+    ensure!(
+        body.len() >= 12 + trailing,
+        "short movement acknowledgement"
+    );
+    let (head, rest) = body.split_at(12);
+    let (pose, tail) = rest.split_at(rest.len() - trailing);
+    let mut word = [0; 4];
+    word[..trailing].copy_from_slice(tail);
+    Ok((
+        Guid::new(u64::from_le_bytes(head[..8].try_into()?)),
+        u32::from_le_bytes(head[8..].try_into()?),
+        bytes_to_movement_info(pose)?,
+        word,
+    ))
+}
+
+/// Read before the typed reader, which misreads the build-5875 transport tail.
 pub fn read_movement_client(
     opcode: u32,
     body: &[u8],
 ) -> Result<Option<super::ClientOpcodeMessage>> {
-    use super::{movement_opcodes, ClientOpcodeMessage};
+    use super::{movement_opcodes, ClientOpcodeMessage as C};
     use wow_world_messages::vanilla::*;
+    macro_rules! speed_ack {
+        ($variant:ident, $counter:ident) => {{
+            let (guid, $counter, info, speed) = acknowledgement(body, 4)?;
+            C::$variant(Box::new($variant {
+                guid,
+                $counter,
+                info,
+                new_speed: f32::from_le_bytes(speed),
+            }))
+        }};
+    }
+    macro_rules! flag_ack {
+        ($variant:ident) => {{
+            let (guid, movement_counter, info, apply) = acknowledgement(body, 4)?;
+            C::$variant(Box::new($variant {
+                guid,
+                movement_counter,
+                info,
+                apply: u32::from_le_bytes(apply),
+            }))
+        }};
+    }
+    macro_rules! pose_ack {
+        ($variant:ident) => {{
+            let (guid, movement_counter, info, _) = acknowledgement(body, 0)?;
+            C::$variant(Box::new($variant {
+                guid,
+                movement_counter,
+                info,
+            }))
+        }};
+    }
+    match opcode {
+        0x00E3 => return Ok(Some(speed_ack!(CMSG_FORCE_RUN_SPEED_CHANGE_ACK, counter))),
+        0x00E5 => {
+            return Ok(Some(speed_ack!(
+                CMSG_FORCE_RUN_BACK_SPEED_CHANGE_ACK,
+                movement_counter
+            )))
+        }
+        0x00E7 => return Ok(Some(speed_ack!(CMSG_FORCE_SWIM_SPEED_CHANGE_ACK, counter))),
+        0x02DB => return Ok(Some(speed_ack!(CMSG_FORCE_WALK_SPEED_CHANGE_ACK, counter))),
+        0x02DD => {
+            return Ok(Some(speed_ack!(
+                CMSG_FORCE_SWIM_BACK_SPEED_CHANGE_ACK,
+                counter
+            )))
+        }
+        0x02DF => return Ok(Some(speed_ack!(CMSG_FORCE_TURN_RATE_CHANGE_ACK, counter))),
+        0x00E9 => return Ok(Some(pose_ack!(CMSG_FORCE_MOVE_ROOT_ACK))),
+        0x00EB => return Ok(Some(pose_ack!(CMSG_FORCE_MOVE_UNROOT_ACK))),
+        0x00F0 => {
+            let (guid, counter, info, _) = acknowledgement(body, 0)?;
+            return Ok(Some(C::CMSG_MOVE_KNOCK_BACK_ACK(Box::new(
+                CMSG_MOVE_KNOCK_BACK_ACK {
+                    guid,
+                    counter,
+                    info,
+                },
+            ))));
+        }
+        0x00F6 => {
+            let (guid, counter, info, applied) = acknowledgement(body, 4)?;
+            return Ok(Some(C::CMSG_MOVE_HOVER_ACK(Box::new(
+                CMSG_MOVE_HOVER_ACK {
+                    guid,
+                    counter,
+                    info,
+                    is_applied: u32::from_le_bytes(applied),
+                },
+            ))));
+        }
+        0x02CF => return Ok(Some(flag_ack!(CMSG_MOVE_FEATHER_FALL_ACK))),
+        0x02D0 => return Ok(Some(flag_ack!(CMSG_MOVE_WATER_WALK_ACK))),
+        _ => {}
+    }
     if !movement_opcodes::is_slice_move(opcode) {
         return Ok(None);
     }
     let info = bytes_to_movement_info(body)?;
-    Ok(Some(match opcode {
-        movement_opcodes::MSG_MOVE_START_FORWARD => {
-            ClientOpcodeMessage::MSG_MOVE_START_FORWARD(Box::new(MSG_MOVE_START_FORWARD_Client {
-                info,
-            }))
-        }
-        movement_opcodes::MSG_MOVE_START_BACKWARD => {
-            ClientOpcodeMessage::MSG_MOVE_START_BACKWARD(Box::new(MSG_MOVE_START_BACKWARD_Client {
-                info,
-            }))
-        }
-        movement_opcodes::MSG_MOVE_STOP => {
-            ClientOpcodeMessage::MSG_MOVE_STOP(Box::new(MSG_MOVE_STOP_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_START_STRAFE_LEFT => {
-            ClientOpcodeMessage::MSG_MOVE_START_STRAFE_LEFT(Box::new(
-                MSG_MOVE_START_STRAFE_LEFT_Client { info },
-            ))
-        }
-        movement_opcodes::MSG_MOVE_START_STRAFE_RIGHT => {
-            ClientOpcodeMessage::MSG_MOVE_START_STRAFE_RIGHT(Box::new(
-                MSG_MOVE_START_STRAFE_RIGHT_Client { info },
-            ))
-        }
-        movement_opcodes::MSG_MOVE_STOP_STRAFE => {
-            ClientOpcodeMessage::MSG_MOVE_STOP_STRAFE(Box::new(MSG_MOVE_STOP_STRAFE_Client {
-                info,
-            }))
-        }
-        movement_opcodes::MSG_MOVE_JUMP => {
-            ClientOpcodeMessage::MSG_MOVE_JUMP(Box::new(MSG_MOVE_JUMP_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_START_TURN_LEFT => {
-            ClientOpcodeMessage::MSG_MOVE_START_TURN_LEFT(Box::new(
-                MSG_MOVE_START_TURN_LEFT_Client { info },
-            ))
-        }
-        movement_opcodes::MSG_MOVE_START_TURN_RIGHT => {
-            ClientOpcodeMessage::MSG_MOVE_START_TURN_RIGHT(Box::new(
-                MSG_MOVE_START_TURN_RIGHT_Client { info },
-            ))
-        }
-        movement_opcodes::MSG_MOVE_STOP_TURN => {
-            ClientOpcodeMessage::MSG_MOVE_STOP_TURN(Box::new(MSG_MOVE_STOP_TURN_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_SET_RUN_MODE => {
-            ClientOpcodeMessage::MSG_MOVE_SET_RUN_MODE(Box::new(MSG_MOVE_SET_RUN_MODE_Client {
-                info,
-            }))
-        }
-        movement_opcodes::MSG_MOVE_SET_WALK_MODE => {
-            ClientOpcodeMessage::MSG_MOVE_SET_WALK_MODE(Box::new(MSG_MOVE_SET_WALK_MODE_Client {
-                info,
-            }))
-        }
-        movement_opcodes::MSG_MOVE_FALL_LAND => {
-            ClientOpcodeMessage::MSG_MOVE_FALL_LAND(Box::new(MSG_MOVE_FALL_LAND_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_START_SWIM => {
-            ClientOpcodeMessage::MSG_MOVE_START_SWIM(Box::new(MSG_MOVE_START_SWIM_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_STOP_SWIM => {
-            ClientOpcodeMessage::MSG_MOVE_STOP_SWIM(Box::new(MSG_MOVE_STOP_SWIM_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_SET_FACING => {
-            ClientOpcodeMessage::MSG_MOVE_SET_FACING(Box::new(MSG_MOVE_SET_FACING_Client { info }))
-        }
-        movement_opcodes::MSG_MOVE_HEARTBEAT => {
-            ClientOpcodeMessage::MSG_MOVE_HEARTBEAT(Box::new(MSG_MOVE_HEARTBEAT_Client { info }))
-        }
-        _ => return Ok(None),
+    macro_rules! moves {
+        ($($opcode:ident => $variant:ident),+ $(,)?) => {
+            match opcode {
+                $(movement_opcodes::$opcode => C::$opcode(Box::new($variant { info })),)+
+                _ => return Ok(None),
+            }
+        };
+    }
+    Ok(Some(moves! {
+        MSG_MOVE_START_FORWARD => MSG_MOVE_START_FORWARD_Client,
+        MSG_MOVE_START_BACKWARD => MSG_MOVE_START_BACKWARD_Client,
+        MSG_MOVE_STOP => MSG_MOVE_STOP_Client,
+        MSG_MOVE_START_STRAFE_LEFT => MSG_MOVE_START_STRAFE_LEFT_Client,
+        MSG_MOVE_START_STRAFE_RIGHT => MSG_MOVE_START_STRAFE_RIGHT_Client,
+        MSG_MOVE_STOP_STRAFE => MSG_MOVE_STOP_STRAFE_Client,
+        MSG_MOVE_JUMP => MSG_MOVE_JUMP_Client,
+        MSG_MOVE_START_TURN_LEFT => MSG_MOVE_START_TURN_LEFT_Client,
+        MSG_MOVE_START_TURN_RIGHT => MSG_MOVE_START_TURN_RIGHT_Client,
+        MSG_MOVE_STOP_TURN => MSG_MOVE_STOP_TURN_Client,
+        MSG_MOVE_START_PITCH_UP => MSG_MOVE_START_PITCH_UP_Client,
+        MSG_MOVE_START_PITCH_DOWN => MSG_MOVE_START_PITCH_DOWN_Client,
+        MSG_MOVE_STOP_PITCH => MSG_MOVE_STOP_PITCH_Client,
+        MSG_MOVE_SET_RUN_MODE => MSG_MOVE_SET_RUN_MODE_Client,
+        MSG_MOVE_SET_WALK_MODE => MSG_MOVE_SET_WALK_MODE_Client,
+        MSG_MOVE_FALL_LAND => MSG_MOVE_FALL_LAND_Client,
+        MSG_MOVE_START_SWIM => MSG_MOVE_START_SWIM_Client,
+        MSG_MOVE_STOP_SWIM => MSG_MOVE_STOP_SWIM_Client,
+        MSG_MOVE_SET_FACING => MSG_MOVE_SET_FACING_Client,
+        MSG_MOVE_SET_PITCH => MSG_MOVE_SET_PITCH_Client,
+        MSG_MOVE_HEARTBEAT => MSG_MOVE_HEARTBEAT_Client,
     }))
 }
