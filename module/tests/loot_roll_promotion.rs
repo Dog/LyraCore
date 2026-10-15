@@ -89,6 +89,9 @@ fn fixture(name: &str) -> Standalone {
     standalone.publish_module();
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
+    // The event reaper deletes group events older than a second, which would empty the
+    // assertions below.
+    standalone.assert_sql("DELETE FROM game_event_reaper_schedule");
     standalone
 }
 
@@ -353,11 +356,21 @@ fn votes(standalone: &Standalone) -> Vec<BTreeMap<String, String>> {
     rows
 }
 
-/// `(recipient, payload)` of every event of `kind`, in recipient order.
-fn events_of(standalone: &Standalone, kind: u8) -> Vec<(String, String)> {
+/// The newest group event id, 0 when none exists.
+fn newest_event(standalone: &Standalone) -> u64 {
+    standalone
+        .query_rows("SELECT id FROM game_group_event")
+        .iter()
+        .map(|row| row["id"].parse::<u64>().unwrap())
+        .max()
+        .unwrap_or(0)
+}
+
+/// `(recipient, payload)` of every event of `kind` newer than `after`, in recipient order.
+fn events_of(standalone: &Standalone, kind: u8, after: u64) -> Vec<(String, String)> {
     let mut events: Vec<_> = standalone
         .query_rows(&format!(
-            "SELECT recipient_guid, payload FROM game_group_event WHERE kind = {kind}"
+            "SELECT recipient_guid, payload FROM game_group_event WHERE kind = {kind} AND id > {after}"
         ))
         .into_iter()
         .map(|row| (row["recipient_guid"].clone(), row["payload"].clone()))
@@ -376,17 +389,18 @@ fn an_all_pass_resolution_tells_every_roller_and_a_win_does_not() {
     resolve(&standalone);
     let payload = format!("{CORPSE},0,{ITEM},117");
     assert_eq!(
-        events_of(&standalone, ALL_PASSED),
+        events_of(&standalone, ALL_PASSED, 0),
         ["5090003", "5090004", "5090005"].map(|roller| (roller.to_string(), payload.clone()))
     );
-    assert!(events_of(&standalone, ROLL_WON).is_empty());
+    assert!(events_of(&standalone, ROLL_WON, 0).is_empty());
 
     // A contested roll announces its winner and adds no all-passed notice.
+    let before = newest_event(&standalone);
     promotion.source_roll_id = 11;
     promotion.send(&standalone);
     vote(&standalone, "5090003", "1");
     vote(&standalone, "5090004", "0");
     vote(&standalone, "5090005", "0");
-    assert_eq!(events_of(&standalone, ALL_PASSED).len(), 3);
-    assert_eq!(events_of(&standalone, ROLL_WON).len(), 3);
+    assert!(events_of(&standalone, ALL_PASSED, before).is_empty());
+    assert_eq!(events_of(&standalone, ROLL_WON, before).len(), 3);
 }
