@@ -291,6 +291,7 @@ impl NpcStore for HandleLootFake {
         _option_id: u32,
         _option_row_id: u32,
         _source_menu_id: u32,
+        _selected_action: u32,
     ) -> Result<()> {
         unreachable!("no test reaches the NPC family")
     }

@@ -1318,3 +1318,164 @@ fn a_menu_source_switch_refuses_colliding_and_synthesized_clicks_before_service_
         }
     }
 }
+
+#[test]
+fn changed_actions_and_new_authored_services_close_the_stale_menu_without_a_service_reply() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+
+    for source in [0, 509_9001] {
+        for synthesized in [false, true] {
+            let mut store = quest_store();
+            let mut option = opt(1, "Supplies.", gossip_option::VENDOR);
+            option.row_id = 509_9001;
+            let options = if synthesized {
+                Vec::new()
+            } else {
+                vec![option.clone()]
+            };
+            if source == 0 {
+                store.npc.gossip_opts = options;
+            } else {
+                store.npc.gossip_profiles.insert(source, options);
+                store
+                    .npc
+                    .gossip_source_menu_id
+                    .store(source, std::sync::atomic::Ordering::SeqCst);
+            }
+            store.vendor.vendor_stock = vec![codec::VendorItemView {
+                item_entry: 4540,
+                ..Default::default()
+            }];
+            let mut session = ProtocolSession::in_world(7, 1);
+            let hello = handlers::Query::handle(
+                &store,
+                &mut session,
+                ProtocolRequest::Message(
+                    CMSG_GOSSIP_HELLO {
+                        guid: Guid::new(90),
+                    }
+                    .into(),
+                ),
+            )
+            .unwrap();
+            let messages = outbound_messages(hello.outbound);
+            let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+                panic!("expected the service menu");
+            };
+            assert_eq!(menu.gossips.len(), 2);
+            let current = if source == 0 {
+                &mut store.npc.gossip_opts
+            } else {
+                store.npc.gossip_profiles.get_mut(&source).unwrap()
+            };
+            if synthesized {
+                option.cond_type = gossip_condition::NEVER;
+                current.push(option);
+            } else {
+                current[0].action = gossip_option::GOSSIP;
+            }
+            let reply = handlers::Query::handle(
+                &store,
+                &mut session,
+                ProtocolRequest::Message(
+                    CMSG_GOSSIP_SELECT_OPTION {
+                        guid: Guid::new(90),
+                        gossip_list_id: 0,
+                        unknown: None,
+                    }
+                    .into(),
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                outbound_messages(reply.outbound).as_slice(),
+                [ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE]
+            ));
+            assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+            assert!(session.gossip_menu.is_none());
+        }
+    }
+}
+
+#[test]
+fn rewarded_repeatable_quests_show_only_the_source_eligible_options() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    use lyracore_shared::gossip::Condition;
+
+    let mut store = quest_store();
+    store.quest.quest_log = vec![(60, true)].into();
+    store.quest.repeatable_quests.insert(60);
+    for (id, kind, flags, text) in [
+        (1, 8, 0, "Rewarded"),
+        (2, 8, 1, "Not rewarded"),
+        (3, 22, 0, "No current or rewarded quest"),
+        (4, 22, 1, "Current or rewarded quest"),
+        (5, 9, 0, "Current quest"),
+        (6, 9, 1, "No current quest"),
+    ] {
+        store.npc.gossip_conditions.insert(
+            id,
+            Condition {
+                kind,
+                values: [60, 0, 0, 0],
+                flags,
+            },
+        );
+        let mut option = opt(0, text, gossip_option::GOSSIP);
+        option.row_id = id;
+        option.cond_type = gossip_condition::REFERENCE;
+        option.cond_value1 = id;
+        store.npc.gossip_opts.push(option);
+    }
+    let reply = handlers::Query::handle(
+        &store,
+        &mut ProtocolSession::in_world(7, 1),
+        ProtocolRequest::Message(
+            CMSG_GOSSIP_HELLO {
+                guid: Guid::new(90),
+            }
+            .into(),
+        ),
+    )
+    .unwrap();
+    let messages = outbound_messages(reply.outbound);
+    let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+        panic!("expected the quest-conditioned menu");
+    };
+    assert_eq!(
+        menu.gossips
+            .iter()
+            .map(|option| option.message.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Not rewarded",
+            "No current or rewarded quest",
+            "No current quest",
+            "Farewell."
+        ]
+    );
+}
+
+#[test]
+fn gossip_selection_transport_loss_ends_the_world_session_without_a_service_reply() {
+    use lyracore_shared::constants::gossip_option;
+    use std::io::Read;
+
+    let mut fixture = quest_store();
+    fixture.npc.gossip_opts = vec![opt(1, "Supplies.", gossip_option::VENDOR)];
+    fixture.npc.gossip_select_error =
+        Some(|| crate::stdb::ReducerCallError::transport_lost("gw_gossip_select").into());
+    let store = std::sync::Arc::new(fixture);
+    let (mut client, mut c_enc, mut c_dec, world) = enter_world_unjoined(store.clone(), 1);
+    gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    CMSG_GOSSIP_SELECT_OPTION {
+        guid: Guid::new(90),
+        gossip_list_id: 0,
+        unknown: None,
+    }
+    .write_encrypted_client(&mut client, &mut c_enc)
+    .unwrap();
+    assert_eq!(client.read(&mut [0u8; 1]).unwrap(), 0);
+    assert!(world.join().unwrap().is_err());
+    assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+}

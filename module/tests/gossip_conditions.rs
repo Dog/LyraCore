@@ -1,5 +1,6 @@
 mod support;
 
+use lyracore_shared::constants::{gossip_option, npc_flags};
 use support::Standalone;
 
 const OPTION: u32 = 509_9001;
@@ -14,14 +15,28 @@ fn xp(shard: &Standalone) -> u32 {
 }
 
 fn select(shard: &Standalone, npc: &str, row: u32, allowed: bool) {
-    select_from(shard, npc, row, 0, allowed);
+    select_from(shard, npc, row, 0, gossip_option::VENDOR, allowed);
 }
 
-fn select_from(shard: &Standalone, npc: &str, row: u32, source_menu_id: u32, allowed: bool) {
+fn select_from(
+    shard: &Standalone,
+    npc: &str,
+    row: u32,
+    source_menu_id: u32,
+    action: u32,
+    allowed: bool,
+) {
     let before = xp(shard);
     let result = shard.call(
         "debug_gossip_select",
-        &["1", npc, "0", &row.to_string(), &source_menu_id.to_string()],
+        &[
+            "1",
+            npc,
+            "0",
+            &row.to_string(),
+            &source_menu_id.to_string(),
+            &action.to_string(),
+        ],
     );
     assert_eq!(
         result.status.success(),
@@ -42,6 +57,9 @@ fn fixture(name: &str) -> (Standalone, String) {
     shard.assert_call("claim_operator", &[]);
     shard.assert_call("install_guid_range", &["0"]);
     shard.assert_call("debug_seed_scenario_fixtures", &[]);
+    shard.assert_sql(&format!(
+        "UPDATE game_quest_template SET repeatable = false WHERE entry = {QUEST}"
+    ));
     shard.assert_call("debug_spawn_player_entity", &["1"]);
     shard.assert_call("debug_spawn_at_feet", &["1", &VENDOR.to_string(), "2"]);
     let npc = shard.query_rows(&format!(
@@ -113,25 +131,172 @@ fn a_menu_switch_refuses_colliding_rows_and_synthesized_options_before_the_hook(
     shard.assert_sql(&format!("UPDATE game_gossip_condition SET kind = 0, value1 = 0, value2 = 0 WHERE condition_id = {CONDITION}"));
     shard.assert_sql(&format!("INSERT INTO game_gossip_menu_profile (menu_id,text_id) VALUES ({FIRST_MENU},1),({SECOND_MENU},1)"));
     shard.assert_sql(&format!("INSERT INTO game_gossip_menu_profile_option (row_id,menu_id,option_index,icon,text,action,action_menu_id,cond_type,cond_value1,cond_value2) VALUES ({OPTION},{FIRST_MENU},0,0,'Profile supplies',3,0,0,0,0)"));
-    select_from(&shard, &npc, OPTION, 0, true);
+    select_from(&shard, &npc, OPTION, 0, gossip_option::VENDOR, true);
 
     let entity = &shard.query_rows(&format!(
         "SELECT map_id,instance_id FROM game_world_entity WHERE guid = {npc}"
     ))[0];
     shard.assert_sql(&format!("INSERT INTO game_creature_gossip_menu_override (creature_guid,menu_id,map_id,instance_id) VALUES ({npc},{FIRST_MENU},{},{})", entity["map_id"], entity["instance_id"]));
-    select_from(&shard, &npc, OPTION, 0, false);
-    select_from(&shard, &npc, u32::MAX, 0, false);
-    select_from(&shard, &npc, OPTION, FIRST_MENU, true);
+    select_from(&shard, &npc, OPTION, 0, gossip_option::VENDOR, false);
+    select_from(&shard, &npc, u32::MAX, 0, gossip_option::VENDOR, false);
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        FIRST_MENU,
+        gossip_option::VENDOR,
+        true,
+    );
 
     shard.assert_sql(&format!("UPDATE game_gossip_menu_profile_option SET menu_id = {SECOND_MENU} WHERE row_id = {OPTION}"));
     shard.assert_sql(&format!("UPDATE game_creature_gossip_menu_override SET menu_id = {SECOND_MENU} WHERE creature_guid = {npc}"));
-    select_from(&shard, &npc, OPTION, FIRST_MENU, false);
-    select_from(&shard, &npc, u32::MAX, FIRST_MENU, false);
-    select_from(&shard, &npc, OPTION, SECOND_MENU, true);
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        FIRST_MENU,
+        gossip_option::VENDOR,
+        false,
+    );
+    select_from(
+        &shard,
+        &npc,
+        u32::MAX,
+        FIRST_MENU,
+        gossip_option::VENDOR,
+        false,
+    );
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        SECOND_MENU,
+        gossip_option::VENDOR,
+        true,
+    );
 
     shard.assert_sql(&format!(
         "DELETE FROM game_creature_gossip_menu_override WHERE creature_guid = {npc}"
     ));
-    select_from(&shard, &npc, OPTION, SECOND_MENU, false);
-    select_from(&shard, &npc, OPTION, 0, true);
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        SECOND_MENU,
+        gossip_option::VENDOR,
+        false,
+    );
+    select_from(&shard, &npc, OPTION, 0, gossip_option::VENDOR, true);
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn a_rewarded_repeatable_quest_is_neither_current_nor_rewarded_for_gossip() {
+    let (shard, npc) = fixture("gossip-repeatable-quest");
+    shard.assert_sql(&format!(
+        "UPDATE game_quest_template SET repeatable = true WHERE entry = {QUEST}"
+    ));
+    shard.assert_call("debug_grant_quest", &["1", &QUEST.to_string()]);
+    shard.assert_sql("UPDATE game_quest_objective SET required_count = 0 WHERE id = 5090000");
+    shard.assert_call("debug_spawn_at_feet", &["1", "51003", "2"]);
+    let giver =
+        &shard.query_rows("SELECT guid FROM game_world_entity WHERE entry = 51003")[0]["guid"];
+    shard.assert_call(
+        "debug_turn_in_quest",
+        &["1", giver, &QUEST.to_string(), "0"],
+    );
+    assert_eq!(
+        shard.query_rows(&format!(
+            "SELECT rewarded FROM game_character_quest WHERE quest_entry = {QUEST}"
+        ))[0]["rewarded"],
+        "true"
+    );
+
+    for (kind, expected) in [(8, false), (9, false), (22, true)] {
+        for flags in [0, 1] {
+            shard.assert_sql(&format!("UPDATE game_gossip_condition SET kind = {kind}, value2 = 0, flags = {flags} WHERE condition_id = {CONDITION}"));
+            select(
+                &shard,
+                &npc,
+                OPTION,
+                if flags == 0 { expected } else { !expected },
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn changed_service_actions_and_new_authored_services_refuse_stale_clicks() {
+    const MENU: u32 = 509_9001;
+    let (shard, npc) = fixture("gossip-service-identity");
+    shard.assert_sql(&format!("UPDATE game_gossip_condition SET kind = 0, value1 = 0, value2 = 0 WHERE condition_id = {CONDITION}"));
+    shard.assert_sql(&format!(
+        "INSERT INTO game_gossip_menu_profile (menu_id,text_id) VALUES ({MENU},1)"
+    ));
+    shard.assert_sql(&format!("INSERT INTO game_gossip_menu_profile_option (row_id,menu_id,option_index,icon,text,action,action_menu_id,cond_type,cond_value1,cond_value2) VALUES ({OPTION},{MENU},0,0,'Profile supplies',3,0,0,0,0)"));
+    let entity = &shard.query_rows(&format!(
+        "SELECT map_id,instance_id FROM game_world_entity WHERE guid = {npc}"
+    ))[0];
+
+    for (table, source) in [
+        ("game_gossip_option", 0),
+        ("game_gossip_menu_profile_option", MENU),
+    ] {
+        if source != 0 {
+            shard.assert_sql(&format!("INSERT INTO game_creature_gossip_menu_override (creature_guid,menu_id,map_id,instance_id) VALUES ({npc},{MENU},{},{})", entity["map_id"], entity["instance_id"]));
+        }
+        select_from(&shard, &npc, OPTION, source, gossip_option::VENDOR, true);
+        shard.assert_sql(&format!(
+            "UPDATE {table} SET action = 1 WHERE row_id = {OPTION}"
+        ));
+        select_from(&shard, &npc, OPTION, source, gossip_option::VENDOR, false);
+        select_from(&shard, &npc, OPTION, source, gossip_option::GOSSIP, true);
+        select_from(&shard, &npc, u32::MAX, source, gossip_option::VENDOR, true);
+        shard.assert_sql(&format!(
+            "UPDATE {table} SET action = 3, cond_type = 3 WHERE row_id = {OPTION}"
+        ));
+        select_from(&shard, &npc, u32::MAX, source, gossip_option::VENDOR, false);
+        select_from(&shard, &npc, OPTION, source, gossip_option::VENDOR, false);
+    }
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn synthesized_services_require_current_capability_and_resolvable_stock() {
+    let (shard, npc) = fixture("gossip-service-capability");
+    shard.assert_sql(&format!(
+        "DELETE FROM game_gossip_option WHERE row_id = {OPTION}"
+    ));
+    select(&shard, &npc, u32::MAX, true);
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP
+    ));
+    select(&shard, &npc, u32::MAX, false);
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP | npc_flags::VENDOR
+    ));
+    select(&shard, &npc, u32::MAX, true);
+    shard.assert_sql(&format!(
+        "DELETE FROM game_npc_vendor WHERE creature_entry = {VENDOR}"
+    ));
+    select(&shard, &npc, u32::MAX, false);
+    shard.assert_sql(&format!("INSERT INTO game_npc_vendor (id,creature_entry,item_entry,slot,max_count) VALUES (5099001,{VENDOR},5099999,0,0)"));
+    select(&shard, &npc, u32::MAX, false);
+    shard.assert_sql("UPDATE game_npc_vendor SET item_entry = 5090050 WHERE id = 5099001");
+    select(&shard, &npc, u32::MAX, true);
+
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP | npc_flags::INNKEEPER
+    ));
+    select_from(&shard, &npc, u32::MAX, 0, gossip_option::INNKEEPER, true);
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP
+    ));
+    select_from(&shard, &npc, u32::MAX, 0, gossip_option::INNKEEPER, false);
+    select_from(&shard, &npc, u32::MAX, 0, gossip_option::GOSSIP, false);
 }

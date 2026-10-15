@@ -155,7 +155,16 @@ impl NpcStore for Coordinator {
                     return QuestState::Absent;
                 };
                 if quest.rewarded {
-                    QuestState::Rewarded
+                    if db
+                        .game_quest_template()
+                        .entry()
+                        .find(&quest_entry)
+                        .is_some_and(|template| template.repeatable)
+                    {
+                        QuestState::Absent
+                    } else {
+                        QuestState::Rewarded
+                    }
                 } else if quest.failed {
                     QuestState::Failed
                 } else if crate::stdb::reads::quest_objectives_complete(
@@ -290,6 +299,7 @@ impl NpcStore for Coordinator {
         option_id: u32,
         option_row_id: u32,
         source_menu_id: u32,
+        selected_action: u32,
     ) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(
@@ -300,7 +310,8 @@ impl NpcStore for Coordinator {
                 npc_guid,
                 option_id,
                 option_row_id,
-                source_menu_id
+                source_menu_id,
+                selected_action
             )
         )
     }

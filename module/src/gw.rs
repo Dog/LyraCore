@@ -1194,6 +1194,7 @@ pub fn gw_gossip_select(
     option_id: u32,
     option_row_id: u32,
     source_menu_id: u32,
+    selected_action: u32,
 ) -> Result<(), String> {
     require_operator(ctx)?;
     let actor_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
@@ -1205,6 +1206,7 @@ pub fn gw_gossip_select(
         option_id,
         option_row_id,
         source_menu_id,
+        selected_action,
     )
 }
 

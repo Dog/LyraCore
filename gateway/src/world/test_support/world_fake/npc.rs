@@ -110,6 +110,7 @@ impl NpcStore for WorldFake {
                 class: character.class,
             },
             |quest_id| match self.quest_status(character_guid, quest_id) {
+                (_, true) if self.quest.repeatable_quests.contains(&quest_id) => QuestState::Absent,
                 (_, true) => QuestState::Rewarded,
                 (true, false)
                     if self
@@ -161,6 +162,7 @@ impl NpcStore for WorldFake {
         option_id: u32,
         option_row_id: u32,
         source_menu_id: u32,
+        selected_action: u32,
     ) -> Result<()> {
         if let Some(error) = self.npc.gossip_select_error {
             return Err(error());
@@ -179,10 +181,36 @@ impl NpcStore for WorldFake {
                 .ok_or_else(|| {
                     ReducerCallError::refused("gw_gossip_select", "no such gossip option")
                 })?;
+            if option.action != selected_action {
+                return Err(ReducerCallError::refused(
+                    "gw_gossip_select",
+                    "gossip option action has changed",
+                )
+                .into());
+            }
             if !self.gossip_option_available(actor.guid(), option)? {
                 return Err(ReducerCallError::refused(
                     "gw_gossip_select",
                     "gossip option is no longer available",
+                )
+                .into());
+            }
+        } else {
+            use lyracore_shared::constants::gossip_option;
+            let available = match selected_action {
+                gossip_option::VENDOR => !self.vendor_stock(npc_guid)?.is_empty(),
+                gossip_option::INNKEEPER => self.npc_is_innkeeper(npc_guid)?,
+                _ => false,
+            };
+            if !available
+                || menu
+                    .options
+                    .iter()
+                    .any(|option| option.action == selected_action)
+            {
+                return Err(ReducerCallError::refused(
+                    "gw_gossip_select",
+                    "gossip service is no longer available",
                 )
                 .into());
             }

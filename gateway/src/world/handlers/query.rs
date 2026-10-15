@@ -54,6 +54,7 @@ pub(crate) trait NpcStore: Send + Sync {
         option_id: u32,
         option_row_id: u32,
         source_menu_id: u32,
+        selected_action: u32,
     ) -> Result<()>;
 }
 
@@ -317,9 +318,14 @@ impl<
                         vec![Outbound::One(ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE)].into(),
                     );
                 };
-                if let Err(error) =
-                    store.gossip_select(actor, npc, c.gossip_list_id, option_row_id, source_menu_id)
-                {
+                if let Err(error) = store.gossip_select(
+                    actor,
+                    npc,
+                    c.gossip_list_id,
+                    option_row_id,
+                    source_menu_id,
+                    action,
+                ) {
                     match classify(&error) {
                         DurableFailure::Refusal { .. } => {
                             session.gossip_menu = None;

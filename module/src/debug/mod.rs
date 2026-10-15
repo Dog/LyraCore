@@ -1107,6 +1107,7 @@ pub fn debug_gossip_select(
     option_id: u32,
     option_row_id: u32,
     source_menu_id: u32,
+    selected_action: u32,
 ) -> Result<(), String> {
     crate::world::apply_gossip_select(
         ctx,
@@ -1115,6 +1116,7 @@ pub fn debug_gossip_select(
         option_id,
         option_row_id,
         source_menu_id,
+        selected_action,
     )
 }
 

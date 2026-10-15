@@ -11,6 +11,7 @@ pub(crate) struct QuestState {
     pub(crate) turned_in: std::sync::Mutex<Vec<(u64, u64, u32, u32)>>,
     pub(crate) turn_in_reward_letter: Option<crate::world::mail::HeldEscrow>,
     pub(crate) quest_log: std::sync::Mutex<Vec<(u32, bool)>>,
+    pub(crate) repeatable_quests: std::collections::HashSet<u32>,
 }
 
 impl QuestActionStore for WorldFake {

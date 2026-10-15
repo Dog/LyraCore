@@ -1,3 +1,4 @@
+use lyracore_shared::constants::{gossip_option, npc_flags};
 use lyracore_shared::gossip::{self, CharacterFacts, Condition, QuestState};
 use spacetimedb::{table, ReducerContext};
 
@@ -5,7 +6,8 @@ use crate::creatures::{
     game_creature_gossip_menu_override, game_gossip_menu_profile, game_gossip_menu_profile_option,
     game_gossip_option,
 };
-use crate::quest::game_character_quest;
+use crate::items::{game_item_template, game_npc_vendor};
+use crate::quest::{game_character_quest, game_quest_template};
 
 #[table(accessor = game_gossip_condition, public)]
 pub struct GossipCondition {
@@ -26,6 +28,7 @@ pub(crate) fn select_gate(
     npc_guid: u64,
     option_row_id: u32,
     source_menu_id: u32,
+    selected_action: u32,
 ) -> Result<(), String> {
     let (actor, npc) = crate::items::npc_interaction_gate(
         ctx,
@@ -56,55 +59,70 @@ pub(crate) fn select_gate(
     }
     // u32::MAX denotes a synthesized service line without an imported row.
     if option_row_id == u32::MAX {
+        if !synthesized_service_available(
+            ctx,
+            &npc,
+            active_menu.map(|menu| menu.menu_id),
+            selected_action,
+        ) {
+            return Err("gossip service is no longer available".into());
+        }
         return Ok(());
     }
-    let condition = if let Some(menu) = active_menu {
+    let (action, kind, value1, value2) = if let Some(menu) = active_menu {
         ctx.db
             .game_gossip_menu_profile_option()
             .row_id()
             .find(option_row_id)
             .filter(|option| option.menu_id == menu.menu_id)
-            .map(|option| (option.cond_type, option.cond_value1, option.cond_value2))
+            .map(|option| {
+                (
+                    option.action,
+                    option.cond_type,
+                    option.cond_value1,
+                    option.cond_value2,
+                )
+            })
     } else {
         ctx.db
             .game_gossip_option()
             .row_id()
             .find(option_row_id)
             .filter(|option| option.entry == npc.entry)
-            .map(|option| (option.cond_type, option.cond_value1, option.cond_value2))
+            .map(|option| {
+                (
+                    option.action,
+                    option.cond_type,
+                    option.cond_value1,
+                    option.cond_value2,
+                )
+            })
     }
     .ok_or_else(|| "gossip option does not belong to this creature's active menu".to_string())?;
+    if action != selected_action {
+        return Err("gossip option action has changed".into());
+    }
+    condition_gate(ctx, character_guid, actor.level, (kind, value1, value2))
+}
+
+fn condition_gate(
+    ctx: &ReducerContext,
+    character_guid: u64,
+    level: u32,
+    (kind, value1, value2): (u32, u32, u32),
+) -> Result<(), String> {
     let character = crate::helpers::character_by_guid(ctx, character_guid)
         .ok_or_else(|| "gossip Character is unavailable".to_string())?;
     let result = gossip::evaluate_option(
-        condition.0,
-        condition.1,
-        condition.2,
+        kind,
+        value1,
+        value2,
         CharacterFacts {
-            level: actor.level,
+            level,
             race: character.race,
             class: character.class,
         },
-        |quest_entry| {
-            let Some(quest) = ctx
-                .db
-                .game_character_quest()
-                .by_character_quest()
-                .filter((character_guid, quest_entry))
-                .next()
-            else {
-                return QuestState::Absent;
-            };
-            if quest.rewarded {
-                QuestState::Rewarded
-            } else if quest.failed {
-                QuestState::Failed
-            } else if crate::quest::quest_is_complete(ctx, &quest) {
-                QuestState::Complete
-            } else {
-                QuestState::Incomplete
-            }
-        },
+        |quest_entry| quest_state(ctx, character_guid, quest_entry),
         |id| {
             ctx.db
                 .game_gossip_condition()
@@ -123,5 +141,79 @@ pub(crate) fn select_gate(
         Err(reason) => Err(format!(
             "gossip option condition is unavailable: {reason:?}"
         )),
+    }
+}
+
+fn synthesized_service_available(
+    ctx: &ReducerContext,
+    npc: &crate::WorldEntity,
+    menu_id: Option<u32>,
+    selected_action: u32,
+) -> bool {
+    let has_authored_service = if let Some(menu_id) = menu_id {
+        ctx.db
+            .game_gossip_menu_profile_option()
+            .by_menu()
+            .filter(&menu_id)
+            .any(|option| option.action == selected_action)
+    } else {
+        ctx.db
+            .game_gossip_option()
+            .by_entry()
+            .filter(&npc.entry)
+            .any(|option| option.action == selected_action)
+    };
+    if has_authored_service {
+        return false;
+    }
+    match selected_action {
+        gossip_option::VENDOR => {
+            npc.npc_flags & npc_flags::VENDOR != 0
+                && ctx
+                    .db
+                    .game_npc_vendor()
+                    .by_vendor()
+                    .filter(&npc.entry)
+                    .any(|stock| {
+                        ctx.db
+                            .game_item_template()
+                            .entry()
+                            .find(stock.item_entry)
+                            .is_some()
+                    })
+        }
+        gossip_option::INNKEEPER => npc.npc_flags & npc_flags::INNKEEPER != 0,
+        _ => false,
+    }
+}
+
+fn quest_state(ctx: &ReducerContext, character_guid: u64, quest_entry: u32) -> QuestState {
+    let Some(quest) = ctx
+        .db
+        .game_character_quest()
+        .by_character_quest()
+        .filter((character_guid, quest_entry))
+        .next()
+    else {
+        return QuestState::Absent;
+    };
+    if quest.rewarded {
+        if ctx
+            .db
+            .game_quest_template()
+            .entry()
+            .find(quest_entry)
+            .is_some_and(|template| template.repeatable)
+        {
+            QuestState::Absent
+        } else {
+            QuestState::Rewarded
+        }
+    } else if quest.failed {
+        QuestState::Failed
+    } else if crate::quest::quest_is_complete(ctx, &quest) {
+        QuestState::Complete
+    } else {
+        QuestState::Incomplete
     }
 }
