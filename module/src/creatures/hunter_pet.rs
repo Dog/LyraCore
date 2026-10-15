@@ -1,5 +1,5 @@
-use lyracore_shared::pet::pet_guid_for;
-use spacetimedb::{table, ReducerContext, Table, TimeDuration, Timestamp};
+use lyracore_shared::pet::{is_valid_pet_name, pet_guid_for, PET_NAME_INVALID};
+use spacetimedb::{reducer, table, ReducerContext, Table, TimeDuration, Timestamp};
 
 use crate::{
     game_creature_family, game_creature_spawn, game_creature_template, game_world_entity,
@@ -8,6 +8,8 @@ use crate::{
 
 const CLASS_HUNTER: u8 = 3;
 const INITIAL_HAPPINESS: u32 = 166_500;
+// In 1.12, Rename Pet eligibility uses UNIT_FIELD_FLAGS rather than UNIT_FIELD_BYTES_2.
+const UNIT_FLAG_PET_RENAME: u32 = 0x0000_0010;
 
 #[derive(Clone)]
 #[table(
@@ -30,6 +32,9 @@ pub struct HunterPet {
     pub created_at: Timestamp,
     pub care_updated_at: Timestamp,
     pub loyalty_updated_at: Timestamp,
+    /// Name-cache stamp in Unix seconds; zero falls back to `created_at` for existing rows.
+    #[default(0u32)]
+    pub name_timestamp: u32,
 }
 
 #[table(
@@ -106,14 +111,33 @@ pub(crate) fn publish_hunter_pet_protocol(
     pet: &HunterPet,
     live_pet_guid: u64,
 ) {
+    if let Some(mut live) = ctx
+        .db
+        .game_world_entity()
+        .guid()
+        .find(live_pet_guid)
+        .filter(|live| {
+            live.owner_guid == pet.owner_guid
+                && live_pet_kind(ctx, live.guid) == (PetKind::Hunter { pet_id: pet.pet_id })
+        })
+    {
+        let flags = if pet.rename_allowed {
+            live.unit_flags | UNIT_FLAG_PET_RENAME
+        } else {
+            live.unit_flags & !UNIT_FLAG_PET_RENAME
+        };
+        if flags != live.unit_flags {
+            live.unit_flags = flags;
+            ctx.db.game_world_entity().guid().update(live);
+        }
+    }
     let row = HunterPetProtocol {
         pet_id: pet.pet_id,
         owner_guid: pet.owner_guid,
         live_pet_guid,
         creature_entry: pet.creature_entry,
         name: pet.name.clone(),
-        name_timestamp: (pet.created_at.to_micros_since_unix_epoch() / 1_000_000)
-            .clamp(0, u32::MAX as i64) as u32,
+        name_timestamp: effective_name_timestamp(pet),
         level: pet.level,
         pet_xp: pet.pet_xp,
         next_level_xp: super::pet_xp_to_next_level(pet.level),
@@ -284,6 +308,7 @@ pub(crate) fn tame_creature(
     target.wp_target = 0;
     target.combat_until_ms = 0;
     target.unit_flags &= !lyracore_shared::constants::unit_flags::IN_COMBAT;
+    target.unit_flags |= UNIT_FLAG_PET_RENAME;
 
     // Taming retires this wild life; preserve its authored spawn and arm its future appearance.
     let wild_guid = target.guid;
@@ -323,6 +348,7 @@ pub(crate) fn tame_creature(
         created_at: now,
         care_updated_at: now,
         loyalty_updated_at: now,
+        name_timestamp: unix_seconds(now),
     };
     ctx.db.game_hunter_pet().pet_id().delete(pet_id);
     let hunter_pet = ctx.db.game_hunter_pet().insert(hunter_pet);
@@ -334,9 +360,86 @@ pub(crate) fn tame_creature(
     Ok(())
 }
 
+fn unix_seconds(at: Timestamp) -> u32 {
+    (at.to_micros_since_unix_epoch() / 1_000_000).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+fn effective_name_timestamp(pet: &HunterPet) -> u32 {
+    if pet.name_timestamp == 0 {
+        unix_seconds(pet.created_at)
+    } else {
+        pet.name_timestamp
+    }
+}
+
+/// Advance the name-cache timestamp even for a same-second rename, up to the protocol limit.
+fn next_name_timestamp(previous: u32, now: u32) -> u32 {
+    now.max(previous.saturating_add(1))
+}
+
+/// See docs/benilla-compatibility.md, Combat feedback, for rename Gates and client replies.
+pub(crate) fn rename_hunter_pet(
+    ctx: &ReducerContext,
+    owner_guid: u64,
+    pet_guid: u64,
+    name: &str,
+) -> Result<(), String> {
+    let live = super::pet_of(ctx, owner_guid)
+        .filter(|pet| pet.guid == pet_guid)
+        .ok_or_else(|| format!("pet rename: {owner_guid} has no live pet {pet_guid}"))?;
+    let PetKind::Hunter { pet_id } = live_pet_kind(ctx, live.guid) else {
+        return Err(format!("pet rename: {pet_guid} is not a Hunter pet"));
+    };
+    let mut pet = ctx
+        .db
+        .game_hunter_pet()
+        .pet_id()
+        .find(pet_id)
+        .filter(|pet| pet.owner_guid == owner_guid)
+        .ok_or_else(|| format!("pet rename: {owner_guid} does not own Hunter pet {pet_id}"))?;
+    if !pet.rename_allowed {
+        return Err(format!(
+            "pet rename: Hunter pet {pet_id} was already renamed"
+        ));
+    }
+    if !is_valid_pet_name(name) {
+        return Err(PET_NAME_INVALID.to_string());
+    }
+
+    pet.name = name.to_string();
+    pet.rename_allowed = false;
+    pet.name_timestamp =
+        next_name_timestamp(effective_name_timestamp(&pet), unix_seconds(ctx.timestamp));
+    let pet = ctx.db.game_hunter_pet().pet_id().update(pet);
+    publish_hunter_pet_protocol(ctx, &pet, pet_guid);
+    Ok(())
+}
+
+#[reducer]
+pub fn gw_pet_rename(
+    ctx: &ReducerContext,
+    request_actor: crate::account_ownership::SessionActor,
+    pet_guid: u64,
+    name: String,
+) -> Result<(), String> {
+    crate::helpers::require_operator(ctx)?;
+    let owner_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
+    crate::helpers::acting_entity_by_guid(ctx, owner_guid)
+        .ok_or_else(|| "mover not in world".to_string())?;
+    rename_hunter_pet(ctx, owner_guid, pet_guid, &name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_name_timestamp_advances_until_the_protocol_limit() {
+        assert_eq!(next_name_timestamp(100, 250), 250);
+        assert_eq!(next_name_timestamp(250, 250), 251);
+        assert_eq!(next_name_timestamp(300, 250), 301);
+        assert_eq!(next_name_timestamp(u32::MAX, 250), u32::MAX);
+    }
 
     fn eligible() -> TameEligibility {
         TameEligibility {

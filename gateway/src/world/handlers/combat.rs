@@ -1,10 +1,19 @@
 use super::super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PetRenameOutcome {
+    Renamed,
+    NameInvalid,
+}
+
 pub(crate) trait CombatStore: Send + Sync {
     fn set_target(&self, actor: Actor, target_guid: u64) -> Result<()>;
 
     /// PET_ACTION packs flag << 24 | id; flag 0x07 is command and 0x06 is react state.
     fn pet_command(&self, actor: Actor, data: u32, target_guid: u64) -> Result<()>;
+
+    /// Returns NameInvalid for a bad name; other Refusals and Transport Loss stay Err.
+    fn pet_rename(&self, actor: Actor, pet_guid: u64, name: &str) -> Result<PetRenameOutcome>;
 
     fn set_sheathed(&self, actor: Actor, state: u8) -> Result<()>;
 }
@@ -44,6 +53,20 @@ impl<St: CombatStore + ?Sized> ProtocolFamily<St> for Combat {
                 if let Some(actor) = actor {
                     let result = store.pet_command(actor, p.data, p.target.guid());
                     ignore_refusal("pet_command", conn.account_id, result)?;
+                }
+            }
+            ClientOpcodeMessage::CMSG_PET_RENAME(r) => {
+                if let Some(actor) = actor {
+                    match store.pet_rename(actor, r.pet.guid(), &r.name) {
+                        Ok(PetRenameOutcome::Renamed) => {}
+                        Ok(PetRenameOutcome::NameInvalid) => {
+                            return Ok(vec![Outbound::One(
+                                ServerOpcodeMessage::SMSG_PET_NAME_INVALID,
+                            )]
+                            .into());
+                        }
+                        Err(error) => ignore_refusal("pet_rename", conn.account_id, Err(error))?,
+                    }
                 }
             }
             ClientOpcodeMessage::CMSG_FORCE_RUN_SPEED_CHANGE_ACK(_) => {}

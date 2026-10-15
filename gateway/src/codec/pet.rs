@@ -39,6 +39,13 @@ pub fn build_hunter_pet_values(pet: &HunterPetProtocolView) -> SMSG_UPDATE_OBJEC
     })
 }
 
+pub fn build_hunter_pet_identity_values(pet: &HunterPetProtocolView) -> SMSG_UPDATE_OBJECT {
+    values::unit_values(pet.live_pet_guid, |unit| {
+        unit.set_unit_petnumber(pet.pet_id as u32 as i32);
+        unit.set_unit_pet_name_timestamp(pet.name_timestamp as i32);
+    })
+}
+
 pub fn build_pet_name_query_response(pet: &PetNameView) -> SMSG_PET_NAME_QUERY_RESPONSE {
     SMSG_PET_NAME_QUERY_RESPONSE {
         pet_number: pet.pet_number,
@@ -108,6 +115,19 @@ mod tests {
             tail.extend_from_slice(&value.to_le_bytes());
         }
         assert!(bytes.ends_with(&tail), "unexpected Hunter pet VALUES tail");
+    }
+
+    #[test]
+    fn public_pet_identity_has_only_number_and_name_timestamp() {
+        let msg = build_hunter_pet_identity_values(&hunter_pet());
+        let mut bytes = Vec::new();
+        msg.write_unencrypted_server(&mut bytes).unwrap();
+        let mut tail = vec![
+            5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x18, 0, 0,
+        ];
+        tail.extend_from_slice(&0x1234u32.to_le_bytes());
+        tail.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+        assert!(bytes.ends_with(&tail));
     }
 
     #[test]

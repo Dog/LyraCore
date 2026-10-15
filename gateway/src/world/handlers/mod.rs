@@ -49,7 +49,7 @@ pub(crate) use chat::{
     Chat, ChatActionStore, ChatOutcome, RealmChatRequest, SpeakerFacts, SpeechStore,
     WhisperRequest, WhisperTargetFacts,
 };
-pub(crate) use combat::{Combat, CombatStore};
+pub(crate) use combat::{Combat, CombatStore, PetRenameOutcome};
 pub(crate) use death::DeathStore;
 pub(crate) use duel::{Duel, DuelActionStore};
 pub(crate) use guild::{
