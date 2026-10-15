@@ -308,12 +308,14 @@ pub(crate) fn offer_peer_create_for(
     if let Some(equipment) = db.game_encounter_equip().creature_guid().find(&row.guid) {
         append_encounter_equip_after_create(&mut out, viewer, &equipment);
     }
-    if row.owner_guid != 0
-        && let Some(pet) = db
-            .game_hunter_pet_protocol()
-            .iter()
-            .find(|pet| pet.live_pet_guid == row.guid && pet.owner_guid == row.owner_guid)
-    {
+    let pet = (row.owner_guid != 0)
+        .then(|| {
+            db.game_hunter_pet_protocol()
+                .iter()
+                .find(|pet| pet.live_pet_guid == row.guid && pet.owner_guid == row.owner_guid)
+        })
+        .flatten();
+    if let Some(pet) = pet {
         out.extend(crate::codec::pet::subscriptions::hunter_pet_outbound(
             &pet,
             viewer.self_guid,
