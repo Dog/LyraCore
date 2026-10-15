@@ -53,12 +53,10 @@ pub fn fits_length(text: &str, max: usize) -> bool {
 pub fn validate_guild_name(name: &str) -> Result<(), GuildRefusal> {
     let length = name.chars().count();
     let spaced_once = !name.starts_with(' ') && !name.ends_with(' ') && !name.contains("  ");
-    let one_script = [Script::Latin, Script::Cyrillic, Script::EastAsian]
-        .into_iter()
-        .any(|script| {
-            name.chars()
-                .all(|c| c.is_ascii_digit() || c == ' ' || script.holds(c))
-        });
+    let one_script = Script::ALL.into_iter().any(|script| {
+        name.chars()
+            .all(|c| c.is_ascii_digit() || c == ' ' || script.holds(c))
+    });
     if (MIN_GUILD_NAME..=MAX_GUILD_NAME).contains(&length) && spaced_once && one_script {
         Ok(())
     } else {
@@ -67,14 +65,16 @@ pub fn validate_guild_name(name: &str) -> Result<(), GuildRefusal> {
 }
 
 #[derive(Clone, Copy)]
-enum Script {
+pub(crate) enum Script {
     Latin,
     Cyrillic,
     EastAsian,
 }
 
 impl Script {
-    fn holds(self, c: char) -> bool {
+    pub(crate) const ALL: [Self; 3] = [Self::Latin, Self::Cyrillic, Self::EastAsian];
+
+    pub(crate) fn holds(self, c: char) -> bool {
         let c = u32::from(c);
         let ranges: &[(u32, u32)] = match self {
             Self::Latin => &[

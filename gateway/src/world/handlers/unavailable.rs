@@ -81,7 +81,6 @@ pub(crate) fn unavailable_outbound(
         },
         ClientOpcodeMessage::CMSG_PET_SET_ACTION(_) => unavailable("Pet action bar changes"),
         ClientOpcodeMessage::CMSG_PET_ABANDON(_) => unavailable("Pet abandonment requests"),
-        ClientOpcodeMessage::CMSG_PET_RENAME(_) => unavailable("Pet name changes"),
         ClientOpcodeMessage::CMSG_PET_STOP_ATTACK(_) => unavailable("Pet stop-attack requests"),
         ClientOpcodeMessage::CMSG_PET_CANCEL_AURA(_) => unavailable("Pet aura cancellations"),
         ClientOpcodeMessage::CMSG_PET_UNLEARN(_) => unavailable("Pet talent resets"),

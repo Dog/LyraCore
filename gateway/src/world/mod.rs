@@ -58,9 +58,9 @@ pub(crate) use handlers::{
     CancelAuctionRequest, ChannelOutcome, ChannelRequest, ChannelRoster, CharacterFacts,
     ChatOutcome, CreateAuctionOutcome, CreateAuctionRequest, GuildEventSnapshot, GuildOutcome,
     GuildRequest, ItemActionResult, LootActionStatus, LootWindowRefusal, LootWindowRequestStatus,
-    MeetingStoneOutcome, MemberPresence, MemberStatsRecord, MemberStatsStore, PlaceBidOutcome,
-    PlaceBidRequest, ReadableItem, RealmChatRequest, ResolvedTarget, SeekerFacts, SpeakerFacts,
-    TrainerBuyOutcome, WeatherStore, WhisperRequest, WhisperTargetFacts,
+    MeetingStoneOutcome, MemberPresence, MemberStatsRecord, MemberStatsStore, PetRenameOutcome,
+    PlaceBidOutcome, PlaceBidRequest, ReadableItem, RealmChatRequest, ResolvedTarget, SeekerFacts,
+    SpeakerFacts, TrainerBuyOutcome, WeatherStore, WhisperRequest, WhisperTargetFacts,
 };
 pub(crate) use handlers::{
     AuctionActionStore, BankStore, CastStore, ChannelActionStore, CharacterStore, ChatActionStore,

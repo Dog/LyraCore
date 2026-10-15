@@ -53,6 +53,7 @@ protocol_families! {
     Combat => [
         CMSG_SET_SELECTION,
         CMSG_PET_ACTION,
+        CMSG_PET_RENAME,
         CMSG_FORCE_RUN_SPEED_CHANGE_ACK,
         CMSG_SETSHEATHED,
         CMSG_CANCEL_GROWTH_AURA,

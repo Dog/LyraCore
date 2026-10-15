@@ -271,6 +271,19 @@ and a resist for a magic one. The caster of an instant cast already holds a GO, 
 interrupted player cast get `SMSG_SPELL_FAILED_OTHER`. Mount refusals name the vanilla cast
 failure: dead, in combat, indoors or in deep water.
 
+`CMSG_PET_RENAME` renames the Character's live Hunter pet once. The Module checks
+ownership, pet kind and the remaining rename before changing any state. Those
+Refusals are silent. An invalid name receives `SMSG_PET_NAME_INVALID`; names must
+have 2 to 12 letters from one script. Success stores the name and a changed timestamp
+so the client can refresh its cached name.
+
+The name-cache fields reach nearby viewers as well as the owner. Existing live pets
+recover their rename flag during the normal care update, using their creation timestamp
+until their first rename. Durable tests cover refused requests, logout persistence and
+this reconciliation. Call Pet and restoration after login remain unavailable, so name
+persistence does not yet mean the pet returns after reconnect. Reserved-name and profanity
+lists are also absent.
+
 Imported gossip conditions retain source references and operands. Supported rules
 cover quest state, level, team, race and class, plus compound conditions and negation.
 Unknown, dangling or cyclic conditions make an option unavailable. The Module repeats
@@ -291,7 +304,7 @@ per World Session. Repeated requests do not add chat lines.
 | Battleground spirit healers | System Message reporting unavailability. | Resurrection queues and timers. |
 | GM tickets | System disabled, no current ticket, creation and update refused. Deletion reports the already-absent ticket. | Durable tickets and GM workflow. |
 | Pet stables | Stable failure code 6 for listing, storing, retrieving, swapping and slot purchase. | Stable storage and purchases. |
-| Pet controls | Specific System Messages for bar changes, autocast, aura cancellation, stop-attack, naming, abandonment and unlearning. A pet-bar spell cast gets `SMSG_PET_CAST_FAILED` with the unreported reason, then a System Message. A pet-info request is ignored; the pet bar arrives with the pet. | These operations and their durable state, and an owner-to-pet read to resend the pet bar. Existing pet action commands and progression remain separate. |
+| Pet controls | Specific System Messages for bar changes, autocast, aura cancellation, stop-attack, abandonment and unlearning. A pet-bar spell cast gets `SMSG_PET_CAST_FAILED` with the unreported reason, then a System Message. A pet-info request is ignored; the pet bar arrives with the pet. | These operations and their durable state, and an owner-to-pet read to resend the pet bar. Pet action commands, Hunter pet rename and progression have separate implementations. |
 | Item containers and gifts | Inventory Refusal 39. | Item-container loot, wrapping and unwrapping. |
 | Readable pages | A terminal page names the unavailable text service. | Page-text catalog import and page chains. |
 | Reading items | Read failure with the close reason and a System Message, for an item with page text. An item without page text gets Inventory Refusal 23. | Page-text catalog import, then the read-OK reply. |

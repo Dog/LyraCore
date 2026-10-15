@@ -7,7 +7,7 @@ use crate::codec::taxi::subscriptions::append_resident_taxi_after_create;
 use crate::codec::weather::subscriptions::zone_crossed;
 use crate::codec::{self, CreateKind};
 use crate::stdb::bindings::*;
-use crate::stdb::views::{entity_view, hunter_pet_protocol_view};
+use crate::stdb::views::entity_view;
 use crate::stdb::world_index::{CellKey, EntityLayer, SessionId, ShardId};
 use crate::stdb::world_view::*;
 use crate::stdb::Coordinator;
@@ -308,21 +308,20 @@ pub(crate) fn offer_peer_create_for(
     if let Some(equipment) = db.game_encounter_equip().creature_guid().find(&row.guid) {
         append_encounter_equip_after_create(&mut out, viewer, &equipment);
     }
+    if let Some(pet) = db
+        .game_hunter_pet_protocol()
+        .iter()
+        .find(|pet| pet.live_pet_guid == row.guid && pet.owner_guid == row.owner_guid)
+    {
+        out.extend(crate::codec::pet::subscriptions::hunter_pet_outbound(
+            &pet,
+            viewer.self_guid,
+        ));
+    }
     if row.owner_guid == viewer.self_guid {
         out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
             Box::new(codec::build_owner_summon_values(viewer.self_guid, row.guid)),
         )));
-        if let Some(pet) = db
-            .game_hunter_pet_protocol()
-            .iter()
-            .find(|pet| pet.live_pet_guid == row.guid && pet.owner_guid == viewer.self_guid)
-        {
-            out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
-                Box::new(codec::build_hunter_pet_values(&hunter_pet_protocol_view(
-                    pet,
-                ))),
-            )));
-        }
         let spells: Vec<u32> = db
             .game_creature_cast()
             .iter()

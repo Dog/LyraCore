@@ -1145,7 +1145,6 @@ fn benilla_missing_gameplay_returns_a_specific_refusal_without_disconnect() {
             messages::pet_set_action(99, &[(0, 1), (1, 0)]),
         ),
         (opcode::CMSG_PET_ABANDON, messages::pet_abandon(99)),
-        (opcode::CMSG_PET_RENAME, messages::pet_rename(99, "Wolf")),
         (opcode::CMSG_PET_STOP_ATTACK, messages::pet_stop_attack(99)),
         (
             opcode::CMSG_PET_CANCEL_AURA,

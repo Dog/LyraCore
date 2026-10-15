@@ -21,6 +21,15 @@ impl CombatStore for WorldFake {
         Ok(())
     }
 
+    fn pet_rename(
+        &self,
+        _actor: Actor,
+        _pet_guid: u64,
+        _name: &str,
+    ) -> Result<crate::world::handlers::PetRenameOutcome> {
+        Ok(crate::world::handlers::PetRenameOutcome::Renamed)
+    }
+
     fn set_sheathed(&self, _actor: Actor, _state: u8) -> Result<()> {
         Ok(())
     }
