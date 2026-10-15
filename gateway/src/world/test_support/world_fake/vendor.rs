@@ -34,7 +34,7 @@ impl VendorActionStore for WorldFake {
         [0; 3]
     }
 
-    fn vendor_item_slot(&self, _item_guid: u64) -> Option<u8> {
+    fn vendor_item_slot(&self, _owner_guid: u64, _item_guid: u64) -> Option<u8> {
         None
     }
 

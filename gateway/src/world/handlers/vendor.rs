@@ -13,7 +13,8 @@ pub(crate) trait VendorActionStore: Send + Sync {
 
     fn random_property_enchant_ids(&self, random_property_id: u32) -> [u32; 3];
 
-    fn vendor_item_slot(&self, item_guid: u64) -> Option<u8>;
+    /// Slot of `item_guid` when `owner_guid` holds it; another Character's item is `None`.
+    fn vendor_item_slot(&self, owner_guid: u64, item_guid: u64) -> Option<u8>;
 
     fn vendor_repair(&self, actor: Actor, npc_guid: u64, slot: u8) -> Result<()>;
 
@@ -124,7 +125,7 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 let slot = if item_guid == 0 {
                     Some(u8::MAX)
                 } else {
-                    store.vendor_item_slot(item_guid)
+                    store.vendor_item_slot(actor.guid(), item_guid)
                 };
                 let Some(slot) = slot else {
                     return Ok(ProtocolReply::from(Vec::new()));
@@ -162,10 +163,8 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 if item_guid == 0 {
                     return Ok(ProtocolReply::from(Vec::new()));
                 }
-                let Some(slot) = store.vendor_item_slot(item_guid) else {
-                    return Ok(ProtocolReply::from(sell_refused(
-                        codec::SellItemResult::CantFindItem,
-                    )));
+                let Some(slot) = store.vendor_item_slot(actor.guid(), item_guid) else {
+                    return Ok(ProtocolReply::from(Vec::new()));
                 };
                 match store.vendor_sell(actor, vendor_guid, slot) {
                     Ok(()) => Ok(ProtocolReply::from(build_buyback_view(store, actor.guid()))),
@@ -309,6 +308,8 @@ pub(super) mod tests {
         pub(crate) ring: Mutex<Vec<(u32, u32, u32, u32)>>,
         pub(crate) random_properties: Vec<(u32, [u32; 3])>,
         pub(crate) item_slots: Vec<(u64, u8)>,
+        /// Guids in `item_slots` that another Character holds.
+        pub(crate) foreign_items: Vec<u64>,
         pub(crate) repair_error: Option<Failure>,
         pub(crate) sell_error: Option<Failure>,
         pub(crate) buyback_requests: Mutex<Vec<(u64, u64, u8)>>,
@@ -365,7 +366,10 @@ pub(super) mod tests {
                 .map_or([0; 3], |&(_, enchant_ids)| enchant_ids)
         }
 
-        fn vendor_item_slot(&self, item_guid: u64) -> Option<u8> {
+        fn vendor_item_slot(&self, _owner_guid: u64, item_guid: u64) -> Option<u8> {
+            if self.foreign_items.contains(&item_guid) {
+                return None;
+            }
             self.item_slots
                 .iter()
                 .find(|(g, _)| *g == item_guid)
@@ -753,13 +757,29 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn selling_an_unknown_item_guid_answers_cant_find_item_without_a_durable_request() {
+    fn selling_an_unknown_item_guid_is_silent_without_a_durable_request() {
         let actions = InMemoryVendorActions::default();
 
         let outcome = Vendor::handle(&actions, &mut player(), sell_item(0x99).into()).unwrap();
 
-        assert_eq!(sell_refusal(outcome), (VENDOR, 0x99, 1));
+        assert!(outcome.outbound.is_empty());
         assert!(actions.sell_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn selling_or_repairing_another_characters_item_asks_the_module_nothing() {
+        let actions = InMemoryVendorActions {
+            item_slots: vec![(ITEM, 30)],
+            foreign_items: vec![ITEM],
+            ..Default::default()
+        };
+
+        let sold = Vendor::handle(&actions, &mut player(), sell_item(ITEM).into()).unwrap();
+        let repaired = Vendor::handle(&actions, &mut player(), repair_item(ITEM).into()).unwrap();
+
+        assert!(sold.outbound.is_empty() && repaired.outbound.is_empty());
+        assert!(actions.sell_requests.lock().unwrap().is_empty());
+        assert!(actions.repair_requests.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -81,8 +81,8 @@ impl VendorActionStore for crate::stdb::Coordinator {
         property_enchant_ids(&guard.conn.db, random_property_id)
     }
 
-    fn vendor_item_slot(&self, item_guid: u64) -> Option<u8> {
-        crate::stdb::Coordinator::item_slot_by_guid(self, item_guid)
+    fn vendor_item_slot(&self, owner_guid: u64, item_guid: u64) -> Option<u8> {
+        crate::stdb::Coordinator::item_slot_by_guid(self, owner_guid, item_guid)
     }
 
     fn vendor_repair(&self, actor: Actor, npc_guid: u64, slot: u8) -> Result<()> {

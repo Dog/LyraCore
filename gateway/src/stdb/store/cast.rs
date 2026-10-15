@@ -203,8 +203,8 @@ impl CastStore for Coordinator {
         )
     }
 
-    fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8> {
-        Coordinator::item_slot_by_guid(self, item_guid)
+    fn item_slot_by_guid(&self, owner_guid: u64, item_guid: u64) -> Option<u8> {
+        Coordinator::item_slot_by_guid(self, owner_guid, item_guid)
     }
 
     fn player_items(&self, owner_guid: u64) -> Result<Vec<codec::ItemInstanceView>> {
