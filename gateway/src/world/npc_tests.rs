@@ -1479,3 +1479,100 @@ fn gossip_selection_transport_loss_ends_the_world_session_without_a_service_repl
     assert!(world.join().unwrap().is_err());
     assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
 }
+
+#[test]
+fn authored_services_that_become_unavailable_close_the_menu_without_a_service_reply() {
+    use lyracore_shared::constants::gossip_option;
+
+    for action in [gossip_option::VENDOR, gossip_option::INNKEEPER] {
+        let mut store = quest_store();
+        store.npc.innkeeper = true;
+        store.npc.gossip_opts = vec![opt(0, "Service.", action)];
+        store.vendor.vendor_stock = vec![codec::VendorItemView {
+            item_entry: 4540,
+            ..Default::default()
+        }];
+        let mut session = ProtocolSession::in_world(7, 1);
+        handlers::Query::handle(
+            &store,
+            &mut session,
+            ProtocolRequest::Message(
+                CMSG_GOSSIP_HELLO {
+                    guid: Guid::new(90),
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        store.npc.innkeeper = false;
+        store.vendor.vendor_stock.clear();
+        let reply = handlers::Query::handle(
+            &store,
+            &mut session,
+            ProtocolRequest::Message(
+                CMSG_GOSSIP_SELECT_OPTION {
+                    guid: Guid::new(90),
+                    gossip_list_id: 0,
+                    unknown: None,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            outbound_messages(reply.outbound).as_slice(),
+            [ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE]
+        ));
+        assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+        assert!(session.gossip_menu.is_none());
+    }
+}
+
+#[test]
+fn missing_quest_subjects_hide_options_even_when_progress_rows_remain() {
+    use lyracore_shared::constants::{gossip_condition, gossip_option};
+    use lyracore_shared::gossip::Condition;
+
+    let mut store = quest_store();
+    store.quest.quest_log = vec![(60, true)].into();
+    store.quest.missing_quests.insert(60);
+    for (id, kind, flags) in [
+        (1, 8, 0),
+        (2, 8, 1),
+        (3, 9, 0),
+        (4, 9, 1),
+        (5, 22, 0),
+        (6, 22, 1),
+    ] {
+        store.npc.gossip_conditions.insert(
+            id,
+            Condition {
+                kind,
+                values: [60, 0, 0, 0],
+                flags,
+            },
+        );
+        let mut option = opt(0, "Missing quest.", gossip_option::GOSSIP);
+        option.row_id = id;
+        option.cond_type = gossip_condition::REFERENCE;
+        option.cond_value1 = id;
+        store.npc.gossip_opts.push(option);
+    }
+    let reply = handlers::Query::handle(
+        &store,
+        &mut ProtocolSession::in_world(7, 1),
+        ProtocolRequest::Message(
+            CMSG_GOSSIP_HELLO {
+                guid: Guid::new(90),
+            }
+            .into(),
+        ),
+    )
+    .unwrap();
+    let messages = outbound_messages(reply.outbound);
+    let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
+        panic!("expected the quest-conditioned menu");
+    };
+    assert_eq!(menu.gossips.len(), 1);
+    assert_eq!(menu.gossips[0].message, "Farewell.");
+}

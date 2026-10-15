@@ -110,6 +110,7 @@ impl NpcStore for WorldFake {
                 class: character.class,
             },
             |quest_id| match self.quest_status(character_guid, quest_id) {
+                _ if self.quest.missing_quests.contains(&quest_id) => QuestState::Missing,
                 (_, true) if self.quest.repeatable_quests.contains(&quest_id) => QuestState::Absent,
                 (_, true) => QuestState::Rewarded,
                 (true, false)
@@ -167,6 +168,26 @@ impl NpcStore for WorldFake {
         if let Some(error) = self.npc.gossip_select_error {
             return Err(error());
         }
+        use lyracore_shared::constants::{gossip_option, MIN_TALENT_LEVEL};
+        let service_available = match selected_action {
+            gossip_option::VENDOR => !self.vendor_stock(npc_guid)?.is_empty(),
+            gossip_option::INNKEEPER => self.npc_is_innkeeper(npc_guid)?,
+            gossip_option::TRAINER | gossip_option::UNLEARNTALENTS => {
+                self.trainer_serves(actor.guid(), npc_guid)?
+                    && (selected_action != gossip_option::UNLEARNTALENTS
+                        || self
+                            .character_by_guid(actor.guid())?
+                            .is_some_and(|character| character.level >= MIN_TALENT_LEVEL))
+            }
+            _ => true,
+        };
+        if !service_available {
+            return Err(ReducerCallError::refused(
+                "gw_gossip_select",
+                "gossip service is no longer available",
+            )
+            .into());
+        }
         let menu = self.gossip_options(npc_guid)?;
         if menu.source_menu_id != source_menu_id {
             return Err(
@@ -196,17 +217,13 @@ impl NpcStore for WorldFake {
                 .into());
             }
         } else {
-            use lyracore_shared::constants::gossip_option;
-            let available = match selected_action {
-                gossip_option::VENDOR => !self.vendor_stock(npc_guid)?.is_empty(),
-                gossip_option::INNKEEPER => self.npc_is_innkeeper(npc_guid)?,
-                _ => false,
-            };
-            if !available
-                || menu
-                    .options
-                    .iter()
-                    .any(|option| option.action == selected_action)
+            if !matches!(
+                selected_action,
+                gossip_option::VENDOR | gossip_option::INNKEEPER
+            ) || menu
+                .options
+                .iter()
+                .any(|option| option.action == selected_action)
             {
                 return Err(ReducerCallError::refused(
                     "gw_gossip_select",

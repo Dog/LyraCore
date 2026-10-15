@@ -149,18 +149,16 @@ impl NpcStore for Coordinator {
                 class: character.class,
             },
             |quest_entry| {
+                let Some(template) = db.game_quest_template().entry().find(&quest_entry) else {
+                    return QuestState::Missing;
+                };
                 let Some(quest) = db.game_character_quest().iter().find(|quest| {
                     quest.character_guid == character_guid && quest.quest_entry == quest_entry
                 }) else {
                     return QuestState::Absent;
                 };
                 if quest.rewarded {
-                    if db
-                        .game_quest_template()
-                        .entry()
-                        .find(&quest_entry)
-                        .is_some_and(|template| template.repeatable)
-                    {
+                    if template.repeatable {
                         QuestState::Absent
                     } else {
                         QuestState::Rewarded

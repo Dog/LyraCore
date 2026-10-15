@@ -300,3 +300,136 @@ fn synthesized_services_require_current_capability_and_resolvable_stock() {
     select_from(&shard, &npc, u32::MAX, 0, gossip_option::INNKEEPER, false);
     select_from(&shard, &npc, u32::MAX, 0, gossip_option::GOSSIP, false);
 }
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn authored_services_require_current_capability_before_the_hook() {
+    const MENU: u32 = 509_9001;
+    let (shard, npc) = fixture("gossip-authored-capability");
+    shard.assert_sql("UPDATE game_world_entity SET level = 20 WHERE guid = 1");
+    shard.assert_sql(&format!(
+        "UPDATE game_gossip_option SET cond_type = 0 WHERE row_id = {OPTION}"
+    ));
+    shard.assert_sql(&format!(
+        "INSERT INTO game_gossip_menu_profile (menu_id,text_id) VALUES ({MENU},1)"
+    ));
+    shard.assert_sql(&format!("INSERT INTO game_gossip_menu_profile_option (row_id,menu_id,option_index,icon,text,action,action_menu_id,cond_type,cond_value1,cond_value2) VALUES ({OPTION},{MENU},0,0,'Profile supplies',3,0,0,0,0)"));
+    let entity = &shard.query_rows(&format!(
+        "SELECT map_id,instance_id FROM game_world_entity WHERE guid = {npc}"
+    ))[0];
+
+    for (table, source) in [
+        ("game_gossip_option", 0),
+        ("game_gossip_menu_profile_option", MENU),
+    ] {
+        if source != 0 {
+            shard.assert_sql(&format!("INSERT INTO game_creature_gossip_menu_override (creature_guid,menu_id,map_id,instance_id) VALUES ({npc},{MENU},{},{})", entity["map_id"], entity["instance_id"]));
+        }
+        for (action, flag) in [
+            (gossip_option::VENDOR, npc_flags::VENDOR),
+            (gossip_option::INNKEEPER, npc_flags::INNKEEPER),
+            (gossip_option::TRAINER, npc_flags::TRAINER),
+            (gossip_option::UNLEARNTALENTS, npc_flags::TRAINER),
+            (gossip_option::TAXI, npc_flags::TAXI),
+            (gossip_option::BANKER, npc_flags::BANKER),
+            (gossip_option::PETITIONER, npc_flags::PETITIONER),
+            (gossip_option::TABARDDESIGNER, npc_flags::TABARDDESIGNER),
+        ] {
+            shard.assert_sql(&format!(
+                "UPDATE {table} SET action = {action} WHERE row_id = {OPTION}"
+            ));
+            shard.assert_sql(&format!(
+                "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+                npc_flags::GOSSIP | flag
+            ));
+            select_from(&shard, &npc, OPTION, source, action, true);
+            shard.assert_sql(&format!(
+                "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+                npc_flags::GOSSIP
+            ));
+            select_from(&shard, &npc, OPTION, source, action, false);
+        }
+    }
+
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP | npc_flags::VENDOR
+    ));
+    shard.assert_sql(&format!(
+        "UPDATE game_gossip_menu_profile_option SET action = 3 WHERE row_id = {OPTION}"
+    ));
+    shard.assert_sql(&format!(
+        "DELETE FROM game_npc_vendor WHERE creature_entry = {VENDOR}"
+    ));
+    select_from(&shard, &npc, OPTION, MENU, gossip_option::VENDOR, false);
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn trainer_options_repeat_current_class_and_talent_level_gates_before_the_hook() {
+    let (shard, npc) = fixture("gossip-trainer-eligibility");
+    shard.assert_sql(&format!(
+        "UPDATE game_world_entity SET npc_flags = {} WHERE guid = {npc}",
+        npc_flags::GOSSIP | npc_flags::TRAINER
+    ));
+    shard.assert_sql(&format!(
+        "UPDATE game_gossip_option SET action = 5, cond_type = 0 WHERE row_id = {OPTION}"
+    ));
+    shard.assert_sql(&format!(
+        "UPDATE game_creature_template SET trainer_type = 0, trainer_class = 1 WHERE entry = {VENDOR}"
+    ));
+    select_from(&shard, &npc, OPTION, 0, gossip_option::TRAINER, true);
+    shard.assert_sql(&format!(
+        "UPDATE game_creature_template SET trainer_class = 8 WHERE entry = {VENDOR}"
+    ));
+    select_from(&shard, &npc, OPTION, 0, gossip_option::TRAINER, false);
+    shard.assert_sql(&format!(
+        "UPDATE game_gossip_option SET action = 16 WHERE row_id = {OPTION}"
+    ));
+    shard.assert_sql("UPDATE game_world_entity SET level = 10 WHERE guid = 1");
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        0,
+        gossip_option::UNLEARNTALENTS,
+        false,
+    );
+    shard.assert_sql(&format!(
+        "UPDATE game_creature_template SET trainer_class = 1 WHERE entry = {VENDOR}"
+    ));
+    select_from(&shard, &npc, OPTION, 0, gossip_option::UNLEARNTALENTS, true);
+    shard.assert_sql("UPDATE game_world_entity SET level = 9 WHERE guid = 1");
+    select_from(
+        &shard,
+        &npc,
+        OPTION,
+        0,
+        gossip_option::UNLEARNTALENTS,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn a_missing_quest_subject_refuses_selection_even_with_retained_progress() {
+    let (shard, npc) = fixture("gossip-missing-quest");
+    shard.assert_call("debug_grant_quest", &["1", &QUEST.to_string()]);
+    select(&shard, &npc, OPTION, true);
+    shard.assert_sql(&format!(
+        "DELETE FROM game_quest_template WHERE entry = {QUEST}"
+    ));
+    for kind in [8, 9, 22] {
+        for flags in [0, 1] {
+            shard.assert_sql(&format!("UPDATE game_gossip_condition SET kind = {kind}, value2 = 0, flags = {flags} WHERE condition_id = {CONDITION}"));
+            select(&shard, &npc, OPTION, false);
+        }
+    }
+    shard.assert_sql(&format!(
+        "DELETE FROM game_character_quest WHERE quest_entry = {QUEST}"
+    ));
+    shard.assert_sql(&format!(
+        "UPDATE game_gossip_condition SET flags = 0 WHERE condition_id = {CONDITION}"
+    ));
+    select(&shard, &npc, OPTION, false);
+}

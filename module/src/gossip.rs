@@ -1,4 +1,4 @@
-use lyracore_shared::constants::{gossip_option, npc_flags};
+use lyracore_shared::constants::{gossip_option, npc_flags, MIN_TALENT_LEVEL};
 use lyracore_shared::gossip::{self, CharacterFacts, Condition, QuestState};
 use spacetimedb::{table, ReducerContext};
 
@@ -57,9 +57,12 @@ pub(crate) fn select_gate(
     if source_menu_id != active_menu.as_ref().map_or(0, |menu| menu.menu_id) {
         return Err("gossip menu has changed".into());
     }
+    if !service_available(ctx, &actor, &npc, selected_action) {
+        return Err("gossip service is no longer available".into());
+    }
     // u32::MAX denotes a synthesized service line without an imported row.
     if option_row_id == u32::MAX {
-        if !synthesized_service_available(
+        if !synthesized_service_matches(
             ctx,
             &npc,
             active_menu.map(|menu| menu.menu_id),
@@ -144,12 +147,18 @@ fn condition_gate(
     }
 }
 
-fn synthesized_service_available(
+fn synthesized_service_matches(
     ctx: &ReducerContext,
     npc: &crate::WorldEntity,
     menu_id: Option<u32>,
     selected_action: u32,
 ) -> bool {
+    if !matches!(
+        selected_action,
+        gossip_option::VENDOR | gossip_option::INNKEEPER
+    ) {
+        return false;
+    }
     let has_authored_service = if let Some(menu_id) = menu_id {
         ctx.db
             .game_gossip_menu_profile_option()
@@ -163,9 +172,15 @@ fn synthesized_service_available(
             .filter(&npc.entry)
             .any(|option| option.action == selected_action)
     };
-    if has_authored_service {
-        return false;
-    }
+    !has_authored_service
+}
+
+fn service_available(
+    ctx: &ReducerContext,
+    actor: &crate::WorldEntity,
+    npc: &crate::WorldEntity,
+    selected_action: u32,
+) -> bool {
     match selected_action {
         gossip_option::VENDOR => {
             npc.npc_flags & npc_flags::VENDOR != 0
@@ -183,11 +198,23 @@ fn synthesized_service_available(
                     })
         }
         gossip_option::INNKEEPER => npc.npc_flags & npc_flags::INNKEEPER != 0,
-        _ => false,
+        gossip_option::TRAINER | gossip_option::UNLEARNTALENTS => {
+            (selected_action != gossip_option::UNLEARNTALENTS
+                || actor.level >= u32::from(MIN_TALENT_LEVEL))
+                && crate::trainer::validate_trainer_interaction(ctx, actor, npc.guid).is_ok()
+        }
+        gossip_option::TAXI => npc.npc_flags & npc_flags::TAXI != 0,
+        gossip_option::BANKER => npc.npc_flags & npc_flags::BANKER != 0,
+        gossip_option::PETITIONER => npc.npc_flags & npc_flags::PETITIONER != 0,
+        gossip_option::TABARDDESIGNER => npc.npc_flags & npc_flags::TABARDDESIGNER != 0,
+        _ => true,
     }
 }
 
 fn quest_state(ctx: &ReducerContext, character_guid: u64, quest_entry: u32) -> QuestState {
+    let Some(template) = ctx.db.game_quest_template().entry().find(quest_entry) else {
+        return QuestState::Missing;
+    };
     let Some(quest) = ctx
         .db
         .game_character_quest()
@@ -198,13 +225,7 @@ fn quest_state(ctx: &ReducerContext, character_guid: u64, quest_entry: u32) -> Q
         return QuestState::Absent;
     };
     if quest.rewarded {
-        if ctx
-            .db
-            .game_quest_template()
-            .entry()
-            .find(quest_entry)
-            .is_some_and(|template| template.repeatable)
-        {
+        if template.repeatable {
             QuestState::Absent
         } else {
             QuestState::Rewarded

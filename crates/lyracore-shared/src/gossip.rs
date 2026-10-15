@@ -10,6 +10,8 @@ pub struct Condition {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuestState {
+    /// The quest template does not exist.
+    Missing,
     Absent,
     Incomplete,
     Complete,
@@ -28,6 +30,7 @@ pub struct CharacterFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unavailable {
     Missing(u32),
+    MissingQuest(u32),
     Cycle(u32),
     Unsupported(i32),
     Operands(i32),
@@ -146,12 +149,16 @@ where
                 }
                 crate::faction::team_for_race(self.character.race) == a
             }
-            8 if a != 0 && b == 0 => (self.quest)(a) == QuestState::Rewarded,
+            8 if a != 0 && b == 0 => self.quest_state(a)? == QuestState::Rewarded,
             9 if a != 0 && b <= 2 => matches!(
-                ((self.quest)(a), b),
+                (self.quest_state(a)?, b),
                 (QuestState::Incomplete, 0 | 1) | (QuestState::Complete, 0 | 2)
             ),
             14 => {
+                // CMaNGOS loading requires a playable bit per nonzero mask and at least one mask.
+                if (a == 0 && b == 0) || (a != 0 && a & 0xff == 0) || (b != 0 && b & 0x5df == 0) {
+                    return Err(Unavailable::Operands(row.kind));
+                }
                 let race = self
                     .character
                     .race
@@ -173,12 +180,22 @@ where
                 _ => self.character.level <= a,
             },
             22 if a != 0 && b == 0 => {
-                matches!((self.quest)(a), QuestState::Absent | QuestState::Failed)
+                matches!(
+                    self.quest_state(a)?,
+                    QuestState::Absent | QuestState::Failed
+                )
             }
             -3 | 0 | 6 | 8 | 9 | 15 | 22 => return Err(Unavailable::Operands(row.kind)),
             kind => return Err(Unavailable::Unsupported(kind)),
         };
         Ok(if row.flags & 1 != 0 { !result } else { result })
+    }
+
+    fn quest_state(&self, id: u32) -> Result<QuestState, Unavailable> {
+        match (self.quest)(id) {
+            QuestState::Missing => Err(Unavailable::MissingQuest(id)),
+            state => Ok(state),
+        }
     }
 }
 
@@ -252,6 +269,8 @@ mod tests {
             (encoded::RACE_CLASS, 2, 1, false),
             (encoded::RACE_CLASS, 1, 2, false),
             (encoded::RACE_CLASS, 0, 1, true),
+            (encoded::RACE_CLASS, 1, 0, true),
+            (encoded::RACE_CLASS, 0x101, 0x21, true),
         ] {
             assert_eq!(
                 evaluate_option(kind, a, b, HUMAN_WARRIOR, |_| QuestState::Absent, |_| None),
@@ -330,5 +349,54 @@ mod tests {
             },
         );
         assert_eq!(result, Err(Unavailable::Limit));
+    }
+
+    #[test]
+    fn invalid_race_class_masks_stay_unavailable_under_reverse_and_not() {
+        for (race, class) in [(0, 0), (0x100, 0), (0, 0x20)] {
+            for flags in [0, 1] {
+                let mut invalid = row(14, race, class);
+                invalid.flags = flags;
+                let rows = HashMap::from([(1, invalid), (2, row(-3, 1, 0))]);
+                for id in [1, 2] {
+                    assert_eq!(
+                        evaluate_reference(
+                            id,
+                            HUMAN_WARRIOR,
+                            |_| QuestState::Absent,
+                            |id| rows.get(&id).copied(),
+                        ),
+                        Err(Unavailable::Operands(14))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_quest_subject_stays_unavailable_under_reverse_not_and_or() {
+        for kind in [8, 9, 22] {
+            for flags in [0, 1] {
+                let mut missing_quest = row(kind, 777, 0);
+                missing_quest.flags = flags;
+                let rows = HashMap::from([
+                    (1, missing_quest),
+                    (2, row(-3, 1, 0)),
+                    (3, row(0, 0, 0)),
+                    (4, row(-2, 3, 1)),
+                ]);
+                for id in [1, 2, 4] {
+                    assert_eq!(
+                        evaluate_reference(
+                            id,
+                            HUMAN_WARRIOR,
+                            |_| QuestState::Missing,
+                            |id| rows.get(&id).copied(),
+                        ),
+                        Err(Unavailable::MissingQuest(777))
+                    );
+                }
+            }
+        }
     }
 }
