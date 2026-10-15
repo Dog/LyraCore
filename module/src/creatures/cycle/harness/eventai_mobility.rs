@@ -1,5 +1,3 @@
-//! EventAI summon and ranged-posture scenarios.
-
 use super::*;
 use crate::creatures::eventai::*;
 
@@ -237,9 +235,6 @@ fn a_summon_guid_carries_the_entry_and_the_first_sequence_of_the_eventai_band() 
     let [summoned] = summoned_guids.as_slice() else {
         panic!("expected one summon");
     };
-    // The wave-guid layout: the template entry in the high 24 bits of the low 48, the low 24 bits
-    // for the band and sequence. The EventAI band is 0x40_0000 and this world's first summon takes
-    // sequence 1.
     assert_eq!((summoned >> 24) & 0xFF_FFFF, u64::from(SUMMON_ENTRY));
     assert_eq!(summoned & 0xFF_FFFF, 0x40_0000 | 1);
 }
@@ -327,8 +322,6 @@ fn missing_summon_catalogue_or_template_fails_without_a_partial_creature() {
 
 #[test]
 fn a_creature_standing_on_its_authored_hold_point_turns_to_its_victim() {
-    // Placed exactly where the 10 yd / 90° posture holds it, looking the other way: the shape a
-    // victim who ran a quarter circle around it leaves behind.
     let mut scenario = Scenario::new(1_000_000)
         .creature(CREATURE, point(20.0, 10.0))
         .entry(CREATURE, ENTRY)

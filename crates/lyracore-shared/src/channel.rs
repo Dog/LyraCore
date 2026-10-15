@@ -1,7 +1,3 @@
-//! The Chat Channel wire contract both crates import: notice codes, member and channel flags, op
-//! codes, the built-in catalogue, the name rules and the typed [`ChannelRefusal`].
-
-/// `SMSG_CHANNEL_NOTIFY` notice codes (cm:Channel.h:33-69, gtker vanilla `chat_notify.rs`).
 pub mod notice {
     pub const JOINED: u8 = 0x00;
     pub const LEFT: u8 = 0x01;
@@ -37,9 +33,7 @@ pub mod notice {
     pub const THROTTLED: u8 = 0x1F;
 }
 
-/// Channel Membership flags as both cores define them (cm:Channel.h:117-128,
-/// vm:Channel.h:121-127). gtker's `ChannelMemberFlags` names disagree (it calls 0x04 MODERATOR),
-/// so nothing that encodes a member list may use its named constants.
+// gtker names 0x04 MODERATOR; vanilla uses 0x04 for VOICED.
 pub mod member_flag {
     pub const OWNER: u8 = 0x01;
     pub const MODERATOR: u8 = 0x02;
@@ -47,7 +41,6 @@ pub mod member_flag {
     pub const MUTED: u8 = 0x08;
 }
 
-/// Wire channel flags (cm:Channel.h:85-101), sent in YOU_JOINED and `SMSG_CHANNEL_LIST`.
 pub mod channel_flag {
     pub const CUSTOM: u8 = 0x01;
     pub const TRADE: u8 = 0x04;
@@ -57,8 +50,6 @@ pub mod channel_flag {
     pub const LFG: u8 = 0x40;
 }
 
-/// The op byte of the `realm_channel_op` reducer. Every code is reserved here so the reducer
-/// signature never changes as ops are added.
 pub mod channel_op {
     pub const JOIN: u8 = 0;
     pub const LEAVE: u8 = 1;
@@ -76,33 +67,25 @@ pub mod channel_op {
     pub const MODERATE: u8 = 13;
 }
 
-/// The ChatChannels.dbc flag bits that decide the wire flags (cm:Channel.h:103-115).
 mod dbc_flag {
     pub const TRADE: u32 = 0x0_0008;
     pub const CITY_ONLY2: u32 = 0x0_0020;
     pub const LFG: u32 = 0x4_0000;
 }
 
-/// One row of the 1.12 client's ChatChannels.dbc. Realm-core receives no DBC imports and the 1.12
-/// join packet carries no channel id, so the catalogue is matched by its enUS name. A localized
-/// client's built-in names become custom channels.
+// Build 5875 carries no channel id on join; localized names become custom channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltinChannel {
-    /// The ChatChannels id.
     pub id: u32,
-    /// The ChatChannels flags column.
     pub dbc_flags: u32,
-    /// The pattern up to its `%s`, or the whole name when it has none.
+    // Pattern prefix before %s, or the complete unzoned name.
     pub prefix: &'static str,
-    /// The pattern carries a zone name (`%s`), so the name only has to start with `prefix`.
     pub zoned: bool,
 }
 
 pub const WORLD_DEFENSE_ID: u32 = 23;
-/// A Guild member never joins GuildRecruitment (cm:Channel.cpp:94-95).
 pub const GUILD_RECRUITMENT_ID: u32 = 25;
 
-/// dbc:ChatChannels.dbc, every row of the local 1.12.1 client.
 pub const BUILTIN_CHANNELS: [BuiltinChannel; 6] = [
     BuiltinChannel {
         id: 1,
@@ -143,8 +126,6 @@ pub const BUILTIN_CHANNELS: [BuiltinChannel; 6] = [
 ];
 
 impl BuiltinChannel {
-    /// The wire flags the way cm:Channel.cpp:29-48 derives them: GENERAL, plus TRADE and CITY from
-    /// their dbc bits, plus LFG or NOT_LFG.
     pub fn wire_flags(self) -> u8 {
         let mut flags = channel_flag::GENERAL;
         if self.dbc_flags & dbc_flag::TRADE != 0 {
@@ -161,16 +142,12 @@ impl BuiltinChannel {
         flags
     }
 
-    /// Both cores require an honor rank to speak in WorldDefense (cm:Channel.cpp:604-606,
-    /// vm:Channel.cpp:648). LyraCore has no honor ranks, so nobody speaks there.
+    // WorldDefense requires honor ranks, which this realm does not implement.
     pub fn players_may_speak(self) -> bool {
         self.id != WORLD_DEFENSE_ID
     }
 }
 
-/// The built-in channel `name` names, if any. A zoned pattern matches as a case-insensitive
-/// prefix and the others as a whole name. Stricter than the mangos substring search
-/// (cm:DBCStores.cpp:762-770), so a custom channel named "My General - x" stays custom.
 pub fn classify(name: &str) -> Option<BuiltinChannel> {
     BUILTIN_CHANNELS.into_iter().find(|builtin| {
         if builtin.zoned {
@@ -182,23 +159,16 @@ pub fn classify(name: &str) -> Option<BuiltinChannel> {
     })
 }
 
-/// cm:ChannelHandler.cpp:24-29 and cm:ChannelHandler.cpp:31-38.
 pub const MAX_NAME_CHARS: usize = 128;
 pub const MAX_PASSWORD_CHARS: usize = 128;
 
-/// A channel name as the Realm stores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelName {
-    /// The lowercase name: with the team, the channel's identity (cm:ChannelMgr.cpp:47-61).
     pub key: String,
-    /// The spelling the wire echoes.
     pub display: String,
 }
 
 impl ChannelName {
-    /// Cap at [`MAX_NAME_CHARS`], then collapse each run of space, tab, bell and newline into one
-    /// space, in that order (cm:ChannelHandler.cpp:24-29, cm Util.cpp `stripLineInvisibleChars`).
-    /// No validity check: a lookup by an invalid name simply finds no channel.
     pub fn normalize(raw: &str) -> Self {
         let mut display = String::with_capacity(raw.len());
         let mut in_gap = false;
@@ -220,8 +190,6 @@ impl ChannelName {
     }
 }
 
-/// A name a new channel may carry: [`ChannelName::normalize`], then the first character must be a
-/// letter. Non-ASCII first characters pass, as in vm:ChannelHandler.cpp:29-37.
 pub fn channel_name(raw: &str) -> Result<ChannelName, ChannelRefusal> {
     let name = ChannelName::normalize(raw);
     match name.display.chars().next() {
@@ -230,8 +198,6 @@ pub fn channel_name(raw: &str) -> Result<ChannelName, ChannelRefusal> {
     }
 }
 
-/// A join password longer than [`MAX_PASSWORD_CHARS`] answers WRONG_PASSWORD
-/// (cm:ChannelHandler.cpp:31-38).
 pub fn check_password(password: &str) -> Result<(), ChannelRefusal> {
     if password.chars().count() > MAX_PASSWORD_CHARS {
         Err(ChannelRefusal::WrongPassword)
@@ -240,8 +206,6 @@ pub fn check_password(password: &str) -> Result<(), ChannelRefusal> {
     }
 }
 
-/// Why the Module refused a channel op or a channel line. Each renders one notice to the actor
-/// alone. The tag is the whole reducer error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelRefusal {
     NotMember,
@@ -276,8 +240,6 @@ impl ChannelRefusal {
         Self::NotModerated,
     ];
 
-    /// Tags share the `chat:` family with `ChatRefusal`, because a refused channel line comes back
-    /// from the `realm_chat` reducer with the same tag.
     pub fn as_tag(self) -> &'static str {
         match self {
             Self::NotMember => "chat:channel:not_member",
@@ -302,7 +264,6 @@ impl ChannelRefusal {
             .find(|refusal| refusal.as_tag() == tag)
     }
 
-    /// The notice the actor gets.
     pub fn notice(self) -> u8 {
         match self {
             Self::NotMember => notice::NOT_MEMBER,
@@ -326,7 +287,6 @@ impl ChannelRefusal {
 mod tests {
     use super::*;
 
-    /// cm:Channel.h:33-69, `enum ChatNotify`.
     #[test]
     fn notice_codes_are_the_vanilla_chat_notify_values() {
         let pinned = [
@@ -368,8 +328,6 @@ mod tests {
         }
     }
 
-    /// cm:Channel.h:117-128 and vm:Channel.h:121-127 agree. gtker's MODERATOR is 0x04, which is
-    /// VOICED here.
     #[test]
     fn member_flags_are_the_cores_values() {
         assert_eq!(member_flag::OWNER, 0x01);
@@ -378,7 +336,6 @@ mod tests {
         assert_eq!(member_flag::MUTED, 0x08);
     }
 
-    /// cm:Channel.h:85-101.
     #[test]
     fn channel_flags_are_the_cores_values() {
         assert_eq!(channel_flag::CUSTOM, 0x01);
@@ -410,9 +367,6 @@ mod tests {
         assert_eq!(ops, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     }
 
-    /// Each dbc:ChatChannels.dbc row with its wire flags worked out by hand from the dbc flags:
-    /// General 0x3 and LocalDefense 0x10003 give GENERAL|NOT_LFG; Trade 0x3B adds TRADE (0x08)
-    /// and CITY (0x20); GuildRecruitment 0x20032 adds CITY only.
     #[test]
     fn every_builtin_channel_classifies_with_its_wire_flags() {
         let rows = [
@@ -525,7 +479,6 @@ mod tests {
         assert_eq!(ChannelRefusal::parse_tag("chat:not_in_group"), None);
     }
 
-    /// cm:Channel.h:33-69: the notice each Refusal answers.
     #[test]
     fn each_refusal_renders_its_notice() {
         let expected = [

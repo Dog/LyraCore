@@ -1,13 +1,9 @@
-//! Melee-attack dispatcher: durable engagement, session transition, and client stance messages.
-
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
 use crate::world::family::{ProtocolFamily, ProtocolReply, ProtocolRequest, ProtocolSession};
 
 pub(crate) trait MeleeActionStore: Send + Sync {
     fn start_attack(&self, actor: Actor, target_guid: u64) -> Result<()>;
-    /// Disarm the actor's outgoing engagement row. Also the ranged auto-repeat teardown call;
-    /// `attack_stop` states the rule the two share.
     fn stop_attack(&self, actor: Actor) -> Result<()>;
 }
 
@@ -43,20 +39,17 @@ impl<St: MeleeActionStore + ?Sized> ProtocolFamily<St> for Melee {
     }
 }
 
-/// The Character's entity is gone, so no further action can be served. End the World Session so the client can log in again.
 fn desync_exit(error: anyhow::Error, opcode: &str) -> anyhow::Error {
     error.context(format!(
         "Character entity missing on {opcode}: desync ends the World Session"
     ))
 }
 
-/// Arm the durable engagement first; session state and client stance follow only on success.
 fn attack_start<St: MeleeActionStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
     target_guid: u64,
 ) -> Result<ProtocolReply> {
-    // Not in the world: no combat state to arm and no attacker guid to name.
     let Some(actor) = session.actor() else {
         return Ok(ProtocolReply::default());
     };
@@ -64,8 +57,6 @@ fn attack_start<St: MeleeActionStore + ?Sized>(
         let DurableFailure::Refusal { reason } = classify(&e) else {
             return Err(e);
         };
-        // A corpse or a friendly target must be answered: with no refusal the client hangs in
-        // combat stance and never swings. Both are transient per-swing failures, not fatal.
         let refusal = if reason.contains(lyracore_shared::ERR_ATTACK_TARGET_DEAD) {
             Some(ServerOpcodeMessage::SMSG_ATTACKSWING_DEADTARGET)
         } else if reason.contains(lyracore_shared::ERR_ATTACK_FRIENDLY) {
@@ -73,10 +64,8 @@ fn attack_start<St: MeleeActionStore + ?Sized>(
         } else if is_desync_error(&e) {
             return Err(desync_exit(e, "attackswing"));
         } else {
-            // Out of range, retarget races: expected, so ignore.
             None
         };
-        // Every non-desync refusal stays visible to operators, answered ones included.
         log::debug!(
             "world: start_attack ignored (account {}): {e}",
             session.account_id
@@ -98,16 +87,11 @@ fn attack_start<St: MeleeActionStore + ?Sized>(
     })
 }
 
-/// Request durable disengagement first; the session drops its target and the client leaves
-/// combat stance after.
 fn attack_stop<St: MeleeActionStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
 ) -> Result<ProtocolReply> {
-    // Melee and ranged auto-repeat share one durable engagement row per attacker. The client sends
-    // CMSG_ATTACKSTOP whenever it leaves melee stance, ranged loop armed or not, so honoring it
-    // here would delete the auto-shot engagement: one shot, then silence. Only
-    // CMSG_CANCEL_AUTO_REPEAT_SPELL tears that loop down.
+    // Ignore melee stop while ranged is armed; both share one durable engagement row.
     if matches!(&session.state, WorldState::InWorld(world) if world.ranged_repeat) {
         return Ok(ProtocolReply::default());
     }
@@ -126,8 +110,6 @@ fn attack_stop<St: MeleeActionStore + ?Sized>(
         if is_desync_error(&e) {
             return Err(desync_exit(e, "attackstop"));
         }
-        // A refused stop still clears the client's stance: the recorded target may already be dead,
-        // and leaving the Character swinging at nothing is worse than a stale disarm.
         log::debug!(
             "world: stop_attack ignored (account {}): {e}",
             session.account_id
@@ -161,16 +143,11 @@ pub(super) mod tests {
 
     #[derive(Default)]
     pub(crate) struct InMemoryMeleeActions {
-        /// Recorded `start_attack` calls: actor and target.
         pub(crate) start_requests: Mutex<Vec<(u64, u64)>>,
-        /// The Module's reason when `start_attack` is refused.
         pub(crate) start_error: Option<String>,
         pub(crate) stop_requests: Mutex<Vec<u64>>,
-        /// The Module's reason when `stop_attack` is refused.
         pub(crate) stop_error: Option<String>,
-        /// Every durable call fails with a Transport Loss.
         pub(crate) transport_lost: bool,
-        /// The attackers with a live engagement: a started attack adds its actor, a stop removes it.
         pub(crate) engaged: Mutex<Vec<u64>>,
     }
 

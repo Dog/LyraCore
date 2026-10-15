@@ -6,7 +6,6 @@ const GM: u64 = 5_090_001;
 const LEADER: u64 = 5_090_002;
 const OTHER: u64 = 5_090_003;
 
-/// A tokenless actor: Realm-core holds no Account Claim for the reserved guids.
 fn actor(guid: u64) -> String {
     format!(r#"{{"guid":{guid},"ownership":null}}"#)
 }
@@ -38,7 +37,6 @@ fn guild_rows(realm: &Standalone) -> (usize, usize, usize) {
     )
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_gm_founds_a_guild_on_realm_core_and_refusals_change_nothing() {

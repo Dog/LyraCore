@@ -1,16 +1,7 @@
-//! Per-player spellbook — `game_player_spell` rows are the ONE source of castability.
-//!
-//! `cast_spell`'s gate (`knows_spell`) accepts exactly the spells stored for the character; the gateway
-//! builds `SMSG_INITIAL_SPELLS` from the same rows, so the client book and the server gate can never
-//! drift. `learn_spell` is the single grant path: character creation copies the createinfo kit in
-//! (`grant_createinfo_spells`, from the seeded `game_createinfo_spell` data), and talents/trainers/
-//! quest rewards insert on top of it. [entity]
-
 use spacetimedb::{table, Identity, ReducerContext, Table};
 
-use crate::{game_aura, game_spell}; // racial-passive attribute lookup (game_spell); aura strip (game_aura)
+use crate::{game_aura, game_spell};
 
-/// A Character's learned spell. The pair index answers membership without scanning the spellbook.
 #[table(
     accessor = game_player_spell,
     public,
@@ -26,17 +17,12 @@ pub struct PlayerSpell {
     pub spell_id: u32,
 }
 
-// Character-owned sweeps: learned spells are deleted on character delete, re-owned
-// (identity re-stamp) on a relog under a changed gateway identity.
 crate::character_owned!(delete, fn sweep_delete_game_player_spell(ctx, character_guid) {
     let spells = ctx.db.game_player_spell();
     for r in spells.by_character().filter(&character_guid).collect::<Vec<_>>() {
         spells.id().delete(r.id);
     }
 });
-// CROSS-DATABASE transport, HOT: the spellbook is what the character can DO on arrival —
-// without it the login spellbook is empty and every cast fails "spell not known". `id` is a
-// surrogate PK, re-minted.
 crate::character_owned!(transfer, fn sweep_transfer_game_player_spell(ctx, character_guid, io) {
     table = game_player_spell,
     by = by_character,
@@ -52,12 +38,7 @@ crate::character_owned!(restamp, fn sweep_restamp_game_player_spell(ctx, charact
     }
 });
 
-/// One createinfo entry: the spell a fresh character of a matching (race, class) starts with.
-/// `race == 0` / `class == 0` are wildcards (a class kit row matches every race; a racial row matches
-/// every class). Copied into `game_player_spell` at character creation — this table is never consulted
-/// on the cast path, so editing it only affects characters created afterwards. Hand-authored seed data
-/// (createinfo exists in no client DBC; values derived from the classic-db `playercreateinfo_spell`
-/// dump — licensing firewall: derived, not bulk-imported). [reference]
+// Zero race or class matches every value in that field.
 #[table(accessor = game_createinfo_spell)]
 pub struct CreateinfoSpell {
     #[primary_key]
@@ -68,9 +49,6 @@ pub struct CreateinfoSpell {
     pub spell_id: u32,
 }
 
-/// Copy the createinfo kit for (`race`, `class`) into `guid`'s spellbook — the character-creation
-/// grant. Idempotent via `learn_spell`. The table stays tiny (a few rows per class), so the full scan
-/// with wildcard matching beats maintaining an index nobody else needs.
 pub(crate) fn grant_createinfo_spells(
     ctx: &ReducerContext,
     guid: u64,
@@ -85,16 +63,10 @@ pub(crate) fn grant_createinfo_spells(
     }
 }
 
-/// Does a `game_createinfo_spell` row (`row_race`, `row_class`) apply to a fresh character of (`race`,
-/// `class`)? Each side matches on EITHER an exact equal id OR the row's own 0-wildcard: `row_race == 0`
-/// matches every race (a class-kit row); `row_class == 0` matches every class (a racial row); `(0, 0)`
-/// matches everyone. Both sides must match for the row to apply. Pure — the wildcard join
-/// `grant_createinfo_spells` scans is unit-tested here without a live ctx.
 pub(crate) fn createinfo_row_matches(row_race: u8, row_class: u8, race: u8, class: u8) -> bool {
     (row_race == 0 || row_race == race) && (row_class == 0 || row_class == class)
 }
 
-/// Whether the Character has learned this spell, including its creation kit.
 pub(crate) fn knows_spell(ctx: &ReducerContext, guid: u64, spell_id: u32) -> bool {
     ctx.db
         .game_player_spell()
@@ -104,14 +76,7 @@ pub(crate) fn knows_spell(ctx: &ReducerContext, guid: u64, spell_id: u32) -> boo
         .is_some()
 }
 
-/// Apply the PASSIVE racial spells' auras for `race` at login (parallel to `apply_learned_talents`). Only
-/// spells flagged `SPELL_ATTR_PASSIVE` in the imported `game_spell` are applied — read from data, never a
-/// hardcoded list — so the always-on racials (The Human Spirit, weapon specs, Diplomacy) get their aura
-/// while an ACTIVE racial (Perception) is left for on-demand cast. Idempotent: `apply_spell_auras`'s
-/// `aura_apply` refreshes by effect, never stacks. A racial not yet imported (no `game_spell` row) is
-/// skipped, so this is safe before the racials are in the DB. [entity]
 pub(crate) fn apply_racial_passives(ctx: &ReducerContext, guid: u64, race: u8, level: u8) {
-    // The race's createinfo rows (class == 0 wildcard) — the same set creation copied into the book.
     let racials: Vec<u32> = ctx
         .db
         .game_createinfo_spell()
@@ -129,7 +94,6 @@ pub(crate) fn apply_racial_passives(ctx: &ReducerContext, guid: u64, race: u8, l
     }
 }
 
-/// Learn a missing spell once. Creation, talents, trainers, and quest rewards use this operation.
 pub(crate) fn learn_spell(ctx: &ReducerContext, guid: u64, owner: Identity, spell_id: u32) {
     if knows_spell(ctx, guid, spell_id) {
         return;
@@ -140,13 +104,9 @@ pub(crate) fn learn_spell(ctx: &ReducerContext, guid: u64, owner: Identity, spel
         owner_identity: owner,
         spell_id,
     });
-    // Pick Lock: learning it grants the Lockpicking (633) skill line, so the first pick_lock cast
-    // reads a real skill row (a no-op for every other spell). Runs on the single grant seam.
     crate::skill::grant_lockpicking_on_learn(ctx, guid, owner, spell_id);
 }
 
-/// Forget every matching row without changing auras. Talent supersession and respec remove those
-/// separately through `strip_spell_auras`.
 pub(crate) fn forget_spell(ctx: &ReducerContext, guid: u64, spell_id: u32) {
     let spells = ctx.db.game_player_spell();
     for row in spells
@@ -158,14 +118,7 @@ pub(crate) fn forget_spell(ctx: &ReducerContext, guid: u64, spell_id: u32) {
     }
 }
 
-/// Strip every `game_aura` row `guid` has from `spell_id` (collect-then-delete — never mutate mid-scan,
-/// matches `scheduler::cancel_aura`'s pattern). Returns whether any removed aura moved vitals
-/// (`aura_moves_vitals`) — the caller's cue to run exactly ONE `recompute_vitals` after stripping a batch
-/// of spells, never per-spell (this function deliberately does NOT call `recompute_vitals` itself: a
-/// respec strips several passives per unlearn and folding the flag across all of them keeps that a single
-/// call, mirroring the pre-existing talent.rs call sites this replaces). A PASSIVE aura has no
-/// `cancel_aura` path (it refuses a passive spell by design), so this is the only way to remove one
-/// server-side. [entity]
+// The caller must recompute vitals once after stripping its batch of spells.
 pub(crate) fn strip_spell_auras(ctx: &ReducerContext, guid: u64, spell_id: u32) -> bool {
     let auras = ctx.db.game_aura();
     let redisplay = auras
@@ -191,9 +144,6 @@ pub(crate) fn strip_spell_auras(ctx: &ReducerContext, guid: u64, spell_id: u32) 
         moved_vitals |= mv;
         moved_mount |= mm;
     }
-    // Unlike vitals, the mount recompute runs HERE rather than being folded back to the caller: it is
-    // already gated on a mount aura having been removed (never true on the respec path, the only
-    // caller that batches several spells), so per-spell costs nothing and no call site has to know.
     if moved_mount {
         crate::mount::recompute_mount(ctx, guid);
     }
@@ -213,10 +163,6 @@ pub struct SpellChain {
     pub req_spell: u32,
 }
 
-/// One "learning `parent_spell` also auto-teaches `learn_spell`" dependent (cmangos `spell_learn_spell`,
-/// reduced scope), e.g. a weapon-skill spell that auto-grants a companion passive. Read
-/// by [`learn_spell_with_dependents`] via `by_parent`. Module-only, no Timestamp, unsubscribed — same
-/// shape/rationale as `SpellChain` above. [reference]
 #[table(accessor = game_spell_learn, index(accessor = by_parent, btree(columns = [parent_spell])))]
 pub struct SpellLearn {
     #[primary_key]
@@ -257,11 +203,6 @@ mod tests {
     use super::{createinfo_row_matches, dependent_spell_ids};
     use crate::seed::CREATEINFO_KIT;
 
-    // --- (reduced scope): spell-chain / spell-learn dependents ------------------------
-
-    /// `dependent_spell_ids` returns ONLY the rows whose parent matches, in row order, and is empty for
-    /// a parent with no dependents at all (the "no game_spell_learn row" fallback: a plain rank-only
-    /// spell with nothing to auto-teach, or an empty/un-imported table).
     #[test]
     fn dependent_spell_ids_filters_by_parent_and_is_empty_for_no_match_or_empty_table() {
         let rows = vec![(100u32, 200u32), (100, 201), (300, 400)];
@@ -279,9 +220,6 @@ mod tests {
         );
     }
 
-    /// A class trainer sells the armor-proficiency WRAPPER; the passive it teaches is what the equip
-    /// Gate reads. The importer synthesizes exactly one `game_spell_learn` row per wrapper, so the
-    /// buy's single level of dependents is what turns the purchase into a Proficiency.
     #[test]
     fn an_armor_proficiency_wrapper_teaches_its_passive_as_a_dependent() {
         use lyracore_shared::constants::armor_proficiency::*;
@@ -298,42 +236,34 @@ mod tests {
             dependent_spell_ids(&rows, MAIL_TRAINER_SPELL_ID),
             vec![MAIL_PASSIVE_SPELL_ID]
         );
-        // The passive teaches nothing further, so one level of dependents reaches the whole grant.
         assert_eq!(
             dependent_spell_ids(&rows, PLATE_PASSIVE_SPELL_ID),
             Vec::<u32>::new()
         );
     }
 
-    /// An exact (race, class) match always applies, regardless of any wildcards elsewhere.
     #[test]
     fn createinfo_row_matches_exact_race_and_class() {
-        assert!(createinfo_row_matches(1, 1, 1, 1)); // Human Warrior row on a Human Warrior
-        assert!(!createinfo_row_matches(1, 1, 1, 4)); // same row, a Human Mage → class mismatch
-        assert!(!createinfo_row_matches(1, 1, 3, 1)); // same row, a Dwarf Warrior → race mismatch
+        assert!(createinfo_row_matches(1, 1, 1, 1));
+        assert!(!createinfo_row_matches(1, 1, 1, 4));
+        assert!(!createinfo_row_matches(1, 1, 3, 1));
     }
 
-    /// `row.race == 0` is a TRUE wildcard: a class-kit row (e.g. every Warrior's Heroic Strike) matches
-    /// EVERY race, as long as the class still matches exactly.
     #[test]
     fn createinfo_row_matches_race_wildcard_matches_every_race() {
-        assert!(createinfo_row_matches(0, 1, 1, 1)); // Human Warrior
-        assert!(createinfo_row_matches(0, 1, 3, 1)); // Dwarf Warrior
-        assert!(createinfo_row_matches(0, 1, 7, 1)); // Orc Warrior
-        assert!(!createinfo_row_matches(0, 1, 1, 4)); // class still gates: a Human MAGE does not match
+        assert!(createinfo_row_matches(0, 1, 1, 1));
+        assert!(createinfo_row_matches(0, 1, 3, 1));
+        assert!(createinfo_row_matches(0, 1, 7, 1));
+        assert!(!createinfo_row_matches(0, 1, 1, 4));
     }
 
-    /// `row.class == 0` is a TRUE wildcard: a racial row (e.g. Human's The Human Spirit) matches EVERY
-    /// class, as long as the race still matches exactly.
     #[test]
     fn createinfo_row_matches_class_wildcard_matches_every_class() {
-        assert!(createinfo_row_matches(1, 0, 1, 1)); // Human Warrior
-        assert!(createinfo_row_matches(1, 0, 1, 8)); // Human Priest
-        assert!(!createinfo_row_matches(1, 0, 3, 1)); // race still gates: a Dwarf does not match a Human row
+        assert!(createinfo_row_matches(1, 0, 1, 1));
+        assert!(createinfo_row_matches(1, 0, 1, 8));
+        assert!(!createinfo_row_matches(1, 0, 3, 1));
     }
 
-    /// `(row.race, row.class) == (0, 0)` — both wildcards — matches EVERY (race, class) pair (a
-    /// universal grant row, if one were ever seeded).
     #[test]
     fn createinfo_row_matches_double_wildcard_matches_everyone() {
         assert!(createinfo_row_matches(0, 0, 1, 1));
@@ -348,16 +278,13 @@ mod tests {
                 .iter()
                 .any(|&(r, c, s)| r == race && c == class && s == id)
         };
-        // The Warrior createinfo kit is just Heroic Strike + Battle Stance.
-        assert!(has(0, 1, 78)); // Heroic Strike
-        assert!(has(0, 1, 2457)); // Battle Stance
-                                  // Human racials ride class-wildcard rows.
-        assert!(has(1, 0, 20598)); // The Human Spirit
-                                   // TRAINER-taught spells are NOT createinfo — they must be learned to cast.
+        assert!(has(0, 1, 78));
+        assert!(has(0, 1, 2457));
+        assert!(has(1, 0, 20598));
         let ids: Vec<u32> = CREATEINFO_KIT.iter().map(|&(_, _, s)| s).collect();
-        assert!(!ids.contains(&6673)); // Battle Shout
-        assert!(!ids.contains(&871)); // Shield Wall
-        assert!(!ids.contains(&51300)); // Death Wish (talent-granted)
-        assert!(!ids.contains(&51000)); // Cruelty passive (applied, never player-cast)
+        assert!(!ids.contains(&6673));
+        assert!(!ids.contains(&871));
+        assert!(!ids.contains(&51300));
+        assert!(!ids.contains(&51000));
     }
 }

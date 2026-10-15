@@ -1,6 +1,3 @@
-//! Durable mail rows and single-database mailbox operations.
-//! Attachments are item snapshots; cross-database moves live in `mail_escrow`.
-
 use lyracore_shared::mail::{MailSender, CHECK_MASK_RETURNED};
 use spacetimedb::{reducer, table, ReducerContext, Table, Timestamp};
 
@@ -28,28 +25,20 @@ pub struct Mail {
     pub created_at: Timestamp,
     #[default(0)]
     pub random_property_id: u32,
-    /// The vanilla `MailMessageType` code of the [`MailSender`]. 0 is a Character.
     #[default(0u8)]
     pub sender_kind: u8,
-    /// The auction house id, or the creature or gameobject entry. 0 for a Character.
     #[default(0u32)]
     pub sender_entry: u32,
-    /// `CHECK_MASK_*` bits other than READ, which is `was_read`.
     #[default(0u32)]
     pub check_flags: u32,
     #[default(0u32)]
     pub mail_template_id: u32,
-    /// When the recipient can first see the mail. 0 means from creation.
     #[default(0i64)]
     pub deliver_micros: i64,
-    /// The attached Plain Letter's `ITEM_FIELD_ITEM_TEXT_ID`. 0 when the attachment is not a
-    /// Letter Copy's letter.
     #[default(0u32)]
     pub item_text_id: u32,
 }
-// A Transfer runs this sweep on the source after the rows travel, so it destroys no letter. The
-// Character deletion that does destroy them drops their text first
-// (`mail_text::drop_character_letters`).
+// Transfer deletes transported source rows without destroying their letter text.
 crate::character_owned!(delete, fn sweep_delete_game_mail(ctx, character_guid) {
     let mails = ctx.db.game_mail();
     for r in mails.by_recipient().filter(&character_guid).collect::<Vec<_>>() {
@@ -87,7 +76,6 @@ pub(crate) enum Attach {
     Soulbound,
     Detach,
 }
-/// `owned` is `(owner_guid, soulbound)` off the live row, when one exists.
 pub(crate) fn plan_attach(item_guid: u64, owned: Option<(u64, bool)>, sender_guid: u64) -> Attach {
     if item_guid == 0 {
         return Attach::Nothing;
@@ -139,7 +127,6 @@ pub(crate) fn grant_snapshot(
         .ok_or_else(|| format!("mail: no template for attached item {}", snapshot.entry))?;
     crate::items::store_instance_state(ctx, payee_guid, payee.owner_identity, &tmpl, None, snapshot)
 }
-/// Everything a mail row is created from.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Letter {
     pub recipient_guid: u64,
@@ -150,15 +137,11 @@ pub(crate) struct Letter {
     pub cod: u32,
     pub item: ItemSnapshot,
     pub mail_template_id: u32,
-    /// `CHECK_MASK_*` bits other than READ.
     pub check_flags: u32,
-    /// When the recipient can first see the mail. 0 means from creation.
     pub deliver_micros: i64,
 }
 
 impl Letter {
-    /// A letter from a character. It has HAS_BODY when it has a body and COPIED when it has none,
-    /// so the client offers no copy of an empty letter (cmangos `MailHandler.cpp:264`).
     pub(crate) fn from_character(
         sender_guid: u64,
         recipient_guid: u64,
@@ -186,9 +169,6 @@ impl Letter {
             deliver_micros: 0,
         }
     }
-    /// A Reward Letter from a quest giver. cmangos sends it with an empty subject and names the
-    /// Mail Template (`Player.cpp:12672-12673`). vmangos also stores the template text as the body
-    /// (`Mail/Mail.cpp:113-116`), so the letter has HAS_BODY.
     pub(crate) fn reward(
         header: lyracore_shared::mail::RewardHeader,
         recipient_guid: u64,
@@ -209,16 +189,12 @@ impl Letter {
             deliver_micros: 0,
         }
     }
-    /// The same letter as the payment for a cash on delivery take. It keeps the priced letter's
-    /// subject, and the client shows "COD Payment: <subject>" (cmangos `MailHandler.cpp:475-477`).
     pub(crate) fn into_cod_payment(self) -> Self {
         Self {
             check_flags: lyracore_shared::mail::CHECK_MASK_COD_PAYMENT,
             ..self
         }
     }
-    /// The same Character letter sent back to its writer before its recipient got it, as a
-    /// Returned Mail. A COD payment whose price nobody owes any more goes back this way.
     pub(crate) fn into_returned(self) -> Self {
         let (_, writer_guid, _) = self.sender.columns();
         Self {
@@ -229,8 +205,6 @@ impl Letter {
             ..self
         }
     }
-    /// The same letter, delivered `delay_secs` after `now_micros`. A delay of 0 leaves it visible
-    /// from creation.
     pub(crate) fn delayed(self, now_micros: i64, delay_secs: u32) -> Self {
         if delay_secs == 0 {
             return self;
@@ -241,13 +215,7 @@ impl Letter {
         }
     }
 }
-/// vanilla's `MailDeliveryDelay` default of one hour (cmangos `World.cpp:614`).
 pub(crate) const MAIL_DELIVERY_DELAY_SECS: u32 = 3_600;
-/// The Delivery Delay of a Character's letter: an item sent to a Character on another Account
-/// waits one hour, and everything else arrives at once (mangoszero `MailHandler.cpp:306-318` for a
-/// send, cmangos `Mail.cpp:241-261` for a return). A cash on delivery price needs an item, so a
-/// priced letter waits too. The caller decides `same_account` from Realm Accounts, and an Account
-/// it cannot name counts as another Account.
 pub(crate) fn delivery_delay_secs(has_item: bool, same_account: bool) -> u32 {
     if has_item && !same_account {
         MAIL_DELIVERY_DELAY_SECS
@@ -258,8 +226,6 @@ pub(crate) fn delivery_delay_secs(has_item: bool, same_account: bool) -> u32 {
 fn after_delay(now_micros: i64, delay_secs: u32) -> i64 {
     now_micros.saturating_add(i64::from(delay_secs) * 1_000_000)
 }
-/// The one way a mail row is created. It starts the Mail's timer, and sends a Mail Arrival when
-/// the recipient can see the Mail now.
 pub(crate) fn insert_letter(ctx: &ReducerContext, letter: Letter) -> u64 {
     let (sender_kind, sender_guid, sender_entry) = letter.sender.columns();
     let mail = ctx.db.game_mail().insert(Mail {
@@ -288,8 +254,6 @@ pub(crate) fn insert_letter(ctx: &ReducerContext, letter: Letter) -> u64 {
     crate::mail_timer::start(ctx, &mail);
     mail.id
 }
-/// The mail as its recipient can act on it. Before its delivery instant it does not exist for
-/// them yet (cmangos `MailHandler.cpp:359,417,516`).
 pub(crate) fn delivered_mail(ctx: &ReducerContext, mail_id: u64) -> Option<Mail> {
     ctx.db
         .game_mail()
@@ -442,8 +406,6 @@ pub(crate) fn clear_mail_money(ctx: &ReducerContext, mail_id: u64) {
 pub(crate) fn credited(purse: u32, amount: u32) -> u32 {
     purse.saturating_add(amount)
 }
-/// Split a refund into the new purse and the remainder that does not fit in it. The caller sends
-/// the remainder by mail, so no copper is lost to a full purse.
 pub(crate) fn split_refund(purse: u32, refund: u32) -> (u32, u32) {
     let purse_credit = refund.min(u32::MAX - purse);
     (purse + purse_credit, refund - purse_credit)
@@ -514,9 +476,6 @@ pub(crate) fn apply_take_item(
     }
     Ok(())
 }
-/// Mark-read and delete refuse a Mail before its delivery instant, as every take and the return do.
-/// cmangos needs no such Gate because its client never lists the Mail, but a Gateway whose clock
-/// runs ahead of this one can.
 pub(crate) fn apply_mark_read(
     ctx: &ReducerContext,
     recipient_guid: u64,
@@ -539,8 +498,6 @@ pub(crate) enum DeletePlan {
     CodPriced,
     Delete,
 }
-/// The client offers no Delete on a priced mail, so the Gate refuses a crafted one
-/// (cmangos `MailHandler.cpp:327-331`).
 pub(crate) fn plan_delete(row: Option<&Mail>, caller_guid: u64) -> DeletePlan {
     match row {
         Some(m) if m.recipient_guid != caller_guid => DeletePlan::NotYours,
@@ -570,10 +527,7 @@ pub(crate) enum ReturnPlan {
     AlreadyReturned,
     Return,
 }
-/// Only a Character's mail goes back, and only once. These are LyraCore Gates, not cmangos server
-/// behavior: cmangos accepts every return and silently drops a mail with no Character sender
-/// (`MailHandler.cpp:375`), and it relies on the client hiding Return on a returned mail. The
-/// client hides Return on each mail these Gates refuse, so a refusal answers a crafted packet.
+// The client hides Return on non-Character and returned Mail; refuse crafted packets too.
 pub(crate) fn plan_return(row: Option<&Mail>, caller_guid: u64) -> ReturnPlan {
     let Some(row) = row.filter(|m| m.recipient_guid == caller_guid) else {
         return ReturnPlan::NotYours;
@@ -608,8 +562,6 @@ pub(crate) fn apply_return(
     send_back(ctx, row, delay_secs);
     Ok(())
 }
-/// Send `row` back to its sender, to arrive `delay_secs` from now. The Mail starts a new life with
-/// that sender.
 pub(crate) fn send_back(ctx: &ReducerContext, row: Mail, delay_secs: u32) {
     let arrives = Timestamp::from_micros_since_unix_epoch(after_delay(
         ctx.timestamp.to_micros_since_unix_epoch(),
@@ -618,21 +570,16 @@ pub(crate) fn send_back(ctx: &ReducerContext, row: Mail, delay_secs: u32) {
     let back = ctx.db.game_mail().id().update(returned(row, arrives));
     crate::mail_timer::start(ctx, &back);
 }
-/// Delete a Mail with its item snapshot, its copper and its timer. An attached Plain Letter is
-/// destroyed with it.
 pub(crate) fn delete_mail(ctx: &ReducerContext, mail_id: u64) {
     if let Some(row) = ctx.db.game_mail().id().find(mail_id) {
         crate::mail_text::drop_letter_text(ctx, row.item_text_id);
     }
     remove_mail(ctx, mail_id);
 }
-/// Remove a Mail row and its timer, and leave any attached letter's text alone.
 fn remove_mail(ctx: &ReducerContext, mail_id: u64) {
     ctx.db.game_mail().id().delete(mail_id);
     crate::mail_timer::stop(ctx, mail_id);
 }
-/// `row` sent back to its sender, arriving at `arrives`. It carries only RETURNED, loses its price
-/// and read state, and its expiry clock restarts at the arrival (cmangos `Mail.cpp:264,299-313`).
 pub(crate) fn returned(row: Mail, arrives: Timestamp) -> Mail {
     Mail {
         recipient_guid: row.sender_guid,
@@ -654,10 +601,8 @@ pub fn realm_mail_mark_read(
     let recipient_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
     apply_mark_read(ctx, recipient_guid, mail_id)
 }
-/// `same_account` says whether the sender and the recipient belong to one Realm Account. The
-/// Gateway reads it, because the recipient's Account may live on another Shard.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // a reducer's arguments are the wire
+#[allow(clippy::too_many_arguments)]
 pub fn realm_mail_send(
     ctx: &ReducerContext,
     request_actor: crate::account_ownership::SessionActor,
@@ -728,8 +673,6 @@ pub fn realm_mail_delete(
     let recipient_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
     apply_delete(ctx, recipient_guid, mail_id)
 }
-/// `same_account` says whether the returning recipient and the Mail's sender belong to one Realm
-/// Account, as in [`realm_mail_send`].
 #[reducer]
 pub fn realm_mail_return(
     ctx: &ReducerContext,

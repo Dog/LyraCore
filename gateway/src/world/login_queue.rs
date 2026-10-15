@@ -3,21 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Default rate-limiter tick for `LYRACORE_ADMIT_CONCURRENCY` (production). Tests inject a much shorter
-/// tick via [`LoginQueue::with_tick`] so the rate limiter can be exercised without real sleeps.
 const ADMIT_TICK: Duration = Duration::from_secs(1);
 
-/// A queued connection's place in line. Opaque — meaningful only as an argument back into the same
-/// [`LoginQueue`] that issued it.
 pub type Ticket = u64;
 
-/// The result of [`LoginQueue::request`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// A seat was free (or the queue is unlimited): proceed immediately, no wait.
     Admitted,
-    /// No seat was free: `Ticket` is this caller's place in the FIFO line. Poll
-    /// [`LoginQueue::position`] until it returns `None`.
     Queued(Ticket),
 }
 
@@ -27,43 +19,26 @@ struct Waiter {
 }
 
 struct State {
-    /// Sessions currently holding a seat.
     active: usize,
-    /// FIFO line, front = next to admit.
     waiting: VecDeque<Waiter>,
     next_ticket: Ticket,
-    /// Rate-limiter bookkeeping for `admit_concurrency > 0` — see `drain_locked`.
     tick_started: Instant,
     admitted_this_tick: usize,
 }
 
-/// FIFO admission gate for world-session establishment. Cheap to construct and cheap to consult
-/// when unconfigured: [`LoginQueue::request`] returns `Admitted` before ever touching the mutex
-/// when `max_sessions == 0`, so an unconfigured gateway pays nothing for this existing.
 pub struct LoginQueue {
     max_sessions: usize,
     admit_concurrency: usize,
     tick: Duration,
     state: Mutex<State>,
-    /// Cumulative admissions since construction (immediate + drained-from-queue), for the
-    /// QUEUESTAT admitted/s rate — read-and-diff by the periodic reporting task, same convention as
-    /// `MOTION_CALLS` et al. in `stdb/subscriptions.rs`. An instance field, not a global static: a
-    /// bare `static` would leak counts across unrelated `LoginQueue`s (every test that builds its
-    /// own queue would pollute every other test's rate).
     admitted_total: AtomicU64,
 }
 
 impl LoginQueue {
-    /// `max_sessions == 0` disables the gate entirely (today's behavior, byte for byte — see the
-    /// module docs). `admit_concurrency == 0` disables the extra per-tick rate limit: seats fill as
-    /// fast as they free, subject only to `max_sessions`. Uses the production 1s tick; see
-    /// [`Self::with_tick`] for tests.
     pub fn new(max_sessions: usize, admit_concurrency: usize) -> Self {
         Self::with_tick(max_sessions, admit_concurrency, ADMIT_TICK)
     }
 
-    /// Like [`Self::new`] with an injectable tick length, so a test exercising the rate limiter
-    /// doesn't have to sleep a full second per admission.
     pub fn with_tick(max_sessions: usize, admit_concurrency: usize, tick: Duration) -> Self {
         Self {
             max_sessions,
@@ -80,18 +55,11 @@ impl LoginQueue {
         }
     }
 
-    /// The gate every unconfigured gateway gets: `LYRACORE_MAX_SESSIONS` unset ⇒ this, and every
-    /// existing test/call site that doesn't care about the admission gate passes this to stay
-    /// byte-identical to the pre-gate behavior.
-    ///
-    /// Test-only: a production gateway builds its queue with [`LoginQueue::from_env`], which already
-    /// yields an unlimited gate when `LYRACORE_MAX_SESSIONS` is unset.
     #[cfg(test)]
     pub fn unlimited() -> Self {
         Self::new(0, 0)
     }
 
-    /// Read both admission limits. Unset or zero means unlimited; malformed values fail startup.
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self::new(
             crate::config::max_sessions()?,
@@ -99,10 +67,6 @@ impl LoginQueue {
         ))
     }
 
-    /// Ask for a seat. Immediate [`Admission::Admitted`] when the queue is unlimited, or when the
-    /// line is empty and a seat happens to be free; otherwise joins the FIFO tail — always, even if
-    /// capacity is technically free, so a new arrival can never jump an existing line (fairness is
-    /// unconditional; only [`Self::depart`]/[`Self::position`] ever drain it).
     pub fn request(&self) -> Admission {
         if self.max_sessions == 0 {
             return Admission::Admitted;
@@ -122,10 +86,6 @@ impl LoginQueue {
         Admission::Queued(ticket)
     }
 
-    /// 1-based position of `ticket` in line, or `None` once it has been admitted (the caller should
-    /// stop polling and proceed). Opportunistically drains the front of the line first, so an
-    /// admission becomes visible to whichever queued connection next calls this — not only to
-    /// whoever happens to call [`Self::depart`].
     pub fn position(&self, ticket: Ticket) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
         self.drain_locked(&mut s);
@@ -135,17 +95,11 @@ impl LoginQueue {
             .map(|i| i + 1)
     }
 
-    /// Leave the line without ever taking a seat — the disconnect-while-queued case. A no-op if
-    /// `ticket` was already admitted (it is simply not found in `waiting` anymore).
     pub fn cancel(&self, ticket: Ticket) {
         let mut s = self.state.lock().unwrap();
         s.waiting.retain(|w| w.ticket != ticket);
     }
 
-    /// Release a held seat — a world session ended (socket closed), however it ended. A no-op for
-    /// the unlimited queue. Immediately tries to drain the line into the freed capacity, subject to
-    /// the rate limit, so admission is responsive rather than waiting for some queued connection's
-    /// own next poll.
     pub fn depart(&self) {
         if self.max_sessions == 0 {
             return;
@@ -155,18 +109,11 @@ impl LoginQueue {
         self.drain_locked(&mut s);
     }
 
-    /// Force a drain pass with no state change of its own — a backstop so periodic reporting (or
-    /// anything else with a spare moment) can keep the line moving even if every queued
-    /// connection's own poll cadence is slow.
     pub fn tick(&self) {
         let mut s = self.state.lock().unwrap();
         self.drain_locked(&mut s);
     }
 
-    /// Move FIFO-front tickets from `waiting` into `active`. Always bounded by free capacity.
-    /// ADDITIONALLY bounded by `admit_concurrency` per `tick` when that throttle is configured: a
-    /// fresh tick resets the per-tick allowance, so demand beyond it waits for the next tick rather
-    /// than draining in one burst just because many seats are free right now.
     fn drain_locked(&self, s: &mut State) {
         if self.admit_concurrency > 0 {
             let now = Instant::now();
@@ -191,35 +138,27 @@ impl LoginQueue {
         }
     }
 
-    /// Current queue depth (sessions NOT yet admitted), for QUEUESTAT.
     pub fn depth(&self) -> usize {
         self.state.lock().unwrap().waiting.len()
     }
 
-    /// Sessions currently holding a seat.
     pub fn active(&self) -> usize {
         self.state.lock().unwrap().active
     }
 
-    /// How long the longest-waiting queued connection has been in line, for QUEUESTAT. `None` when
-    /// the queue is empty.
     pub fn oldest_wait(&self) -> Option<Duration> {
         let s = self.state.lock().unwrap();
         s.waiting.front().map(|w| w.queued_at.elapsed())
     }
 
-    /// Cumulative admissions since construction, for the QUEUESTAT admitted/s rate (the caller
-    /// reads this every N seconds and diffs against its own last reading).
     pub fn admitted_total(&self) -> u64 {
         self.admitted_total.load(Ordering::Relaxed)
     }
 
-    /// The configured seat cap (`0` = unlimited) — for the startup log line and QUEUESTAT.
     pub fn max_sessions(&self) -> usize {
         self.max_sessions
     }
 
-    /// The configured per-tick admission rate limit (`0` = unlimited) — for the startup log line.
     pub fn admit_concurrency(&self) -> usize {
         self.admit_concurrency
     }
@@ -229,19 +168,6 @@ impl LoginQueue {
 mod tests {
     use super::*;
 
-    // ===================================================================================
-    //  The seat CAP itself: the limit that keeps a login storm from taking the realm
-    //  down, and the release paths that keep seats from leaking.
-    // ===================================================================================
-
-    /// The property the whole cap exists for: however many connections arrive AT ONCE, no more than
-    /// `max_sessions` of them ever hold a seat. `request()` decides that under the mutex, so this
-    /// drives 64 threads at a cap of 4 and asserts the ledger reconciles exactly.
-    ///
-    /// Deterministic under any thread interleaving: it asserts only invariants
-    /// (`admitted <= cap`, `active == admitted`, `depth == arrivals - admitted`), never a
-    /// particular ordering or timing. The counts are read after every thread has joined, so there
-    /// is no in-flight state to race with.
     #[test]
     fn a_simultaneous_login_storm_never_seats_more_than_the_cap() {
         const CAP: usize = 4;
@@ -287,13 +213,6 @@ mod tests {
         );
     }
 
-    /// Session cleanup on the release side. `run_world_session_with_queue` calls `depart()` in its
-    /// teardown for every session that was admitted — including the ones that ended by error or by
-    /// a severed socket. If a seat could leak, a realm at its cap would refuse logins forever after
-    /// enough crashed clients, with no way back short of a restart.
-    ///
-    /// A full cycle is driven twice over, so the queue is proven to return to EXACTLY its initial
-    /// state rather than merely to a working one.
     #[test]
     fn every_seat_returns_to_the_pool_when_its_session_ends() {
         let q = LoginQueue::new(3, 0);
@@ -302,7 +221,6 @@ mod tests {
                 assert_eq!(q.request(), Admission::Admitted, "round {round}");
             }
             assert_eq!(q.active(), 3);
-            // The 4th arrival is the one the cap is for; it gives up rather than waiting.
             let Admission::Queued(t) = q.request() else {
                 panic!("round {round}: the 4th arrival must queue behind the 3 seats");
             };
@@ -321,17 +239,12 @@ mod tests {
         }
     }
 
-    /// A seat must never be released twice. `depart()` is called from session teardown, and this
-    /// module's own comment notes the care taken that it runs exactly once per admitted session — but
-    /// `active` is a `usize`, so a double release would underflow to `usize::MAX` and the cap would
-    /// be permanently, silently unenforceable. The `saturating_sub` is what prevents that; this
-    /// pins it.
     #[test]
     fn releasing_a_seat_more_often_than_it_was_taken_never_underflows_the_cap() {
         let q = LoginQueue::new(2, 0);
         assert_eq!(q.request(), Admission::Admitted);
         q.depart();
-        q.depart(); // the spurious one
+        q.depart();
         q.depart();
         assert_eq!(
             q.active(),
@@ -339,15 +252,11 @@ mod tests {
             "an extra release must clamp at zero, not wrap to usize::MAX — a wrapped counter makes \
              `active < max_sessions` false forever and every subsequent login queues behind nothing"
         );
-        // And the cap still works afterwards.
         assert_eq!(q.request(), Admission::Admitted);
         assert_eq!(q.request(), Admission::Admitted);
         assert!(matches!(q.request(), Admission::Queued(_)));
     }
 
-    /// `depart()` on the UNLIMITED queue short-circuits before touching the mutex, so the counters
-    /// stay at zero. Worth pinning because it is the configuration nearly every deployment runs,
-    /// and because it means the unlimited path costs no lock at all on the disconnect hot path.
     #[test]
     fn the_unlimited_queue_takes_no_lock_and_keeps_no_ledger_on_departure() {
         let q = LoginQueue::unlimited();
@@ -364,12 +273,6 @@ mod tests {
         );
     }
 
-    /// `tick()` is the backstop drain: nothing about it changes state on its own, it just gives the
-    /// line a chance to move when no queued connection happens to be polling and no session happens
-    /// to be departing. It is called from the periodic QUEUESTAT reporting, and until now nothing
-    /// exercised it at all.
-    ///
-    /// The scenario is the one it exists for: a seat freed while the only waiter is between polls.
     #[test]
     fn tick_drains_the_line_into_free_capacity_without_any_other_event() {
         let q = LoginQueue::new(1, 0);
@@ -379,8 +282,6 @@ mod tests {
         };
         assert_eq!(q.position(t), Some(1));
 
-        // Free the seat WITHOUT letting `depart`'s own drain run, by reaching past it: this is the
-        // state a gateway is in when a session ends and the waiter is asleep between polls.
         q.state.lock().unwrap().active = 0;
         assert_eq!(
             q.depth(),
@@ -404,8 +305,6 @@ mod tests {
         );
     }
 
-    /// `tick()` on an empty queue, and on an unlimited one, must be a harmless no-op — it runs on a
-    /// timer, so it runs far more often than there is anything to do.
     #[test]
     fn tick_is_inert_when_there_is_nothing_to_drain() {
         let q = LoginQueue::new(2, 0);
@@ -417,10 +316,6 @@ mod tests {
         assert_eq!((u.active(), u.depth(), u.admitted_total()), (0, 0, 0));
     }
 
-    /// The configured limits have to be readable back — the startup log line and QUEUESTAT both
-    /// report them, and an operator who cannot see the cap the gateway actually applied cannot tell
-    /// a misread env var from a working one. (`LYRACORE_MAX_SESSIONS` is exactly the kind of
-    /// silently-ignored setting the shard-map vars are also prone to.)
     #[test]
     fn the_configured_limits_are_reported_back_verbatim() {
         let q = LoginQueue::new(250, 8);
@@ -432,9 +327,6 @@ mod tests {
         assert_eq!(u.admit_concurrency(), 0);
     }
 
-    /// Tickets must never be reused. `cancel` removes a waiter but `next_ticket` only ever
-    /// increases, so a reconnecting client's stale ticket can never match a live one — which would
-    /// otherwise let it read (or cancel) a stranger's place in line.
     #[test]
     fn a_cancelled_tickets_number_is_never_handed_out_again() {
         let q = LoginQueue::new(1, 0);
@@ -450,7 +342,7 @@ mod tests {
                 "ticket {t} was issued twice — a stale ticket would then address a live waiter"
             );
             seen.push(t);
-            q.cancel(t); // leave immediately, freeing the number for reuse if it were reusable
+            q.cancel(t);
         }
         assert_eq!(
             seen,
@@ -460,9 +352,6 @@ mod tests {
         assert_eq!(q.depth(), 0, "every one of them left the line");
     }
 
-    /// `oldest_wait` feeds the QUEUESTAT "longest wait" figure. `None` on an empty line is what
-    /// tells the reporter there is nothing to report; a zero would read as "someone is waiting, for
-    /// no time at all".
     #[test]
     fn oldest_wait_is_none_when_nobody_is_in_line() {
         let q = LoginQueue::new(1, 0);
@@ -491,16 +380,12 @@ mod tests {
         for _ in 0..1000 {
             assert_eq!(q.request(), Admission::Admitted);
         }
-        // No bookkeeping at all — active/depth stay at their initial values because `request`
-        // short-circuits before touching the mutex.
         assert_eq!(q.depth(), 0);
         assert_eq!(q.active(), 0);
     }
 
     #[test]
     fn cap_zero_is_the_unlimited_shape_too() {
-        // `LoginQueue::new(0, N)` for any N must behave exactly like `unlimited()` — the cap is
-        // what disables the gate, not the concurrency knob.
         let q = LoginQueue::new(0, 5);
         assert_eq!(q.request(), Admission::Admitted);
         assert_eq!(q.depth(), 0);
@@ -509,7 +394,6 @@ mod tests {
     #[test]
     fn fifo_order_and_positions() {
         let q = LoginQueue::new(1, 0);
-        // Take the only seat directly (simulates another already-admitted session).
         assert_eq!(q.request(), Admission::Admitted);
 
         let Admission::Queued(a) = q.request() else {
@@ -531,7 +415,7 @@ mod tests {
     #[test]
     fn position_updates_on_admission_in_fifo_order() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted); // the only seat
+        assert_eq!(q.request(), Admission::Admitted);
 
         let Admission::Queued(a) = q.request() else {
             panic!()
@@ -547,7 +431,6 @@ mod tests {
             (Some(1), Some(2), Some(3))
         );
 
-        // Free the seat: A (the front) must be admitted, not B or C.
         q.depart();
         assert_eq!(
             q.position(a),
@@ -579,7 +462,6 @@ mod tests {
         };
         assert_eq!(q.depth(), 2);
 
-        // A disconnects while waiting: it leaves the line and consumes no seat.
         q.cancel(a);
         assert_eq!(q.depth(), 1);
         assert_eq!(
@@ -598,7 +480,6 @@ mod tests {
             "cancelling a WAITING ticket must never free or grant a seat"
         );
 
-        // Freeing the real seat now admits B, not a phantom slot for the cancelled A.
         q.depart();
         assert_eq!(q.position(b), None);
         assert_eq!(q.active(), 1);
@@ -608,15 +489,10 @@ mod tests {
     #[test]
     fn cancelling_an_already_admitted_ticket_is_a_harmless_noop() {
         let q = LoginQueue::new(0, 0);
-        // Unlimited: `request()` never mints a real ticket, but a caller that (incorrectly) still
-        // calls `cancel` on some arbitrary id must not panic or corrupt state.
         q.cancel(999);
         assert_eq!(q.depth(), 0);
     }
 
-    /// Fill every seat via the empty-line fast path in `request()` itself (not the drain limiter):
-    /// each of the first `cap` calls sees an empty line and free capacity, so all `cap` of them are
-    /// `Admitted` outright. Returns once `active() == cap`.
     fn fill_to_capacity(q: &LoginQueue, cap: usize) {
         for _ in 0..cap {
             assert_eq!(q.request(), Admission::Admitted);
@@ -626,8 +502,6 @@ mod tests {
 
     #[test]
     fn admit_concurrency_throttles_the_drain_rate_even_with_free_capacity() {
-        // Cap 10, full house, then queue three behind it. A long tick so the test can assert the
-        // throttle actually bound something before the next tick would roll over.
         let q = LoginQueue::with_tick(10, 1, Duration::from_secs(3600));
         fill_to_capacity(&q, 10);
         let Admission::Queued(a) = q.request() else {
@@ -641,9 +515,6 @@ mod tests {
         };
         assert_eq!(q.depth(), 3);
 
-        // Simulate 5 near-simultaneous departures (a raid wipe) — plenty of freed capacity (5 of
-        // 10 seats), but the per-tick allowance is 1: only the FIRST of these five `depart()` calls
-        // may actually admit anyone; the rest find `admitted_this_tick` already spent.
         for _ in 0..5 {
             q.depart();
         }
@@ -664,7 +535,6 @@ mod tests {
             "5 seats freed, only 1 refilled: 10 - 5 + 1 = 6"
         );
 
-        // Polling again within the SAME tick must not admit more.
         assert_eq!(q.position(b), Some(1));
     }
 
@@ -714,7 +584,7 @@ mod tests {
     fn admitted_total_counts_both_immediate_and_drained_admissions() {
         let q = LoginQueue::new(1, 0);
         assert_eq!(q.admitted_total(), 0);
-        assert_eq!(q.request(), Admission::Admitted); // immediate: +1
+        assert_eq!(q.request(), Admission::Admitted);
         assert_eq!(q.admitted_total(), 1);
 
         let Admission::Queued(a) = q.request() else {

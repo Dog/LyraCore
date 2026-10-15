@@ -1,4 +1,4 @@
-//! Build-5875 MovementInfo bodies. The typed codec uses the later transport flag and layout.
+//! Build 5875 uses a different transport flag and layout from the typed codec.
 
 use anyhow::{ensure, Result};
 use lyracore_shared::env::{MOVEMENT_FLAG_ON_TRANSPORT, MOVEMENT_FLAG_SWIMMING};
@@ -44,7 +44,7 @@ pub fn bytes_to_movement_info(mut body: &[u8]) -> Result<MovementInfo> {
                 guid: Guid::new(u64::from_le_bytes(guid)),
                 position: position(&mut body)?,
                 orientation: float(&mut body)?,
-                timestamp: 0, // The library requires this field; vanilla has no transport time.
+                timestamp: 0,
             },
         })
     } else {
@@ -57,7 +57,6 @@ pub fn bytes_to_movement_info(mut body: &[u8]) -> Result<MovementInfo> {
     } else {
         None
     };
-    // Keep the u32 millisecond bits in the library's f32 carrier.
     let fall_time = f32::from_bits(u32::from_le_bytes(word(&mut body)?));
     let jumping = if flags & JUMPING != 0 {
         Some(MovementInfo_MovementFlags_Jumping {
@@ -108,7 +107,6 @@ pub fn movement_info_to_bytes(info: &MovementInfo) -> Result<Vec<u8>> {
         );
     }
     if let Some(tail) = flags.get_on_transport() {
-        // Replace the library's packed guid and timestamp with vanilla's full guid and pose.
         let guid = tail.transport.guid.guid();
         let packed_len = 1 + guid.to_le_bytes().iter().filter(|&&byte| byte != 0).count();
         let mut transport = Vec::with_capacity(24);
@@ -126,8 +124,6 @@ pub fn movement_info_to_bytes(info: &MovementInfo) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-/// Replace the initial, tail-free living pose with the Module's current vanilla movement body.
-/// CREATE descriptors and speeds still come from the typed builder.
 pub fn create_with_movement(
     create: &wow_world_messages::vanilla::SMSG_UPDATE_OBJECT,
     movement: &[u8],
@@ -155,7 +151,6 @@ pub fn create_with_movement(
     Ok(body)
 }
 
-/// Decode relayed movement before the general typed packet reader sees its transport tail.
 pub fn read_movement_client(
     opcode: u32,
     body: &[u8],

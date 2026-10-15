@@ -1,35 +1,21 @@
-//! Logon Limiter: the caps on SRP6 proof attempts, per connection and per peer address.
-//!
-//! Every challenge and every proof costs the gateway a modular exponentiation, and a wrong
-//! password was free to retry without bound. The limiter is in-memory and per gateway process;
-//! nothing here is durable, so a restart forgives every address.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Logon attempts one connection may start. The classic client's own retry ceiling.
 pub const ATTEMPTS_PER_CONNECTION: u32 = 3;
-/// Failed logons one address may make per window; the rest of the window is refused.
 pub const FAILURES_PER_WINDOW: u32 = 10;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
-/// Open logon connections one address may hold at once.
 pub const CONNECTIONS_PER_ADDRESS: usize = 8;
-/// Pause before answering a failed proof, so a guess costs wall-clock time as well as a modexp.
 pub const PROOF_FAILURE_DELAY: Duration = Duration::from_millis(200);
 
 const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Why the limiter closed or refused a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogonRefusal {
-    /// The address already holds `CONNECTIONS_PER_ADDRESS` open logon connections.
     TooManyConnections,
-    /// The address failed `FAILURES_PER_WINDOW` logons inside the current window.
     TooManyFailures,
-    /// This connection has used its `ATTEMPTS_PER_CONNECTION`.
     AttemptsExhausted,
 }
 
@@ -60,13 +46,11 @@ impl std::error::Error for LogonRefusal {}
 #[derive(Default)]
 struct AddressRecord {
     open_connections: usize,
-    /// Start of the failure window; `None` until the first failure.
     window_started: Option<Instant>,
     failures: u32,
 }
 
 impl AddressRecord {
-    /// Drop a window that has run out, so the next failure opens a fresh one.
     fn roll_window(&mut self, now: Instant) {
         if self
             .window_started
@@ -88,7 +72,6 @@ impl AddressRecord {
         self.failures = self.failures.saturating_add(1);
     }
 
-    /// Nothing left to remember: no open connection and no live window.
     fn is_idle(&mut self, now: Instant) -> bool {
         self.roll_window(now);
         self.open_connections == 0 && self.window_started.is_none()
@@ -101,7 +84,6 @@ struct TrackedAddresses {
     last_pruned: Option<Instant>,
 }
 
-/// Shared across every logon connection of one listener.
 #[derive(Default)]
 pub struct LogonLimiter {
     addresses: Mutex<TrackedAddresses>,
@@ -112,9 +94,6 @@ impl LogonLimiter {
         Arc::new(Self::default())
     }
 
-    /// Admit one connection from `ip`, or refuse it before it costs a thread. Check this address
-    /// every time; prune idle addresses on the first admission at least one second after the last
-    /// scan. Admissions between scans only look up this address under the shared lock.
     pub fn admit(
         self: &Arc<Self>,
         ip: IpAddr,
@@ -164,7 +143,7 @@ impl LogonLimiter {
         }
     }
 
-    /// A poisoned lock only means a connection task panicked mid-update; the counts are still usable.
+    // Poisoning can follow a connection panic; the retained counts remain usable.
     fn lock(&self) -> std::sync::MutexGuard<'_, TrackedAddresses> {
         self.addresses
             .lock()
@@ -177,7 +156,6 @@ impl LogonLimiter {
     }
 }
 
-/// One admitted connection's share of the limits. Dropping it frees its address slot.
 pub struct LogonConnection {
     limiter: Arc<LogonLimiter>,
     ip: IpAddr,
@@ -185,8 +163,6 @@ pub struct LogonConnection {
 }
 
 impl LogonConnection {
-    /// Called on every challenge, before any SRP math. Refuses once this connection or its
-    /// address is out of attempts.
     pub fn start_attempt(&mut self, now: Instant) -> Result<(), LogonRefusal> {
         if self.attempts >= ATTEMPTS_PER_CONNECTION {
             return Err(LogonRefusal::AttemptsExhausted);
@@ -198,8 +174,6 @@ impl LogonConnection {
         Ok(())
     }
 
-    /// Called after a refused challenge or a failed proof. Counts it against the address, and
-    /// returns the refusal that closes this connection once its attempts are spent.
     pub fn record_failure(&mut self, now: Instant) -> Result<(), LogonRefusal> {
         self.limiter.record_failure(self.ip, now);
         if self.attempts >= ATTEMPTS_PER_CONNECTION {
@@ -251,7 +225,6 @@ mod tests {
         for i in 0..FAILURES_PER_WINDOW {
             let mut connection = limiter.admit(ip(1), start).unwrap();
             connection.start_attempt(start).unwrap();
-            // Every attempt on a fresh connection is that connection's first, so none closes.
             connection
                 .record_failure(start)
                 .unwrap_or_else(|_| panic!("failure {i} closed"));

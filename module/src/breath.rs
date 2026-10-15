@@ -1,17 +1,8 @@
-//! Player breath: a tiny non-spatial timer for underwater players. The movement edge only arms or
-//! flips rows; this scheduled reducer advances them so a motionless player still drowns.
-
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use crate::{game_world_entity, world::WorldEntity};
 use lyracore_shared::env::{advance_breath, drowning_damage, FULL_AIR_MICROS};
 
-// Vanilla's `Player::HandleDrowning` gives a player about one minute of air. Surfacing recovers
-// the same bar over ten seconds; the slower recovery prevents brief surface bobs from resetting it.
-
-/// One active breath timer. This is deliberately non-spatial: the scheduled tick must iterate all
-/// rows, and spatial iteration would silently omit players outside the caller's subscribed slice.
-/// A row exists only while the player is draining or recovering a partial bar.
 #[table(accessor = game_breath_state)]
 pub struct BreathState {
     #[primary_key]
@@ -21,14 +12,11 @@ pub struct BreathState {
     pub draining: bool,
 }
 
-// Breath is transient live-world state, not character progression. Delete it with the character;
-// never transport it so an arrival starts with a fresh bar instead of replaying stale water state.
 crate::character_owned!(delete, fn sweep_delete_game_breath_state(ctx, character_guid) {
     ctx.db.game_breath_state().entity_guid().delete(character_guid);
 });
 crate::character_owned!(not_transported, fn sweep_transfer_game_breath_state());
 
-/// Drives breath independently of movement packets. [server]
 #[table(accessor = game_breath_schedule, scheduled(tick_breath))]
 pub struct BreathSchedule {
     #[primary_key]
@@ -37,8 +25,6 @@ pub struct BreathSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// Fold one movement edge into the state table. Callers have already passed the godmode/dead/ghost
-/// exemption and supplied the authoritative underwater predicate.
 pub(crate) fn update_breath_edge(ctx: &ReducerContext, mover: &WorldEntity, submerged: bool) {
     let states = ctx.db.game_breath_state();
     let now = ctx.timestamp;
@@ -101,7 +87,6 @@ pub fn tick_breath(ctx: &ReducerContext, _schedule: BreathSchedule) {
             states.entity_guid().delete(entity_guid);
             continue;
         };
-        // A dead player, ghost, or godmode mover must never retain a draining/refilling timer.
         if entity.dead
             || entity.godmode
             || !entity.is_player()
@@ -124,9 +109,6 @@ pub fn tick_breath(ctx: &ReducerContext, _schedule: BreathSchedule) {
         if advanced.drowning_ticks == 0 {
             continue;
         }
-        // Preserve one one-second hit (and one relay line) per catch-up tick. `kill_player` owns
-        // the lethal write, so the last line reports the health actually removed rather than an
-        // overkill nominal value.
         let mut health = entity.health;
         let mut died = false;
         for _ in 0..advanced.drowning_ticks {
@@ -134,7 +116,6 @@ pub fn tick_breath(ctx: &ReducerContext, _schedule: BreathSchedule) {
             let actual = nominal.min(health);
             let (_, lethal) = crate::world::resolve_environmental_damage(nominal, health);
             if lethal {
-                // Self/environmental killer: no player receives kill credit or loot.
                 if health != entity.health {
                     if let Some(mut pre_death) = ctx.db.game_world_entity().guid().find(entity_guid)
                     {

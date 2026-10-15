@@ -1,11 +1,5 @@
-//! Gameobject wire mapping: the GameObject CREATE_OBJECT (a stationary world prop) + the
-//! `SMSG_GAMEOBJECT_QUERY_RESPONSE` template reply. The CREATE_OBJECT mirrors `corpse.rs` exactly — a
-//! stationary `HasPosition` object — but with the `UpdateGameObject` descriptor. The descriptor is a
-//! FULL build via `finalize()` (not a partial VALUES), so there is no OBJECT_FIELD_TYPE crash risk.
-
 use super::*;
 
-/// A `game_gameobject` row joined with its template, flattened for the CREATE_OBJECT.
 #[derive(Clone, Debug, Default)]
 pub struct GameObjectView {
     pub guid: u64,
@@ -17,20 +11,13 @@ pub struct GameObjectView {
     pub state: u8,
     pub type_id: u8,
     pub display_id: u32,
-    /// The cmangos spawn quaternion, `GAMEOBJECT_ROTATION`, the field the 5875 client
-    /// actually renders a static prop's orientation from. All-zero means "no quaternion stored"
-    /// (every row without rotation data and every hand-seeded fixture): `build_gameobject_rotation_values` derives
-    /// a yaw-only fallback from `orientation` in that case rather than sending a degenerate rotation.
     pub rotation_0: f32,
     pub rotation_1: f32,
     pub rotation_2: f32,
     pub rotation_3: f32,
-    /// The template's render scale. Non-positive means no size stored — see `object_scale_x`.
     pub size: f32,
 }
 
-/// The `OBJECT_FIELD_SCALE_X` to send for a gameobject. Guards `> 0.0` rather than `!= 0.0` so a
-/// corrupt negative or a NaN falls back too — a 0 on the wire renders the prop invisible.
 fn object_scale_x(size: f32) -> f32 {
     if size > 0.0 {
         size
@@ -39,7 +26,6 @@ fn object_scale_x(size: f32) -> f32 {
     }
 }
 
-/// A `game_gameobject_template` row, for the `CMSG_GAMEOBJECT_QUERY` reply.
 #[derive(Clone, Debug, Default)]
 pub struct GameObjectTemplateView {
     pub type_id: u8,
@@ -47,14 +33,9 @@ pub struct GameObjectTemplateView {
     pub name: String,
     pub data0: u32,
     pub data1: u32,
-    /// A Meeting Stone's dungeon area. 0 for every other type.
     pub data2: u32,
 }
 
-/// Build the CREATE_OBJECT for a gameobject: a GAMEOBJECT-type object with a stationary position
-/// (`HasPosition`, like a corpse) carrying the `UpdateGameObject` descriptors (display, state, type,
-/// position) so the client renders the prop. Relayed on `game_gameobject` insert; the matching
-/// `SMSG_DESTROY_OBJECT` on delete reuses `build_destroy_object`. Full descriptor → no VALUES crash risk.
 pub fn build_gameobject_create_object(go: &GameObjectView) -> SMSG_UPDATE_OBJECT {
     let mask = UpdateGameObject::builder()
         .set_object_guid(Guid::new(go.guid))
@@ -92,13 +73,7 @@ pub fn build_gameobject_create_object(go: &GameObjectView) -> SMSG_UPDATE_OBJECT
     }
 }
 
-/// Build the raw `GAMEOBJECT_ROTATION` VALUES update, the 4-float spawn quaternion the
-/// client actually orients a static prop's model from. gtker's typed builder only exposes
-/// `set_gameobject_rotation(f32)`, which reaches slot 0 alone (the same descriptor-setter wall as the
-/// multi-aura array), so all 4 slots (rot0..3, wire index `GAMEOBJECT_ROTATION`..+3) ride the
-/// hand-rolled raw encoder instead. Not a partial UNIT/PLAYER update — `GAMEOBJECT_ROTATION` (10) never
-/// collides with `OBJECT_FIELD_TYPE` (2), so `build_values_update_raw`'s debug_assert is inert here by
-/// construction, same as every other GAMEOBJECT field.
+/// gtker's rotation setter reaches only slot 0 of the four-float quaternion.
 pub fn build_gameobject_rotation_values(go: &GameObjectView) -> (u16, Vec<u8>) {
     let (rot0, rot1, rot2, rot3) = if go.rotation_0 == 0.0
         && go.rotation_1 == 0.0
@@ -118,8 +93,6 @@ pub fn build_gameobject_rotation_values(go: &GameObjectView) -> (u16, Vec<u8>) {
     build_values_update_raw(go.guid, &mask)
 }
 
-/// Build `SMSG_GAMEOBJECT_QUERY_RESPONSE` (the client asks for a GO template's name/type/display before
-/// it can render/interact). `None` → the not-found form (`entry_id` with the high bit set, per protocol).
 pub fn build_gameobject_query_response(
     entry: u32,
     template: Option<&GameObjectTemplateView>,
@@ -145,11 +118,6 @@ pub fn build_gameobject_query_response(
     }
 }
 
-/// A ground-area spell's DYNAMICOBJECT CREATE (Consecration's swirl): the 5875 client renders
-/// the persistent ground effect from `DYNAMICOBJECT_SPELLID`'s SpellVisual, sized by RADIUS at
-/// POS — it never draws it from the cast packets alone (live find). Same stationary
-/// `CreateObject2` + `HasPosition` shape as the gameobject CREATE above; entry = the spell id and
-/// bytes = (1,0,0,0) = DYNAMIC_OBJECT_AREA_SPELL — the value the 5875 client expects here.
 pub fn build_dynamicobject_create_object(
     guid: u64,
     caster_guid: u64,
@@ -164,7 +132,7 @@ pub fn build_dynamicobject_create_object(
         .set_object_entry(spell_id as i32)
         .set_object_scale_x(1.0)
         .set_dynamicobject_caster(Guid::new(caster_guid))
-        .set_dynamicobject_bytes(1, 0, 0, 0) // DYNAMIC_OBJECT_AREA_SPELL
+        .set_dynamicobject_bytes(1, 0, 0, 0)
         .set_dynamicobject_spellid(spell_id as i32)
         .set_dynamicobject_radius(radius)
         .set_dynamicobject_pos_x(x)
@@ -197,8 +165,6 @@ mod tests {
 
     #[test]
     fn gameobject_create_object_carries_descriptor_fields_and_serializes() {
-        // Was WEAK (only asserted non-empty serialization); now pins the actual descriptor fields
-        // the client renders the prop from, plus the object-type/mask shape, before serializing.
         let go = GameObjectView {
             guid: (0xF110u64 << 48) | 1,
             template_entry: 50100,
@@ -206,8 +172,8 @@ mod tests {
             y: -139.0,
             z: 83.5,
             orientation: 0.0,
-            state: 1, // open — distinct from the enum's 0 default, so a dropped setter call is caught
-            type_id: 3, // CHEST
+            state: 1,
+            type_id: 3,
             display_id: 259,
             rotation_0: 0.0,
             rotation_1: 0.0,
@@ -233,8 +199,6 @@ mod tests {
             }
             other => panic!("expected a GameObject CreateObject2, got {other:?}"),
         }
-        // The full GAMEOBJECT CREATE_OBJECT must still serialize without panic (stationary
-        // descriptor like a corpse).
         let msg = ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(built));
         let mut buf = Vec::new();
         msg.write_unencrypted_server(&mut buf).unwrap();
@@ -268,14 +232,10 @@ mod tests {
         }
     }
 
-    /// Decode a `build_gameobject_rotation_values` body: strips the fixed envelope (amount_of_objects,
-    /// has_transport, update_type, packed guid — byte-identical to `build_values_update_raw`'s other
-    /// callers, pinned separately by `raw_values_body_matches_gtker_envelope`) and reads the 4
-    /// consecutive `GAMEOBJECT_ROTATION` float slots in ascending index order. Test-only.
     fn decode_rotation_floats(guid: u64, body: &[u8]) -> [f32; 4] {
         let mut packed_guid = Vec::new();
         super::write_packed_guid_u64(&mut packed_guid, guid);
-        let mask_start = 4 + 1 + 1 + packed_guid.len(); // amount_of_objects + has_transport + update_type + guid
+        let mask_start = 4 + 1 + 1 + packed_guid.len();
         let block_count = body[mask_start] as usize;
         let values_start = mask_start + 1 + block_count * 4;
         let mut out = [0.0f32; 4];
@@ -290,9 +250,6 @@ mod tests {
 
     #[test]
     fn gameobject_rotation_values_passes_through_a_stored_nonzero_quaternion() {
-        // A non-degenerate stored quaternion (e.g. a bench flush against a sloped wall, rot0/rot1
-        // nonzero) must ride the wire UNCHANGED — no derive-from-orientation fallback applies once
-        // ANY of the 4 stored slots is nonzero.
         let go = GameObjectView {
             guid: 5,
             template_entry: 446,
@@ -301,7 +258,7 @@ mod tests {
             z: 55.0,
             orientation: 1.57,
             state: 0,
-            type_id: 0, // DOOR
+            type_id: 0,
             display_id: 259,
             rotation_0: 0.1,
             rotation_1: 0.2,
@@ -317,17 +274,13 @@ mod tests {
 
     #[test]
     fn gameobject_rotation_values_derives_yaw_only_from_orientation_when_quaternion_is_all_zero() {
-        // Every row without rotation data and every hand-seeded fixture stores an all-zero quaternion, that must
-        // NOT ride verbatim (a real spawn's quaternion is never exactly (0,0,0,0); sending it as-is
-        // is the exact tilted-bench bug this issue reports). Derive rot2/rot3 = sin(o/2)/cos(o/2)
-        // (Z-axis-only yaw) instead, leaving rot0/rot1 (terrain pitch) at 0.
         let go = GameObjectView {
             guid: 5,
             template_entry: 446,
             x: -9450.0,
             y: -90.0,
             z: 55.0,
-            orientation: std::f32::consts::FRAC_PI_2, // 90°
+            orientation: std::f32::consts::FRAC_PI_2,
             state: 0,
             type_id: 0,
             display_id: 259,
@@ -373,8 +326,6 @@ mod tests {
         assert!(missing.found.is_none());
     }
 
-    /// A Meeting Stone's tooltip reads its level range from `data0`/`data1` and its dungeon from
-    /// `data2` (cm:Entities/GameObject.h:266-272).
     #[test]
     fn a_meeting_stone_query_response_carries_its_level_range_and_area() {
         let stone = GameObjectTemplateView {

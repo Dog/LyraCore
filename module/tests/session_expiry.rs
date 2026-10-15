@@ -71,8 +71,6 @@ fn logon_renews_expired_sessions_and_the_scheduler_reaps_only_expired_rows() {
     assert!(message.contains("scheduler only"), "{message}");
     assert_eq!(session(&standalone, &expired), before);
 
-    // The production interval was checked above. Keep the real scheduler and reducer, but bring
-    // the next invocation forward on this private instance.
     assert!(!standalone
         .call_anonymous("debug_accelerate_session_reaper", &[])
         .status

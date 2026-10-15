@@ -1,8 +1,3 @@
-//! Distract against a real shard: the ground destination Gate, the Distraction each idle Creature
-//! near the point receives, and the creature behavior cycle holding and resuming its idle movement.
-//! The spell rows carry the client data for spell 1725: one effect 69 at the enemies around the
-//! point, 10 yd radius, amount 10, 30 yd range, 30 energy, 30 s cooldown and stealth safe.
-
 mod support;
 
 use lyracore_shared::spell::taxonomy::{
@@ -30,8 +25,6 @@ const DISTRACT_MS: u64 = 10_000;
 const ENERGY: u32 = 100;
 const COST: u32 = 30;
 
-/// The player's position and facing. Creatures spawn along the facing, and each point sits to one
-/// side of it, so facing the point differs from the spawn orientation.
 #[derive(Clone, Copy)]
 struct Line {
     x: f32,
@@ -62,8 +55,6 @@ fn same_angle(a: f32, b: f32) -> bool {
     d < 1e-3 || TAU - d < 1e-3
 }
 
-/// A fresh shard with a level 60 player, so the level 1 Test Wolves never aggro it, and the
-/// Distract rows staged.
 fn shard(name: &str) -> (Standalone, Line) {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -145,8 +136,6 @@ fn insert_effect(
     ));
 }
 
-/// The player's template 1 and the Test Wolf's template 14, as their FactionTemplate.dbc group
-/// masks: player 1, alliance 2, horde 4, monster 8. The area selection only turns hostile units.
 fn seed_hostile_factions(shard: &Standalone) {
     for (id, faction, group, friends, enemies) in [(1, 1, 3, 2, 12), (14, 16, 8, 0, 1)] {
         shard.assert_sql(&format!(
@@ -161,7 +150,6 @@ fn seed_hostile_factions(shard: &Standalone) {
     }
 }
 
-/// A Test Wolf `ahead` yards along the player's facing, facing the same way.
 fn spawn_wolf(shard: &Standalone, ahead: f32) -> u64 {
     shard.assert_call(
         "debug_spawn_at_feet",
@@ -230,7 +218,6 @@ fn assert_refused(output: &std::process::Output, reason: &str) {
     assert!(!output.status.success() && text.contains(reason), "{text}");
 }
 
-/// Keep a unit flagged in combat past the test, so the combat-drop pass never clears it.
 fn hold_in_combat(shard: &Standalone, guid: u64) {
     let flags: u32 = number(&entity(shard, guid), "unit_flags");
     shard.assert_sql(&format!(
@@ -255,8 +242,6 @@ fn assert_orientation(shard: &Standalone, guid: u64, angle: f32, when: &str) {
     );
 }
 
-/// The stored orientation and the facing row the Gateway relays. The next spline advance reaps a
-/// zero-duration row, so only a shard without the creature tick can read it reliably.
 fn assert_faces(shard: &Standalone, guid: u64, angle: f32, when: &str) {
     assert_orientation(shard, guid, angle, when);
     let leg = spline(shard, guid).unwrap_or_else(|| panic!("{when}: {guid} has no spline row"));
@@ -271,21 +256,17 @@ fn assert_faces(shard: &Standalone, guid: u64, angle: f32, when: &str) {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn distract_turns_only_the_idle_creatures_near_the_point_and_keeps_the_rogue_hidden() {
     let (shard, line) = shard("distract-cast");
-    // No creature tick: nothing reaps the facing rows, and nothing else moves the wolves.
-    // Without the tick nothing regenerates energy either, so refill it once the tick is gone.
     shard.assert_sql("DELETE FROM game_creature_move_schedule");
     shard.assert_call(
         "debug_set_power",
         &[&PLAYER.to_string(), &ENERGY.to_string()],
     );
-    // 6 yd ahead of and 6 yd beside the inside wolf, so it turns 45 degrees off the spawn facing.
     let point = line.at(20.0, 6.0);
     let inside = spawn_wolf(&shard, 14.0);
     let fighting = spawn_wolf(&shard, 18.0);
     let homing = spawn_wolf(&shard, 16.0);
     let outside = spawn_wolf(&shard, 32.0);
     hold_in_combat(&shard, fighting);
-    // A wolf that walks home after an evade is neither in combat nor engaged, and still keeps going.
     shard.assert_sql(&format!(
         "INSERT INTO game_creature_ai_returning_home (creature_guid) VALUES ({homing})"
     ));
@@ -326,7 +307,6 @@ fn distract_turns_only_the_idle_creatures_near_the_point_and_keeps_the_rogue_hid
         "the fixture stealth must land"
     );
 
-    // Both Refusals come first: they spend nothing and start no cooldown.
     assert_refused(
         &shard.call(
             "debug_force_cast_at",
@@ -398,12 +378,10 @@ fn distract_turns_only_the_idle_creatures_near_the_point_and_keeps_the_rogue_hid
             .is_empty());
     }
 
-    // A second Distract refreshes the expiry and faces the second point.
     std::thread::sleep(Duration::from_millis(1_500));
     shard.assert_sql(&format!(
         "DELETE FROM game_spell_cd WHERE caster_guid = {PLAYER}"
     ));
-    // 4 yd ahead of and 4 yd to the other side of the inside wolf.
     let second_point = line.at(18.0, -4.0);
     let second = cast_at(&shard, second_point);
     assert!(second.status.success(), "{second:?}");
@@ -436,12 +414,9 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
     shard.assert_sql(&format!(
         "UPDATE game_creature_spawn SET movement_type = {MOVEMENT_RANDOM} WHERE guid = {wanderer}"
     ));
-    // 3 yd ahead of and 3 yd beside the point, so it turns 45 degrees off the spawn facing.
     let idle = spawn_wolf(&shard, 17.0);
     let spawn_orientation = line.o;
 
-    // Cast while both the patroller and the wanderer walk a leg. A wander leg starts on about one
-    // sense firing in three, so this can take several firings.
     let walking = |guid: u64| {
         spline(&shard, guid).is_some_and(|leg| {
             let ends_micros = number::<u64>(&leg, "start_micros")
@@ -455,7 +430,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
             && walking(wanderer)),
         "the patroller and the wanderer must both walk a leg"
     );
-    // The wait can outlast the player's out-of-combat power, so refill it for the cast.
     shard.assert_call(
         "debug_set_power",
         &[&PLAYER.to_string(), &ENERGY.to_string()],
@@ -471,7 +445,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
         );
         let at = entity(&shard, guid);
         let (x, y): (f32, f32) = (number(&at, "x"), number(&at, "y"));
-        // The walkers stop wherever their leg was, so check the facing points along the line to it.
         let o: f32 = number(&at, "orientation");
         let (dx, dy) = (point.0 - x, point.1 - y);
         let length = dx.hypot(dy);
@@ -483,14 +456,11 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
     }
     assert_orientation(&shard, idle, line.o + FRAC_PI_4, "after the cast");
 
-    // Keep every Distraction active past the hold window, however slow the runner.
     shard.assert_sql(&format!(
         "UPDATE game_creature_distraction SET ends_ms = {} WHERE ends_ms > 0",
         now_ms() + 600_000
     ));
 
-    // Patrol and wander hold across two sense firings: no leg, only the facing row until the
-    // advance reaps it.
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
         for guid in [patroller, wanderer] {
@@ -512,7 +482,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
         );
     }
 
-    // At the expiry an idle Creature turns back to its spawn orientation and the Distraction ends.
     shard.assert_sql(&format!(
         "UPDATE game_creature_distraction SET ends_ms = 1 WHERE creature_guid = {idle}"
     ));
@@ -523,7 +492,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
     );
     assert_orientation(&shard, idle, spawn_orientation, "after the expiry");
 
-    // A patroller turns back the same way, then walks on toward the waypoint it was walking to.
     shard.assert_sql(&format!(
         "UPDATE game_creature_distraction SET ends_ms = 1 WHERE creature_guid = {patroller}"
     ));
@@ -543,7 +511,6 @@ fn a_distraction_holds_idle_movement_until_its_expiry_and_ends_on_an_engagement(
         "the patrol continues toward the same waypoint"
     );
 
-    // An Engagement ends the wanderer's Distraction long before its expiry.
     assert!(
         distraction(&shard, wanderer).is_some_and(|ends| ends > now_ms() + 60_000),
         "the wanderer must still be distracted before the Engagement"

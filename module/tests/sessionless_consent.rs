@@ -1,5 +1,3 @@
-//! Consent admission and row lifetime through real Module operations on a private Standalone.
-
 mod support;
 
 use support::{poll_until, Standalone, POLL_TIMEOUT};
@@ -529,7 +527,6 @@ fn admission_reads_current_consent_and_session_ownership() {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn each_selection_clears_only_its_characters_unclaimed_group_intents() {
     let shard = stage("sessionless-intents");
-    // Disable scheduled event GC so row lifetime cannot hide a failed cleanup or claim.
     shard.assert_sql("DELETE FROM game_event_reaper_schedule");
     shard.assert_call("debug_emit_sessionless_group_intent", &["1", "2", "false"]);
     shard.assert_call("debug_emit_sessionless_group_intent", &["1", "0", "true"]);

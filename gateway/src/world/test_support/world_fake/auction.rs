@@ -3,7 +3,6 @@ use crate::world::Actor;
 
 #[derive(Default)]
 pub(crate) struct AuctionState {
-    /// The auctioneer's house and faction verdict returned to the focused auction seam.
     pub(crate) auction_interaction: Option<AuctionInteraction>,
 }
 

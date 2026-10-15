@@ -100,6 +100,23 @@ root, hover, feather-fall, water-walk, knockback, teleport and spline completion
 acknowledgements keep the World Session usable. This does not establish boat
 simulation, transport membership or acknowledgement counter enforcement.
 
+### Root receipts
+
+The client moves independently of the Module. The Gateway sends a root packet for a root, stun or
+polymorph and sends an unroot packet only after the last hold ends. The Module drops steering
+samples while held, but accepts stop receipts, turns and landings so fall damage still applies.
+
+`gateway/src/world/mod.rs::root_receipt_stop` relays the current Character's root or unroot receipt
+as a stop. Peers otherwise retain the last run. A root receipt clears steering flags so the Module
+accepts the reported stop position. The pinned library's `clear_*` methods mask with
+`reverse_bits`, so the Gateway clears the bits in the encoded bytes instead. The typed reader skips
+the build-5875 transport tail; the encoder refuses that incomplete value, so receipts on a
+transport are not relayed.
+
+Movement interruption uses client flags, including jumping, rather than a change in stored
+position. A delayed stop can update the stored position after Shadowmeld begins without ending
+the aura. Turning in place also preserves it.
+
 ## Gameplay scenarios and remaining gaps
 
 The Headless Client scenarios cover these exchanges through the same WorldStore Seam:
@@ -207,9 +224,9 @@ feature once per World Session. Repeated requests do not add chat lines.
 | Summon acceptance, remote cameras and opening cinematics | System Messages. | Summon offers, camera control and cinematic start state. |
 | LFG preferences | System Message. | Durable LFG slots and comments. Meeting Stone requests use their existing path. |
 
-Movement-control acknowledgements, skipped time, inactive-mover movement,
-cinematic camera advances and cinematic completion are receipt-only. They do
-not move the Character or establish acknowledgement counter enforcement. Setting
+Apart from the [root receipts](#root-receipts) above, movement-control acknowledgements, skipped
+time, inactive-mover movement, cinematic camera advances and cinematic completion are receipt-only.
+They do not move the Character. No receipt establishes acknowledgement counter enforcement. Setting
 the active mover to the current Character is accepted; another mover receives a
 System Message. Possession and remote movement authority remain unavailable.
 

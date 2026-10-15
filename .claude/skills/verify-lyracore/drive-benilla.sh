@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Run one scripted Benilla session against a LyraCore Realm and keep its evidence.
-#
-#   BENILLA_DIR=<benilla checkout> WOW_DATA=<1.12.1 Data dir> \
-#   WOW_USER=TEST WOW_PASS=test123 WOW_CHAR=Tester \
-#   WOW_PROBE_CHAT='.tele goldshire' WOW_PROBE_LUA='ProbeLog(GetZoneText())' \
-#     .claude/skills/verify-lyracore/drive-benilla.sh [exit-after-secs]
-#
-# Every other WOW_* variable passes through to Benilla. Output: $EVIDENCE (default
-# /tmp/lyracore-verify/<UTC stamp>) gets benilla.log, probe.log and shot.png. Exit code is Benilla's.
 set -uo pipefail
 
 : "${BENILLA_DIR:?set BENILLA_DIR to a Benilla checkout}"
@@ -16,7 +7,7 @@ secs=${1:-60}
 out=${EVIDENCE:-/tmp/lyracore-verify/$(date -u +%Y%m%dT%H%M%SZ)}
 mkdir -p "$out"
 
-# BENILLA_HOME keeps the run off the operator's own benilla-config (settings, saved variables).
+# BENILLA_HOME isolates this run from the Operator's saved settings.
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 

@@ -1,13 +1,9 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::ShardId;
 use crate::stdb::world_view::*;
 use crate::world::Outbound;
 
-/// Shared-dispatch recipient leg for a breath relay row. The owner-session lookup in
-/// `world_view::breath_relay_appeared` has already established the self-only audience.
 pub(crate) fn relay_breath_event(
     character_guid: u64,
     kind: u8,
@@ -27,7 +23,6 @@ pub(crate) fn relay_breath_event(
     vec![Outbound::One(msg)]
 }
 
-/// Send breath events to their owner on the callback's Shard.
 pub(crate) fn breath_relay_appeared(view: &WorldView, shard: ShardId, row: &BreathRelayEvent) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
         return;

@@ -147,7 +147,6 @@ fn resolved_promotion_does_not_recreate_roll_or_votes() {
         receipt
     );
 
-    // A normal publish retains the receipt after the active roll and votes have been cleaned up.
     standalone.publish_module();
     promotion.send(&standalone);
     assert_no_active_roll(&standalone);
@@ -221,7 +220,6 @@ fn concurrent_promotions_preserve_one_roll_and_its_votes() {
     assert_eq!(standalone.query_rows("SELECT * FROM game_loot_roll"), rolls);
     assert_eq!(votes(&standalone), voted);
 
-    // Sequence order belongs to each source/corpse/slot key, not to all promotions from a source.
     promotion.voters = VOTERS.into();
     promotion.source_roll_id = 1;
     promotion.slot = 1;

@@ -1,19 +1,10 @@
-//! Chat Channel dispatcher: join, leave, password, the member list and the owner query. Ops are
-//! Durable Requests on Realm-core; their success notices come back on the Relay
-//! (`stdb::world_view::channel_notice_appeared`). A Refusal rolls back its transaction, so this
-//! file answers it to the actor alone. Channel speech is a `CMSG_MESSAGECHAT` kind and lives in
-//! `chat.rs`.
-
 use super::super::*;
 use super::chat::{drop_unrecognised_refusal, ChatActionStore, SpeakerFacts};
 use lyracore_shared::channel::{channel_op, notice, ChannelRefusal};
 use lyracore_shared::faction::team_for_race;
 
-/// One channel op on its way to the `realm_channel_op` reducer. The Coordinator conveys every field
-/// but the speaker's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChannelRequest {
-    /// As the client typed it.
     pub(crate) channel_name: String,
     pub(crate) password: String,
     pub(crate) target_guid: u64,
@@ -23,31 +14,21 @@ pub(crate) struct ChannelRequest {
     pub(crate) speaker: SpeakerFacts,
 }
 
-/// How the Module answered one channel op. A timeout, transport or SDK failure stays an `Err` with
-/// an unknown durable outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChannelOutcome {
     Done,
     Refused(ChannelRefusal),
 }
 
-/// One Chat Channel as the Realm-core cache holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChannelRoster {
-    /// The stored spelling.
     pub(crate) name: String,
-    /// Wire channel flags.
     pub(crate) flags: u8,
-    /// 0 for none.
     pub(crate) owner_guid: u64,
-    /// The owner's name from whichever World Shard holds the Character. Empty when unresolved.
     pub(crate) owner_name: String,
-    /// `(guid, raw member flags)` in join order.
     pub(crate) members: Vec<(u64, u8)>,
 }
 
-/// A Character [`ChannelActionStore::online_character_by_name`] resolved: its guid, race and
-/// canonical spelling, the identity a targeted op conveys to the Module once found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedTarget {
     pub(crate) guid: u64,
@@ -56,22 +37,12 @@ pub(crate) struct ResolvedTarget {
 }
 
 pub(crate) trait ChannelActionStore: ChatActionStore {
-    /// Durable Request on Realm-core. The Coordinator picks the database; handlers never do.
     fn channel_op(&self, actor: Actor, op: u8, request: ChannelRequest) -> Result<ChannelOutcome>;
-    /// Durable Read of the Realm-core cache. `None` when `team` has no channel by that name.
     fn channel_roster(&self, team: u32, channel_name: &str) -> Result<Option<ChannelRoster>>;
-    /// The first `session_online` Character named `name`, realm-wide. `None` when no online
-    /// Character carries that name.
     fn online_character_by_name(&self, name: &str) -> Result<Option<ResolvedTarget>>;
-    /// Does `owner_guid` have `other_guid` on its ignore list, read from wherever the owner's
-    /// contact rows live?
     fn ignores(&self, owner_guid: u64, other_guid: u64) -> Result<bool>;
 }
 
-/// The read [`ChannelActionStore::online_character_by_name`] and its Fakes share: every op that
-/// names a Character resolves it realm-wide and requires it online, the same shape whisper's
-/// ONLINE gate uses (`whisper::run`). A channel can only name a Character presently reachable to
-/// notify.
 pub(crate) fn resolve_online_character<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     name: &str,
@@ -90,12 +61,9 @@ pub(crate) fn resolve_online_character<St: ShardRoutingStore + SocialStore + ?Si
     Ok(None)
 }
 
-/// What CHANNEL_OWNER names when a channel has no owner (vm:Channel.cpp:881-890).
 const NO_OWNER: &str = "Nobody";
-/// What CHANNEL_OWNER names when the owner's Character cannot be found (cm:Channel.cpp:817-824).
 const OWNER_NOT_FOUND: &str = "PLAYER_NOT_FOUND";
 
-/// Handle Chat Channel requests and map Module outcomes to client notices.
 pub(crate) struct Channel;
 
 impl<St: ChannelActionStore + ?Sized> ProtocolFamily<St> for Channel {
@@ -107,7 +75,6 @@ impl<St: ChannelActionStore + ?Sized> ProtocolFamily<St> for Channel {
         let player = &*session;
         let msg = request.message()?;
         let outbound = match msg {
-            // An empty name is dropped (cm:ChannelHandler.cpp:66-67, cm:ChannelHandler.cpp:88-89).
             ClientOpcodeMessage::CMSG_JOIN_CHANNEL(join) if join.channel_name.is_empty() => {
                 Vec::new()
             }
@@ -245,9 +212,6 @@ impl<St: ChannelActionStore + ?Sized> ProtocolFamily<St> for Channel {
     }
 }
 
-/// The actor and Speaker Facts every channel op needs. `None` when the caller has no live entity
-/// to act as (a session at Character Select, or between shards), the same silent drop every
-/// channel op takes for that case.
 fn actor_and_speaker<St: ChannelActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -261,18 +225,12 @@ fn actor_and_speaker<St: ChannelActionStore + ?Sized>(
     Ok(Some((actor, speaker)))
 }
 
-/// What a Refusal from [`submit_channel_op`] names in its notice: the channel as the client typed
-/// it, and who or what to name as `subject_guid`/`target_name`. The actor for an untargeted op;
-/// the resolved (or unresolved-sentinel) target for one that names a Character.
 struct RefusalContext {
     channel_name: String,
     subject_guid: u64,
     target_name: String,
 }
 
-/// Submit one built `request` as `op` and translate the outcome. Success notices return on the
-/// Relay; a Refusal is answered here, from `refusal`. A Refusal this Gateway does not know is
-/// logged at debug and dropped. A Transport Loss ends the World Session.
 fn submit_channel_op<St: ChannelActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -296,8 +254,6 @@ fn submit_channel_op<St: ChannelActionStore + ?Sized>(
     }
 }
 
-/// Run one op as the player: JOIN, LEAVE, PASSWORD, ANNOUNCEMENTS and MODERATE. None of these
-/// name another Character.
 fn run_op<St: ChannelActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -331,14 +287,6 @@ fn run_op<St: ChannelActionStore + ?Sized>(
     )
 }
 
-/// Run one op that names another Character: SET_OWNER, MODERATOR, UNMODERATOR, MUTE, UNMUTE, KICK,
-/// BAN, UNBAN and INVITE. The target is resolved realm-wide and must be online
-/// (cm:Channel.cpp:192-199, cm:Channel.cpp:262-269, cm:Channel.cpp:348-355, cm:Channel.cpp:416-423,
-/// cm:Channel.cpp:678-685). cmangos checks membership, then rights, then the target name, so an
-/// unresolved name still reaches the Module: it goes out as `target_guid` 0, the sentinel no real
-/// Character ever holds, and the op core runs its own NotMember, NotModerator or NotOwner Gate
-/// first and only then answers PLAYER_NOT_FOUND. A target whose Realm Presence is unknown goes out
-/// the same way. Any other failed target read ends the World Session.
 fn run_targeted_op<St: ChannelActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -380,8 +328,6 @@ fn run_targeted_op<St: ChannelActionStore + ?Sized>(
     )
 }
 
-/// Answer a read with `answer` when the player is a member of the named channel, else NOT_MEMBER
-/// with the name the client typed (cm:Channel.cpp:446-456, cm:Channel.cpp:479-488).
 fn read_roster<St: ChannelActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -408,10 +354,6 @@ fn read_roster<St: ChannelActionStore + ?Sized>(
     }])
 }
 
-/// The notice a Refusal answers to the actor alone, naming the channel as the client typed it.
-/// PLAYER_ALREADY_MEMBER names `subject_guid`. The name notices carry `target_name`: the name the
-/// client typed when the target could not be resolved, otherwise the target's canonical resolved
-/// spelling, the same normalization cmangos applies through `normalizePlayerName`.
 pub(super) fn refusal_notice(
     refusal: ChannelRefusal,
     channel_name: String,
@@ -445,13 +387,10 @@ mod tests {
         CMSG_CHANNEL_UNMODERATOR, CMSG_CHANNEL_UNMUTE, CMSG_JOIN_CHANNEL, CMSG_LEAVE_CHANNEL,
     };
 
-    /// How a Fake's Durable Request or read fails.
     #[derive(Clone, Copy)]
     enum Failure {
-        /// The Module rejects with a tag this Gateway does not know.
         Refused,
         TransportLost,
-        /// Another World Shard cannot vouch for a Character's absence.
         PresenceUnknown,
     }
 
@@ -474,14 +413,9 @@ mod tests {
         outcome: Option<Result<ChannelOutcome, Failure>>,
         roster: Option<ChannelRoster>,
         roster_failure: bool,
-        /// What `online_character_by_name` resolves a typed name to. `None` answers
-        /// PLAYER_NOT_FOUND, as an unknown or offline Character does.
         online: Option<ResolvedTarget>,
-        /// `online_character_by_name` fails like this instead of resolving.
         lookup_failure: Option<Failure>,
-        /// What `ignores` answers for every pair.
         ignored: bool,
-        /// `ignores` fails like this instead of answering.
         ignore_failure: Option<Failure>,
         ignore_reads: Mutex<u32>,
         ops: Mutex<Vec<(u64, u8, ChannelRequest)>>,
@@ -686,7 +620,6 @@ mod tests {
         outcome.outbound
     }
 
-    /// The single raw packet `outbound` holds, as `(opcode, body)`.
     fn only_raw(outbound: Vec<Outbound>) -> (u16, Vec<u8>) {
         let mut outbound = outbound.into_iter();
         match (outbound.next(), outbound.next()) {
@@ -760,7 +693,6 @@ mod tests {
         assert!(store.ops.lock().unwrap().is_empty());
     }
 
-    /// NOT_MEMBER 0x05 with the typed name and no payload.
     #[test]
     fn leaving_a_channel_you_are_not_on_answers_not_member_with_the_typed_name() {
         let store = store(Some(Ok(ChannelOutcome::Refused(ChannelRefusal::NotMember))));
@@ -793,7 +725,6 @@ mod tests {
         }
     }
 
-    /// PLAYER_ALREADY_MEMBER 0x17 names the joiner (cm:Channel.cpp:64-72).
     #[test]
     fn a_repeat_join_of_a_custom_channel_names_the_joiner() {
         let store = store(Some(Ok(ChannelOutcome::Refused(
@@ -847,8 +778,6 @@ mod tests {
         assert!(store.ops.lock().unwrap().is_empty());
     }
 
-    /// cm:Channel.cpp:490-515: the stored name and flags, then each member with raw flag bits.
-    /// An Orc (race 2) reads the Horde's channels.
     #[test]
     fn the_member_list_carries_every_member_with_raw_flag_bits() {
         let store = InMemoryChannelActions {
@@ -914,7 +843,6 @@ mod tests {
         );
     }
 
-    /// vm:Channel.cpp:881-890.
     #[test]
     fn a_channel_without_an_owner_names_nobody() {
         let store = InMemoryChannelActions {
@@ -939,7 +867,7 @@ mod tests {
     }
 
     const TARGET: u64 = 9;
-    const TARGET_RACE: u8 = 6; // Tauren
+    const TARGET_RACE: u8 = 6;
 
     fn resolved(ignored: bool) -> InMemoryChannelActions {
         InMemoryChannelActions {
@@ -953,9 +881,6 @@ mod tests {
         }
     }
 
-    /// Every op that names a Character resolves it through `online_character_by_name` and conveys the
-    /// resolved guid, race and canonical name. Only INVITE also reads `ignores`
-    /// (cm:Channel.cpp:192-199 and the other target-lookup sites).
     #[test]
     fn every_targeted_op_resolves_the_target_and_conveys_its_op_code() {
         let cases: [(ClientOpcodeMessage, u8); 9] = [
@@ -991,8 +916,6 @@ mod tests {
         }
     }
 
-    /// ANNOUNCEMENTS and MODERATE name no Character, so they run through the same untargeted path as
-    /// JOIN, LEAVE and PASSWORD.
     #[test]
     fn announcements_and_moderate_carry_no_target() {
         let store = store(None);
@@ -1007,14 +930,11 @@ mod tests {
         );
     }
 
-    /// An unresolved or offline target still reaches the Module, as `target_guid` 0 with the
-    /// typed name: cmangos checks membership and rights before the target name, so the Module
-    /// runs those Gates first and PLAYER_NOT_FOUND is its own answer, not a Gateway shortcut.
     #[test]
     fn an_unresolved_target_reaches_the_module_as_guid_zero_with_the_typed_name() {
         let store = InMemoryChannelActions {
             outcome: Some(Ok(ChannelOutcome::Refused(ChannelRefusal::PlayerNotFound))),
-            ..store(None) // `online` defaults to `None`.
+            ..store(None)
         };
         let outbound = handled(
             Channel::handle(&store, &mut player(), kick("Raiders", "Ghost").into()).unwrap(),
@@ -1029,7 +949,6 @@ mod tests {
         assert_eq!(ops[0].2.target_name, "Ghost");
     }
 
-    /// A target whose Realm Presence is unknown goes out unresolved, so the Module answers.
     #[test]
     fn an_unknown_target_presence_goes_out_unresolved() {
         let store = InMemoryChannelActions {
@@ -1043,7 +962,6 @@ mod tests {
         assert_eq!(ops[0].2.target_name, "Ghost");
     }
 
-    /// A lost target lookup is a Transport Loss: no Durable Request goes out.
     #[test]
     fn a_lost_target_lookup_ends_the_session() {
         let store = InMemoryChannelActions {
@@ -1057,9 +975,6 @@ mod tests {
         assert!(store.ops.lock().unwrap().is_empty());
     }
 
-    /// An unresolved INVITE target carries `target_ignores_actor` false and never reads the
-    /// ignore list at all: race 0 would otherwise pass the Alliance branch of the team check and
-    /// the invite would wrongly go through instead of refusing PLAYER_NOT_FOUND.
     #[test]
     fn an_unresolved_invite_target_skips_the_ignore_read() {
         let store = InMemoryChannelActions {
@@ -1078,7 +993,6 @@ mod tests {
         );
     }
 
-    /// A failed ignore-list read on INVITE is a Transport Loss: no Durable Request goes out.
     #[test]
     fn a_failed_ignore_read_ends_the_session() {
         let store = InMemoryChannelActions {
@@ -1091,7 +1005,6 @@ mod tests {
         assert!(store.ops.lock().unwrap().is_empty());
     }
 
-    /// PLAYER_ALREADY_MEMBER 0x17 names the resolved target, not the actor.
     #[test]
     fn player_already_member_names_the_resolved_target() {
         let store = InMemoryChannelActions {
@@ -1112,7 +1025,6 @@ mod tests {
         );
     }
 
-    /// PLAYER_NOT_BANNED 0x16 carries the resolved target's canonical name.
     #[test]
     fn player_not_banned_names_the_resolved_target() {
         let store = InMemoryChannelActions {

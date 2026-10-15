@@ -55,7 +55,6 @@ fn at_micros(micros: i64) -> spacetimedb_sdk::ScheduleAt {
     ))
 }
 
-/// The one `SMSG_RAID_GROUP_ONLY` timer a writer job produced.
 fn raid_group_only_timer(out: &[Outbound]) -> u32 {
     match out {
         [Outbound::One(ServerOpcodeMessage::SMSG_RAID_GROUP_ONLY(packet))] => {
@@ -79,7 +78,6 @@ fn an_instance_removal_shows_and_hides_the_countdown_for_its_owner_only() {
     let anchor = CellKey::at(36, 7, 0, 0);
     view.add_viewer_on_shard(owner.clone(), anchor, 1);
     view.add_viewer_on_shard(other, anchor, 1);
-    // Due in 2100: far enough ahead that the time left is always the full countdown.
     let row = InstanceRemoval {
         scheduled_id: 3,
         scheduled_at: at_micros(4_102_444_800_000_000),
@@ -103,8 +101,6 @@ fn an_instance_removal_shows_and_hides_the_countdown_for_its_owner_only() {
     );
 }
 
-/// A world-port drops the source viewer before the source Shard deletes the row, so the delete
-/// reaches nobody. The countdown the client still shows is hidden at the next world entry.
 #[test]
 fn a_world_entry_hides_a_countdown_whose_row_is_gone() {
     let view = Arc::new(WorldView::new(true));
@@ -136,7 +132,6 @@ fn a_world_entry_hides_a_countdown_whose_row_is_gone() {
     );
 }
 
-/// The world-entry sweep and a replayed insert both show the time left, not a fresh 60 s.
 #[test]
 fn the_countdown_shows_the_time_left_rounded_up_and_nothing_once_due() {
     let due = 1_900_000_000_000_000;

@@ -1,4 +1,4 @@
-//! Synthetic durable verification. Even success aborts the transaction to preserve existing rows.
+//! Even successful verification aborts the transaction to preserve existing rows.
 
 use crate::game_world_entity;
 use crate::gameobject::game_gameobject;
@@ -9,7 +9,6 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 const MAP: u32 = 36;
 const ENTRY: u32 = 509_113;
-// The ray misses the spawn origin, so an incorrectly centered tiny radius would discard it.
 const A: [f32; 3] = [-4.0, 0.5, 0.0];
 const B: [f32; 3] = [4.0, 0.5, 0.0];
 
@@ -149,7 +148,6 @@ fn package_lifecycle(ctx: &ReducerContext) -> Result<(), String> {
 }
 
 fn packed_model(entry: u32, scale: f32) -> String {
-    // Off-center local geometry exposes an incorrect spawn-centered use of an AABB radius.
     let tris = [VmapTri {
         verts: [[1.0, -2.0, -2.0], [1.0, 2.0, -2.0], [1.0, 0.0, 2.0]],
         class: TriClass::M2,
@@ -345,7 +343,6 @@ pub fn debug_assert_go_collision(ctx: &ReducerContext) -> Result<(), String> {
     ctx.db.game_gameobject().guid().update(closed);
     rays(ctx, first, Some(1.0))?;
 
-    // Static and dynamic hits compete by distance, independent of insertion order.
     {
         use crate::vmap::{
             game_vmap_generation, game_vmap_generation_chunk, VmapGeneration, VmapGenerationChunk,
@@ -397,7 +394,6 @@ pub fn debug_assert_go_collision(ctx: &ReducerContext) -> Result<(), String> {
         ctx.db.game_vmap_generation().id().delete(generation_id);
     }
 
-    // Model replacement refreshes every registered instance and its broad-phase bound.
     crate::go_model::import_go_models_append(ctx, packed_model(ENTRY, 2.0))?;
     rays(ctx, first, Some(2.0))?;
     rays(ctx, sibling, Some(2.0))?;
@@ -421,7 +417,6 @@ pub fn debug_assert_go_collision(ctx: &ReducerContext) -> Result<(), String> {
     )?;
     crate::instance::teardown_instance(ctx, first);
 
-    // The durable ray uses the spawn's current yaw/quaternion, translation and model scale.
     let mut transformed = door(ctx, 0)?;
     transformed.x = 10.0;
     transformed.y = 20.0;
@@ -440,7 +435,6 @@ pub fn debug_assert_go_collision(ctx: &ReducerContext) -> Result<(), String> {
     }
     walking_support(ctx)?;
 
-    // A stale registry row cannot resurrect a deleted GameObject.
     let source = door(ctx, 0)?.guid;
     ctx.db.game_gameobject().guid().delete(source);
     for hit in [
@@ -455,7 +449,6 @@ pub fn debug_assert_go_collision(ctx: &ReducerContext) -> Result<(), String> {
         "rebuild retained orphan",
     )?;
 
-    // Both supported types register; an unrelated prop with a model does not.
     for (entry, type_id, expected) in [(ENTRY + 1, 1, true), (ENTRY + 2, 3, false)] {
         crate::debug::debug_spawn_gameobject(
             ctx, entry, type_id, 0, 0, MAP, 0.0, 0.0, 0.0, 0, 0, 0, 0,

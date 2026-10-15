@@ -1,10 +1,3 @@
-//! Guild family: the guild window reads, CMSG_GUILD_CREATE, the `.guild create` dot-command, the
-//! tabard designer, Petitions and their Guild Charters, and the guild steps of world entry and
-//! exit. Every guild fact lives on Realm-core, so every read and Durable Request here goes there.
-//! The Gateway adds only the Character facts Realm-core cannot read: name, team, Realm Account,
-//! whether the Character is live, the actor's GM level and whether it holds a Guild Charter, both
-//! from its Home Shard. A guild fee moves through `guild_fee`.
-
 use super::super::guild_fee::{self, GuildFeeStore};
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
@@ -16,8 +9,6 @@ use wow_world_messages::vanilla::{
 };
 use wow_world_messages::Guid;
 
-/// Character facts a guild Gate or render needs, read from whichever World Shard holds the
-/// Character.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CharacterFacts {
     pub(crate) guid: u64,
@@ -27,25 +18,17 @@ pub(crate) struct CharacterFacts {
     pub(crate) level: u8,
     pub(crate) zone_id: u32,
     pub(crate) last_logout_micros: u64,
-    /// A live entity on any World Shard, bots included.
     pub(crate) online: bool,
-    /// No live entity, but between two places, such as in a Transfer. The roster lists the
-    /// member online, so it does not flicker offline across a Shard Boundary.
     pub(crate) in_transit: bool,
-    /// 0 when no World Shard retains the Character's Realm Account.
     pub(crate) realm_account_id: u64,
 }
 
-/// The Character facts only a durable `game_character` row holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DurableCharacterFacts {
     pub(crate) last_logout_micros: u64,
-    /// 0 when no World Shard retains the Character's Realm Account.
     pub(crate) realm_account_id: u64,
 }
 
-/// A Character's facts from its durable row and its Realm Presence. Without a durable row there is
-/// no Character, only perhaps a live creature, so `read_presence` is not called.
 pub(crate) fn character_facts(
     durable: Option<DurableCharacterFacts>,
     read_presence: impl FnOnce() -> Result<Option<presence::RealmPresence>>,
@@ -71,10 +54,8 @@ pub(crate) fn character_facts(
     }))
 }
 
-/// One guild Durable Request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GuildRequest {
-    /// A GM founds a Guild led by `leader_guid`.
     GmCreate {
         leader_guid: u64,
         leader_name: String,
@@ -83,138 +64,116 @@ pub(crate) enum GuildRequest {
         gm_level: u8,
         name: String,
     },
-    /// The actor entered the world; `actor_name` refreshes its member name snapshot.
-    SignOn { actor_name: String },
-    /// The actor left the world.
+    SignOn {
+        actor_name: String,
+    },
     SignOff,
-    /// A member offers a live Character, resolved realm-wide, a place in its Guild.
     Invite {
         target_guid: u64,
         actor_team: u32,
         target_team: u32,
         target_ignores_actor: bool,
     },
-    /// The actor accepts its pending Guild Invite.
-    Accept { actor_name: String, actor_team: u32 },
-    /// The actor declines its pending Guild Invite.
-    Decline { actor_name: String },
-    /// The actor leaves its Guild.
+    Accept {
+        actor_name: String,
+        actor_team: u32,
+    },
+    Decline {
+        actor_name: String,
+    },
     Leave,
-    /// A member expels `target_guid` from the actor's Guild.
-    Remove { target_guid: u64 },
-    /// A member raises `target_guid` one Guild Rank.
-    Promote { target_guid: u64 },
-    /// A member lowers `target_guid` one Guild Rank.
-    Demote { target_guid: u64 },
-    /// The Guild Leader passes leadership to `target_guid`.
-    SetLeader { target_guid: u64 },
-    /// The Guild Leader dissolves its Guild.
+    Remove {
+        target_guid: u64,
+    },
+    Promote {
+        target_guid: u64,
+    },
+    Demote {
+        target_guid: u64,
+    },
+    SetLeader {
+        target_guid: u64,
+    },
     Disband,
-    /// CMSG_GUILD_MOTD.
-    SetMotd { text: String },
-    /// CMSG_GUILD_INFO_TEXT.
-    SetInfo { text: String },
-    /// CMSG_GUILD_SET_PUBLIC_NOTE, target already resolved by name.
-    SetPublicNote { target_guid: u64, text: String },
-    /// CMSG_GUILD_SET_OFFICER_NOTE, target already resolved by name.
-    SetOfficerNote { target_guid: u64, text: String },
-    /// CMSG_GUILD_RANK.
+    SetMotd {
+        text: String,
+    },
+    SetInfo {
+        text: String,
+    },
+    SetPublicNote {
+        target_guid: u64,
+        text: String,
+    },
+    SetOfficerNote {
+        target_guid: u64,
+        text: String,
+    },
     EditRank {
         rank_id: u32,
         rights: u32,
         name: String,
     },
-    /// CMSG_GUILD_ADD_RANK.
-    AddRank { name: String },
-    /// CMSG_GUILD_DEL_RANK.
+    AddRank {
+        name: String,
+    },
     DeleteRank,
-    /// The actor signs the Petition of `charter_item_guid`.
     SignPetition {
         charter_item_guid: u64,
         actor_name: String,
         actor_team: u32,
     },
-    /// The owner shows its Petition to the live Character `target_guid`.
     OfferPetition {
         charter_item_guid: u64,
         target_guid: u64,
         target_team: u32,
     },
-    /// The actor declines to sign the Petition of `charter_item_guid`.
-    DeclinePetition { charter_item_guid: u64 },
-    /// The owner renames its Petition.
+    DeclinePetition {
+        charter_item_guid: u64,
+    },
     RenamePetition {
         charter_item_guid: u64,
         name: String,
     },
-    /// The owner founds the Guild its Petition proposes.
-    TurnInPetition { charter_item_guid: u64 },
-    /// The owner drops its Petition.
-    ClosePetition { petition_id: u32 },
-    /// The actor is a Character no World Shard holds any more: remove every guild trace of it.
-    /// Sent by the deleted-Character reconciliation only, as a tokenless actor.
+    TurnInPetition {
+        charter_item_guid: u64,
+    },
+    ClosePetition {
+        petition_id: u32,
+    },
     ForgetDeletedCharacter,
 }
 
-/// What Realm-core did with a guild Durable Request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GuildOutcome {
     Ran,
     Refused(GuildRefusal),
 }
 
-/// Guild reads and requests, in the seam's own vocabulary. Guild reads and `guild_op` go to
-/// Realm-core; Character facts are realm-wide reads over the World Shards. Guild fees go through
-/// [`GuildFeeStore`].
 pub(crate) trait GuildActionStore: GuildFeeStore + Send + Sync {
-    /// The membership row of `character_guid`, if it is in a Guild.
     fn guild_member(&self, character_guid: u64) -> Result<Option<codec::GuildMemberView>>;
-    /// One Guild with its Guild Ranks.
     fn guild(&self, guild_id: u32) -> Result<Option<codec::GuildView>>;
-    /// Every member row of one Guild.
     fn guild_members(&self, guild_id: u32) -> Result<Vec<codec::GuildMemberView>>;
-    /// Facts for one Character from whichever World Shard holds it.
     fn guild_character_facts(&self, character_guid: u64) -> Result<Option<CharacterFacts>>;
-    /// Every Character guid that carries `name`, across every World Shard.
     fn guild_characters_named(&self, name: &str) -> Result<Vec<u64>>;
-    /// The actor's GM level, read from THIS handle: the actor's Home Shard. A copy an interrupted
-    /// Transfer left on another shard is not authority.
     fn guild_gm_level(&self, actor_guid: u64) -> Result<u8>;
-    /// The unit the actor has selected, 0 for none.
     fn guild_selected_target(&self, actor_guid: u64) -> u64;
-    /// Does `owner_guid` have `other_guid` on their ignore list, checked realm-wide?
     fn guild_ignored_by(&self, owner_guid: u64, other_guid: u64) -> Result<bool>;
-    /// Run one guild op on Realm-core as `actor`.
     fn guild_op(&self, actor: Actor, request: GuildRequest) -> Result<GuildOutcome>;
-    /// Does the NPC refuse the actor by faction? The one Gate a read path answers here.
     fn guild_npc_refuses(&self, npc_guid: u64, actor_guid: u64) -> Result<bool>;
-    /// The open Petition of the Guild Charter `charter_item_guid`.
     fn guild_petition_of_charter(
         &self,
         charter_item_guid: u64,
     ) -> Result<Option<codec::PetitionView>>;
-    /// The open Petition `owner_guid` owns.
     fn guild_petition_of_owner(&self, owner_guid: u64) -> Result<Option<codec::PetitionView>>;
-    /// Does a Guild hold `name`, without regard to case?
     fn guild_name_taken(&self, name: &str) -> Result<bool>;
-    /// Does the actor hold the Guild Charter `charter_item_guid`, read from THIS handle, the
-    /// actor's Home Shard?
     fn guild_holds_charter(&self, actor_guid: u64, charter_item_guid: u64) -> Result<bool>;
-    /// Destroy a turned-in Guild Charter on THIS handle, the actor's Home Shard. A Charter
-    /// already gone is Ok.
     fn guild_destroy_charter(&self, actor: Actor, charter_item_guid: u64) -> Result<()>;
-    /// Every Character a Guild, a Petition or a Signature names. Fails while Realm-core cannot
-    /// answer, so the deleted-Character reconciliation retries instead of skipping anyone.
     fn guild_character_guids(&self) -> Result<Vec<u64>>;
-    /// Does a Guild, a Petition or a Signature name `character_guid`? Fails like
-    /// [`Self::guild_character_guids`].
     fn guild_names_character(&self, character_guid: u64) -> Result<bool>;
-    /// The name of the Guild `character_guid` belongs to, if any.
     fn guild_name_of_member(&self, character_guid: u64) -> Result<Option<String>>;
 }
 
-/// A Transport Loss ends the World Session. A Refusal this Gateway has no answer for, or a Realm
-/// Presence another World Shard cannot vouch for, comes back for the caller to drop.
 fn unless_transport_loss(error: anyhow::Error) -> Result<anyhow::Error> {
     if presence::is_unknown(&error) {
         return Ok(error);
@@ -359,7 +318,6 @@ fn command_result(command: GuildCommand, name: String, result: GuildCommandResul
     )))
 }
 
-/// What mangos answers a guild request from outside any Guild (`cm:GuildHandler.cpp:43,248`).
 fn not_in_guild() -> Outbound {
     command_result(
         GuildCommand::Create,
@@ -368,8 +326,6 @@ fn not_in_guild() -> Outbound {
     )
 }
 
-/// Any Guild answers, in any state: the character list asks for the names of its Characters'
-/// Guilds before world entry (`cm:Opcodes.cpp:112` STATUS_AUTHED).
 fn query_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     guild_id: u32,
@@ -382,7 +338,6 @@ fn query_outbound<St: GuildActionStore + ?Sized>(
     }])
 }
 
-/// The actor's membership and its Guild, when both exist.
 fn actor_guild<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -396,9 +351,6 @@ fn actor_guild<St: GuildActionStore + ?Sized>(
     Ok(store.guild(member.guild_id)?.map(|guild| (member, guild)))
 }
 
-/// Outside a Guild the client gets no reply (`cm:GuildHandler.cpp:265-266`). One viewer, so lines
-/// are read lazily: `roster_packet` stops pulling once the roster body is full, and a member past
-/// the cap never pays for a `guild_character_facts` read that would be discarded.
 fn roster_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -419,10 +371,6 @@ fn roster_outbound<St: GuildActionStore + ?Sized>(
     ))])
 }
 
-/// Every roster line of `guild_id`, officer note included; `roster_packet` blanks it per viewer.
-/// Reading each member's Character facts is the expensive part of a roster, so a caller that
-/// serves more than one viewer of the same Guild (a settings-change relay) must call this once and
-/// pass the result to every `roster_packet` call, not call `roster_outbound` per viewer.
 pub(crate) fn roster_lines<St: GuildActionStore + ?Sized>(
     store: &St,
     guild_id: u32,
@@ -435,8 +383,6 @@ pub(crate) fn roster_lines<St: GuildActionStore + ?Sized>(
         .collect())
 }
 
-/// One roster line, officer note included. A member whose World Shard cannot answer still lists,
-/// offline, under its name snapshot.
 fn roster_line<St: GuildActionStore + ?Sized>(
     store: &St,
     member: codec::GuildMemberView,
@@ -477,12 +423,6 @@ fn roster_line<St: GuildActionStore + ?Sized>(
     }
 }
 
-/// SMSG_GUILD_ROSTER from `lines`, blanking each line's officer note unless `sees_officer_notes`.
-/// The one place that encodes a roster, so CMSG_GUILD_ROSTER and a settings-change relay can never
-/// draw the wire body two different ways. `lines` stays generic over `IntoIterator` rather than a
-/// slice: the single-viewer client path feeds it a lazy iterator so a member past the roster's
-/// body cap is never read, while a settings-change relay, which renders both note visibilities
-/// from one shared read, feeds it `lines.iter().cloned()` over its already-collected Vec.
 pub(crate) fn roster_packet(
     guild: &codec::GuildView,
     lines: impl IntoIterator<Item = codec::GuildRosterLine>,
@@ -515,7 +455,6 @@ fn info_outbound<St: GuildActionStore + ?Sized>(
     ))])
 }
 
-/// Distinct Realm Accounts among `members`. A member whose Account is unknown counts as one.
 fn account_count(members: &[codec::GuildMemberView]) -> u32 {
     let mut known: Vec<u64> = members
         .iter()
@@ -531,8 +470,6 @@ fn account_count(members: &[codec::GuildMemberView]) -> u32 {
     u32::try_from(known.len() + unknown).unwrap_or(u32::MAX)
 }
 
-/// CMSG_GUILD_CREATE founds a Guild for a GM only; the Guild Charter is the player path. mangos
-/// replies to neither outcome (`cm:GuildHandler.cpp:46-64`).
 fn create_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -567,8 +504,6 @@ fn gm_create(leader: &CharacterFacts, gm_level: u8, name: String) -> GuildReques
     }
 }
 
-/// Every live Character on `name`, realm-wide; the first live candidate wins, the way
-/// `whisper::target_facts` picks the first online one.
 fn live_character_named<St: GuildActionStore + ?Sized>(
     store: &St,
     name: &str,
@@ -583,9 +518,6 @@ fn live_character_named<St: GuildActionStore + ?Sized>(
     Ok(None)
 }
 
-/// CMSG_GUILD_INVITE (`cm:GuildHandler.cpp:66-131`): the actor offers a live Character, resolved
-/// realm-wide, a place in its Guild. mangos answers "player not found" before any Guild Gate runs,
-/// so this Gateway read happens first here too.
 fn invite_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -626,7 +558,6 @@ fn invite_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// CMSG_GUILD_ACCEPT (`cm:GuildHandler.cpp:192-211`): every failure is silent, like mangos.
 fn accept_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -651,7 +582,6 @@ fn accept_outbound<St: GuildActionStore + ?Sized>(
     Ok(Vec::new())
 }
 
-/// CMSG_GUILD_DECLINE (`cm:GuildHandler.cpp:214-238`): every failure is silent.
 fn decline_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -675,11 +605,6 @@ fn decline_outbound<St: GuildActionStore + ?Sized>(
     Ok(Vec::new())
 }
 
-/// CMSG_GUILD_LEAVE (`cm:GuildHandler.cpp:383-404`): mangos answers QUIT/0x00 only for an ordinary
-/// member's leave, never for a lone Guild Leader's leave-and-disband. The Module refuses a Guild
-/// Leader who still has company (`GuildRefusal::LeaderCannotLeave`), so a Guild Leader's Leave can
-/// only ever *succeed* by disbanding alone. No member count needs reading here to tell the two
-/// outcomes apart, only whether the actor already is the Guild Leader.
 fn leave_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -711,7 +636,6 @@ fn leave_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// CMSG_GUILD_DISBAND (`cm:GuildHandler.cpp:424-435`).
 fn disband_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -733,9 +657,6 @@ fn disband_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// The shape CMSG_GUILD_REMOVE, PROMOTE, DEMOTE and LEADER share: resolve `typed_name` against the
-/// actor's own Guild roster, then run the Durable Request and map its outcome
-/// (`cm:GuildHandler.cpp:146-152,290-296,343-349,467-473`).
 fn named_member_op<St, F>(
     store: &St,
     player: &ProtocolSession,
@@ -772,8 +693,6 @@ where
     })
 }
 
-/// Which client opcode a Refusal reply is being built for: the same [`GuildRefusal`] wire-maps
-/// differently depending on which op produced it.
 #[derive(Clone, Copy, Debug)]
 enum GuildOpKind {
     Invite,
@@ -785,8 +704,6 @@ enum GuildOpKind {
     Disband,
 }
 
-/// GUILD_PERMISSIONS_OR_LEADER (0x08): both `NoPermission` (a missing Rank Right) and `NotLeader`
-/// (the actor is not the Guild Leader) answer this exact reply.
 fn no_permission() -> Outbound {
     command_result(
         GuildCommand::Invite,
@@ -795,10 +712,6 @@ fn no_permission() -> Outbound {
     )
 }
 
-/// Every membership Refusal's wire reply, derived from `cm:GuildHandler.cpp`'s line-numbered
-/// `SendGuildCommandResult` calls (cited on each [`GuildRefusal`] variant in `lyracore_shared`).
-/// `typed_name` is the client's own input; `target_name` is the resolved target's name snapshot,
-/// used only where mangos itself reads it back off the found Character rather than the packet.
 fn membership_refusal_outbound(
     op: GuildOpKind,
     refusal: GuildRefusal,
@@ -865,7 +778,6 @@ fn membership_refusal_outbound(
     }
 }
 
-/// CMSG_GUILD_MOTD (`cm:GuildHandler.cpp:488-513`).
 fn motd_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -883,11 +795,10 @@ fn motd_outbound<St: GuildActionStore + ?Sized>(
             String::new(),
             GuildCommandResult::GuildPermissionsOrLeader,
         )],
-        GuildOutcome::Refused(_) => Vec::new(), // TooLong: the stock client cannot produce it.
+        GuildOutcome::Refused(_) => Vec::new(),
     })
 }
 
-/// CMSG_GUILD_INFO_TEXT (`cm:GuildHandler.cpp:693-713`).
 fn info_text_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -909,9 +820,6 @@ fn info_text_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// CMSG_GUILD_SET_PUBLIC_NOTE / SET_OFFICER_NOTE, shared: resolve `target_name` against the
-/// actor's own Guild through its member name snapshots (`member_by_name`), same as mangos'
-/// `GetMemberSlot` (`cm:GuildHandler.cpp:526-545,564-582`), then run the edit.
 fn set_note_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -942,14 +850,10 @@ fn set_note_outbound<St: GuildActionStore + ?Sized>(
             target_name,
             GuildCommandResult::GuildPlayerNotInGuildS,
         )],
-        _ => Vec::new(), // TooLong is silent: the stock client cannot produce it.
+        _ => Vec::new(),
     })
 }
 
-/// The rank-management opcodes (RANK, ADD_RANK, DEL_RANK) share their refusal replies: `NotInGuild`
-/// answers the same as every other guild-less request, `NotLeader` answers PERMISSIONS, and every
-/// other refusal, including `RanksAtLimit`, is silent (`cm:GuildHandler.cpp:606-611,645-651,
-/// 671-673`).
 fn rank_refusal_outbound(outcome: GuildOutcome) -> Vec<Outbound> {
     match outcome {
         GuildOutcome::Refused(GuildRefusal::NotInGuild) => vec![not_in_guild()],
@@ -962,7 +866,6 @@ fn rank_refusal_outbound(outcome: GuildOutcome) -> Vec<Outbound> {
     }
 }
 
-/// CMSG_GUILD_RANK.
 fn edit_rank_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -984,7 +887,6 @@ fn edit_rank_outbound<St: GuildActionStore + ?Sized>(
     Ok(rank_refusal_outbound(outcome))
 }
 
-/// CMSG_GUILD_ADD_RANK.
 fn add_rank_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -997,7 +899,6 @@ fn add_rank_outbound<St: GuildActionStore + ?Sized>(
     Ok(rank_refusal_outbound(outcome))
 }
 
-/// CMSG_GUILD_DEL_RANK.
 fn delete_rank_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1011,15 +912,11 @@ fn delete_rank_outbound<St: GuildActionStore + ?Sized>(
 
 const GUILD_CREATE_USAGE: &str = "usage: .guild create [<leader>] \"<name>\"";
 
-/// Is this Say line a `.guild` dot-command?
 pub(crate) fn is_guild_dot_command(text: &str) -> bool {
     text.strip_prefix(".guild")
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
-/// `.guild create [<leader>] "<name>"` (`cm:Level3.cpp:2945-2977`), GM level only. Without a
-/// leader name the leader is the actor's selected player, else the actor. `Some(line)` is the
-/// system line for the actor; success is silent, like every other dot-command.
 pub(crate) fn run_guild_dot_command<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1061,8 +958,6 @@ pub(crate) fn run_guild_dot_command<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// The leader `.guild create` names: the typed name, else the selected player, else the actor.
-/// `Ok(Err(line))` is the system line for a name that resolves to nobody or to more than one.
 fn guild_create_leader<St: GuildActionStore + ?Sized>(
     store: &St,
     actor_guid: u64,
@@ -1085,8 +980,6 @@ fn guild_create_leader<St: GuildActionStore + ?Sized>(
     Ok(leader.ok_or_else(|| format!("no player named {}", leader_name.unwrap_or_default())))
 }
 
-/// Split `.guild create [<leader>] "<name>"` into the optional leader name and the quoted guild
-/// name. `None` for any other shape.
 fn parse_guild_create(text: &str) -> Option<(Option<&str>, &str)> {
     let rest = text.strip_prefix(".guild")?.trim_start();
     let (subcommand, rest) = rest.split_once(char::is_whitespace)?;
@@ -1105,9 +998,6 @@ fn parse_guild_create(text: &str) -> Option<(Option<&str>, &str)> {
     (!name.is_empty() && !name.contains('"')).then_some((leader, name))
 }
 
-/// MSG_TABARDVENDOR_ACTIVATE opens the tabard designer (`cm:NPCHandler.cpp:47-67`). This is a read
-/// path, so only the faction refusal is answered here, silently. The NPC flag, reach and life Gates
-/// run in the Fee Hold when the emblem is saved.
 fn tabard_window_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1122,8 +1012,6 @@ fn tabard_window_outbound<St: GuildActionStore + ?Sized>(
     Ok(vec![tabard_designer_window(npc_guid)])
 }
 
-/// The tabard designer window for `npc_guid`. Gossip action 11 opens it too
-/// (`cm:Player.cpp:11877-11880`).
 pub(crate) fn tabard_designer_window(npc_guid: u64) -> Outbound {
     Outbound::One(ServerOpcodeMessage::MSG_TABARDVENDOR_ACTIVATE(
         MSG_TABARDVENDOR_ACTIVATE {
@@ -1132,11 +1020,6 @@ pub(crate) fn tabard_designer_window(npc_guid: u64) -> Outbound {
     ))
 }
 
-/// MSG_SAVE_GUILD_EMBLEM (`cm:GuildHandler.cpp:716-771`). Advisory reads of the Realm-core cache
-/// answer NO_GUILD and NOT_GUILD_MASTER before any copper moves, and Realm-core decides again inside
-/// the fee. mangos checks the NPC first. Here the NPC Gate runs in the Fee Hold, so a non-member at
-/// the wrong NPC hears NO_GUILD. The new emblem reaches every online member, the payer included,
-/// through the TABARD_CHANGED Guild Event.
 fn save_emblem_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1162,9 +1045,6 @@ fn save_emblem_outbound<St: GuildActionStore + ?Sized>(
             };
             match guild_fee::pay(store, actor, request) {
                 Ok(outcome) => emblem_result(outcome),
-                // The decision may have committed. The Hold is finished at the next fee or world
-                // entry, and the new emblem, if saved, reaches every member as TABARD_CHANGED.
-                // The client still needs an answer to close its wait.
                 Err(error) => {
                     let error = unless_transport_loss(error)?;
                     log::warn!("world: emblem fee of {actor_guid} left unfinished: {error:#}");
@@ -1185,15 +1065,10 @@ fn emblem_result(outcome: guild_fee::FeeOutcome) -> GuildEmblemResult {
         Refused(GuildRefusal::NotInGuild) => GuildEmblemResult::NoGuild,
         Refused(GuildRefusal::NotLeader) => GuildEmblemResult::NotGuildMaster,
         Refused(GuildRefusal::NotEnoughMoney) => GuildEmblemResult::NotEnoughMoney,
-        // The NPC Gate. mangos names the value INVALIDVENDOR; the client shows nothing for it
-        // (`vm:src/game/Handlers/GuildHandler.cpp:686-693`).
         Refused(_) => GuildEmblemResult::NoMessage,
     }
 }
 
-/// CMSG_PETITION_SHOWLIST (`cm:PetitionsHandler.cpp:636-678`). A read path, so only the faction
-/// refusal is answered here, silently. The NPC Gates run in the Fee Hold when the Charter is
-/// bought.
 fn petition_showlist_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1208,8 +1083,6 @@ fn petition_showlist_outbound<St: GuildActionStore + ?Sized>(
     Ok(vec![petition_showlist(npc_guid)])
 }
 
-/// The Guild Charter list of the Petitioner `npc_guid`. Gossip action 10 opens it too
-/// (`cm:Player.cpp:11873-11876`).
 pub(crate) fn petition_showlist(npc_guid: u64) -> Outbound {
     Outbound::One(ServerOpcodeMessage::SMSG_PETITION_SHOWLIST(Box::new(
         codec::build_petition_showlist(npc_guid),
@@ -1220,11 +1093,6 @@ fn guild_create_result(name: String, result: GuildCommandResult) -> Outbound {
     command_result(GuildCommand::Create, name, result)
 }
 
-/// CMSG_PETITION_BUY (`cm:PetitionsHandler.cpp:44-174`). Advisory reads of the Realm-core cache
-/// answer in mangos order before any copper moves: a member and an owner who still holds a Charter
-/// hear nothing, then a taken and an invalid name. An owner whose Charter is gone gets its old
-/// Petition closed first, so it is not stranded. Realm-core decides again inside the fee, and the
-/// Charter reaches the client through the item relay.
 fn petition_buy_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1295,7 +1163,6 @@ fn charter_purchase_reply(
         Refused(GuildRefusal::NotEnoughMoney) => {
             vec![buy_failed(npc_guid, BuyResult::NotEnoughMoney)]
         }
-        // mangos names no vendor here (`cm:PetitionsHandler.cpp:114-118`).
         Refused(GuildRefusal::CharterUnavailable) => vec![buy_failed(0, BuyResult::CantFindItem)],
         Refused(GuildRefusal::BagsFull) => vec![Outbound::One(
             ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
@@ -1315,12 +1182,10 @@ fn charter_purchase_reply(
             name,
             GuildCommandResult::GuildNameInvalid,
         )],
-        // A member, an owner of a Petition, or an NPC that does not serve: mangos is silent.
         Refused(_) => Vec::new(),
     }
 }
 
-/// CMSG_PETITION_SHOW_SIGNATURES (`cm:PetitionsHandler.cpp:176-218`). A member hears nothing.
 fn show_signatures_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1339,14 +1204,12 @@ fn show_signatures_outbound<St: GuildActionStore + ?Sized>(
         .collect())
 }
 
-/// The signature window of `petition`.
 fn petition_signatures(petition: &codec::PetitionView) -> Outbound {
     Outbound::One(ServerOpcodeMessage::SMSG_PETITION_SHOW_SIGNATURES(
         Box::new(codec::build_petition_show_signatures(petition)),
     ))
 }
 
-/// CMSG_PETITION_QUERY (`cm:PetitionsHandler.cpp:220-282`). An unknown Charter is silent.
 fn petition_query_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     charter_item_guid: u64,
@@ -1358,15 +1221,12 @@ fn petition_query_outbound<St: GuildActionStore + ?Sized>(
         .collect())
 }
 
-/// The petition query response for `petition`.
 fn petition_query(petition: &codec::PetitionView) -> Outbound {
     Outbound::One(ServerOpcodeMessage::SMSG_PETITION_QUERY_RESPONSE(Box::new(
         codec::build_petition_query_response(petition),
     )))
 }
 
-/// MSG_PETITION_RENAME (`cm:PetitionsHandler.cpp:284-319`): only while the actor holds the
-/// Charter. The reply echoes the new name.
 fn rename_petition_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1406,10 +1266,6 @@ fn rename_petition_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// CMSG_OFFER_PETITION (`cm:PetitionsHandler.cpp:452-512`): the owner shows its Petition to a live
-/// Character. The target sees the signature window through a Guild Event. ALREADY_IN_GUILD_S and
-/// ALREADY_INVITED_TO_GUILD_S name the target, which is what the client line reads; mangos writes
-/// the offerer's name there.
 fn offer_petition_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1456,8 +1312,6 @@ fn offer_petition_outbound<St: GuildActionStore + ?Sized>(
     })
 }
 
-/// CMSG_PETITION_SIGN (`cm:PetitionsHandler.cpp:321-422`). A signature, and an attempt by a Realm
-/// Account that already signed, reach both the signer and the owner through Guild Events.
 fn sign_petition_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1504,13 +1358,10 @@ fn sign_petition_outbound<St: GuildActionStore + ?Sized>(
             actor_facts.name,
             GuildCommandResult::AlreadyInvitedToGuildS,
         )],
-        // Signed or already signed: the Guild Events answer. A full or unknown Petition is silent.
         _ => Vec::new(),
     })
 }
 
-/// MSG_PETITION_DECLINE (`cm:PetitionsHandler.cpp:424-450`): the owner hears it through a Guild
-/// Event; the decliner hears nothing.
 fn decline_petition_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1527,10 +1378,6 @@ fn decline_petition_outbound<St: GuildActionStore + ?Sized>(
     Ok(Vec::new())
 }
 
-/// CMSG_TURN_IN_PETITION (`cm:PetitionsHandler.cpp:514-634`): only while the actor holds the
-/// Charter. Realm-core founds the Guild first; the Charter is destroyed on the Home Shard after.
-/// A crash between leaves an inert Charter whose Petition is gone, so it founds nothing twice, and
-/// the next world entry destroys it (`destroy_inert_charters`).
 fn turn_in_petition_outbound<St: GuildActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -1559,10 +1406,7 @@ fn turn_in_petition_outbound<St: GuildActionStore + ?Sized>(
                 let error = unless_transport_loss(error)?;
                 log::warn!("world: turned-in Charter {charter_item_guid} left inert: {error:#}");
             }
-            // mangos sends both: the founding result from the turn-in handler, since
-            // `Guild::Create` sends nothing (`cm:PetitionsHandler.cpp:596-597`,
-            // `cm:Guild.cpp:104-154`), then the turn-in result (`:631-633`). Result 0 is success;
-            // gtker names the zero value PLAYER_NO_MORE_IN_GUILD.
+            // Vanilla sends founding then turn-in results; gtker misnames the success value.
             vec![
                 guild_create_result(name, GuildCommandResult::PlayerNoMoreInGuild),
                 turn_in_result(PetitionResult::Ok),
@@ -1578,13 +1422,10 @@ fn turn_in_petition_outbound<St: GuildActionStore + ?Sized>(
             name,
             GuildCommandResult::GuildNameExistsS,
         )],
-        // Not the owner, or no Petition: mangos is silent.
         GuildOutcome::Refused(_) => Vec::new(),
     })
 }
 
-/// The Guild Projection for `character_guid`: `(guild_id, rank_id)`, or `(0, 0)` outside a Guild or
-/// when Realm-core cannot answer.
 pub(crate) fn guild_projection<St: GuildActionStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1599,11 +1440,6 @@ pub(crate) fn guild_projection<St: GuildActionStore + ?Sized>(
     }
 }
 
-/// The guild packets of world entry, sent after the viewer is registered. The self CREATE
-/// carried `created`, the Guild Projection read before registration; a membership change that
-/// landed in between reached no viewer, so a different current value goes out as a VALUES update,
-/// `(0, 0)` after a removal. A fresh login of a member also gets the MOTD
-/// (`cm:CharacterHandler.cpp:775-785`). A failed read logs and never fails the entry.
 pub(crate) fn guild_world_entry<St: GuildActionStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1639,8 +1475,6 @@ pub(crate) fn guild_world_entry<St: GuildActionStore + ?Sized>(
     outbound
 }
 
-/// A member entering the world fresh signs on, which tells the other online members. Answers
-/// whether SIGNED_ON went out, so the World Session owes a sign-off whatever happens next.
 pub(crate) fn guild_sign_on<St: GuildActionStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1660,8 +1494,7 @@ pub(crate) fn guild_sign_on<St: GuildActionStore + ?Sized>(
     run_best_effort(store, actor, GuildRequest::SignOn { actor_name }, "sign-on")
 }
 
-/// The guild part of leaving the world: a member signs off. Runs before the Account Claim is
-/// released, while Realm-core still accepts the actor (`cm:WorldSession.cpp:714-724`).
+/// Sign off before releasing the Account Claim, while Realm-core still accepts the Actor.
 pub(crate) fn guild_world_exit<St: GuildActionStore + ?Sized>(store: &St, character_guid: u64) {
     let Some(actor) = Actor::new(character_guid) else {
         return;
@@ -1671,7 +1504,6 @@ pub(crate) fn guild_world_exit<St: GuildActionStore + ?Sized>(store: &St, charac
     }
 }
 
-/// Run one guild op whose failure must not fail the caller. Answers whether it ran.
 fn run_best_effort<St: GuildActionStore + ?Sized>(
     store: &St,
     actor: Actor,
@@ -1692,12 +1524,6 @@ fn run_best_effort<St: GuildActionStore + ?Sized>(
     }
 }
 
-/// Destroy each Guild Charter in `charter_item_guids` that no Petition stands behind any more: its
-/// Petition was turned in and the destroy after it failed, or its owner joined a Guild. Such a
-/// Charter founds nothing, and as a unique item it blocks the next Charter purchase. Call it at
-/// world entry after the Fee Hold re-drive, so a Charter whose purchase was still being decided
-/// has its Petition by then. A Fee Hold that is still unfinished, or a Realm-core that cannot
-/// answer, destroys nothing.
 pub(crate) fn destroy_inert_charters<St: GuildActionStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1735,9 +1561,6 @@ pub(crate) fn destroy_inert_charters<St: GuildActionStore + ?Sized>(
     }
 }
 
-/// Does `character_guid` lead a Guild? The Home Shard cannot read Realm-core, so the Gateway
-/// answers this before it asks the Home Shard to delete the Character
-/// (`cm:CharacterHandler.cpp:540-546`).
 pub(crate) fn leads_a_guild<St: GuildActionStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1750,19 +1573,12 @@ pub(crate) fn leads_a_guild<St: GuildActionStore + ?Sized>(
         .is_some_and(|guild| guild.leader_guid == character_guid))
 }
 
-/// What one pass of the deleted-Character reconciliation did for one Character.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeletedCharacterGuildCleanup {
-    /// Some World Shard still holds the Character.
     Preserved,
     Forgotten,
 }
 
-/// Forget `character_guid` on Realm-core once every World Shard proves it is gone. A Character
-/// row in any Shard's cache is a positive signal and needs no proof, so it costs no durable
-/// snapshot: a Transfer deletes the source row only after the destination holds one, and a row
-/// that is stale in a cache starts another pass when its delete arrives. Only then comes the
-/// party cleanup's absence check, two durable snapshots of every configured World Shard.
 pub(crate) fn forget_deleted_character<
     St: CharacterStore + GuildActionStore + ShardRoutingStore + ?Sized,
 >(
@@ -1787,9 +1603,6 @@ pub(crate) fn forget_deleted_character<
     }
 }
 
-/// The guild cleanup the deleted-Character worker owes. A full sweep checks every Character that
-/// guild state names: at startup and after a reconnect, when a delete may have gone unseen. A
-/// `game_character` delete owes only its own guid.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GuildCleanup {
     pub(crate) sweep: bool,
@@ -1797,15 +1610,12 @@ pub(crate) struct GuildCleanup {
 }
 
 impl GuildCleanup {
-    /// Add work that a failed pass still owes.
     pub(crate) fn merge(&mut self, owed: GuildCleanup) {
         self.sweep |= owed.sweep;
         self.deleted.extend(owed.deleted);
     }
 }
 
-/// Run the guild cleanup `work` asks for. Every Character is tried; the first failure is
-/// returned, so the worker keeps the work and retries it.
 pub(crate) fn reconcile_deleted_guild_characters<
     St: CharacterStore + GuildActionStore + ShardRoutingStore + ?Sized,
 >(
@@ -1846,9 +1656,6 @@ pub(crate) fn reconcile_deleted_guild_characters<
     first_error.map_or(Ok(()), Err)
 }
 
-/// Resolve a typed member name against a Guild's name snapshots, case-insensitively, as mangos
-/// searches its member list (`cm:Guild.h:285-292`). No match and two matches both answer
-/// [`MemberMatch::NotInGuild`], so a by-name op never picks one of two homonyms.
 pub(crate) fn member_by_name(members: &[codec::GuildMemberView], name: &str) -> MemberMatch {
     let mut found = members
         .iter()
@@ -1865,11 +1672,6 @@ pub(crate) enum MemberMatch {
     NotInGuild,
 }
 
-/// Guild data for one settings-changing Guild Event, read once and shared by every recipient's
-/// job: the query response, and, for a roster-carrying kind, both roster encodings, so a viewer's
-/// own job only has to pick which one its Guild Rank sees and never re-reads the Realm-core cache
-/// or the World Shards. A relay is not a reply to a client request, so a Guild that is gone renders
-/// nothing here rather than the `not_in_guild()` command result a live request would get.
 #[derive(Clone, Default)]
 pub(crate) struct GuildEventSnapshot {
     pub(crate) query: Option<ServerOpcodeMessage>,
@@ -1879,7 +1681,6 @@ pub(crate) struct GuildEventSnapshot {
 }
 
 impl GuildEventSnapshot {
-    /// Read the Guild, and its roster too unless `kind` only needs the query response.
     pub(crate) fn build<St: GuildActionStore + ?Sized>(
         store: &St,
         guild_id: u32,
@@ -1920,13 +1721,10 @@ impl GuildEventSnapshot {
         }
     }
 
-    /// The query response, or nothing when the Guild is gone.
     pub(crate) fn query_response(&self) -> Option<ServerOpcodeMessage> {
         self.query.clone()
     }
 
-    /// The roster `rank_id` sees: officer notes shown only with VIEWOFFNOTE, nothing when the
-    /// Guild is gone or this snapshot carries no roster.
     pub(crate) fn roster_for_rank(&self, rank_id: u32) -> Option<ServerOpcodeMessage> {
         let rank_rights = self
             .rank_rights
@@ -1967,43 +1765,25 @@ mod tests {
     const BOB: u64 = 5_090_002;
     const CAROL: u64 = 5_090_003;
 
-    /// An in-memory Realm-core plus World Shards. `guild_op` applies the same Gates the Module
-    /// applies, so outcomes are observable as rows.
     #[derive(Default)]
     struct InMemoryGuildActions {
         guilds: Mutex<Vec<codec::GuildView>>,
         members: Mutex<Vec<codec::GuildMemberView>>,
         characters: Vec<CharacterFacts>,
-        /// GM levels as each actor's Home Shard holds them.
         gm_levels: Vec<(u64, u8)>,
-        /// `(owner_guid, ignored_guid)`.
         ignored: Vec<(u64, u64)>,
         selected: u64,
         ops: Mutex<Vec<(u64, GuildRequest)>>,
-        /// `guild_op` fails like this.
         op_error: Option<fn() -> anyhow::Error>,
-        /// NPCs that refuse every actor by faction.
         refusing_npcs: Vec<u64>,
-        /// Every fee request that reached the Home Shard.
         fee_requests: Mutex<Vec<guild_fee::FeeRequest>>,
-        /// What the Home Shard answers a hold; `None` holds.
         hold_refusal: Option<GuildRefusal>,
-        /// What Realm-core decides; `None` accepts.
         fee_refusal: Option<GuildRefusal>,
-        /// The decision's answer is lost, as when it commits but is late to the cache.
         fee_decide_error: Option<fn() -> anyhow::Error>,
-        /// Realm Presence cannot answer, as when a World Shard's subscription is unhealthy.
         facts_error: Option<fn() -> anyhow::Error>,
-        /// What the next non-`GmCreate` op answers; `None` runs it. The Gate arithmetic for every
-        /// op lives on the Module, proved by its own unit and durable tests; this seam only proves
-        /// the wire mapping from a given outcome, the same shape `GuildFeeStore` below uses for the
-        /// Fee Hold protocol.
         refuse_next: Mutex<Option<GuildRefusal>>,
-        /// Realm-core Petitions.
         petitions: Vec<codec::PetitionView>,
-        /// Guild Charters every actor holds on its Home Shard.
         held_charters: Vec<u64>,
-        /// Every Guild Charter destroyed on a Home Shard.
         destroyed_charters: Mutex<Vec<u64>>,
     }
 
@@ -2029,7 +1809,6 @@ mod tests {
             });
         }
 
-        /// Gate order after `cm:GuildHandler.cpp:46-64` and `founding_gate`.
         fn gm_create(&self, leader_guid: u64, gm_level: u8, name: String) -> Result<GuildOutcome> {
             let refused = |refusal: GuildRefusal| -> Result<GuildOutcome> {
                 Ok(GuildOutcome::Refused(refusal))
@@ -2065,8 +1844,6 @@ mod tests {
             Ok(GuildOutcome::Ran)
         }
 
-        /// The next non-`GmCreate` `guild_op` call answers this refusal, so a test can pin the
-        /// Gateway's reply mapping without reproducing the Module's own Gate in this Fake.
         fn refuse_next_op(&self, refusal: GuildRefusal) {
             *self.refuse_next.lock().unwrap() = Some(refusal);
         }
@@ -2151,10 +1928,6 @@ mod tests {
             if let Some(error) = self.op_error {
                 return Err(error());
             }
-            // Every op but GmCreate is a Module Gate this Fake does not reproduce (proved by the
-            // Module's own unit and durable tests instead): it answers the outcome a test scripts
-            // through `refuse_next_op`, defaulting to `Ran`, so a seam test proves only the wire
-            // mapping between a `GuildOutcome` and the client reply.
             if !matches!(request, GuildRequest::GmCreate { .. }) {
                 if let Some(refusal) = self.refuse_next.lock().unwrap().take() {
                     return Ok(GuildOutcome::Refused(refusal));
@@ -2238,7 +2011,6 @@ mod tests {
         }
     }
 
-    /// The fee answers the seam maps to result codes. `guild_fee`'s own tests drive the protocol.
     impl GuildFeeStore for InMemoryGuildActions {
         fn guild_fee_held(&self, _actor: Actor) -> Result<Option<guild_fee::FeeHold>> {
             Ok(None)
@@ -2321,7 +2093,6 @@ mod tests {
         ReducerCallError::transport_lost("realm_guild_op").into()
     }
 
-    /// Another World Shard cannot vouch for a Character's absence.
     fn presence_unknown() -> anyhow::Error {
         presence::PresenceUnknown(anyhow::anyhow!(
             "World Shard instances has no healthy Coordinator subscription"
@@ -2329,7 +2100,6 @@ mod tests {
         .into()
     }
 
-    /// A Module rejection whose tag this Gateway does not know.
     fn unknown_refusal() -> anyhow::Error {
         ReducerCallError::refused("realm_guild_op", "mystery").into()
     }
@@ -2500,8 +2270,6 @@ mod tests {
         assert!(store.ops.lock().unwrap().is_empty());
     }
 
-    /// A creature has a live entity and no Character row. Without the row there are no facts, so
-    /// `.guild create` with a creature selected falls back to the actor.
     #[test]
     fn a_live_entity_without_a_character_row_has_no_facts() {
         let facts = character_facts(None, || panic!("no row, so no presence read")).unwrap();
@@ -2674,7 +2442,6 @@ mod tests {
     fn founded_with_members() -> InMemoryGuildActions {
         let mut store = realm();
         store.characters[2].online = false;
-        // A day and a half ago: 1.5 * 86_400_000_000 micros.
         store.characters[2].last_logout_micros = now_micros() - 129_600_000_000;
         run_guild_dot_command(&store, &in_world(GM), ".guild create \"Knights\"").unwrap();
         store.add_member(1, BOB, 3, "bob note");
@@ -2964,7 +2731,6 @@ mod tests {
         }
     }
 
-    /// Bob leads Knights; Carol is a member at rank 3.
     fn led_by_bob(
         hold_refusal: Option<GuildRefusal>,
         fee_refusal: Option<GuildRefusal>,
@@ -3049,10 +2815,6 @@ mod tests {
         }
     }
 
-    // Membership: invite, accept, decline, leave, remove, promote, demote, pass leadership,
-    // disband. The Module's own unit and durable tests prove the Gate arithmetic; these seam
-    // tests script an outcome through `refuse_next_op` and prove only the wire mapping.
-
     const DAVE: u64 = 5_090_004;
 
     fn horde_facts(guid: u64, name: &str) -> CharacterFacts {
@@ -3062,8 +2824,6 @@ mod tests {
         }
     }
 
-    /// `InMemoryGuildActions::add_member` snapshots every member's name as `Snapshot<guid>`
-    /// regardless of its note; by-name ops must type that snapshot, not the Character's real name.
     fn snapshot_name(guid: u64) -> String {
         format!("Snapshot{guid}")
     }
@@ -4068,7 +3828,6 @@ mod tests {
         };
         assert_eq!(response.name, "Knights");
 
-        // Bob is rank 3 (Member), without VIEWOFFNOTE.
         let ServerOpcodeMessage::SMSG_GUILD_ROSTER(bob_roster) =
             snapshot.roster_for_rank(3).expect("a roster")
         else {
@@ -4079,7 +3838,6 @@ mod tests {
             "Bob's rank cannot view officer notes"
         );
 
-        // The Guild Leader is rank 0, which holds every right.
         let ServerOpcodeMessage::SMSG_GUILD_ROSTER(leader_roster) =
             snapshot.roster_for_rank(0).expect("a roster")
         else {
@@ -4113,9 +3871,6 @@ mod tests {
         assert!(snapshot.roster_for_rank(0).is_none());
     }
 
-    // Petitions: the Guild Charter list, purchase, signature window, query, rename, offer, sign,
-    // decline and turn-in. The Module's own tests prove the Gates; these prove each reply.
-
     const PETITIONER: u64 = 5_090_020;
     const CHARTER: u64 = 0x4000_0000_0000_0101;
     const HORDE_TEAM: u32 = 67;
@@ -4130,7 +3885,6 @@ mod tests {
         }
     }
 
-    /// Bob owns Petition 42 and holds its Guild Charter.
     fn bobs_petition() -> InMemoryGuildActions {
         InMemoryGuildActions {
             petitions: vec![night_watch(BOB)],
@@ -4494,7 +4248,6 @@ mod tests {
             )
         );
 
-        // `cm:PetitionsHandler.cpp:480-484`: (INVITE, name, 0x05).
         store.refuse_next_op(GuildRefusal::AlreadyInvited);
         let ServerOpcodeMessage::SMSG_GUILD_COMMAND_RESULT(result) =
             only_message(offer(&store, CAROL))
@@ -4584,7 +4337,6 @@ mod tests {
                 GuildCommandResult::AlreadyInGuildS
             )
         );
-        // `cm:PetitionsHandler.cpp:365-369`: (INVITE, own name, 0x05).
         store.refuse_next_op(GuildRefusal::AlreadyInvited);
         let ServerOpcodeMessage::SMSG_GUILD_COMMAND_RESULT(result) =
             only_message(sign(&store, CAROL))

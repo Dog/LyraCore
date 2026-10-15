@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`SocialStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::social::ContactRefusal;
 use spacetimedb_sdk::Table;
@@ -11,8 +9,6 @@ use crate::stdb::{classify, DurableFailure};
 use crate::world::{Actor, ContactOutcome, SocialStore};
 
 impl SocialStore for Coordinator {
-    /// This Shard's durable Character row for `guid`: identity plus the session flag. `None` if
-    /// this Shard holds no `game_character` row for it.
     fn character_identity(
         &self,
         guid: u64,
@@ -36,9 +32,6 @@ impl SocialStore for Coordinator {
             }))
     }
 
-    /// This Shard's live `game_world_entity` row for `guid`, if any — the Member Stats columns
-    /// [`crate::codec::MemberEntity`] carries, joined with nothing else: level and zone come
-    /// straight off the entity, current unlike the durable row.
     fn live_entity(&self, guid: u64) -> Option<crate::codec::MemberEntity> {
         let guard = self.0.coord();
         let entity = guard.conn.db.game_world_entity().guid().find(&guid)?;
@@ -54,15 +47,10 @@ impl SocialStore for Coordinator {
             y: entity.y,
             dead: entity.dead,
             player_flags: entity.player_flags,
-            // Member Stats' own aura/pet overlay (`Coordinator::with_member_shard_stats`) fills
-            // these afterward, keyed by the `ShardId` this generic, guid-only read cannot carry.
             ..Default::default()
         })
     }
 
-    /// Does this Shard show `guid` between two places: its own Character row reading online with
-    /// no live entity here, or a Transfer Intent naming a session-less bot mid-crossing? The
-    /// Transfer Intent table is bounded by the Module's writer Gate, so the scan is short.
     fn character_in_transit(&self, guid: u64) -> bool {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -78,8 +66,6 @@ impl SocialStore for Coordinator {
                 .any(|intent| intent.bot_guid == guid)
     }
 
-    /// The stored Auto-Reply for `guid` on this Shard: one primary-key read of the private
-    /// `game_character_away` cache.
     fn auto_reply_text(&self, guid: u64) -> Result<Option<String>> {
         Ok(self
             .0
@@ -97,11 +83,6 @@ impl SocialStore for Coordinator {
         Ok(())
     }
 
-    /// Every in-world player Character on this Shard, for `CMSG_WHO → SMSG_WHO`
-    /// (`presence::in_world_characters`'s per-Shard input, replacing the former `online_players`).
-    /// Iterates `game_world_entity` for entries with `entry == 0` (player entities; creatures have a
-    /// non-zero entry), then joins each against `game_character`. The coordinator bypasses RLS so it
-    /// sees every player's entity regardless of the caller's scope.
     fn in_world_players(&self) -> Result<Vec<crate::world::presence::RealmPresence>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -109,7 +90,7 @@ impl SocialStore for Coordinator {
         let rows = db
             .game_world_entity()
             .iter()
-            .filter(|e| e.entry == 0) // players have entry == 0; creatures have a template entry
+            .filter(|e| e.entry == 0)
             .filter_map(|e| {
                 let ch = db.game_character().guid().find(&e.guid)?;
                 let away = crate::world::presence::away_from_player_flags(e.player_flags);
@@ -125,7 +106,6 @@ impl SocialStore for Coordinator {
                     y: e.y,
                     dead: e.dead,
                     player_flags: e.player_flags,
-                    // `/who` does not read auras or a pet, so this bulk scan never fills them.
                     ..Default::default()
                 };
                 Some(crate::world::presence::RealmPresence {
@@ -147,8 +127,6 @@ impl SocialStore for Coordinator {
         Ok(rows)
     }
 
-    /// `game_area.name` for `zone_id`, `/who`'s search-string match against a zone name — a static
-    /// catalogue, subscribed unconditionally. Empty when the catalogue holds no row for it.
     fn zone_name(&self, zone_id: u32) -> String {
         self.0
             .coord()
@@ -161,15 +139,6 @@ impl SocialStore for Coordinator {
             .unwrap_or_default()
     }
 
-    /// `owner_guid`'s friend guids and ignore guids for `CMSG_FRIEND_LIST`, per
-    /// [`crate::world::SocialStore::contact_lists`]. `owner_guid` is always the CALLING
-    /// World Session's own guid, which is always live and registered right now, so this reads the
-    /// guids off its Gateway-side `Viewer` — the friend and ignore sets `world_view`'s contact
-    /// Relay already keeps current — instead of scanning `game_character_contact`. `None` Viewer
-    /// (should not happen for this caller) degrades to two empty lists rather than erroring.
-    /// Presence composition (online/team/Away Status) lives over the Store seam in
-    /// `world::social::friend_views`, not here, so a Store Fake exercises the same code a
-    /// Coordinator does.
     fn contact_lists(&self, owner_guid: u64) -> Result<(Vec<u64>, Vec<u64>)> {
         let Some(viewer) = self
             .world_view()
@@ -180,22 +149,12 @@ impl SocialStore for Coordinator {
         Ok((viewer.friend_guids(), viewer.ignored_guids()))
     }
 
-    /// `owner_guid`'s ignore guids from this Shard's [`ContactIndex`], realm-wide safe for ANY
-    /// owner, per [`crate::world::SocialStore::ignored_guids`]. Unlike `contact_lists`,
-    /// `owner_guid` here is a Character this Gateway process may never have a `Viewer` for at all (a
-    /// whisper sender or a guild-invite target is usually a PEER, not the connected session), so
-    /// this cannot route through one.
     fn ignored_guids(&self, owner_guid: u64) -> Result<Vec<u64>> {
         let guard = self.0.coord();
         let contacts = guard.contacts.read().unwrap_or_else(|p| p.into_inner());
         Ok(contacts.ignored_by(owner_guid))
     }
 
-    /// Resolve a typed name to a Character guid on this Shard, ASCII case-insensitive like the
-    /// Module's own `helpers::character_by_name`, from the Shard's [`CharacterNameIndex`]. `None`
-    /// if no Character here has that name. Every realm-wide name lookup (whisper, party and guild
-    /// invites, contacts, channel moderation) reaches this through `presence::resolve_by_name` or
-    /// `presence::resolve_all_by_name`.
     fn character_guid_by_name(&self, name: &str) -> Result<Option<u64>> {
         let guard = self.0.coord();
         let names = guard
@@ -205,8 +164,6 @@ impl SocialStore for Coordinator {
         Ok(names.guid_named(name))
     }
 
-    /// `CMSG_ADD_FRIEND` — `target_guid` is already resolved by the gateway. `target_race` is the
-    /// target's Speaker Fact, read realm-wide (`presence::of`): the Module's Enemy Gate needs it.
     fn add_friend(
         &self,
         actor: Actor,
@@ -228,7 +185,6 @@ impl SocialStore for Coordinator {
         ))
     }
 
-    /// `CMSG_ADD_IGNORE` — `target_guid` is already resolved by the gateway.
     fn add_ignore(&self, actor: Actor, target_guid: u64) -> Result<ContactOutcome> {
         contact_outcome(call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -246,8 +202,6 @@ impl SocialStore for Coordinator {
     }
 }
 
-/// The friends and ignore lists' Refusal decoder: a tagged Refusal is an outcome the client
-/// renders, and an untagged one or a Transport Loss stays `Err`.
 fn contact_outcome(result: Result<()>) -> Result<ContactOutcome> {
     let Err(error) = result else {
         return Ok(ContactOutcome::Done);

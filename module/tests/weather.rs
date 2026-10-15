@@ -1,10 +1,3 @@
-//! Durable weather behaviour against a real SpacetimeDB standalone: the forced-weather Verb's write
-//! path and its Refusals, per-zone independence, and the roll's schedule surviving a republish.
-//!
-//! The pure decisions behind a roll (season, weighted selection, transition, intensity bounds) are
-//! unit-tested in `module/src/weather.rs`. What only a live database can show is what a row looks
-//! like afterwards, so that is all this file asserts.
-
 mod support;
 
 use std::collections::BTreeMap;
@@ -30,7 +23,6 @@ fn one_row(standalone: &Standalone, zone_id: &str) -> BTreeMap<String, String> {
     rows.into_iter().next().unwrap()
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
@@ -39,8 +31,6 @@ fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
     standalone.assert_call("claim_operator", &[]);
     standalone.assert_call("install_guid_range", &["0"]);
 
-    // The seeded climate covers Elwynn Forest and Westfall, and no zone has weather until something
-    // gives it some.
     assert_eq!(
         standalone.query_rows("SELECT * FROM game_weather").len(),
         2,
@@ -61,10 +51,6 @@ fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
         "forcing Elwynn must not give Westfall weather"
     );
 
-    // A type the client cannot render, an intensity outside the vanilla grade range, and a zone with
-    // no climate data are all Refusals — and none of them writes anything. Negative and non-finite
-    // intensities take the same Gate and are pinned by `gate_forced_weather`'s unit tests; the CLI
-    // reads a leading minus as a flag, so they cannot be sent from here.
     for (zone_id, weather_type, intensity, why) in [
         (
             ELWYNN,
@@ -101,7 +87,6 @@ fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
         );
     }
 
-    // Westfall takes its own weather without disturbing Elwynn's.
     standalone.assert_call("gw_force_zone_weather", &[WESTFALL, SNOW, "0.25"]);
     assert_eq!(one_row(&standalone, WESTFALL)["weather_type"], SNOW);
     assert_eq!(
@@ -110,7 +95,6 @@ fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
         "Westfall's weather must not reach Elwynn's row"
     );
 
-    // Forcing the same zone again replaces its row in place rather than adding a second one.
     standalone.assert_call("gw_force_zone_weather", &[ELWYNN, FINE, "0.0"]);
     let cleared = one_row(&standalone, ELWYNN);
     assert_eq!(cleared["weather_type"], FINE);
@@ -120,7 +104,6 @@ fn forced_weather_is_per_zone_and_a_refusal_leaves_every_row_unchanged() {
     );
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_weather_roll_and_its_climate_survive_a_republish() {
@@ -138,8 +121,6 @@ fn the_weather_roll_and_its_climate_survive_a_republish() {
         "init arms exactly one weather roll"
     );
 
-    // A republish auto-migrates and does NOT re-run `init`, so the repair pass is what restores the
-    // schedule and the climate rows on an already-migrated database.
     standalone.publish_module();
     standalone.assert_call("debug_repair_after_publish", &[]);
 
@@ -161,7 +142,6 @@ fn the_weather_roll_and_its_climate_survive_a_republish() {
         "a zone keeps the weather it had across a republish"
     );
 
-    // A second repair pass is a no-op, which is what makes it safe to run after every publish.
     standalone.assert_call("debug_repair_after_publish", &[]);
     assert_eq!(
         standalone

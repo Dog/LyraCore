@@ -1,7 +1,3 @@
-//! Membership lifecycle: invite, accept, decline, leave, remove, promote, demote, pass leadership
-//! and disband. The Gates and their order are cmangos-classic's (`cm:GuildHandler.cpp`); the cores
-//! here are what [`super::realm_guild_op`] dispatches to.
-
 use lyracore_shared::guild::{event_kind, has_right, rights, GuildRefusal, LEADER_RANK};
 use spacetimedb::{table, ReducerContext, Table, Timestamp};
 
@@ -10,12 +6,8 @@ use super::{
     GuildAcceptRequest, GuildInviteRequest,
 };
 
-/// The Guild Rank id `SetLeader` gives the old Guild Leader: the default Officer rank (`cm:Guild.h:37`).
 const OFFICER_RANK: u32 = 1;
 
-/// A pending offer for one Character to join one Guild. At most one per target: a repeated invite
-/// to the same target is a Refusal, never a replacement. Reaped on `INVITE_TTL_MICROS`
-/// (`module/src/gc.rs`), like `game_group_invite`.
 #[table(accessor = game_guild_invite, index(accessor = by_guild, btree(columns = [guild_id])))]
 pub struct GuildInvite {
     #[primary_key]
@@ -25,9 +17,6 @@ pub struct GuildInvite {
     pub created_at: Timestamp,
 }
 
-/// `Invite` (`cm:GuildHandler.cpp:66-131`): a member on `actor_guid`'s side offers `request.target_guid`
-/// a place in its Guild. An ignored actor gets a silent success and no row, matching mangos'
-/// "OK result but not send invite".
 pub(crate) fn invite(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -80,8 +69,6 @@ pub(crate) fn invite(
     Ok(())
 }
 
-/// `Accept` (`cm:GuildHandler.cpp:192-211`): the actor joins the Guild that invited it, at the
-/// lowest Guild Rank. A stale, missing or cross-team invite is silent, exactly like mangos.
 pub(crate) fn accept(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -128,8 +115,6 @@ pub(crate) fn accept(
     Ok(())
 }
 
-/// `Decline` (`cm:GuildHandler.cpp:214-238`): the actor refuses its pending Guild Invite. The
-/// inviter hears about it through SMSG_GUILD_DECLINE, addressed by this Guild Event.
 pub(crate) fn decline(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -157,8 +142,6 @@ pub(crate) fn decline(
     Ok(())
 }
 
-/// Which of Leave's two outcomes a member gets, pure so the branch is unit-testable without a
-/// `ReducerContext`. Mirrors `cm:GuildHandler.cpp:383-404`.
 #[derive(Debug, PartialEq, Eq)]
 enum LeaveOutcome {
     Disband,
@@ -173,8 +156,6 @@ fn leave_outcome(is_leader: bool, member_count: usize) -> Result<LeaveOutcome, G
     }
 }
 
-/// `Leave` (`cm:GuildHandler.cpp:383-404`): an ordinary member departs; a lone Guild Leader
-/// disbands the Guild instead. A Guild Leader with company must pass leadership first.
 pub(crate) fn leave(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GuildRefusal> {
     let actor = member(ctx, actor_guid).ok_or(GuildRefusal::NotInGuild)?;
     let guild = ctx
@@ -211,8 +192,6 @@ pub(crate) fn leave(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GuildRe
     Ok(())
 }
 
-/// Remove's rank Gate (`cm:GuildHandler.cpp:146-177`): the Guild Leader cannot be removed, and the
-/// actor can only remove someone below its own Guild Rank.
 fn remove_gate(actor_rank: u32, target_rank: u32) -> Result<(), GuildRefusal> {
     if target_rank == LEADER_RANK {
         return Err(GuildRefusal::LeaderCannotLeave);
@@ -223,7 +202,6 @@ fn remove_gate(actor_rank: u32, target_rank: u32) -> Result<(), GuildRefusal> {
     Ok(())
 }
 
-/// `Remove` (`cm:GuildHandler.cpp:136-190`): the actor expels `target_guid` from its own Guild.
 pub(crate) fn remove(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -254,8 +232,6 @@ pub(crate) fn remove(
     Ok(())
 }
 
-/// Promote's rank Gate (`cm:GuildHandler.cpp:279-311`): the actor can only promote to a Guild Rank
-/// below its own plus one. Answers the Guild Rank the promotion lands on.
 fn promote_target_rank(
     actor_rank: u32,
     target_rank: u32,
@@ -270,8 +246,6 @@ fn promote_target_rank(
     Ok(target_rank - 1)
 }
 
-/// `Promote` (`cm:GuildHandler.cpp:269-320`): `target_guid` moves one Guild Rank up (its rank id
-/// decreases by one).
 pub(crate) fn promote(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -301,8 +275,6 @@ pub(crate) fn promote(
     Ok(())
 }
 
-/// Demote's rank Gate (`cm:GuildHandler.cpp:332-372`): the actor can only demote someone below its
-/// own Guild Rank, and never past the Guild's lowest. Answers the Guild Rank the demotion lands on.
 fn demote_target_rank(
     actor_rank: u32,
     target_rank: u32,
@@ -321,8 +293,6 @@ fn demote_target_rank(
     Ok(target_rank + 1)
 }
 
-/// `Demote` (`cm:GuildHandler.cpp:322-380`): `target_guid` moves one Guild Rank down (its rank id
-/// increases by one).
 pub(crate) fn demote(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -358,9 +328,6 @@ pub(crate) fn demote(
     Ok(())
 }
 
-/// `SetLeader` (`cm:GuildHandler.cpp:441-486`): the Guild Leader passes leadership to `target_guid`.
-/// Naming itself is a no-op: mangos' own code demotes the leader to Officer here through a shared
-/// path (`cm:GuildHandler.cpp:482-483`), which this Gate declines to reproduce.
 pub(crate) fn set_leader(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -407,7 +374,6 @@ pub(crate) fn set_leader(
     Ok(())
 }
 
-/// `Disband` (`cm:GuildHandler.cpp:424-435`): the Guild Leader dissolves its own Guild.
 pub(crate) fn disband(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GuildRefusal> {
     let actor = member(ctx, actor_guid).ok_or(GuildRefusal::NotInGuild)?;
     let guild = ctx
@@ -423,9 +389,7 @@ pub(crate) fn disband(ctx: &ReducerContext, actor_guid: u64) -> Result<(), Guild
     Ok(())
 }
 
-/// The mechanics both `Disband` and a lone Guild Leader's `Leave` share (`cm:Guild.cpp:695-711`).
-/// DISBANDED goes out addressed, one row per member, before any row is deleted: the generic
-/// broadcast reads membership when its relay job runs, which is too late once the members are gone.
+// Address DISBANDED before deletion; the later broadcast Relay cannot read deleted membership.
 pub(super) fn disband_guild(ctx: &ReducerContext, guild_id: u32) {
     let member_guids: Vec<u64> = ctx
         .db
@@ -471,8 +435,6 @@ pub(super) fn disband_guild(ctx: &ReducerContext, guild_id: u32) {
     ctx.db.game_guild().guild_id().delete(guild_id);
 }
 
-/// The name of one Guild Rank, empty for an unknown rank (`cm:Guild.cpp:660-666`'s rule, read for
-/// names rather than rights).
 fn rank_name(ctx: &ReducerContext, guild_id: u32, rank_id: u32) -> String {
     ctx.db
         .game_guild_rank()

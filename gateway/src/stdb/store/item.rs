@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`ItemActionStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::item::ItemRefusal;
 
@@ -9,8 +7,6 @@ use crate::stdb::Coordinator;
 use crate::world::{Actor, ItemActionResult, ItemActionStore};
 
 impl ItemActionStore for Coordinator {
-    /// Equip the item in main-inventory `from_slot` (`CMSG_AUTOEQUIP_ITEM`) over the coordinator
-    /// connection. The module resolves the matching equipment slot and gates the required level.
     fn equip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(
@@ -20,8 +16,6 @@ impl ItemActionStore for Coordinator {
         ))
     }
 
-    /// Unequip the item in equipment `from_slot` to a free backpack slot (`CMSG_AUTOSTORE_BAG_ITEM`)
-    /// over the coordinator connection. The module gates "is equipped" + "backpack has room".
     fn unequip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(
@@ -31,8 +25,6 @@ impl ItemActionStore for Coordinator {
         ))
     }
 
-    /// Move (or swap) main-inventory `from_slot` → `to_slot` (`CMSG_SWAP_INV_ITEM`/`CMSG_SWAP_ITEM`)
-    /// over the coordinator connection. The module's move primitive validates equip-slot transitions.
     fn move_item(&self, actor: Actor, from_slot: u8, to_slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(
@@ -42,9 +34,6 @@ impl ItemActionStore for Coordinator {
         ))
     }
 
-    /// Use the consumable in main-inventory `slot` (`CMSG_USE_ITEM`) over the coordinator connection —
-    /// eat/drink/potion/bandage. The module applies the on-use effect (flat heal for slice food) and
-    /// decrements the stack; a gameplay `Err` (no item / not usable) is per-action.
     fn use_item(&self, actor: Actor, slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(
@@ -79,8 +68,6 @@ impl ItemActionStore for Coordinator {
     }
 }
 
-/// The Module's typed item Refusal, on the same rule as the auction family: only a reducer the
-/// Module rejected carries a tag, so a timeout or transport failure keeps its unknown outcome.
 fn item_action(result: Result<()>) -> Result<ItemActionResult> {
     match result {
         Ok(()) => Ok(ItemActionResult::Done),

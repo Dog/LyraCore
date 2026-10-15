@@ -1,5 +1,3 @@
-//! Compare the Module schema with generated bindings for every Coordinator subscription.
-//! See `docs/binding-schema-parity.md` for the comparison and its platform scope.
 #![cfg(target_os = "linux")]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -7,21 +5,10 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 use spacetimedb_lib::db::raw_def::v9::RawModuleDefV9Builder;
 use spacetimedb_lib::{AlgebraicType, ProductType, SpacetimeType, SumType};
 
-// ---------------------------------------------------------------------------------------------
-// Sentinel: builds ONE real, validly-typed instance of a binding struct so we can read its real
-// field types back (via `&inst.field`) and its real field order back (via its derived `Debug`).
-// ---------------------------------------------------------------------------------------------
-
 trait Sentinel: Sized {
     fn sentinel() -> Self;
 }
 
-/// One concrete-type impl per primitive actually used across the subscribed tables' bindings.
-/// (NOT a `impl<T: Default> Sentinel for T` blanket: rustc's coherence check treats a foreign
-/// type's `Default`-ness as subject to change in a future upstream release, so a blanket-over-
-/// `Default` plus a concrete override for `spacetimedb_lib::Timestamp` — which does NOT derive
-/// `Default` today — is rejected as a potential future conflict (E0119) even though there's no
-/// ACTUAL overlap right now. Enumerating concrete types sidesteps that.)
 macro_rules! sentinel_via_default {
     ($($t:ty),+ $(,)?) => {
         $(impl Sentinel for $t {
@@ -49,7 +36,6 @@ sentinel_via_default!(
     spacetimedb_lib::Identity,
 );
 
-/// `Timestamp` is the one field type in play that does NOT derive `Default` — special-cased.
 impl Sentinel for spacetimedb_lib::Timestamp {
     fn sentinel() -> Self {
         spacetimedb_lib::Timestamp::UNIX_EPOCH
@@ -62,7 +48,6 @@ impl Sentinel for spacetimedb_lib::ScheduleAt {
     }
 }
 
-/// Containers can construct an empty sentinel without constructing their contents.
 impl<T: Sentinel> Sentinel for Option<T> {
     fn sentinel() -> Self {
         None
@@ -74,7 +59,6 @@ impl<T: Sentinel> Sentinel for Vec<T> {
     }
 }
 
-/// Derive a schema from the binding field's real type and value.
 trait BindingFieldShape {
     fn binding_field_shape(&self, ts: &mut RawModuleDefV9Builder) -> AlgebraicType;
 }
@@ -322,17 +306,6 @@ fn field_shape<T: BindingFieldShape>(value: &T, ts: &mut RawModuleDefV9Builder) 
     value.binding_field_shape(ts)
 }
 
-/// Extract the top-level `field_name:` identifiers from a derived `Debug` output of the shape
-/// `StructName { field1: v1, field2: v2, .. }`, ignoring any `word:`-shaped text that belongs to
-/// a NESTED derived `Debug` one level down (e.g. `Timestamp`'s own single field prints the same
-/// `name: value` way inside its own `{ .. }`). Brace/paren/bracket-depth aware; only records
-/// identifiers seen at depth 1 (directly inside the outermost struct's braces).
-///
-/// Not string-literal aware: a Sentinel value whose Debug output embeds
-/// `word: ` inside a quoted string would inject a spurious identifier here. Every current sentinel
-/// is empty/zero/None so this cannot fire today, and an injection would surface as a LOUD
-/// order-mismatch failure, not a silent pass; keep Sentinel impls free of colon/comma-bearing
-/// string values (or teach this parser about `"` first).
 fn top_level_debug_fields(debug: &str) -> Vec<String> {
     let open = debug
         .find('{')
@@ -361,7 +334,6 @@ fn top_level_debug_fields(debug: &str) -> Vec<String> {
                 while j < chars.len() && chars[j] == ' ' {
                     j += 1;
                 }
-                // A field is `ident:` but not `ident::` (no nested paths appear at this depth).
                 if chars.get(j) == Some(&':') && chars.get(j + 1) != Some(&':') {
                     names.push(ident);
                 }
@@ -372,24 +344,15 @@ fn top_level_debug_fields(debug: &str) -> Vec<String> {
     names
 }
 
-/// The binding side's manifest-derived shape for one table, built by the `binding_shape!` macro.
 struct BindingShape {
     field_names: Vec<&'static str>,
     field_shapes: Vec<AlgebraicType>,
     debug_order: Vec<String>,
 }
 
-/// Builds a `BindingShape` for `$Ty { field, field, .. }` — the field list is written ONCE (no
-/// types, no values); `Sentinel::sentinel()` infers each field's real type from the real struct
-/// literal, and `field_shape(&inst.field, ..)` reads that same real type back via `SpacetimeType`.
 macro_rules! binding_shape {
     ($Ty:path, { $($f:ident),+ $(,)? }) => {{
-        // A `path` fragment substituted directly as `$Ty { .. }` hits the classic macro_rules
-        // "found `{`, expected an operator" parse error (an interpolated path is inserted as an
-        // opaque already-parsed node, and Rust's grammar can't then extend it into a struct
-        // literal). Binding it to a fresh local type alias first sidesteps that: `__BindingTy`
-        // below is a plain identifier, not a substituted fragment, so `__BindingTy { .. }` parses
-        // as an ordinary struct literal.
+        // A path fragment is opaque in macro_rules; use an alias before constructing the struct.
         type __BindingTy = $Ty;
         let inst = __BindingTy { $( $f: Sentinel::sentinel() ),+ };
         let debug_order = top_level_debug_fields(&format!("{inst:?}"));
@@ -400,19 +363,6 @@ macro_rules! binding_shape {
     }};
 }
 
-/// Compares one table's module `AlgebraicType` (real, auto-derived) against the binding manifest
-/// (real field types, believed order) for field COUNT, NAME-per-index, and TYPE-per-index.
-///
-/// `renames` is the escape hatch ("where the sdk renames, the manifest line takes
-/// an explicit rename list"): `(module_field_name, binding_field_name)` pairs for fields where the
-/// `spacetime` codegen normalizes the Rust IDENTIFIER (this is a cosmetic/tooling difference, not
-/// a schema drift — BSATN row decode is positional, not name-keyed, so a renamed-but-same-
-/// position-and-type field cannot break live decode). As of this test, real (not synthetic)
-/// instances of this: module's `data0`/`data1` (`GameObjectTemplate`) and `p0`/`p1` (`SpellEffect`)
-/// come out of the `spacetime generate` (CLI 2.6.1) codegen as `data_0`/`data_1`/`p_0`/`p_1` —
-/// the generator inserts `_` before a bare trailing digit that doesn't already have one (compare
-/// `spellid_1` on `ItemTemplate`, which module already spells with the underscore and which the
-/// binding leaves untouched).
 fn check<M: SpacetimeType>(table: &str, binding: BindingShape, renames: &[(&str, &str)]) {
     assert_eq!(
         binding.debug_order, binding.field_names,
@@ -475,9 +425,6 @@ fn check<M: SpacetimeType>(table: &str, binding: BindingShape, renames: &[(&str,
             .map(|(_, b)| *b)
             .unwrap_or(m_name);
         if expected_b_name != m_name {
-            // A rename entry may ONLY paper over the SDK's cosmetic trailing-digit underscore
-            // normalization (data0 -> data_0). Without this guard, a PAIR of same-typed swapped
-            // fields could hide behind two compensating bogus renames.
             assert_eq!(
                 expected_b_name.replace('_', ""),
                 m_name.replace('_', ""),
@@ -499,9 +446,6 @@ fn check<M: SpacetimeType>(table: &str, binding: BindingShape, renames: &[(&str,
     }
 }
 
-/// `#[test] fn <name>() { check::<Module>(table, binding_shape!(Binding { .. })); }` — one
-/// manifest entry per gateway-SUBSCRIBED table, each its own `#[test]` so one table's drift
-/// doesn't mask another's in a single `cargo test` run.
 macro_rules! parity_test {
     ($name:ident, $table:literal, $ModuleTy:ty, $BindingTy:path, { $($f:ident),+ $(,)? }) => {
         #[test]
@@ -520,12 +464,6 @@ macro_rules! parity_test {
         }
     };
 }
-
-// ---------------------------------------------------------------------------------------------
-// The manifest: one line per gateway-SUBSCRIBED table (`stdb/connection.rs`'s coordinator
-// subscription list). `MANIFEST_TABLES` below MUST list the same table names — the completeness
-// guard cross-checks the two.
-// ---------------------------------------------------------------------------------------------
 
 parity_test!(parity_game_realm, "game_realm", lyracore_module::Realm, bindings::realm_type::Realm, {
     id, name, address, realm_type, flags, population, timezone,
@@ -571,9 +509,6 @@ parity_test!(parity_game_map_region, "game_map_region", lyracore_module::MapRegi
 parity_test!(parity_game_region_assignment, "game_region_assignment", lyracore_module::RegionAssignment, bindings::region_assignment_type::RegionAssignment, {
     key, map_id, region_id, shard, epoch, updated_micros,
 });
-// Party state, authoritative on realm-core and mirrored onto each world shard.
-// `game_group_event` earns its entry twice over — it is the one table with an
-// END-appended `recipient_guid`, and the gateway decodes it on two different connections.
 parity_test!(parity_game_group, "game_group", lyracore_module::Group, bindings::group_type::Group, {
     group_id, leader_guid, loot_method, loot_threshold, rr_cursor, master_looter_guid, group_type,
 });
@@ -587,7 +522,6 @@ parity_test!(parity_game_group_member_partition, "game_group_member_partition", 
     character_guid, group_id, membership_revision, member_active, map_id, instance_id,
     locator_revision, state,
 });
-// Guild state, authoritative on Realm-core.
 parity_test!(parity_game_guild, "game_guild", lyracore_module::guild::Guild, bindings::guild_type::Guild, {
     guild_id, name_key, name, leader_guid, team, motd, info, emblem_style, emblem_color,
     border_style, border_color, background_color, created_micros,
@@ -602,7 +536,6 @@ parity_test!(parity_game_guild_member, "game_guild_member", lyracore_module::gui
 parity_test!(parity_game_guild_event, "game_guild_event", lyracore_module::guild::GuildEvent, bindings::guild_event_type::GuildEvent, {
     id, guild_id, recipient_guid, kind, subject_guid, other_guid, strings, created_at,
 });
-// The Fee Hold on the payer's Home Shard and the fee decision on Realm-core.
 parity_test!(parity_game_guild_fee_hold, "game_guild_fee_hold", lyracore_module::guild::fee::GuildFeeHold, bindings::guild_fee_hold_type::GuildFeeHold, {
     payer_guid, operation_id, kind, copper, npc_guid, emblem_style, emblem_color, border_style,
     border_color, background_color, charter_item_guid, charter_name, created_micros,
@@ -610,7 +543,6 @@ parity_test!(parity_game_guild_fee_hold, "game_guild_fee_hold", lyracore_module:
 parity_test!(parity_game_guild_fee_decision, "game_guild_fee_decision", lyracore_module::guild::fee::GuildFeeDecision, bindings::guild_fee_decision_type::GuildFeeDecision, {
     operation_id, payer_guid, kind, accepted, refusal, petition_id, decided_micros,
 });
-// Petitions and their Signatures on Realm-core.
 parity_test!(parity_game_guild_petition, "game_guild_petition", lyracore_module::guild::petition::GuildPetition, bindings::guild_petition_type::GuildPetition, {
     petition_id, charter_item_guid, owner_guid, owner_name, team, name, created_micros,
 });
@@ -632,8 +564,6 @@ parity_test!(parity_game_corpse_loot_eligible, "game_corpse_loot_eligible", lyra
 parity_test!(parity_game_group_event, "game_group_event", lyracore_module::GroupEvent, bindings::group_event_type::GroupEvent, {
     id, recipient_identity, kind, other_guid, other_name, created_at, payload, recipient_guid,
 });
-// The private per-recipient trade-status relay — the `game_group_event` shape minus the
-// name/payload columns (no trade status carries either).
 parity_test!(parity_game_trade_event, "game_trade_event", lyracore_module::TradeEvent, bindings::trade_event_type::TradeEvent, {
     id, recipient_identity, kind, other_guid, created_at, recipient_guid, payload,
 });
@@ -642,14 +572,9 @@ parity_test!(parity_game_duel_event, "game_duel_event", lyracore_module::DuelEve
     initiator_guid, challenged_guid, winner_guid, loser_guid, map_id, instance_id, flag_x, flag_y,
     flag_z, flag_orientation, created_at, winner_name, loser_name,
 });
-// A bot's serendipity invite DECISION, picked up by the coordinator's
-// `world::party::run_bot_invite` relay (`stdb/subscriptions.rs`) — not a client-facing table, but
-// the gateway decodes it off the wire the same as everything else here.
 parity_test!(parity_game_bot_invite_intent, "game_bot_invite_intent", lyracore_module::BotInviteIntent, bindings::bot_invite_intent_type::BotInviteIntent, {
     id, inviter_guid, target_guid, created_at, op,
 });
-// A session-less character's Shard crossing, picked up by the coordinator's
-// `world::transfer::run_bot_transfer` relay — the transfer twin of the row above.
 parity_test!(parity_game_bot_transfer_intent, "game_bot_transfer_intent", lyracore_module::BotTransferIntent, bindings::bot_transfer_intent_type::BotTransferIntent, {
     id, bot_guid, destination_map, destination_instance, reason, created_at,
     controller_generation, claim_token, claim_until_micros, arrival_ready, source_module_identity,
@@ -666,21 +591,16 @@ parity_test!(parity_game_party_command_dispatch_lane, "game_party_command_dispat
 parity_test!(parity_game_party_command_receipt, "game_party_command_receipt", lyracore_module::PartyCommandReceipt, bindings::party_command_receipt_type::PartyCommandReceipt, {
     id, receipt_key, source_identity, intent_id, bot_guid, outcome, retain_until_micros,
 });
-// Auto-Replies on each Home Shard. A drifted column here hands a whisperer the wrong text.
 parity_test!(parity_game_character_away, "game_character_away", lyracore_module::CharacterAway, bindings::character_away_type::CharacterAway, {
     character_guid, kind, message,
 });
 parity_test!(parity_game_system_message_event, "game_system_message_event", lyracore_module::SystemMessageEvent, bindings::system_message_event_type::SystemMessageEvent, {
     id, recipient_identity, recipient_guid, message, created_at,
 });
-// Realm Chat Lines, written on Realm-core with their whole audience. A drifted column here
-// mis-decodes every party line on every Gateway.
 parity_test!(parity_game_realm_chat_event, "game_realm_chat_event", lyracore_module::RealmChatEvent, bindings::realm_chat_event_type::RealmChatEvent, {
     id, kind, speaker_guid, language, chat_tag, channel_name, message, recipients, ignorable,
     created_at,
 });
-// Chat Channels on Realm-core. The index reads channels and members; a drifted notice column
-// mis-encodes every Channel Notice on every Gateway.
 parity_test!(parity_game_chat_channel, "game_chat_channel", lyracore_module::ChatChannel, bindings::chat_channel_type::ChatChannel, {
     channel_id, team, name_key, name, builtin_id, flags, password, owner_guid, announcements,
     moderated,
@@ -695,18 +615,12 @@ parity_test!(parity_game_chat_channel_notice_event, "game_chat_channel_notice_ev
     id, notice, channel_name, subject_guid, actor_guid, old_flags, new_flags, channel_flags, text,
     recipients, created_at,
 });
-// The Meeting Stone Queue. A drifted stone column names the wrong dungeon area; a drifted Seeker
-// column answers `CMSG_MEETINGSTONE_INFO` wrongly.
 parity_test!(parity_game_meeting_stone, "game_meeting_stone", lyracore_module::MeetingStone, bindings::meeting_stone_type::MeetingStone, {
     entry, min_level, max_level, area_id,
 });
 parity_test!(parity_game_meeting_stone_seeker, "game_meeting_stone_seeker", lyracore_module::MeetingStoneSeeker, bindings::meeting_stone_seeker_type::MeetingStoneSeeker, {
     character_guid, area_id, team, class, group_id, queued_at,
 });
-// Private (no per-player subscriber to decode these — every wire-visible roll transition still
-// rides `game_group_event`, unchanged). Subscribed so the gateway's loot-roll relay
-// (`world::loot::relay_tick`) can promote a world shard's staging roll onto realm-core and read
-// realm-core's votes back — a drifted column here breaks that relay silently, not a client packet.
 parity_test!(parity_game_loot_roll, "game_loot_roll", lyracore_module::LootRoll, bindings::loot_roll_type::LootRoll, {
     id, corpse_guid, slot, item_entry, deadline_micros, resolved,
     random_property_id, promotion_source,
@@ -714,9 +628,6 @@ parity_test!(parity_game_loot_roll, "game_loot_roll", lyracore_module::LootRoll,
 parity_test!(parity_game_loot_roll_vote, "game_loot_roll_vote", lyracore_module::LootRollVote, bindings::loot_roll_vote_type::LootRollVote, {
     id, roll_id, voter_guid, voted, vote, rolled,
 });
-// The guid-range trio. `game_guid_allocator` + `game_guid_range` are subscribed on EVERY
-// deployment (a database without a range refuses to create characters), the registry only when
-// sharded. Drift here is silent and expensive: a mis-decoded `base` would install the wrong range.
 parity_test!(parity_game_guid_allocator, "game_guid_allocator", lyracore_module::GuidAllocator, bindings::guid_allocator_type::GuidAllocator, {
     id, high_water,
 });
@@ -749,8 +660,6 @@ parity_test!(parity_game_world_entity, "game_world_entity", lyracore_module::Wor
     bank_bag_slots, mount_display_id, zone_id, sheet_ranged_ap, sheet_ranged_dmg_min,
     sheet_ranged_dmg_max,
 });
-// The live sky, one row per zone. Gateway-subscribed: world entry and zone entry read it, and its
-// updates are the weather relay.
 parity_test!(parity_game_zone_weather, "game_zone_weather", lyracore_module::ZoneWeather, bindings::zone_weather_type::ZoneWeather, {
     zone_id, weather_type, intensity, changed_at_micros,
 });
@@ -758,11 +667,6 @@ parity_test!(parity_game_hunter_pet_protocol, "game_hunter_pet_protocol", lyraco
     pet_id, owner_guid, live_pet_guid, creature_entry, name, name_timestamp, level, pet_xp,
     next_level_xp, happiness, loyalty_level,
 });
-// `game_config` became gateway-subscribed so the startup instance-hosting check can read
-// `hosts_instances` back instead of guessing. The generated binding was STALE when that subscription
-// landed — a later change END-appended `hosts_instances` to the module table and
-// `server_config_type.rs` had never been regenerated, so this manifest line is the guard that made
-// the drift a red test.
 parity_test!(parity_game_config, "game_config", lyracore_module::ServerConfig, bindings::server_config_type::ServerConfig, {
     id, xp_rate, nav_enabled, hosts_instances, bots_idle, vmap_enabled, nav_coverage_enabled,
 });
@@ -829,8 +733,7 @@ parity_test!(parity_game_spell_effect, "game_spell_effect", lyracore_module::Spe
     radius_yd, chain_targets, trigger_spell, effect_mechanic, p_0, p_0_kind, p_1, script_id,
     enters_combat,
 }, renames: {
-    // spacetime generate (CLI 2.6.1) inserts `_` before a bare trailing digit; module's own
-    // field names (p0/p0_kind/p1) don't have it. Cosmetic — BSATN decode is positional.
+    // CLI 2.6.1 inserts underscores before trailing digits; BSATN decodes fields positionally.
     p0 => p_0, p0_kind => p_0_kind, p1 => p_1,
 });
 parity_test!(parity_game_item_instance, "game_item_instance", lyracore_module::ItemInstance, bindings::item_instance_type::ItemInstance, {
@@ -909,9 +812,6 @@ parity_test!(parity_game_player_action, "game_player_action", lyracore_module::P
 parity_test!(parity_game_trainer_spell, "game_trainer_spell", lyracore_module::TrainerSpell, bindings::trainer_spell_type::TrainerSpell, {
     id, trainer_entry, spell_id, cost, required_level, learn_skill_line, learn_skill_cap,
 });
-// The SOURCE-side escrow row. The only module->gateway data flow the cross-database transfer
-// adds, and the one binding in this tree that was hand-authored rather than generated — so this
-// parity check is doing more work here than anywhere else in the file.
 parity_test!(parity_game_transfer_out, "game_transfer_out", lyracore_module::TransferOut, bindings::transfer_out_type::TransferOut, {
     transfer_id, character_guid, dest_map_id, dest_instance_id, dest_x, dest_y, dest_z, dest_o,
     blob, created_micros, cross_database,
@@ -927,9 +827,6 @@ parity_test!(parity_game_instance, "game_instance", lyracore_module::GameInstanc
 parity_test!(parity_game_spell_chain, "game_spell_chain", lyracore_module::SpellChain, bindings::spell_chain_type::SpellChain, {
     spell_id, prev_spell, first_spell, rank, req_spell,
 });
-// Generated even though the gateway does not currently subscribe to or read it. The binding was
-// stale once and therefore earns an explicit regression guard outside the subscribed-table
-// manifest below; recreating the old two-field binding must make this test fail to compile.
 parity_test!(parity_game_spell_group_rule, "game_spell_group_rule", lyracore_module::SpellGroupRule, bindings::spell_group_rule_type::SpellGroupRule, {
     group_id, rule, rank_is_comparable,
 });
@@ -940,10 +837,6 @@ parity_test!(parity_game_gameobject, "game_gameobject", lyracore_module::GameObj
     guid, template_entry, map_id, x, y, z, orientation, state, created_at, respawn_at_micros,
     instance_id, grid_x, grid_y, cell, rotation_0, rotation_1, rotation_2, rotation_3,
 });
-// The AOI-index fix pinned these two when they still rode the per-player AOI box; the
-// shared-connection model moved them onto the coordinator's `SELECT *` list, so they are now in
-// `MANIFEST_TABLES` like every other coordinator-subscribed table and the completeness guard asks
-// for them by itself.
 parity_test!(parity_game_entity_motion, "game_entity_motion", lyracore_module::EntityMotion, bindings::entity_motion_type::EntityMotion, {
     guid, map_id, instance_id, grid_x, grid_y, opcode, movement_info, seq, cell,
 });
@@ -959,7 +852,6 @@ parity_test!(parity_game_gameobject_template, "game_gameobject_template", lyraco
     entry, type_id, display_id, name, data_0, data_1, gather_skill_line, respawn_secs,
     gather_gray, lock_id, size,
 }, renames: {
-    // Same `spacetime generate` (CLI 2.6.1) trailing-digit normalization as SpellEffect above.
     data0 => data_0, data1 => data_1,
 });
 parity_test!(parity_game_talent, "game_talent", lyracore_module::Talent, bindings::talent_type::Talent, {
@@ -1089,9 +981,6 @@ parity_test!(parity_game_faction_template, "game_faction_template", lyracore_mod
 parity_test!(parity_game_encounter_equip, "game_encounter_equip", lyracore_module::EncounterEquip, bindings::encounter_equip_type::EncounterEquip, {
     creature_guid, instance_id, main_hand, off_hand, ranged,
 });
-// The per-player connections subscribe these two for the say/yell + emote relays, so they stay in
-// the manifest for the same reason every coordinator table is — a column added module-side without
-// the matching binding edit corrupts every row the relay decodes.
 parity_test!(parity_game_chat_event, "game_chat_event", lyracore_module::ChatEvent, bindings::chat_event_type::ChatEvent, {
     id, sender_guid, chat_type, language, message, created_at, target_guid,
 });
@@ -1100,12 +989,8 @@ parity_test!(parity_game_emote_event, "game_emote_event", lyracore_module::Emote
     grid_x, grid_y,
 });
 
-/// Every table name that has a `parity_test!` line above. The completeness guard cross-checks
-/// this against the Coordinator reads and registered Protocol Family Relay declarations.
 const MANIFEST_TABLES: &[&str] = &[
     "game_realm",
-    // Shared-connection model: moved from the per-player AOI box onto the coordinator's global
-    // subscription.
     "game_entity_motion",
     "game_creature_spline",
     "game_taxi_passenger_spline",
@@ -1247,16 +1132,9 @@ const MANIFEST_TABLES: &[&str] = &[
     "game_area",
 ];
 
-// ---------------------------------------------------------------------------------------------
-// Completeness guard: a new coordinator subscription without a parity manifest line must fail
-// loudly (catches the FORGOTTEN pair, not just a mistyped one).
-// ---------------------------------------------------------------------------------------------
-
 const CONNECTION_RS: &str = include_str!("../src/stdb/connection.rs");
 const RELAYS_RS: &str = include_str!("../src/stdb/relays.rs");
 
-/// Only executable string literals in the Coordinator query function count. Comments and tests
-/// cannot make an unsubscribed table appear covered.
 fn extract_select_star_tables(source: &str) -> Vec<String> {
     use syn::visit::Visit;
     struct Queries(Vec<String>);

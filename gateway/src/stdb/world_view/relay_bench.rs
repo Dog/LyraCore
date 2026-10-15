@@ -1,11 +1,3 @@
-//! Relay scaling measurement using a synthetic realm in memory, without sockets or a database.
-//!
-//! Run with `cargo test -p lyracore-gateway --release relay_scaling -- --ignored --nocapture`.
-//! It prints one row per population size: the pump cost of a burst of combat, cast and impact
-//! events, the writer-side cost of draining every job those enqueued, the aura relay's audience
-//! and array-sync cost, and the yell audience. Ignored by default because it is a measurement,
-//! not a check.
-
 use super::*;
 use crate::codec::combat::subscriptions::{
     aura_audience, cast_event_appeared, combat_event_appeared, impact_appeared,
@@ -101,8 +93,6 @@ fn aura(id: u64, target_guid: u64, eff_kind: u8) -> Aura {
     }
 }
 
-/// Build Characters, four creatures per Character, and the selected cell and aura density.
-/// Seed each viewer's created set from its visible cells before dispatching events.
 fn build(players: usize, rng: &mut Rng, workload: Workload) -> SyntheticRealm {
     let side = match workload {
         Workload::Dense => 1,
@@ -276,7 +266,6 @@ impl SyntheticRealm {
         }
     }
 
-    /// Run every queued job on every writer queue: `(jobs run, packets produced)`.
     fn drain(&self) -> (usize, usize) {
         let (mut jobs, mut packets) = (0, 0);
         for rx in &self.queues {
@@ -321,8 +310,6 @@ fn micros_per(total: Duration, count: usize) -> f64 {
     total.as_secs_f64() * 1e6 / count as f64
 }
 
-/// The aura relay, event by event: audience selection on the pump, then the per-recipient job
-/// gate and the aura array sync each surviving job builds.
 fn aura_burst(realm: &SyntheticRealm, rng: &mut Rng) -> (Duration, usize, Duration, usize) {
     let mut audience = Duration::ZERO;
     let mut sync = Duration::ZERO;

@@ -1,5 +1,3 @@
-//! Closed DOOR and BUTTON collision, scoped to one map and instance.
-
 use crate::gameobject::{game_gameobject, game_gameobject_template, GameObject};
 use crate::go_model::game_go_model;
 use lyracore_shared::vmap::{decode, segment_tri_hit, supports_walking};
@@ -18,7 +16,6 @@ pub struct GoCollider {
     pub radius_world: f32,
 }
 
-/// Replace derived registration from the current spawn and model. Open doors remain registered.
 pub(crate) fn register(ctx: &ReducerContext, go: &GameObject) {
     remove(ctx, go.guid);
     let Some(template) = ctx
@@ -35,8 +32,7 @@ pub(crate) fn register(ctx: &ReducerContext, go: &GameObject) {
     let Some(model) = ctx.db.game_go_model().entry().find(go.template_entry) else {
         return;
     };
-    // Older imports stored an AABB-centered radius without its center. Derive the origin
-    // bound from vertices so off-center meshes cannot miss the broad phase.
+    // Derive an origin bound from vertices; the imported AABB radius lacks its off-center origin.
     let Ok(tris) = decode(&model.blob) else {
         return;
     };
@@ -69,7 +65,6 @@ pub(crate) fn remove(ctx: &ReducerContext, guid: u64) {
     ctx.db.game_go_collider().go_guid().delete(guid);
 }
 
-/// Operator reconciliation covers every partition hosted by this Shard.
 #[reducer]
 pub fn rebuild_go_colliders(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -102,7 +97,6 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Conservative broad phase, including tangency and a point segment inside the sphere.
 fn overlaps_sphere(a: [f32; 3], b: [f32; 3], center: [f32; 3], radius: f32) -> bool {
     let dir = sub(b, a);
     let len_sq = dot(dir, dir);
@@ -116,7 +110,6 @@ fn overlaps_sphere(a: [f32; 3], b: [f32; 3], center: [f32; 3], radius: f32) -> b
     dot(offset, offset) <= radius * radius + 0.0001
 }
 
-/// Inverse of scale, normalized spawn quaternion and translation. Zero quaternion means yaw.
 fn local_point(
     point: [f32; 3],
     position: [f32; 3],
@@ -144,7 +137,6 @@ fn local_point(
     local.iter().all(|v| v.is_finite()).then_some(local)
 }
 
-/// Nearest world hit. Triangle class is irrelevant for state-controlled geometry.
 pub(crate) fn ray(
     ctx: &ReducerContext,
     map_id: u32,
@@ -155,7 +147,6 @@ pub(crate) fn ray(
     cast(ctx, map_id, instance_id, a, b, false)
 }
 
-/// Nearest walkable support in a vertical world probe, including rotated closed doors.
 pub(crate) fn floor_ray(
     ctx: &ReducerContext,
     map_id: u32,
@@ -288,7 +279,7 @@ mod tests {
 
     #[test]
     fn stored_quaternion_overrides_yaw_and_rotates_out_of_the_horizontal_plane() {
-        let q = [1.0, 0.0, 0.0, 1.0]; // Normalizes to a quarter turn about X.
+        let q = [1.0, 0.0, 0.0, 1.0];
         near(
             local_point([2.0, -6.0, 4.0], [0.0; 3], q, 2.0, 2.0).unwrap(),
             [1.0, 2.0, 3.0],

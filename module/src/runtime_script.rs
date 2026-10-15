@@ -1,4 +1,4 @@
-//! Runtime Script Host. See `docs/runtime-script-host.md` for the contract and rationale.
+//! Before changing Runtime Script execution, read docs/runtime-script-host.md.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,57 +12,25 @@ use piccolo::{
     MetaMethod, StashedClosure, Table, UserData, Value,
 };
 
-/// Fuel handed to one `Executor::step`. The interpreter checks its budget between operations, so a
-/// step can overshoot slightly. The Host refuses the Invocation if that overshoot crosses the total
-/// budget.
+// Piccolo may overshoot one step; enforce the total Fuel Budget after each step.
 const FUEL_PER_STEP: i32 = 64;
 
-/// Metered interpreter work one Invocation may perform before it is cut off as a fuel failure.
-///
-/// Sized by measurement, not by guess. `REPRESENTATIVE_SCRIPT` — the transpiler-shaped workload of
-/// list building, a higher-order function, string work and a host call that this host exists to
-/// run — costs 2,054 fuel over 30 steps, so the budget is roughly a hundred of those. Fifty times
-/// its list still costs only 96,442. At the other end, a bare `while true do end` reaches this
-/// number in under a millisecond of interpreter time, which keeps a runaway script off the 0.5s
-/// tick.
 const FUEL_BUDGET_PER_INVOCATION: i32 = 200_000;
 
-/// Hard cap on `Executor::step` calls per invocation.
-///
-/// The fuel budget is the real limit: a working script spends about 68 fuel per step, so the
-/// budget above runs out around 3,000 steps and this cap never fires. It exists for the step that
-/// returns having burned NO fuel, which would otherwise loop here forever with the budget
-/// untouched.
+// Bound zero-fuel steps too, or an Invocation could loop without spending its Fuel Budget.
 const MAX_STEPS_PER_INVOCATION: usize = 20_000;
 
-/// Hard cap, in bytes, on the script-authored text recorded in a [`ScriptDiagnostic`]. A failing
-/// script controls its own error message, so this is the only unbounded part of a diagnostic; the
-/// script name and event are host-supplied labels.
 const DIAGNOSTIC_MESSAGE_CAP: usize = 512;
 
-/// Maximum bytes retained for each host-supplied diagnostic label.
 const DIAGNOSTIC_LABEL_CAP: usize = 128;
 
 const TRUNCATION_MARK: &str = "…[truncated]";
 
-/// Largest amount any host operation accepts. Far above any authored heal or experience award, so a
-/// bigger number is a script defect rather than a design; refusing it reads as a Script Diagnostic
-/// instead of disappearing into a clamp against max health.
 const MAX_EFFECT_AMOUNT: i64 = 1_000_000;
 
-/// Most Staged Effects one Invocation may hold. The Fuel Budget meters interpreter work, not
-/// durable writes, and a tight loop around a host call buys thousands of them inside the budget.
-/// This is the bound on what one script can ask a single reducer transaction to perform. Crossing
-/// it fails the Invocation, so a script cannot half-commit its way past the cap either.
+// Fuel meters interpreter work; this separate cap bounds staged durable effects.
 const MAX_STAGED_EFFECTS_PER_INVOCATION: usize = 256;
 
-/// The exact global names an Invocation receives from piccolo's core library.
-///
-/// Deliberately absent: `collectgarbage` (interpreter state, not gameplay), `coroutine` (an
-/// Invocation is one straight run under one Fuel Budget, so a suspended thread has nothing to
-/// resume into), and `_G` (globals-as-state does not survive an Invocation, so handing a script a
-/// mirror of its environment only invites the idiom that cannot work). `print` never arrives
-/// because the Host builds on `Lua::core()`, which loads no I/O library.
 const ALLOWED_GLOBALS: &[&str] = &[
     "assert",
     "error",
@@ -79,15 +47,6 @@ const ALLOWED_GLOBALS: &[&str] = &[
     "type",
 ];
 
-/// The allowlisted members of each standard-library table, by library name.
-///
-/// Each library is rebuilt from these names into a table made for the Invocation, so a member this
-/// list omits is nil and a write to one of these tables is invisible to the next Invocation.
-///
-/// `math.random` and `math.randomseed` are omitted: the Module's `getrandom` backend is a fixed
-/// stream on purpose (see [`fixed_entropy`]), so `math.random` returns the same sequence on every
-/// replica and every replay. Durable randomness comes from `ReducerContext::rng` on the Module
-/// side of a host operation, never from the interpreter.
 const ALLOWED_LIBRARY_MEMBERS: &[(&str, &[&str])] = &[
     (
         "math",
@@ -120,20 +79,9 @@ const ALLOWED_LIBRARY_MEMBERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("string", &["len", "lower", "reverse", "sub", "upper"]),
-    // `concat` is the shim's, loaded into the shared globals at Host construction.
     ("table", &["concat", "pack", "unpack"]),
 ];
 
-/// piccolo's stdlib subset omits `table.concat`, which transpiler output uses constantly. Loaded
-/// once into the shared globals at host construction, in the form the Runtime Script Prototype
-/// proved.
-///
-/// Two parameters and a type guard, both deliberate: pinned piccolo passes an inline table
-/// constructor's ELEMENT COUNT as an extra argument, so `table.concat({"a", "b"})` arrives here as
-/// `("a", "b" table, 2)`. A two-parameter function drops that extra value, and the guard catches
-/// the one-argument case where the count lands in `separator`. See
-/// `piccolo_leaks_a_table_constructors_element_count_as_an_extra_argument`. The `i`/`j` range
-/// arguments are left out for the same reason — with the leak they cannot be told from real ones.
 const PICCOLO_SHIM: &str = r#"
 table.concat = function(list, separator)
     if type(separator) ~= "string" then separator = "" end
@@ -146,14 +94,10 @@ table.concat = function(list, separator)
 end
 "#;
 
-/// Why an invocation was abandoned. Every one of these discards the invocation's staged effects.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FailureKind {
-    /// The source did not compile.
     Syntax,
-    /// The script raised an error while running.
     Runtime,
-    /// The script ran past its fuel budget or its step cap.
     Fuel,
 }
 
@@ -167,8 +111,6 @@ impl FailureKind {
     }
 }
 
-/// The bounded record of one failed invocation. Names the script, the event it was running for,
-/// and what kind of failure it was, so an Operator can act on it without interpreter internals.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ScriptDiagnostic {
     pub script: String,
@@ -201,8 +143,6 @@ impl std::fmt::Display for ScriptDiagnostic {
     }
 }
 
-/// Cuts `text` down to `cap` bytes including the truncation mark, on a char boundary so the result
-/// remains valid UTF-8.
 fn bounded(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_string();
@@ -216,12 +156,6 @@ fn bounded(text: &str, cap: usize) -> String {
     out
 }
 
-/// A gameplay operation a Runtime Script asked for. Held, not performed, until the invocation
-/// that staged it succeeds.
-///
-/// Every guid here was resolved by the Host from an Entity Handle. A Runtime Script never supplies
-/// one, so a staged effect can only name an entity the Host already put in front of that
-/// Invocation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum StagedEffect {
     GrantXp {
@@ -239,13 +173,10 @@ pub(crate) enum StagedEffect {
     },
 }
 
-/// Everything one SUCCESSFUL invocation staged, in the order the script staged it. A failed
-/// invocation never produces one of these, so there is no "commit a failed run" state to get wrong.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct StagedEffects(Vec<StagedEffect>);
 
 impl StagedEffects {
-    /// Apply every staged effect through core gameplay operations, in staging order.
     pub(crate) fn commit<S: EffectSink>(self, sink: &mut S) {
         for effect in self.0 {
             match effect {
@@ -267,30 +198,18 @@ impl StagedEffects {
     }
 }
 
-/// What one SUCCESSFUL Invocation produced: everything it staged, and the number it returned.
-///
-/// A failed Invocation produces a [`ScriptDiagnostic`] instead, so there is no "commit a failed
-/// run" state and no answer from a script that did not finish.
 #[derive(Debug)]
 pub(crate) struct Invocation {
-    /// The gameplay operations the script asked for, in staging order.
     pub effects: StagedEffects,
-    /// The **Script Answer**: the number the chunk returned, when it returned one.
-    // ponytail: a number is every answer a caller has needed so far. Widen to a small enum when one
-    // needs a string or a table back.
     pub answer: Option<f64>,
 }
 
-/// The seam staged effects commit through: the real database in the Module, a Fake in tests.
 pub(crate) trait EffectSink {
     fn grant_xp(&mut self, character_guid: u64, amount: u32);
     fn heal(&mut self, healer_guid: u64, target_guid: u64, amount: u32);
     fn send_chat(&mut self, recipient_guid: u64, message: &str);
 }
 
-/// The curated read of one creature or player, taken before the Invocation ran. A Runtime Script
-/// reads these fields off an Entity Handle and can act on the entity through a host operation, but
-/// never learns its guid and never reaches a row.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct EntityView {
     pub guid: u64,
@@ -305,11 +224,6 @@ pub(crate) struct EntityView {
     pub z: f32,
 }
 
-/// What one Invocation is running for: the event label and the entities it involves.
-///
-/// `actor` caused the event, `target` is what it acted on. Either can be absent — an event with no
-/// target leaves `event.target` nil, which is the defined result a script tests for rather than a
-/// failure it has to survive.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub(crate) struct ScriptEvent {
     pub name: String,
@@ -318,7 +232,6 @@ pub(crate) struct ScriptEvent {
     pub payload: ScriptPayload,
 }
 
-/// Payload fields captured at the core hook, before an Invocation reads the entity snapshot.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub(crate) struct ScriptPayload {
     pub character: bool,
@@ -332,31 +245,20 @@ pub(crate) enum ScriptScalar {
     Text(String),
 }
 
-/// What an Entity Handle carries: the identity the Host acts on, and nothing a script can read.
-///
-/// It lives inside a Lua userdata, which a Runtime Script can pass around but cannot construct,
-/// inspect, or forge — so the Host can trust that every handle reaching a host operation is one it
-/// minted. The handle lasts exactly as long as the Invocation, because the environment holding it
-/// is built fresh for that Invocation and nothing carries to the next one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct EntityHandle {
     guid: u64,
     is_player: bool,
 }
 
-/// One Runtime Script as the host sees it: a name for diagnostics and the Lua to run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RuntimeScript<'a> {
     pub name: &'a str,
     pub source: &'a str,
 }
 
-/// The embedded interpreter plus its compiler cache. Long-lived; holds no Lua state that a
-/// Runtime Script can reach from one invocation to the next.
 pub(crate) struct RuntimeScriptHost {
     lua: Lua,
-    /// Compiled chunks keyed by the blake3 hash of their source. Hashing the source means an
-    /// edited script can never hit a stale entry, so the cache needs no invalidation.
     chunks: HashMap<[u8; 32], StashedClosure>,
     compilations: usize,
 }
@@ -364,9 +266,6 @@ pub(crate) struct RuntimeScriptHost {
 impl RuntimeScriptHost {
     pub(crate) fn new() -> Self {
         let mut lua = Lua::core();
-        // The shim is a compile-time constant against a pinned piccolo. A failure here is a build
-        // defect, not a runtime condition; `the_shim_supplies_the_table_concat_piccolo_lacks`
-        // catches it long before a publish.
         let shim = lua
             .try_enter(|ctx| {
                 let closure =
@@ -383,43 +282,15 @@ impl RuntimeScriptHost {
         }
     }
 
-    /// How many chunks this host has compiled since it was built. A cache hit does not raise it,
-    /// which is how "valid Lua compiles once and runs many times" is observable.
-    ///
-    /// An observation point, not a gameplay path: the tests read it, and so does
-    /// `debug_run_runtime_script` so an Operator can watch the cache work on a live realm. Neither
-    /// is compiled into a default release build, which is what the allow says.
     #[cfg_attr(not(feature = "debug_reducers"), allow(dead_code))]
     pub(crate) fn compilations(&self) -> usize {
         self.compilations
     }
 
-    /// Drop every compiled chunk.
-    ///
-    /// The cache is keyed by a hash of the source, so it can never serve stale code and needs no
-    /// invalidation for CORRECTNESS. What it lacks is a reason to ever shrink: without this, every
-    /// script source the Module has seen since the wasm instance started stays compiled in it
-    /// forever, including the ones no Package ships any more.
-    ///
-    /// So there is one eviction point and it is the honest one: a `script` family apply, which is
-    /// the only thing that changes which sources exist. Called from there, the cache holds the
-    /// scripts the Shard is actually running, plus whatever `debug_run_runtime_script` has tried
-    /// since. Nothing durable is lost — a chunk is derived from source and recompiles on demand.
     pub(crate) fn clear_chunks(&mut self) {
         self.chunks.clear();
     }
 
-    /// Run `script` for `event` in a fresh environment under a fuel budget.
-    ///
-    /// On success, returns everything the script staged and the Script Answer it returned — nothing
-    /// has touched the world yet. On any failure, returns a bounded diagnostic and both the staged
-    /// effects and the answer are dropped unread.
-    ///
-    /// Piccolo exposes the caller's generated-Lua line while a Host callback is running, which is
-    /// why `error`, `assert`, and Host Verb diagnostics carry one. Native VM failures reach this
-    /// boundary only after Piccolo has unwound those frames, and an unfinished fuel step exposes no
-    /// frame. Their diagnostics therefore retain the Runtime Script, Event Binding, failure kind,
-    /// and interpreter message, but cannot reliably name a line with Piccolo 0.3.3.
     pub(crate) fn invoke(
         &mut self,
         script: RuntimeScript<'_>,
@@ -432,9 +303,7 @@ impl RuntimeScriptHost {
         let executor = self.lua.enter(|ctx| {
             let env = fresh_environment(ctx, event, staging_handle);
             let closure = ctx.fetch(&chunk);
-            // Rebinding the cached chunk's `_ENV` upvalue is what makes the compiler cache a
-            // CODE cache: the compiled prototype is reused, the environment it closes over is not.
-            // A chunk that never reads or writes a global has no upvalue and needs no rebinding.
+            // Rebind _ENV for every Invocation so cached code cannot retain script-authored state.
             if let Some(env_upvalue) = closure.upvalues().first() {
                 env_upvalue.set(&ctx, UpValueState::Closed(Value::Table(env)));
             }
@@ -478,14 +347,13 @@ impl RuntimeScriptHost {
             }
         }
 
-        let outcome = self.lua.enter(|ctx| {
-            match ctx.fetch(&executor).take_result::<Value>(ctx) {
+        let outcome = self
+            .lua
+            .enter(|ctx| match ctx.fetch(&executor).take_result::<Value>(ctx) {
                 Ok(Ok(returned)) => Ok(script_answer(returned)),
                 Ok(Err(error)) => Err(error.to_string()),
-                // Unreachable: the loop only leaves through `finished`, which means Result mode.
                 Err(mode) => Err(mode.to_string()),
-            }
-        });
+            });
         let answer = match outcome {
             Ok(answer) => answer,
             Err(message) => {
@@ -498,7 +366,6 @@ impl RuntimeScriptHost {
             }
         };
 
-        // The script is gone; nothing else holds the staging buffer.
         let effects = staged.borrow().clone();
         Ok(Invocation {
             effects: StagedEffects(effects),
@@ -535,11 +402,6 @@ impl RuntimeScriptHost {
     }
 }
 
-/// The Script Answer in what a chunk returned: a Lua number, and nothing else.
-///
-/// A string that reads as a number is not an answer. Lua would coerce it happily, but a script that
-/// meant to answer returns a number, so the near miss reads as "no answer" rather than as a silent
-/// conversion the author never asked for.
 fn script_answer(returned: Value<'_>) -> Option<f64> {
     match returned {
         Value::Integer(number) => Some(number as f64),
@@ -548,8 +410,6 @@ fn script_answer(returned: Value<'_>) -> Option<f64> {
     }
 }
 
-/// Build the environment one Invocation sees: the allowlisted standard library, the `event` table
-/// with its Entity Handles, and one global per host operation.
 fn fresh_environment<'gc>(
     ctx: Context<'gc>,
     event: &ScriptEvent,
@@ -567,7 +427,6 @@ fn fresh_environment<'gc>(
     env
 }
 
-/// Refuse a false value and carry the generated Lua line of the call site.
 fn located_assert_operation<'gc>(ctx: Context<'gc>) -> Callback<'gc> {
     Callback::from_fn(&ctx, |ctx, execution, stack| {
         if stack.get(0).to_bool() {
@@ -582,7 +441,6 @@ fn located_assert_operation<'gc>(ctx: Context<'gc>) -> Callback<'gc> {
     })
 }
 
-/// Raise a Lua error that carries the generated Lua line of the call site.
 fn located_error_operation<'gc>(ctx: Context<'gc>) -> Callback<'gc> {
     Callback::from_fn(&ctx, |ctx, execution, stack| {
         let error = Error::from(stack.get(0));
@@ -607,12 +465,6 @@ fn error_with_location<'gc>(
         .into()
 }
 
-/// The environment's standard library, rebuilt name by name from [`ALLOWED_GLOBALS`] and
-/// [`ALLOWED_LIBRARY_MEMBERS`].
-///
-/// Each library table is a new table holding the allowlisted members, so a script that writes to
-/// `string` writes to its own copy. The shared globals this reads from are never handed out, which
-/// is what keeps one Invocation's damage to itself.
 fn allowlisted_standard_library<'gc>(ctx: Context<'gc>) -> Table<'gc> {
     let core = ctx.globals();
     let env = Table::new(&ctx);
@@ -634,8 +486,6 @@ fn allowlisted_standard_library<'gc>(ctx: Context<'gc>) -> Table<'gc> {
     env
 }
 
-/// `event` as a Runtime Script reads it. A fresh table each Invocation, so a script that writes to
-/// it changes nothing the Host will ever read.
 fn event_table<'gc>(ctx: Context<'gc>, event: &ScriptEvent) -> Table<'gc> {
     let table = Table::new(&ctx);
     set(ctx, table, "name", text(ctx, &event.name));
@@ -663,8 +513,6 @@ fn event_table<'gc>(ctx: Context<'gc>, event: &ScriptEvent) -> Table<'gc> {
     table
 }
 
-/// Mint the Entity Handle for one entity: an opaque userdata carrying the identity, with a
-/// metatable serving the curated fields snapshotted from `view`.
 fn entity_handle<'gc>(ctx: Context<'gc>, view: &EntityView) -> UserData<'gc> {
     let fields = Table::new(&ctx);
     set(ctx, fields, "name", text(ctx, &view.name));
@@ -693,8 +541,6 @@ fn entity_handle<'gc>(ctx: Context<'gc>, view: &EntityView) -> UserData<'gc> {
     handle
 }
 
-/// `heal(entity, amount)`. Credits heal-threat to the Invocation's actor, the way a cast heal
-/// credits its caster; an event with no actor heals without pulling aggro for anyone.
 fn heal_operation<'gc>(
     ctx: Context<'gc>,
     actor_guid: Option<u64>,
@@ -722,8 +568,6 @@ fn heal_operation<'gc>(
     })
 }
 
-/// `send_chat(player, text)`. The text is normalized here, by the same rule the chat core applies,
-/// so what the Invocation staged is exactly what commits.
 fn send_chat_operation<'gc>(
     ctx: Context<'gc>,
     staged: &Rc<RefCell<Vec<StagedEffect>>>,
@@ -751,7 +595,6 @@ fn send_chat_operation<'gc>(
     })
 }
 
-/// `grant_xp(player, amount)`.
 fn grant_xp_operation<'gc>(
     ctx: Context<'gc>,
     staged: &Rc<RefCell<Vec<StagedEffect>>>,
@@ -777,9 +620,6 @@ fn grant_xp_operation<'gc>(
     })
 }
 
-/// Record one Staged Effect, refusing once the Invocation has reached
-/// [`MAX_STAGED_EFFECTS_PER_INVOCATION`]. The refusal fails the Invocation, which discards
-/// everything it staged — a script cannot get its first 256 effects committed by overrunning.
 fn stage<'gc>(
     ctx: Context<'gc>,
     staged: &Rc<RefCell<Vec<StagedEffect>>>,
@@ -800,7 +640,6 @@ fn stage<'gc>(
     Ok(())
 }
 
-/// Resolve one host-call argument to the Entity Handle the Host minted for it.
 fn entity_argument<'gc>(
     ctx: Context<'gc>,
     call: &str,
@@ -821,7 +660,6 @@ fn entity_argument<'gc>(
     }
 }
 
-/// The same, for the operations that only mean anything against a player.
 fn player_argument<'gc>(
     ctx: Context<'gc>,
     call: &str,
@@ -839,8 +677,6 @@ fn player_argument<'gc>(
     Ok(handle)
 }
 
-/// Resolve an amount argument. Whole numbers inside `1..=`[`MAX_EFFECT_AMOUNT`] only: zero and
-/// negatives are a script defect rather than a no-op worth performing.
 fn amount_argument<'gc>(
     ctx: Context<'gc>,
     call: &str,
@@ -863,8 +699,6 @@ fn amount_argument<'gc>(
     Ok(amount as u32)
 }
 
-/// Resolve a text argument to UTF-8. Lua strings are bytes, so a script can hand over something no
-/// durable column can hold.
 fn text_argument<'gc>(
     ctx: Context<'gc>,
     call: &str,
@@ -882,22 +716,16 @@ fn text_argument<'gc>(
         .map_err(|_| host_error(ctx, call, "the message is not valid UTF-8"))
 }
 
-/// The Lua error a misused host operation raises: the call that was misused and the fault, so the
-/// Script Diagnostic it becomes can be acted on without reading the script.
 fn host_error<'gc>(ctx: Context<'gc>, call: &str, fault: &str) -> Error<'gc> {
     text(ctx, &format!("{call}: {fault}"))
         .into_value(ctx)
         .into()
 }
 
-/// A Lua string holding `source`. piccolo converts only a `&'static str` implicitly, and most of
-/// what this module hands to a script is owned domain text.
 fn text<'gc>(ctx: Context<'gc>, source: &str) -> piccolo::String<'gc> {
     piccolo::String::from_slice(&ctx, source)
 }
 
-/// Set one key on a Lua table. Every key this module writes is a fixed name, so a failure would
-/// mean a nil or NaN key the code cannot produce.
 fn set<'gc>(ctx: Context<'gc>, table: Table<'gc>, key: &'static str, value: impl IntoValue<'gc>) {
     table
         .set(ctx, key, value)
@@ -905,29 +733,14 @@ fn set<'gc>(ctx: Context<'gc>, table: Table<'gc>, key: &'static str, value: impl
 }
 
 thread_local! {
-    /// The Module's one Runtime Script Host. The wasm instance is single-threaded, and the host
-    /// has to outlive a reducer call for its compiler cache to be worth anything. Nothing durable
-    /// lives here: the cache is derived from script source and rebuilds itself on demand.
     static HOST: RefCell<RuntimeScriptHost> = RefCell::new(RuntimeScriptHost::new());
 }
 
-/// Borrow the Module's Runtime Script Host for the length of one call.
-///
-/// `None` means the host was already borrowed — a Runtime Script reached it again through a core
-/// operation one of its own Staged Effects committed. Refusing the re-entry keeps it from
-/// panicking out of the surrounding reducer, which would take the whole tick down with it; the
-/// invocation that tried simply does not happen.
+// A borrowed Host means staged effects re-entered it; skip recursion rather than panic.
 pub(crate) fn with_host<R>(f: impl FnOnce(&mut RuntimeScriptHost) -> R) -> Option<R> {
     HOST.with(|host| host.try_borrow_mut().ok().map(|mut host| f(&mut host)))
 }
 
-/// Run every Runtime Script bound to `event`, committing the ones that succeed.
-///
-/// This is the failure boundary. A script that fails to compile, raises, or runs out of fuel
-/// contributes a diagnostic and nothing else: no effect of its own lands, and the scripts after it
-/// still run. The returned diagnostics are the caller's to log.
-///
-/// A core hook event has no caller waiting on a Script Answer, so any answer is discarded here.
 pub(crate) fn run_event<S: EffectSink>(
     host: &mut RuntimeScriptHost,
     sink: &mut S,
@@ -937,13 +750,6 @@ pub(crate) fn run_event<S: EffectSink>(
     ask_event(host, sink, event, scripts).0
 }
 
-/// [`run_event`], plus the Script Answer the scripts gave.
-///
-/// The answer is the FIRST number returned, in the order the scripts were handed over — the caller
-/// decided that order, so the answer is decided by it too. The scripts after the answering one
-/// still run: they may stage effects of their own, and a Package that wanted them not to orders
-/// them ahead of it. A script that fails contributes no answer and does not stop the next one, so a
-/// broken script leaves its caller on whatever fallback "no answer" means there.
 pub(crate) fn ask_event<S: EffectSink>(
     host: &mut RuntimeScriptHost,
     sink: &mut S,
@@ -964,18 +770,6 @@ pub(crate) fn ask_event<S: EffectSink>(
     (diagnostics, answer)
 }
 
-/// Run exactly one Runtime Script chosen by identity, for a caller that already knows which script
-/// to invoke and has no Event Binding to look up — the `E_SCRIPTED` spell effect: its `script_id`
-/// names the script outright, so there is no `by_event` dispatch to run. Mirrors what
-/// `script_binding::fire` does around [`run_event`] (one Host borrow, a succeeding invocation's
-/// effects committed to the real database, a failure logged) minus the `by_event` lookup and the
-/// priority ordering `fire` needs only when several scripts answer one event.
-///
-/// Returns whether the invocation succeeded and committed. Every failure shape collapses to
-/// `false` here — a compile/runtime/fuel failure, or the Host already being borrowed by an outer
-/// invocation — because the caller has exactly one thing to decide either way: this effect did not
-/// happen. The failure is still logged, the same `ScriptDiagnostic` line `fire` logs for its own
-/// scripts.
 pub(crate) fn invoke_by_identity(
     ctx: &spacetimedb::ReducerContext,
     script: RuntimeScript<'_>,
@@ -1005,8 +799,6 @@ pub(crate) fn invoke_by_identity(
     }
 }
 
-/// The production [`EffectSink`]: staged effects become real gameplay operations here, and only
-/// here.
 pub(crate) struct CoreEffects<'a> {
     pub ctx: &'a spacetimedb::ReducerContext,
 }
@@ -1023,13 +815,10 @@ impl EffectSink for CoreEffects<'_> {
     }
 
     fn heal(&mut self, healer_guid: u64, target_guid: u64, amount: u32) {
-        // The amount is bounded by `MAX_EFFECT_AMOUNT`, well inside `i32`.
         crate::spell::apply_direct_heal(self.ctx, healer_guid, target_guid, amount as i32);
     }
 
     fn send_chat(&mut self, recipient_guid: u64, message: &str) {
-        // The recipient was online when the Invocation read it and may not be by now. That is an
-        // ordinary outcome, not a script defect, so it does not become a Script Diagnostic.
         if let Err(reason) =
             crate::actor::system_message(self.ctx, recipient_guid, message.to_string())
         {
@@ -1039,11 +828,6 @@ impl EffectSink for CoreEffects<'_> {
 }
 
 impl EntityView {
-    /// Read the live row for `guid` as the curated view one Invocation sees.
-    ///
-    /// `None` when the guid names nothing an Invocation may act on — including a character in
-    /// transit between Shards, which the acting-entity gate already treats as out of the world.
-    /// A caller with no participant to name passes 0 and gets `None`.
     pub(crate) fn read(ctx: &spacetimedb::ReducerContext, guid: u64) -> Option<Self> {
         use crate::game_creature_template;
         let entity = crate::helpers::acting_entity_by_guid(ctx, guid)?;
@@ -1076,9 +860,6 @@ impl EntityView {
 mod tests {
     use super::*;
 
-    /// The workload this host exists to run: a transpiler-shaped chunk of list building, a higher
-    /// order function, string work through the shim, and a host call. The fuel budget is sized
-    /// against this.
     const REPRESENTATIVE_SCRIPT: &str = r#"
 local function map(list, f)
     local out = {}
@@ -1092,21 +873,12 @@ local roster = table.concat(shouted, ",")
 if #roster > 0 then grant_xp(event.actor, 25) end
 "#;
 
-    /// The SAME workload, as the pinned TypeScript toolchain actually emits it.
-    ///
-    /// `datascripts/runtime-scripts/fuel-workload.ts` is the source; `packages build` compiles
-    /// Package scripts with exactly this toolchain, and
-    /// `datascripts/tests/runtime-scripts.test.ts` recompiles the workload and refuses these bytes
-    /// if they have gone stale. So the budget is sized against real transpiler output — the
-    /// `____tbl` guard, the inlined lua library, the `self` conventions and all — not against a
-    /// hand-written impression of it.
     const GENERATED_SCRIPT: &str =
         include_str!("../../datascripts/runtime-scripts/fuel-workload.lua");
 
     const PLAYER_GUID: u64 = 7;
     const CREATURE_GUID: u64 = 9;
 
-    /// One committed gameplay operation, in the order the sink received it.
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum Committed {
         Xp {
@@ -1183,7 +955,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
         }
     }
 
-    /// An event with a label and no participants, for the tests that only care about the label.
     fn unattended(name: &str) -> ScriptEvent {
         ScriptEvent {
             name: name.to_string(),
@@ -1191,7 +962,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
         }
     }
 
-    /// The event most tests run against: a player acting on a creature.
     fn engagement() -> ScriptEvent {
         ScriptEvent {
             name: "on_login".to_string(),
@@ -1205,7 +975,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
         RuntimeScript { name, source }
     }
 
-    /// What one invocation actually puts through the sink: run it, then commit whatever it staged.
     fn committed(
         host: &mut RuntimeScriptHost,
         event: &ScriptEvent,
@@ -1217,8 +986,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
         Ok(sink.committed)
     }
 
-    /// The experience amounts one invocation granted. Several tests use `grant_xp` as the way a
-    /// script reports a number back to Rust.
     fn granted_amounts(committed: &[Committed]) -> Vec<u32> {
         committed
             .iter()
@@ -1304,10 +1071,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
     }
 
     #[test]
-    /// Piccolo gives a caller frame only to an active callback. After `Executor::step` returns,
-    /// its public API exposes no native-fault or fuel-exhaustion frame. Keep the stable context
-    /// rather than inventing a line or instrumenting generated Lua, which would move its Fuel
-    /// Budget measurement.
     fn native_vm_and_fuel_diagnostics_keep_the_stable_invocation_context() {
         let mut host = RuntimeScriptHost::new();
         for (name, source, kind) in [
@@ -1369,10 +1132,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
         assert!(diagnostic.event.ends_with(TRUNCATION_MARK));
     }
 
-    // ---- the allowlisted environment ----
-
-    /// The whole surface an Invocation gets, pinned. A name arriving here that this list does not
-    /// carry is a widening of the host API, which is a decision rather than an accident.
     #[test]
     fn an_invocation_receives_exactly_the_allowlisted_surface() {
         let mut host = RuntimeScriptHost::new();
@@ -1485,8 +1244,6 @@ if #roster > 0 then grant_xp(event.actor, 25) end
             [xp(PLAYER_GUID, 1)]
         );
     }
-
-    // ---- the event and its Entity Handles ----
 
     #[test]
     fn compiled_typescript_login_handler_sends_chat_through_its_event_parameter() {
@@ -1723,8 +1480,6 @@ welcome(event)
         );
     }
 
-    /// The point of an Entity Handle: a script can act on the entity without ever learning which
-    /// row it is.
     #[test]
     fn an_entity_handle_exposes_no_identifier_and_no_row() {
         let mut host = RuntimeScriptHost::new();
@@ -1764,8 +1519,6 @@ welcome(event)
             [xp(PLAYER_GUID, 5)]
         );
     }
-
-    // ---- host operations ----
 
     #[test]
     fn a_staged_heal_commits_against_the_target_and_credits_the_actor() {
@@ -1850,9 +1603,6 @@ welcome(event)
         );
     }
 
-    // ---- misuse is a Script Diagnostic, never a panic ----
-
-    /// Every one of these is a script defect the Host has to name rather than absorb.
     #[test]
     fn a_misused_host_operation_names_the_call_and_the_fault() {
         let mut host = RuntimeScriptHost::new();
@@ -2032,10 +1782,6 @@ welcome(event)
         );
     }
 
-    // ---- the Script Answer ----
-
-    /// The rule a Package Event rests on: the FIRST number wins, later scripts still run, and a
-    /// failure contributes no answer and stops nothing.
     #[test]
     fn the_first_script_to_return_a_number_answers_and_the_rest_still_run() {
         let mut host = RuntimeScriptHost::new();
@@ -2068,8 +1814,6 @@ welcome(event)
         );
     }
 
-    /// A script that fails contributes no answer, whatever it returned before it failed, and the
-    /// next script may still answer.
     #[test]
     fn a_failing_script_answers_nothing_and_the_next_one_still_can() {
         let mut host = RuntimeScriptHost::new();
@@ -2089,8 +1833,6 @@ welcome(event)
         assert_eq!(diagnostics.len(), 1);
     }
 
-    /// Nothing but a number is an answer. A string, a boolean, a table and a bare `return` all mean
-    /// the same thing to a caller: this script did not decide, so keep the fallback.
     #[test]
     fn a_return_that_is_not_a_number_answers_nothing() {
         let mut host = RuntimeScriptHost::new();
@@ -2116,8 +1858,6 @@ welcome(event)
         }
     }
 
-    /// A float answers as itself, and a Lua integer answers as the same number — a caller reads one
-    /// kind of answer, never two.
     #[test]
     fn an_integer_and_a_float_both_answer_as_one_number() {
         let mut host = RuntimeScriptHost::new();
@@ -2139,8 +1879,6 @@ welcome(event)
         }
     }
 
-    /// Nothing bound is the common case for a Package Event nobody scripted: no answer, and the
-    /// caller keeps its fallback.
     #[test]
     fn an_event_with_no_scripts_answers_nothing() {
         let mut host = RuntimeScriptHost::new();
@@ -2152,20 +1890,10 @@ welcome(event)
         assert_eq!(answer, None);
     }
 
-    /// A defect in the pinned interpreter, recorded so it cannot change unnoticed: piccolo 0.3.3 passes
-    /// an inline table constructor's element count as an extra argument, so `f({7, 8, 9})` reaches
-    /// a three-parameter `f` as `f(table, 3, nil)` instead of `f(table, nil, nil)`. Passing the
-    /// same table through a local is correct, so it is the call site, not the callee.
-    ///
-    /// It reproduces in the Runtime Script Prototype, untouched by this Host. `x = x or default`
-    /// is the commonest idiom in Lua and in transpiler output, so anything generating Lua for this
-    /// Host has to know. When this test starts failing, the interpreter has fixed it. Drop the type
-    /// guard in `PICCOLO_SHIM` at the same time.
     #[test]
     fn piccolo_leaks_a_table_constructors_element_count_as_an_extra_argument() {
         let mut host = RuntimeScriptHost::new();
         let event = engagement();
-        // `b` should be nil in every one of these. It is the element count instead.
         for (source, leaked_count) in [
             ("grant_xp(event.actor, seen({}) + 1)", 1),
             ("grant_xp(event.actor, seen({7}) + 1)", 2),
@@ -2180,8 +1908,6 @@ welcome(event)
                 [leaked_count]
             );
         }
-        // The same table through a local is passed correctly, which is what makes it a call-site
-        // defect rather than a calling-convention one.
         assert_eq!(
             granted_amounts(
                 &committed(
@@ -2198,14 +1924,10 @@ welcome(event)
         );
     }
 
-    /// The two facts `datascripts/runtime-scripts/lua-emit.cjs` rewrites generated Lua against.
-    /// If either stops holding, that rewrite is either unnecessary or no longer sufficient, and the
-    /// Package build has to be revisited before the next Runtime Script ships.
     #[test]
     fn only_a_trailing_table_constructor_leaks_and_a_one_parameter_passthrough_stops_it() {
         let mut host = RuntimeScriptHost::new();
         let event = engagement();
-        // 1 when the second parameter arrived nil, which is what a correct call gives.
         let preamble = "local function seen(a, b) if b == nil then return 1 end return 2 end\n";
         for (shape, source) in [
             (
@@ -2225,8 +1947,6 @@ welcome(event)
                 "{shape} must not leak"
             );
         }
-        // Parentheses do NOT stop it: the leak is in how the call site counts its arguments, not
-        // in adjusting a multiple-value expression, so the obvious one-token fix is not one.
         assert_eq!(
             granted_amounts(
                 &committed(
@@ -2251,7 +1971,6 @@ welcome(event)
                 8,
                 "ab-cd-ef",
             ),
-            // No separator: the leaked element count must not be joined in as one.
             (
                 "grant_xp(event.actor, #table.concat({\"ab\", \"cd\"}))",
                 4,
@@ -2279,17 +1998,11 @@ welcome(event)
         let event = engagement();
         host.invoke(script("representative", REPRESENTATIVE_SCRIPT), &event)
             .expect("the workload the budget is sized against must fit");
-        // Fifty times the list, still inside the budget: the headroom is real, not marginal.
         let heavier = REPRESENTATIVE_SCRIPT.replace("1, 20 do", "1, 1000 do");
         host.invoke(script("heavier", &heavier), &event)
             .expect("fifty times the representative workload must still fit");
     }
 
-    /// Real transpiler output runs on this Host, answers its caller, and fits the Fuel Budget.
-    ///
-    /// The three claims are one test on purpose: a chunk that compiles but cannot reach a Host Verb
-    /// is not evidence that the toolchain works, and a chunk that works but does not fit the budget
-    /// is not evidence that the budget is sized for one.
     #[test]
     fn the_generated_representative_script_runs_answers_and_fits_the_fuel_budget() {
         let mut host = RuntimeScriptHost::new();
@@ -2299,18 +2012,12 @@ welcome(event)
             .invoke(script("fire_nova.generated", GENERATED_SCRIPT), &event)
             .expect("generated Lua must run inside the Fuel Budget");
 
-        // "UNIT1".."UNIT20" joined by 19 commas is 130 characters. The chunk's own answer proves
-        // the lua library, the string work and the join all ran, not just the Host Verb.
         assert_eq!(invocation.answer, Some(130.0));
         let mut sink = FakeEffects::default();
         invocation.effects.commit(&mut sink);
         assert_eq!(granted_amounts(&sink.committed), [25]);
     }
 
-    /// A diagnostic's line number is a line of the GENERATED Lua — the bytes `game_script.source`
-    /// holds and an Operator can read — never a line of the TypeScript it came from. There is no
-    /// source map, and a number that pointed into a file no Shard holds would be worse than none.
-    ///
     #[test]
     fn a_syntax_failure_names_a_line_of_the_generated_lua_not_of_its_typescript() {
         let mut host = RuntimeScriptHost::new();
@@ -2333,8 +2040,6 @@ welcome(event)
             generated_lines + 1,
             diagnostic.message
         );
-        // The lua library prologue and the guard put the generated Lua well past the length of the
-        // TypeScript, so this number could not be a source-mapped one.
         assert!(generated_lines > 25);
     }
 
@@ -2367,9 +2072,6 @@ welcome(event)
         }
     }
 
-    /// A Runtime Script that reaches the host again through an effect it staged must be refused,
-    /// not panic the reducer it is running inside. Event bindings make that reachable; the guard
-    /// is here so it is a refusal from the first day it can happen.
     #[test]
     fn re_entering_the_module_host_is_refused_rather_than_a_panic() {
         let outer = with_host(|_| with_host(|host| host.compilations()));
@@ -2385,11 +2087,7 @@ welcome(event)
     }
 }
 
-///
-/// It is a FIXED stream on purpose. The Module is replicated and replayed; a random hash seed
-/// would let table iteration order differ between two runs of the same reducer sequence. Nothing
-/// in the Module uses `getrandom` for security — gameplay randomness comes from `ctx.rng()`, which
-/// SpacetimeDB seeds from the reducer timestamp.
+// Fixed hash entropy keeps replicated reducer replays deterministic.
 #[cfg(target_arch = "wasm32")]
 mod fixed_entropy {
     const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -2407,21 +2105,19 @@ mod fixed_entropy {
                 if written >= len {
                     break;
                 }
-                // SAFETY: the caller guarantees `dest` is writable for `len` bytes.
+                // SAFETY: the caller guarantees dest is writable for len bytes.
                 unsafe { dest.add(written).write(byte) };
                 written += 1;
             }
         }
     }
 
-    /// getrandom 0.2's custom backend, enabled by the `spacetimedb` crate's `custom` feature.
     #[unsafe(no_mangle)]
     unsafe fn __getrandom_custom(dest: *mut u8, len: usize) -> u32 {
         fill(dest, len);
         0
     }
 
-    /// getrandom 0.3's custom backend.
     #[unsafe(no_mangle)]
     unsafe extern "Rust" fn __getrandom_v03_custom(
         dest: *mut u8,

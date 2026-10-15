@@ -1,6 +1,3 @@
-//! Shared test support for World Session tests: [`WorldFake`], the multi-shard Fake every Store
-//! family is implemented on, and its shard topology.
-
 mod entry;
 mod family;
 mod topology;

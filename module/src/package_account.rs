@@ -1,12 +1,7 @@
-//! Package-owned Accounts: the Accounts a Package creates for its own session-less Characters, and
-//! the record of which Package made each one.
-
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::auth::{game_account, Account, Appearance};
 
-/// The Package that created an Account. A Core table, so it outlives the Package's own tables when
-/// the Package is disabled. Private. [session]
 #[table(accessor = game_package_account)]
 pub struct PackageAccount {
     #[primary_key]
@@ -15,11 +10,7 @@ pub struct PackageAccount {
     pub package_name: String,
 }
 
-/// Create a Character with no Session on an Account `package_name` owns, and return its guid. The
-/// Character meets the same name, race and class Refusals as a client-created one, and those
-/// Refusals write nothing. The Character goes on the first owned Account with room. When every one
-/// is full, a new Account without credentials is created and recorded as owned by `package_name`.
-#[cfg_attr(not(has_packages), allow(dead_code))] // package-only caller — see `build.rs`
+#[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn create_package_character(
     ctx: &ReducerContext,
     package_name: &str,
@@ -53,8 +44,7 @@ fn owned_account_with_room(ctx: &ReducerContext, package_name: &str) -> Result<u
     {
         return Ok(id);
     }
-    // `#` keeps the name apart from every login name, which are uppercased alphanumerics. An
-    // Account that lost its ownership row still holds its name, so skip taken names.
+    // The # prefix cannot collide with uppercased alphanumeric login names.
     let accounts = ctx.db.game_account();
     let username = (owned.len()..)
         .map(|n| format!("{package_name}#{n}"))

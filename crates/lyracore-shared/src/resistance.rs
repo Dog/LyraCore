@@ -1,5 +1,3 @@
-//! Resistance calculation shared by combat and the character sheet.
-
 use crate::spell::taxonomy::A_MOD_RESISTANCE;
 use crate::{
     aura::{stacked_amount, AuraAmount},
@@ -40,8 +38,6 @@ pub fn aura_contribution(aura: AuraAmount, school_mask: u8) -> i32 {
     }
 }
 
-/// A multi-school aura contributes once; equipment uses the lowest requested school bit.
-/// Item and equipment sums saturate before the signed aura total is added, as in the Module.
 pub fn resistance_bonus(
     school_mask: u8,
     auras: impl IntoIterator<Item = AuraAmount>,

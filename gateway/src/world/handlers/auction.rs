@@ -1,5 +1,3 @@
-//! Auction-house protocol family.
-
 use super::super::*;
 use lyracore_shared::auction::AuctionRefusal;
 
@@ -10,8 +8,6 @@ pub(crate) struct AuctionHousePolicy {
     pub(crate) consignment_rate: u32,
 }
 
-/// What an auction packet needs from the auctioneer: the house it serves, and whether its faction
-/// refuses to talk to this Character. Every other interaction condition belongs to the Module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuctionInteraction {
     pub(crate) house: AuctionHousePolicy,
@@ -37,7 +33,6 @@ pub(crate) enum CreateAuctionOutcome {
     Database,
 }
 
-// The vanilla client has no code for invalid terms; it reads as the generic database failure.
 impl From<AuctionRefusal> for CreateAuctionOutcome {
     fn from(refusal: AuctionRefusal) -> Self {
         match refusal {
@@ -92,9 +87,6 @@ pub(crate) struct CancelAuctionRequest {
     pub(crate) house_id: u32,
 }
 
-/// What a Cancellation came to. `NotFound` covers a missing or expired listing, another player's,
-/// and another market's; `Stale` covers a cut that changed after the read and every other
-/// Refusal. A seller who `CannotAfford` the cut gets no answer at all, as in vanilla.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CancelAuctionOutcome {
     Cancelled,
@@ -159,9 +151,6 @@ pub(crate) trait AuctionActionStore: Send + Sync {
 
     fn cancel_auction(&self, request: CancelAuctionRequest) -> Result<CancelAuctionOutcome>;
 
-    /// Drive every unfinished bid or Cancellation Hold of `actor` to its end. A Gateway that
-    /// stopped between phases leaves them fenced, and a Cancellation has no natural retry because
-    /// the listing leaves the owner list.
     fn resume_auction_holds(&self, actor: Actor) -> Result<()>;
 
     fn auction_query(
@@ -183,8 +172,7 @@ enum AuctionRequest {
 
 pub(crate) const CMSG_AUCTION_LIST_ITEMS_OPCODE: u32 = 0x0258;
 
-/// Decode build-5875 browse bodies locally because the protocol dependency narrows the wire's
-/// `u32` quality to an enum before callers can observe the real client's `0xffff_ffff` sentinel.
+// The typed quality enum cannot represent the client's 0xffff_ffff sentinel.
 pub(crate) fn decode_auction_browse(body: &[u8]) -> Result<AuctionBrowseRequest> {
     if !(32..=287).contains(&body.len()) {
         return Err(anyhow!(
@@ -259,8 +247,6 @@ fn browse<St: AuctionActionStore + ?Sized>(
     )]))
 }
 
-/// Resolve the Character and auction house. Read paths apply the faction verdict; Durable
-/// Requests leave the interaction Gate to the Module.
 fn auction_actor_interaction<St: AuctionActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -269,7 +255,6 @@ fn auction_actor_interaction<St: AuctionActionStore + ?Sized>(
     let Some(actor) = player.self_guid().and_then(Actor::new) else {
         return Ok(None);
     };
-    // A missing auctioneer or house is `None`; a failed Durable Read is a failure, not a Refusal.
     let interaction = store.auction_interaction(actor, auctioneer_guid)?;
     Ok(interaction.map(|interaction| (actor, interaction)))
 }
@@ -330,9 +315,6 @@ fn bid_result(auction_id: u32, outcome: PlaceBidOutcome) -> ProtocolReply {
     )])
 }
 
-/// `SMSG_AUCTION_COMMAND_RESULT` for a Cancellation (`cm:AuctionHouseHandler.cpp:423-428,441-442,
-/// 459`): the auction id with Removed and Ok, id 0 with Removed and ErrDatabase, or nothing for a
-/// seller who cannot pay the cut.
 fn cancel_result(auction_id: u32, outcome: CancelAuctionOutcome) -> ProtocolReply {
     use wow_world_messages::vanilla::{
         SMSG_AUCTION_COMMAND_RESULT_AuctionCommandAction as Action,
@@ -413,8 +395,6 @@ impl<St: AuctionActionStore + ?Sized> ProtocolFamily<St> for Auction {
                 else {
                     return Ok(bid_result(auction_id, PlaceBidOutcome::Database));
                 };
-                // A Refusal arrives as an outcome. An error is a failure with an unknown durable
-                // result, so it ends the session instead of posing as a gameplay answer.
                 let outcome = store.place_bid(PlaceBidRequest {
                     actor,
                     auctioneer_guid,
@@ -445,8 +425,6 @@ impl<St: AuctionActionStore + ?Sized> ProtocolFamily<St> for Auction {
             ClientOpcodeMessage::CMSG_AUCTION_REMOVE_ITEM(message) => {
                 let auction_id = message.auction_id;
                 let auctioneer_guid = message.auctioneer.guid();
-                // Vanilla ignores a Cancellation away from an auctioneer
-                // (`cm:AuctionHouseHandler.cpp:413-415`).
                 let Some((actor, interaction)) =
                     auction_actor_interaction(store, player, auctioneer_guid)?
                 else {
@@ -528,7 +506,6 @@ pub(super) mod tests {
         CMSG_AUCTION_SELL_ITEM,
     };
 
-    /// How a Fake call fails: a constructor for the typed error, so every call builds a fresh one.
     type Failure = fn() -> ReducerCallError;
 
     pub(crate) struct InMemoryAuctionActions {
@@ -1348,7 +1325,6 @@ pub(super) mod tests {
         .outbound)
     }
 
-    /// The encoded `SMSG_AUCTION_COMMAND_RESULT` body of the one packet in `outbound`.
     fn command_result_bytes(outbound: &[Outbound]) -> Vec<u8> {
         use wow_world_messages::Message;
         let [Outbound::One(ServerOpcodeMessage::SMSG_AUCTION_COMMAND_RESULT(message))] = outbound
@@ -1360,7 +1336,6 @@ pub(super) mod tests {
         bytes
     }
 
-    /// `cm:AuctionHouseHandler.cpp:64-69,459`: auction id, AUCTION_REMOVED (1), AUCTION_OK (0).
     #[test]
     fn a_cancelled_listing_answers_removed_ok_with_its_auction_id() {
         let store = store_with(Some(valid_interaction()));
@@ -1380,8 +1355,6 @@ pub(super) mod tests {
         );
     }
 
-    /// `cm:AuctionHouseHandler.cpp:423-428`: auction id 0, AUCTION_REMOVED (1),
-    /// AUCTION_ERR_DATABASE (2).
     #[test]
     fn a_missing_foreign_or_stale_listing_answers_removed_database_error() {
         for outcome in [CancelAuctionOutcome::NotFound, CancelAuctionOutcome::Stale] {
@@ -1395,8 +1368,6 @@ pub(super) mod tests {
         }
     }
 
-    /// `cm:AuctionHouseHandler.cpp:441-442` and `:413-415`: no answer to a seller who cannot pay
-    /// the cut, or who is not at an auctioneer.
     #[test]
     fn an_unaffordable_cut_or_an_absent_auctioneer_is_answered_by_silence() {
         let store = store_with(Some(valid_interaction()));

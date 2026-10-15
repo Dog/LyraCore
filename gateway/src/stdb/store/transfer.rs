@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`TransferStore`] adapter.
-
 use anyhow::Result;
 
 use crate::stdb::bindings::game_instance_table::GameInstanceTableAccess;
@@ -41,8 +39,6 @@ impl TransferStore for Coordinator {
         })
     }
 
-    /// `begin_transfer` — freeze the character, serialize it (row + every manifest table's rows),
-    /// and delete its live entity, in ONE transaction. Idempotent on `transfer_id`.
     fn begin_transfer(
         &self,
         character: Actor,
@@ -112,7 +108,6 @@ impl TransferStore for Coordinator {
         self.finish_transfer(transfer_id)
     }
 
-    /// `release_transfer` — drop the arrival copy's fence at the destination.
     fn release_transfer(&self, transfer_id: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -163,8 +158,6 @@ impl TransferStore for Coordinator {
             .map(|row| (row.map_id, row.party_id))
     }
 
-    /// `ensure_instance` — mirror an instance id onto this shard (idempotent), spawning its
-    /// population the first time.
     fn ensure_instance(&self, instance_id: u64, map_id: u32, party_id: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -173,7 +166,6 @@ impl TransferStore for Coordinator {
         )
     }
 
-    /// `evict_instance_population` — stop this shard ticking an instance whose run moved elsewhere.
     fn evict_instance_population(&self, instance_id: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -325,8 +317,6 @@ impl TransferStore for Coordinator {
 }
 
 impl Coordinator {
-    /// `release_player_transfer_arrival`, with the exact Realm locator predecessor carried by the
-    /// destination fence.
     pub fn release_player_transfer_arrival(
         &self,
         transfer_id: u64,
@@ -347,8 +337,6 @@ impl Coordinator {
         )
     }
 
-    /// `import_player_character_blob`, with the Realm locator predecessor written as part of the
-    /// destination import transaction.
     pub fn import_player_character_blob(
         &self,
         transfer_id: u64,
@@ -369,8 +357,6 @@ impl Coordinator {
         )
     }
 
-    /// `confirm_import` — attest ON THE SOURCE that the destination copy committed. Called only
-    /// after `import_character_blob` returned Ok; see `world::transfer::run_transfer`.
     pub fn confirm_import(&self, transfer_id: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -379,7 +365,6 @@ impl Coordinator {
         )
     }
 
-    /// `finish_transfer` — delete-last: destroy the source copy and clear the escrow.
     pub fn finish_transfer(&self, transfer_id: u64) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,

@@ -1,5 +1,3 @@
-//! Hunter-pet feeding, happiness decay and white-swing damage scaling.
-
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use crate::{
@@ -7,14 +5,10 @@ use crate::{
     game_live_pet_kind, game_spell_effect, game_world_entity, HunterPet, WorldEntity,
 };
 
-/// One Vanilla happiness band. The three visible states are `[0, band)`, `[band, 2*band)` and
-/// `[2*band, max]`.
 pub const HAPPINESS_BAND: u32 = 333_000;
 pub const MAX_HAPPINESS: u32 = 1_000_000;
 pub const CARE_INTERVAL_MICROS: i64 = 7_500_000;
 
-/// The single global care clock. Each durable pet carries its own last-applied timestamp, so a late
-/// firing catches up by whole intervals and produces the same result as regular firings.
 #[table(accessor = game_pet_care_schedule, scheduled(tick_pet_care))]
 pub struct PetCareSchedule {
     #[primary_key]
@@ -53,8 +47,6 @@ fn scale_damage(range: (u32, u32), happiness: u32) -> (u32, u32) {
     (range.0 * pct / 100, range.1 * pct / 100)
 }
 
-/// Apply happiness only to the live white-swing range of a durable Hunter pet. Missing and explicit
-/// summoned kinds are intentionally identical to ordinary creatures.
 pub(crate) fn scale_hunter_pet_swing(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -76,7 +68,6 @@ pub(crate) fn scale_hunter_pet_swing(
 }
 
 fn decay_per_interval(loyalty_level: u8, in_combat: bool) -> u32 {
-    // CMaNGOS: (140 >> loyalty) * 125 each 7.5s, with its documented 1.5x combat estimate.
     let normal = (140u32 >> loyalty_level.min(7)) * 125;
     if in_combat {
         normal.saturating_mul(3) / 2
@@ -85,8 +76,6 @@ fn decay_per_interval(loyalty_level: u8, in_combat: bool) -> u32 {
     }
 }
 
-/// Returns `(new happiness, whole elapsed intervals consumed)`. Remainders stay on the durable
-/// timestamp so many regular calls and one catch-up call are exactly equivalent.
 #[cfg(test)]
 fn decay_elapsed(
     happiness: u32,
@@ -111,9 +100,6 @@ fn update_care(ctx: &ReducerContext, mut pet: HunterPet) {
             .find(live.guid)
             .is_some_and(|kind| kind.hunter_pet_id == pet.pet_id)
     }) else {
-        // Care pauses while no live pet is materialized — no write, so an absent pet does not
-        // churn its row every tick. A retame replaces the row with a fresh anchor; any future
-        // restore path must reset `care_updated_at` itself or the gap becomes a catch-up penalty.
         return;
     };
     let in_combat = live.unit_flags & lyracore_shared::constants::unit_flags::IN_COMBAT != 0;
@@ -146,8 +132,6 @@ fn update_care(ctx: &ReducerContext, mut pet: HunterPet) {
             .find(pet_id)
             .expect("care pet remains present during its transaction");
 
-        // At both lower bounds every later interval is the same no-op. Advance the time anchor in
-        // one write instead of looping over an arbitrarily long scheduler outage.
         if pet.happiness == old_happiness && !loyalty_changed {
             pet.care_updated_at = Timestamp::from_micros_since_unix_epoch(
                 last.saturating_add(intervals.saturating_mul(CARE_INTERVAL_MICROS)),
@@ -226,8 +210,6 @@ impl FeedEligibility {
     }
 }
 
-/// Resolve a generic item-target spell. The spell effect kind, never its id, selects feeding; the
-/// target slot names the exact stack consumed after every pet and food gate succeeds.
 pub(crate) fn apply_item_target_spell(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -312,8 +294,6 @@ fn feed_item(ctx: &ReducerContext, actor_guid: u64, slot: u8) -> Result<(), Stri
     Ok(())
 }
 
-/// Hunter pets lose one full happiness band at the shared pet-death chokepoint. The live entity is
-/// deleted immediately afterwards, so this can run only once for that death.
 pub(crate) fn on_pet_death(ctx: &ReducerContext, pet_guid: u64) {
     let Some(kind) = ctx
         .db
@@ -349,7 +329,6 @@ mod tests {
         }
     }
 
-    /// One gate broken in an otherwise valid feed.
     type BreakGate = Box<dyn Fn(&mut FeedEligibility)>;
 
     #[test]

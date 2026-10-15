@@ -1,19 +1,9 @@
-//! Forget a deleted Character. Realm-core holds no Character rows, so it cannot see a World Shard
-//! delete one. The Gateway's character-gone reconciliation proves the Character is absent from
-//! every World Shard and then sends `ForgetDeletedCharacter` as that Character, with no ownership
-//! token. Every step here finds nothing on a second call, so a replay is harmless.
-
 use lyracore_shared::guild::{event_kind, GuildRefusal, LEADER_RANK};
 use spacetimedb::ReducerContext;
 
 use super::membership::{disband_guild, game_guild_invite};
 use super::{game_guild, game_guild_member, member, petition, push_event, GuildMember};
 
-/// Remove every guild trace of `character_guid`: the Guild Invite it holds, its membership
-/// (passing leadership or disbanding as `cm:Guild.cpp:493-552` does), its own Petition and the
-/// Signatures it made (`cm:Player.cpp:4061-4062`). A Guild Invite it sent stays: mangos keeps only
-/// the invited Guild on the target (`cm:GuildHandler.cpp:124`), so the target can still accept
-/// while that Guild exists.
 pub(super) fn forget_deleted_character(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -29,8 +19,6 @@ pub(super) fn forget_deleted_character(
     Ok(())
 }
 
-/// Take a deleted member out of its Guild. A Guild Leader passes leadership to its successor
-/// first; a Guild with nobody left disbands.
 fn leave_guild(ctx: &ReducerContext, departed: GuildMember) {
     let guild_id = departed.guild_id;
     let Some(mut guild) = ctx.db.game_guild().guild_id().find(guild_id) else {
@@ -81,9 +69,6 @@ fn leave_guild(ctx: &ReducerContext, departed: GuildMember) {
     );
 }
 
-/// The member who leads after the Guild Leader is gone: the highest Guild Rank (lowest rank id),
-/// as mangos picks (`cm:Guild.cpp:499-516`). mangos breaks a tie by hash-map order; here the
-/// earliest join wins, then the lowest guid, so the choice never depends on storage order.
 fn successor(members: Vec<GuildMember>) -> Option<GuildMember> {
     members
         .into_iter()

@@ -1,39 +1,3 @@
-//! `--pack-client` — the dev-time CLIENT PATCH packager. Builds a `patch-3.MPQ` (DBC overlays + our
-//! own raw assets) into the operator's OWN client `Data/`, installs our addons into `Interface/AddOns/`,
-//! and clears the `WDB/` cache — so a lyracore developer can push client-side changes to their
-//! local client in ONE command. (Player distribution is a separate, out-of-scope problem.)
-//!
-//! SOURCES: the repo-global `client-patch/{mpq,addons}` tree PLUS every package's optional
-//! `packages/<name>/client/{mpq,addons}` — a feature ships its client UI next to its server code
-//! (the packages doctrine), and a client-only package (a `client/` with no `src/`) is legal. Both
-//! channels are first-class: addons are additive and coexist; an `mpq/` file at
-//! `Interface\FrameXML\...` is a whole-file OVERRIDE of the stock UI (reach for it only when
-//! addon hooks can't — packages/ is private-only tooling, not part of the public
-//! mirror). Cross-source collisions (same archive path or
-//! same addon name from two sources) fail the pack loudly naming both sources — never
-//! last-write-wins.
-//!
-//! FIREWALL (see `dbc.rs`): the repo-committed inputs under `client-patch/` are OURS only (our addons,
-//! our raw assets like BLP icons, and overlay code) — NEVER Blizzard files (a `client-patch/.gitignore`
-//! blocks `*.dbc`/`*.MPQ`). DBCs are read from the operator's base archives IN MEMORY, our rows applied,
-//! and re-serialized into the patch MPQ; the emitted `patch-3.MPQ` + installed addons are local build
-//! artifacts in the operator's own client, never committed and never shipped by us.
-//!
-//! Load order on this client: base archives < `patch.MPQ` < `patch-2.MPQ` < `patch-3.MPQ` (higher wins),
-//! so our overlay shadows the base. Patch files must be UNENCRYPTED. After a DBC change the `WDB/` cache
-//! must be cleared or the client serves stale name/tooltip/icon data.
-//!
-//! UI TRANSFORMS: a source may also ship a `ui-transforms.json` beside its `mpq/` and `addons/`
-//! trees. Each entry anchors an insertion into one stock FrameXML or GlueXML file. The packer reads
-//! that file's baseline out of the operator's own UI archives, composes every Package's edits for
-//! it, and packs the result — so two Packages can extend one stock file without either owning it.
-//! A composed file is [`Origin::BaselineDerived`]: it is the client's own bytes with our edits in
-//! it, and it never leaves this machine.
-//!
-//! `--pack-out <dir>` is the second output: the same collected sources written into a plain
-//! directory, for distribution. It never opens a client, so it refuses every baseline-derived file
-//! by its [`Origin`] and names where those bytes came from.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
@@ -47,36 +11,19 @@ use wow_mpq::{compression::flags, ArchiveBuilder, FormatVersion, PatchChain};
 use crate::ui_transform::{self, Edit};
 use crate::Args;
 
-/// First free numeric patch slot on this client (base < patch < patch-2 < patch-3); higher wins.
 const PATCH_MPQ: &str = "patch-3.MPQ";
-/// Source-controlled inputs (ours only) — see the firewall note above.
 const SRC: &str = "client-patch";
 
-/// Dropped inside an installed addon's own folder, naming the source that put it there
-/// (`client-patch` or `package <name>`). This is the ONLY provenance this packer keeps — one file
-/// per addon, gone if the addon folder goes — never a central inventory of every file it has ever
-/// written. It exists solely to power [`stale_addons`]'s warning; nothing here reads it to decide
-/// what to overwrite, and nothing here deletes on its account.
 const SOURCE_MARKER: &str = ".lyracore-source";
 
-/// A source's UI Transform declaration, read from the contribution root itself (beside `mpq/` and
-/// `addons/`) rather than from inside either, so it is never mistaken for content to pack.
 const UI_TRANSFORMS: &str = "ui-transforms.json";
 
-/// Where a packed file's bytes came from. `source` is the human label; this is the provenance the
-/// licensing firewall reads. Only package-authored bytes may leave this machine.
 #[derive(Debug, PartialEq, Eq)]
 enum Origin {
-    /// Bytes an author committed under `client-patch/` or `packages/<name>/client/`.
     PackageAuthored,
-    /// Bytes computed from the operator's own client: a DBC overlay or a UI Transform output.
-    /// `from` names the baseline input, for the refusal message.
     BaselineDerived { from: String },
 }
 
-/// One file destined for the patch MPQ: the internal archive path (backslash-separated) + its
-/// bytes + which source contributed it (for dry-run provenance and collision messages) + the
-/// provenance that decides whether it may be distributed.
 struct PackFile {
     archive_path: String,
     data: Vec<u8>,
@@ -84,16 +31,12 @@ struct PackFile {
     origin: Origin,
 }
 
-/// One addon directory to install: its name (the `Interface/AddOns/<name>` target) + where it
-/// lives + which source contributed it.
 struct AddonDir {
     name: String,
     path: std::path::PathBuf,
     source: String,
 }
 
-/// The client-content contribution roots, in deterministic order: `client-patch/` first, then
-/// every `packages/<name>/client/` alphabetically. Each yields raw MPQ files and/or addon dirs.
 fn client_sources(
     repo_src: &Path,
     packages_root: &Path,
@@ -113,28 +56,20 @@ fn client_sources(
     Ok(sources)
 }
 
-/// Collect every source's `mpq/` files and `addons/` dirs, failing LOUDLY on cross-source
-/// collisions (MPQ paths compared case-insensitively — the archive is; addon names likewise —
-/// the target filesystem may be) and on firewall violations (a committed `.dbc`/`.mpq` is never
-/// ours to ship raw; DBC overlays go through the in-memory stage).
-///
-/// Every file this yields is [`Origin::PackageAuthored`]; the roots hold committed bytes only.
 fn collect_client_content(
     sources: &[(String, std::path::PathBuf)],
 ) -> Result<(Vec<PackFile>, Vec<AddonDir>)> {
     use std::collections::HashMap;
     let mut files: Vec<PackFile> = Vec::new();
     let mut addons: Vec<AddonDir> = Vec::new();
-    let mut seen_paths: HashMap<String, String> = HashMap::new(); // lower(archive path) → source
-    let mut seen_addons: HashMap<String, String> = HashMap::new(); // lower(addon name) → source
+    let mut seen_paths: HashMap<String, String> = HashMap::new();
+    let mut seen_addons: HashMap<String, String> = HashMap::new();
 
     for (label, root) in sources {
         let mpq_root = root.join("mpq");
         if mpq_root.is_dir() {
             let mut raw = Vec::new();
             collect_raw(&mpq_root, &mpq_root, &mut raw)?;
-            // fs::read_dir order is filesystem-dependent — sort so the dry-run listing and the
-            // packed MPQ layout are stable across machines/runs (diff-able).
             raw.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
             for mut f in raw {
                 let lower = f.archive_path.to_ascii_lowercase();
@@ -180,9 +115,6 @@ fn collect_client_content(
     Ok((files, addons))
 }
 
-/// Parse every source's [`UI_TRANSFORMS`] declaration. Most sources have none; that is normal, and
-/// a source with one still contributes its `mpq/` and `addons/` trees as usual. The source label
-/// (`client-patch` or `package <name>`) names the owner in every refusal the engine raises.
 fn collect_ui_transforms(sources: &[(String, PathBuf)]) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     for (label, root) in sources {
@@ -197,8 +129,6 @@ fn collect_ui_transforms(sources: &[(String, PathBuf)]) -> Result<Vec<Edit>> {
     Ok(edits)
 }
 
-/// Everything the repo contributes, collected once for either output. The roots are the same; only
-/// what happens afterwards differs.
 fn collect(
     repo_src: &Path,
     packages_root: &Path,
@@ -209,9 +139,6 @@ fn collect(
     Ok((files, addons, transforms))
 }
 
-/// Group edits by the file they change, matching paths case-insensitively because the archive
-/// does. The key orders the groups, so the composed output does not depend on which Package the
-/// walk reached first; the displayed path keeps its first author's casing.
 fn group_by_path(edits: &[Edit]) -> Vec<(&str, Vec<&Edit>)> {
     let mut grouped: BTreeMap<String, (&str, Vec<&Edit>)> = BTreeMap::new();
     for edit in edits {
@@ -224,7 +151,6 @@ fn group_by_path(edits: &[Edit]) -> Vec<(&str, Vec<&Edit>)> {
     grouped.into_values().collect()
 }
 
-/// The sources behind one group, in source order and without repeats, for a refusal message.
 fn transforming_sources(edits: &[&Edit]) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
     for edit in edits {
@@ -235,9 +161,7 @@ fn transforming_sources(edits: &[&Edit]) -> Vec<String> {
     labels
 }
 
-/// Put the record header in front of the composed file, or, when an XML document opens with an XML
-/// declaration, straight after it. A declaration has to be the first thing in the document, so a
-/// comment above it would make the client reject the file.
+// An XML declaration must remain the first bytes of its document.
 fn with_record_header(header: &str, composed: &str) -> String {
     if composed.starts_with("<?xml") {
         if let Some(end) = composed.find("?>") {
@@ -252,9 +176,6 @@ fn with_record_header(header: &str, composed: &str) -> String {
     format!("{header}{composed}")
 }
 
-/// An `mpq/` file replaces a stock file whole; a UI Transform edits the stock file in place. Both
-/// at one path is a contradiction with no winner worth guessing at, so it fails the pack the same
-/// way a cross-source collision does.
 fn refuse_override_of_a_transformed_path(
     files: &[PackFile],
     groups: &[(&str, Vec<&Edit>)],
@@ -277,13 +198,6 @@ fn refuse_override_of_a_transformed_path(
     Ok(())
 }
 
-/// Compose every transformed path against the operator's own client and return the results as
-/// packed files, ready to join the collision checks like any other path.
-///
-/// The bytes that come back are the client's own baseline with the Packages' edits applied, so
-/// each one is [`Origin::BaselineDerived`] and names the archive it was read out of. A
-/// [`ui_transform::record_header`] line goes in front, carrying the baseline hash and the
-/// transforms hash: the same client and the same declarations rebuild byte-identical output.
 fn compose_ui_transforms(data: &Path, groups: &[(&str, Vec<&Edit>)]) -> Result<Vec<PackFile>> {
     if groups.is_empty() {
         return Ok(Vec::new());
@@ -328,7 +242,6 @@ fn compose_ui_transforms(data: &Path, groups: &[(&str, Vec<&Edit>)]) -> Result<V
     Ok(packed)
 }
 
-/// `--pack-client <client Data/ dir>` mode. Without `--apply` it's a dry run (prints what it would do).
 pub fn run(data_dir: &str, args: &Args) -> Result<()> {
     pack_client(
         Path::new(data_dir),
@@ -347,26 +260,13 @@ fn pack_client(data: &Path, apply: bool, repo_src: &Path, packages_root: &Path) 
     }
     let client_root = data.parent().context("client Data/ has no parent dir")?;
 
-    // 1) Raw assets (ours), from EVERY source: client-patch/mpq/ plus each packages/<name>/client/mpq/
-    //    → the MPQ at its relative path. This is the generic Tier-1 path — BLP icons, sounds, fonts,
-    //    FrameXML overrides, loading screens, etc. Collisions and firewall violations bail here.
     let (mut files, addon_dirs, transforms) = collect(repo_src, packages_root)?;
 
-    // 1b) UI Transforms, declared by the same sources. The repo-only refusals (a bad declaration,
-    //     an override contradicting a transform) land here, before the client is opened at all.
     let groups = group_by_path(&transforms);
     refuse_override_of_a_transformed_path(&files, &groups)?;
 
-    // 2) DBC overlays: read the operator's base DBC IN MEMORY, apply our additions, re-serialize into
-    //    the MPQ (never a committed .dbc). [SPIKE] MVP payload: AreaTable round-trip UNCHANGED — a
-    //    do-nothing identity stage TODAY. It proves wow_dbc::write + the MPQ packing produce a
-    //    client-loadable DBC, and is the exact hook where custom rows go (e.g. a quest-log zone/sort
-    //    header: `area.rows_mut().push(..)`). TODO: when a real DBC overlay lands, apply rows here; if
-    //    none is planned, delete this stage — a patch MPQ with zero DBC overlays is valid and simpler.
     let mut chain = crate::dbc::open_chain(data)?;
     let area: AreaTable = crate::dbc::read_table(&mut chain)?;
-    // OVERLAY HOOK: apply our row additions/edits here before re-serializing, e.g.
-    //   area.rows_mut().push(custom_areatable_header_row);
     let mut buf = Vec::new();
     area.write(&mut buf).context("re-serialize AreaTable.dbc")?;
     files.push(PackFile {
@@ -378,16 +278,10 @@ fn pack_client(data: &Path, apply: bool, repo_src: &Path, packages_root: &Path) 
         },
     });
 
-    // 2b) UI Transforms: compose each edited stock file against this client's UI archives. The
-    //     AreaTable read above already refused a wrong client version, so no second check is needed.
     files.extend(compose_ui_transforms(data, &groups)?);
 
-    // 3) Addons (ours), already collected per source: → <client>/Interface/AddOns/<Name>/.
     let addons_dst = client_root.join("Interface").join("AddOns");
 
-    // Best-effort: an addon this or an earlier `--apply` installed, whose source (a Package, most
-    // often) is disabled or gone this run. Shown on a dry run too — it costs only a directory
-    // listing and an operator deciding whether to `rm -rf` it should not need `--apply` first.
     for warning in stale_addons(&addons_dst, &addon_dirs)? {
         eprintln!("pack-client: WARNING — {warning}");
     }
@@ -400,8 +294,6 @@ fn pack_client(data: &Path, apply: bool, repo_src: &Path, packages_root: &Path) 
             files.len()
         );
         for f in &files {
-            // The origin is on the listing because it decides where the file may go: a
-            // baseline-derived one reaches this client and no artifact.
             let derived = match &f.origin {
                 Origin::PackageAuthored => String::new(),
                 Origin::BaselineDerived { from } => format!(", derived from {from}"),
@@ -437,7 +329,6 @@ fn pack_client(data: &Path, apply: bool, repo_src: &Path, packages_root: &Path) 
         files.len()
     );
 
-    // Install addons (every source's).
     for a in &addon_dirs {
         let to = addons_dst.join(&a.name);
         copy_dir(&a.path, &to)
@@ -458,10 +349,6 @@ fn pack_client(data: &Path, apply: bool, repo_src: &Path, packages_root: &Path) 
     Ok(())
 }
 
-/// `--pack-out <dir>` mode: the client half of the Client Artifact, for distribution. It collects
-/// the same sources as `--pack-client` and opens no client, so a baseline-derived file has no way
-/// in and is refused by name. Writes `<dir>/Data/patch-3.MPQ` and `<dir>/Interface/AddOns/<Name>/`,
-/// and nothing else. Ownership of `<dir>` (replacement, the manifest, the zip) is the CLI's.
 pub fn run_pack_out(out_dir: &str) -> Result<()> {
     pack_out(Path::new(out_dir), Path::new(SRC), Path::new("packages"))
 }
@@ -479,7 +366,6 @@ fn write_pack_out(
 ) -> Result<()> {
     refuse_baseline_derived(files, transforms)?;
 
-    // Every refusal is behind us, so nothing below can leave a half-written artifact.
     fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
     if files.is_empty() {
@@ -516,13 +402,7 @@ fn write_pack_out(
     Ok(())
 }
 
-/// The licensing firewall for a distributable artifact: baseline-derived bytes stay on the
-/// operator's machine, where `--pack-client` puts them. Refuses before the first write and names
-/// the file and the baseline input it came from.
-///
-/// A UI Transform is refused from its declaration rather than from its output, because `--pack-out`
-/// opens no client and so never composes one. Declaring an edit is enough: whatever it produces is
-/// the client's own baseline with that edit in it.
+// Refuse baseline-derived bytes before writing any distributable artifact.
 fn refuse_baseline_derived(files: &[PackFile], transforms: &[Edit]) -> Result<()> {
     for f in files {
         if let Origin::BaselineDerived { from } = &f.origin {
@@ -549,11 +429,9 @@ fn refuse_baseline_derived(files: &[PackFile], transforms: &[Edit]) -> Result<()
     Ok(())
 }
 
-/// Recursively collect files under `dir` (rooted at `root`) as `PackFile`s with backslash archive paths.
 fn collect_raw(root: &Path, dir: &Path, out: &mut Vec<PackFile>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        // Skip hidden files (.gitkeep, .gitignore, editor dotfiles) — never real assets.
         if path
             .file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with('.'))
@@ -593,19 +471,10 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stamp an installed addon directory with the source that put it there — see [`SOURCE_MARKER`].
 fn write_source_marker(addon_dir: &Path, source: &str) -> Result<()> {
     fs::write(addon_dir.join(SOURCE_MARKER), source).context("write addon source marker")
 }
 
-/// Best-effort, no-ledger staleness check: which currently-installed addon directories carry a
-/// [`SOURCE_MARKER`] this run's `current` sources no longer produce.
-///
-/// The only file read is the marker inside each candidate addon's own folder, so this can never
-/// flag an addon nobody's `--apply` ever wrote to — an addon the operator installed by hand, or
-/// one from before this marker existed, is silently left alone rather than guessed at. Matches
-/// addon names case-insensitively, the same as the collision checks above (the destination
-/// filesystem may not distinguish case even where the marker's own text does).
 fn stale_addons(addons_dst: &Path, current: &[AddonDir]) -> Result<Vec<String>> {
     if !addons_dst.is_dir() {
         return Ok(Vec::new());
@@ -639,7 +508,6 @@ fn stale_addons(addons_dst: &Path, current: &[AddonDir]) -> Result<Vec<String>> 
     Ok(stale)
 }
 
-/// Delete the `*.wdb` cache files (stale name/tooltip/icon caches mask DBC changes). Idempotent.
 fn clear_wdb(client_root: &Path) -> Result<()> {
     let wdb = client_root.join("WDB");
     if !wdb.is_dir() {
@@ -660,7 +528,7 @@ fn clear_wdb(client_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build the patch MPQ (vanilla V1, zlib, UNENCRYPTED — the client rejects encrypted patch files).
+// Vanilla patch MPQs must be V1, zlib-compressed and unencrypted.
 fn build_patch_mpq(files: &[PackFile], out: &Path) -> Result<()> {
     let mut b = ArchiveBuilder::new()
         .version(FormatVersion::V1)
@@ -672,8 +540,6 @@ fn build_patch_mpq(files: &[PackFile], out: &Path) -> Result<()> {
         .with_context(|| format!("build {}", out.display()))
 }
 
-/// Self-verify for `--pack-out`: re-open the built MPQ and confirm one packed file comes back
-/// byte for byte. There is no DBC in a package-authored archive, so this is the round-trip proof.
 fn verify_readback(mpq: &Path, file: &PackFile) -> Result<()> {
     let mut chain = PatchChain::new();
     chain.add_archive(mpq, 0).context("reopen built MPQ")?;
@@ -690,9 +556,6 @@ fn verify_readback(mpq: &Path, file: &PackFile) -> Result<()> {
     Ok(())
 }
 
-/// Self-verify: re-open the built patch MPQ and confirm a packed DBC reads back + re-parses (proves the
-/// wow-mpq write + wow_dbc round-trip without needing the client). The live-client load is the operator's
-/// final check.
 fn verify_area_table(mpq: &Path) -> Result<()> {
     let mut chain = PatchChain::new();
     chain
@@ -711,7 +574,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A unique scratch tree per test (std-only; no tempfile dep). Cleaned on drop.
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(tag: &str) -> Self {
@@ -736,7 +598,6 @@ mod tests {
         }
     }
 
-    /// The sorted directory entry names under `dir`, for "and nothing else" assertions.
     fn entry_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -752,7 +613,7 @@ mod tests {
         t.write("client-patch/mpq/.gitkeep", b"");
         t.write("packages/zeta/client/mpq/z.blp", b"z");
         t.write("packages/alpha/client/addons/A/A.toc", b"a");
-        t.write("packages/no-client/src/mod.rs", b""); // no client/ → not a source
+        t.write("packages/no-client/src/mod.rs", b"");
         let sources = client_sources(&t.0.join("client-patch"), &t.0.join("packages")).unwrap();
         let labels: Vec<&str> = sources.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, ["client-patch", "package alpha", "package zeta"]);
@@ -852,15 +713,12 @@ mod tests {
     fn stale_addons_flags_only_marked_addons_the_current_sources_no_longer_provide() {
         let t = Scratch::new("stale-warn");
         let dst = t.0.join("Interface/AddOns");
-        // Still produced by this run: marked, and named by `current` — never flagged.
         let current_addon = dst.join("AutoLoot");
         fs::create_dir_all(&current_addon).unwrap();
         write_source_marker(&current_addon, "package autoloot").unwrap();
-        // The Package behind it was disabled or removed: marked, but NOT named by `current`.
         let retired_addon = dst.join("Retired");
         fs::create_dir_all(&retired_addon).unwrap();
         write_source_marker(&retired_addon, "package retired").unwrap();
-        // The operator's own addon: never marked by any sync, so it must never be flagged.
         t.write("Interface/AddOns/BigWigs/BigWigs.toc", b"");
 
         let current = vec![AddonDir {
@@ -906,8 +764,6 @@ mod tests {
         assert!(stale_addons(&dst, &[]).unwrap().is_empty());
     }
 
-    /// The Client Artifact's client half: every `mpq/` file in one archive, every addon directory
-    /// beside it, and nothing the operator's own client would need (no marker, no WDB).
     #[test]
     fn pack_out_writes_every_collected_file_and_addon_and_nothing_else() {
         let t = Scratch::new("pack-out-full");
@@ -955,8 +811,6 @@ mod tests {
         assert_eq!(entry_names(&out.join("Data")), [PATCH_MPQ]);
     }
 
-    /// A repo whose packages ship addons only has nothing to put in an archive. wow-mpq will build
-    /// an empty one, but an artifact holding a patch MPQ with no content of ours would be a lie.
     #[test]
     fn pack_out_without_mpq_content_writes_the_addons_and_no_archive() {
         let t = Scratch::new("pack-out-addons-only");
@@ -969,8 +823,6 @@ mod tests {
         assert!(out.join("Interface/AddOns/Alpha/Alpha.toc").exists());
     }
 
-    /// The licensing firewall: a file computed out of the operator's client never reaches a
-    /// distributable artifact, and the refusal names the file and the baseline it came from.
     #[test]
     fn pack_out_refuses_a_baseline_derived_file_before_writing_anything() {
         let t = Scratch::new("pack-out-provenance");
@@ -1004,7 +856,6 @@ mod tests {
         );
     }
 
-    /// `--pack-out` reads the repo, never a client. It runs where no client `Data/` dir exists.
     #[test]
     fn pack_out_needs_no_client_data_directory() {
         let t = Scratch::new("pack-out-no-client");
@@ -1020,8 +871,6 @@ mod tests {
         assert!(!t.0.join("Data").exists());
     }
 
-    /// Both outputs collect the same sources, so a collision fails the artifact the same way it
-    /// fails a client sync, and before anything is written.
     #[test]
     fn pack_out_refuses_a_cross_source_collision() {
         let t = Scratch::new("pack-out-collide");
@@ -1046,10 +895,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------------
-    //  UI Transforms
-    // ---------------------------------------------------------------------------------------
-
     const LOOT_FRAME_LUA: &str =
         "function LootFrame_OnLoad()\n\tthis:RegisterEvent(\"LOOT_OPENED\");\nend\n";
     const FRAMEXML_TOC: &str = "## Interface: 11200\nLootFrame.xml\nMainMenuBar.xml\n";
@@ -1065,8 +910,6 @@ mod tests {
         b.build(out).unwrap();
     }
 
-    /// A scratch client `Data/` dir: an empty `AreaTable.dbc` in `dbc.MPQ` (the version check reads
-    /// it) and the given stock UI files in `interface.MPQ`. Never a real client.
     fn scratch_client(t: &Scratch, ui: &[(&str, &[u8])]) -> PathBuf {
         let data = t.0.join("client/Data");
         let mut dbc = Vec::new();
@@ -1079,15 +922,12 @@ mod tests {
         data
     }
 
-    /// One file's text out of a built patch MPQ.
     fn packed_text(mpq: &Path, archive_path: &str) -> String {
         let mut chain = PatchChain::new();
         chain.add_archive(mpq, 0).unwrap();
         String::from_utf8(chain.read_file(archive_path).unwrap()).unwrap()
     }
 
-    /// The whole point: a Package extends a stock FrameXML file it does not own, and the composed
-    /// result carries the header, the insertion and the baseline it was composed from.
     #[test]
     fn a_transform_composes_the_stock_file_into_the_patch_mpq() {
         let t = Scratch::new("ui-compose");
@@ -1130,8 +970,6 @@ mod tests {
         );
     }
 
-    /// The namespaced-file pattern: the Package ships `PkgLoot.lua` under its own `mpq/` and adds
-    /// the TOC line that loads it with a transform. Nothing else is needed to extend the stock UI.
     #[test]
     fn a_package_owned_file_and_the_toc_line_that_loads_it_both_land() {
         let t = Scratch::new("ui-namespaced");
@@ -1168,8 +1006,6 @@ mod tests {
         assert!(toc.contains("PkgLoot.lua\nLootFrame.xml\n"), "{toc}");
     }
 
-    /// Two Packages extend one stock file at different anchors. Neither owns the file, and the
-    /// composed output holds both edits in the baseline's own order.
     #[test]
     fn two_packages_edit_one_file_at_disjoint_anchors() {
         let t = Scratch::new("ui-two-packages");
@@ -1206,8 +1042,6 @@ mod tests {
         );
     }
 
-    /// An XML declaration has to stay the first thing in the document, so the header goes under it
-    /// rather than above it. Every other file takes the header first.
     #[test]
     fn the_record_header_never_displaces_an_xml_declaration() {
         assert_eq!(
@@ -1220,8 +1054,6 @@ mod tests {
         );
     }
 
-    /// Two Packages claiming byte ranges that intersect have no correct merge, so the pack fails
-    /// naming both of them, and the client keeps the patch it already had.
     #[test]
     fn overlapping_transforms_refuse_and_write_nothing() {
         let t = Scratch::new("ui-overlap");
@@ -1261,8 +1093,6 @@ mod tests {
         assert!(!data.join(PATCH_MPQ).exists(), "a refusal writes nothing");
     }
 
-    /// An anchor the baseline holds twice could attach in two places, so the pack refuses rather
-    /// than pick one.
     #[test]
     fn an_ambiguous_anchor_refuses_and_writes_nothing() {
         let t = Scratch::new("ui-ambiguous");
@@ -1291,8 +1121,6 @@ mod tests {
         assert!(!data.join(PATCH_MPQ).exists(), "a refusal writes nothing");
     }
 
-    /// One source replaces a stock file whole while another patches it in place. The override would
-    /// swallow the transform, so the pack refuses and names both sources and the path.
     #[test]
     fn an_override_of_a_transformed_path_refuses_and_writes_nothing() {
         let t = Scratch::new("ui-override");
@@ -1330,8 +1158,6 @@ mod tests {
         assert!(!data.join(PATCH_MPQ).exists(), "a refusal writes nothing");
     }
 
-    /// The licensing firewall for a transform: `--pack-out` never opens a client, so it refuses the
-    /// declaration itself and names every Package and path behind it.
     #[test]
     fn pack_out_refuses_a_declared_transform_without_any_client() {
         let t = Scratch::new("ui-pack-out");
@@ -1359,8 +1185,6 @@ mod tests {
         );
     }
 
-    /// The DBC read is the one client-version check. A client whose `AreaTable.dbc` is not the
-    /// build-5875 schema fails there, before a single baseline byte is read.
     #[test]
     fn a_wrong_client_version_refuses_before_any_baseline_read() {
         let t = Scratch::new("ui-wrong-version");
@@ -1369,7 +1193,6 @@ mod tests {
             &data.join("dbc.MPQ"),
             &[("DBFilesClient\\AreaTable.dbc", b"not a 5875 DBC")],
         );
-        // No interface.MPQ: reaching the baseline read would fail with a different message.
         t.write(
             "packages/loot/client/ui-transforms.json",
             br#"[{ "path": "Interface/FrameXML/LootFrame.lua",

@@ -5,10 +5,6 @@ use crate::stdb::reads::view_of_item_row;
 use crate::world::Outbound;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// The trade-status wire mapping: every `lyracore_shared::trade::event_kind` the module
-/// emits decodes to its `SMSG_TRADE_STATUS` variant — `BeginTrade` carrying the counterparty
-/// guid the client needs to open the window — and an unknown kind (newer module mid-rollout)
-/// drops rather than desyncing the trade window.
 #[test]
 fn trade_event_kinds_decode_to_their_trade_status_variants() {
     use lyracore_shared::trade::event_kind as kind;
@@ -70,7 +66,6 @@ fn trade_event_kinds_decode_to_their_trade_status_variants() {
         status_of(kind::TRADE_COMPLETE),
         SMSG_TRADE_STATUS::TradeComplete
     );
-    // The bag-space refusal closes the window naming WHOSE bags overflowed.
     let full_self = status_of(kind::INV_FULL_SELF);
     let full_partner = status_of(kind::INV_FULL_PARTNER);
     match (&full_self, &full_partner) {
@@ -97,7 +92,6 @@ fn trade_event_kinds_decode_to_their_trade_status_variants() {
         }
         other => panic!("expected CloseWindow pair with flipped target_error, got {other:?}"),
     }
-    // The purse-failure pair mirrors it with NotEnoughMoney.
     match (
         &status_of(kind::GOLD_FAIL_SELF),
         &status_of(kind::GOLD_FAIL_PARTNER),
@@ -132,10 +126,6 @@ fn trade_event_kinds_decode_to_their_trade_status_variants() {
     );
 }
 
-/// The OFFER_* kinds decode to the fixed-444-byte extended status: the polarity byte
-/// comes from the KIND (never inferred), the window-visible item fields survive the payload
-/// round-trip into the right wire slots, unused slots stay zeroed, and a malformed payload
-/// drops the packet entirely.
 #[test]
 fn offer_events_decode_to_the_extended_status_with_the_kind_deciding_self_player() {
     use lyracore_shared::trade::{encode_offer, event_kind as kind, OfferSlot};
@@ -171,8 +161,6 @@ fn offer_events_decode_to_the_extended_status_with_the_kind_deciding_self_player
         }
     };
 
-    // Wire polarity (mangoszero): the `self_player` BYTE is "1 means traders data, 0 means
-    // own", so your OWN echo carries 0 and the partner's side carries 1.
     let own = extended(kind::OFFER_SELF);
     assert!(
         !own.self_player,
@@ -242,11 +230,11 @@ fn a_compatibility_enchant_in_an_offer_goes_out_as_its_client_enchantment() {
 
 #[test]
 fn bag_content_parts_boundaries() {
-    assert_eq!(codec::bag_content_parts(119), None); // just below the bag-content range
-    assert_eq!(codec::bag_content_parts(120), Some((19, 0))); // first bag, first slot
-    assert_eq!(codec::bag_content_parts(137), Some((19, 17))); // first bag, last slot (0..MAX_BAG_SIZE)
-    assert_eq!(codec::bag_content_parts(138), Some((20, 0))); // second bag, first slot
-    assert_eq!(codec::bag_content_parts(191), Some((22, 17))); // fourth (last) bag, last slot
+    assert_eq!(codec::bag_content_parts(119), None);
+    assert_eq!(codec::bag_content_parts(120), Some((19, 0)));
+    assert_eq!(codec::bag_content_parts(137), Some((19, 17)));
+    assert_eq!(codec::bag_content_parts(138), Some((20, 0)));
+    assert_eq!(codec::bag_content_parts(191), Some((22, 17)));
     assert_eq!(codec::bag_content_parts(192), None);
 }
 
@@ -275,8 +263,6 @@ fn item_row(slot: u8, enchant_id: u32) -> ItemInstance {
     }
 }
 
-/// The enchantment word of the item update and the first enchant word of the visible item in an
-/// in-place enchant outbound, with the raw field indexes of every VALUES block.
 fn enchant_words(out: &[Outbound]) -> (Option<u32>, Option<u32>, Vec<Vec<u16>>) {
     use wow_world_messages::vanilla::{Object, ServerMessage, UpdateMask, VisibleItemIndex};
     let (mut item_word, mut visible_word) = (None, None);

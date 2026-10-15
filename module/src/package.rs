@@ -3,10 +3,6 @@
     reason = "Packages select the named API operations they need"
 )]
 
-//! The Package API root for Package-level operations: Operator authorization, Package-owned
-//! Characters, Package Config and encounter choreography. `fixture` exists only with
-//! `debug_reducers` and `test` only in a test build.
-
 #[cfg(feature = "debug_reducers")]
 pub(crate) use crate::package_fixture as fixture;
 #[cfg(test)]
@@ -16,14 +12,12 @@ pub(crate) use crate::helpers::require_operator;
 pub(crate) use crate::package_account::create_package_character as create_character;
 pub(crate) use crate::package_config::ensure_package_config_default as ensure_config_default;
 
-/// The core steps a Package runs to build, level and remove its own Characters.
 pub(crate) mod character {
     pub(crate) use crate::creatures::build_player_entity;
     pub(crate) use crate::stats::set_character_level;
     pub(crate) use crate::world::cascade_delete_character;
 }
 
-/// The encounter kernel a Package drives through `encounter_package!`.
 pub(crate) mod encounter {
     pub(crate) use crate::encounter::{
         encounter_reset, encounter_reset_full, equip_swap, get_encounter_data, get_encounter_state,

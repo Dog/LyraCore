@@ -5,7 +5,6 @@ use support::{actor, Standalone};
 
 const REALM_CHAT_ROWS: &str = "SELECT * FROM game_realm_chat_event";
 
-/// A PARTY request from a Human (race 1) with the given language and message, tagged DND.
 fn party_request(language: u32, message: &str) -> String {
     json!({
         "kind": 1,
@@ -31,7 +30,6 @@ fn refused(realm: &Standalone, args: &[&str], tag: &str) {
     );
 }
 
-/// The inserted Realm Chat Lines of one captured transaction.
 fn inserted_lines(update: &Value) -> Vec<Value> {
     update["game_realm_chat_event"]["inserts"]
         .as_array()
@@ -46,7 +44,6 @@ fn a_party_line_is_one_row_naming_every_member_of_the_realm_core_party() {
     realm.publish_module();
     realm.assert_call("claim_operator", &[]);
     realm.assert_call("install_guid_range", &["0"]);
-    // Characters 1 and 2 form a party on Realm-core, which holds no Character rows at all.
     realm.assert_call("realm_group_op", &["0", &actor("1"), "2", "0", "0", "0"]);
     realm.assert_call("realm_group_op", &["1", &actor("2"), "0", "0", "0", "0"]);
 
@@ -73,7 +70,6 @@ fn a_party_line_is_one_row_naming_every_member_of_the_realm_core_party() {
     recipients.sort_unstable();
     assert_eq!(recipients, [1, 2], "the speaker hears their own line");
 
-    // The shared event GC reaps the line, which also keeps the next capture free of deletes.
     assert!(
         support::poll_until(std::time::Duration::from_secs(20), || realm
             .query_rows(REALM_CHAT_ROWS)
@@ -81,7 +77,6 @@ fn a_party_line_is_one_row_naming_every_member_of_the_realm_core_party() {
         "the event GC never reaped the Realm Chat Line"
     );
 
-    // Refusals roll back: the only row the next transaction carries is the sentinel line.
     let sentinel = party_request(0, "sentinel");
     let updates = realm.capture_updates(REALM_CHAT_ROWS, 1, || {
         refused(
@@ -101,7 +96,6 @@ fn a_party_line_is_one_row_naming_every_member_of_the_realm_core_party() {
     assert_eq!(lines[0]["message"], "sentinel");
     assert_eq!(lines[0]["language"], 0, "Universal passes for party");
 
-    // An addon payload travels as the client sent it (cm:ChatHandler.cpp:306-312).
     assert!(
         support::poll_until(std::time::Duration::from_secs(20), || realm
             .query_rows(REALM_CHAT_ROWS)

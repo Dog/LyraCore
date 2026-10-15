@@ -1,17 +1,3 @@
-//! Class trainers — learn new spells/ranks while leveling (the leveling-spine system that lets the
-//! per-character spellbook GROW past the login class kit). Mirrors the vendor shape: a static
-//! `game_trainer_spell` list (trainer creature entry → teachable spells), a range/flag-gated buy that
-//! charges copper and calls [`crate::spell::learn_spell`], and a debug twin for server verification.
-//! The gateway turns `CMSG_TRAINER_LIST` into `SMSG_TRAINER_LIST` (each spell flagged Green/Red/Gray)
-//! and `CMSG_TRAINER_BUY_SPELL` into this reducer, then pushes `SMSG_LEARNED_SPELL` so the ability
-//! appears on the action bar live (no relog).
-//!
-//! Deliberate simplification: the `game_trainer_spell` row carries only spell_id/cost/required_level —
-//! class spells need no required_skill / prerequisite-spell chain (those are the profession/talent
-//! cases; add the columns when professions land). A refused buy names its reason with a
-//! [`TrainerRefusal`]; the Gateway owns the mapping onto gtker vanilla's three
-//! `TrainingFailureReason` codes. [entity]
-
 use lyracore_shared::trainer::TrainerRefusal;
 use spacetimedb::{table, ReducerContext, Table};
 
@@ -20,22 +6,14 @@ use crate::{
     game_world_entity, WorldEntity,
 };
 
-/// Max distance to train at a trainer: (10 yd)² — same as the vendor/quest/loot interaction range. The
-/// client walks into range before sending `CMSG_TRAINER_BUY_SPELL`, so this only rejects out-of-range abuse.
-/// `pub(crate)` so `talent::do_reset_talents` (also a trainer-gated interaction) shares the ONE range
-/// constant rather than forking a second magic number that could drift from this one.
 pub(crate) const TRAINER_RANGE_SQ: f32 = 100.0;
 
-/// Reducer edge: only the tag crosses to the gateway; the detail stays in module logs.
 pub(crate) fn refused(refusal: TrainerRefusal, detail: &str) -> String {
     let tag = refusal.as_tag();
     spacetimedb::log::info!("trainer refused {tag}: {detail}");
     tag.to_string()
 }
 
-/// One spell a trainer teaches. Static, public, SQL-loadable (no Timestamp), keyed by the trainer's
-/// CREATURE TEMPLATE entry (every spawned trainer of that entry offers the same list — like vendors).
-/// Logical key `(trainer_entry, spell_id)` via the `#[auto_inc]` PK + `by_trainer` btree. [static]
 #[table(
     accessor = game_trainer_spell,
     public,
@@ -46,62 +24,27 @@ pub struct TrainerSpell {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    pub trainer_entry: u32, // -> game_creature_template.entry (the trainer NPC's template)
-    pub spell_id: u32,      // the spell taught
-    pub cost: u32,          // copper charged on purchase
-    pub required_level: u8, // minimum character level to learn it
-    // END-APPENDED, defaulted 0 → `publish` auto-migrates + every existing
-    // class-spell row reads 0 (the unchanged spell path). 0 = a normal spell offering; >0 = this
-    // offering TEACHES that skill_line as a profession (Cooking=185 / Skinning=393) — the buy branch
-    // grants the skill via `crate::skill::learn_profession` instead of casting/learning a spell. The
-    // `spell_id` of a profession offering is a synthetic marker id (50080/50081), never resolved.
-    // `#[default(0u32)]` (typed, not bare 0 — the last_logout_micros lesson) so the column-add
-    // auto-migrates the populated game_trainer_spell table instead of aborting the publish.
+    pub trainer_entry: u32,
+    pub spell_id: u32,
+    pub cost: u32,
+    pub required_level: u8,
     #[default(0u32)]
     pub learn_skill_line: u32,
-    // END-APPENDED (professions slice — rank/cap scaling), defaulted **75** (Apprentice). An auto-migrated
-    // EXISTING profession offering learns at exactly the apprentice cap as before (byte-identical); a
-    // distinct higher-tier offering (Journeyman=150, Expert=225, Artisan=300) marker LIFTS the ceiling on
-    // buy. `#[default(75u32)]` (NOT 0 — a 0 cap would insert a 1/0 profession that can never climb). Only
-    // meaningful when `learn_skill_line > 0`; a class-spell row (line 0) ignores it.
     #[default(75u32)]
     pub learn_skill_cap: u32,
 }
 
-/// What a successful trainer purchase GRANTS — `crate::skill::learn_profession` for
-/// a flagged profession/weapon offering, `crate::spell::learn_spell_with_dependents` for a plain class
-/// spell. Each `apply_trainer_buy` arm constructs its OWN variant directly at the point it already knows
-/// which one applies — there is no longer a separate `grant_for` routing function: the old
-/// shape threaded a `(to_learn, known, cap)` tuple with a `0u32` dead-sentinel `to_learn` on the two
-/// profession/weapon arms (never read on those arms — only `grant_for` re-derived, from `profession_line`
-/// ALONE, the exact branch each tuple was already built in) through to a `grant_for` call that just
-/// re-decided the same fork the caller had already taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuyGrant {
-    /// Teach a profession `(skill_line, cap)` (Cooking=185 / Skinning=393 at cap 75/150/…) →
-    /// `crate::skill::learn_profession`. The cap is the rank ceiling the buy lifts the skill to.
     Profession(u32, u32),
-    /// Teach RIDING at this tier (75 Apprentice, 150 Journeyman) → `crate::skill::learn_riding`. Its own
-    /// variant because riding is granted WHOLE — current and max both become the tier — while a
-    /// profession is born at 1 and climbs to its cap. The mount gate compares the CURRENT rank, so
-    /// granting riding the profession way would leave a paying rider unable to mount.
     Riding(u32),
-    /// Learn the resolved spell id (the LearnSpell wrapper's rank, or the spell itself) → `crate::spell::learn_spell`.
     Spell(u32),
 }
 
-/// Whether a rank purchase's `game_spell_chain` prerequisite is satisfied (reduced scope):
-/// `prev_spell == 0` — the family's first rank, or a spell with no chain concept at all — has no
-/// prerequisite, so it is ALWAYS allowed regardless of `knows_prev`. Otherwise the caster must already
-/// know `prev_spell` (vanilla refuses training "Fireball Rank 3" while only Rank 1 is known). Pure →
-/// unit-tested without a `ReducerContext`.
 pub(crate) fn rank_prereq_met(prev_spell: u32, knows_prev: bool) -> bool {
     prev_spell == 0 || knows_prev
 }
 
-/// Pure purchase gate — decides whether `level`/`money` may learn a spell costing `cost` at `required_level`.
-/// Checked in priority order (already-known first, then level, then money) so the player gets the most
-/// relevant message. Pure → unit-tested.
 pub(crate) fn trainer_buy_check(
     known: bool,
     level: u32,
@@ -257,13 +200,6 @@ fn sorted_offerings(
     (offerings, overflow)
 }
 
-/// Admit one imported trainer spell without scanning the catalogue. One request examines at most 16
-/// class-spell offerings across the requested spell and its wrappers and reads one overflow row when
-/// needed. If the requested id resolves to another target, its rejected direct lookup reads at most
-/// 17 rows before the wrapper search reads at most 17 more. Reverse lookup reads at most 17 effects.
-/// Target resolution reads at most four effects for the requested spell and each of at most 16
-/// candidate wrappers. Every examined class-spell offering reads one exact trainer template. A usable
-/// offering ends the search; `ProfileLimit` means the bounded prefix was inconclusive.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 fn admit_profile_spell(
     ctx: &ReducerContext,
@@ -351,10 +287,6 @@ fn demo_profile_spell_admitted(class: u8, spell_id: u32) -> bool {
     }
 }
 
-/// Reconcile one free class spell selected by a provisioning profile. Imported Shards require a
-/// real offering from a trainer that serves the Character's class, then apply the offering's level
-/// and the spell rank-chain Gates. A seed-only Shard has no trainer catalogue, so its supported
-/// demo profiles may learn a seeded spell at the spell's own level.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn reconcile_profile_spell(
     ctx: &ReducerContext,
@@ -417,10 +349,6 @@ pub(crate) fn reconcile_profile_spell(
     Ok(true)
 }
 
-///
-/// The `Err` is a bare human detail, not a Refusal tag: `apply_trainer_buy` turns it into a
-/// [`TrainerRefusal::Unavailable`] and logs the detail, while `do_reset_talents` keeps the plain
-/// text its respec path already returns.
 pub(crate) fn validate_trainer_interaction(
     ctx: &ReducerContext,
     caster: &WorldEntity,
@@ -456,9 +384,6 @@ pub(crate) fn validate_trainer_interaction(
     Ok(trainer)
 }
 
-/// Shared buy logic for the player + debug paths: validate `trainer` is a real in-range trainer, that it
-/// teaches `spell_id`, run [`trainer_buy_check`], then charge copper + learn the spell. This is the
-/// reducer edge, so a Refusal leaves only its [`TrainerRefusal`] tag in the `Err`. [entity]
 pub(crate) fn apply_trainer_buy(
     ctx: &ReducerContext,
     caster_guid: u64,
@@ -472,8 +397,6 @@ pub(crate) fn apply_trainer_buy(
         .ok_or_else(|| refused(TrainerRefusal::Unavailable, "buyer not in world"))?;
     let trainer = validate_trainer_interaction(ctx, &caster, trainer_guid)
         .map_err(|detail| refused(TrainerRefusal::Unavailable, &detail))?;
-    // The trainer must actually teach this spell (its template's list). The spawned trainer carries its
-    // creature-template `entry`; the list is keyed by that.
     let offered = ctx
         .db
         .game_trainer_spell()
@@ -563,10 +486,6 @@ pub(crate) fn apply_trainer_buy(
                 BuyGrant::Riding(tier) => {
                     crate::skill::learn_riding(ctx, caster_guid, owner, tier as u16)
                 }
-                // Trainer-path only: `learn_spell_with_dependents` also auto-teaches this rank's
-                // ONE-LEVEL `game_spell_learn` dependents (see its doc for why NOT plain `learn_spell`
-                // universally — it would change createinfo's spell COUNT and break the provenance
-                // count-parity runbook).
                 BuyGrant::Spell(id) => {
                     crate::spell::learn_spell_with_dependents(ctx, caster_guid, owner, id)
                 }
@@ -584,7 +503,6 @@ pub(crate) fn apply_trainer_buy(
             TrainerRefusal::NotEnoughMoney,
             &format!("not enough money (need {})", offered.cost),
         )),
-        // `trainer_buy_check` returns no other Refusal; the arm keeps the match exhaustive.
         Err(refusal) => Err(refused(refusal, "purchase gate refused the buy")),
     }
 }
@@ -593,14 +511,6 @@ pub(crate) fn apply_trainer_buy(
 mod tests {
     use super::*;
 
-    // --- (reduced scope): rank-prereq gate ---------------------------------------------
-
-    /// `rank_prereq_met` truth table: `prev_spell == 0` is ALWAYS allowed regardless of `knows_prev`
-    /// (the family's first rank, or a spell with no chain concept — the fn's own NO-ROW-FALLBACK
-    /// shape: `apply_trainer_buy` only calls this at all when a `game_spell_chain` row exists, and an
-    /// absent row is handled at that ctx-bound call site by skipping the gate entirely — see its doc —
-    /// which is behaviorally identical to this fn returning `true` for a `prev_spell == 0` row).
-    /// Otherwise the caster must already know `prev_spell`.
     #[test]
     fn rank_prereq_met_truth_table() {
         assert!(
@@ -620,31 +530,22 @@ mod tests {
 
     #[test]
     fn trainer_buy_check_gates_in_priority_order() {
-        // already known wins even when everything else is fine
         assert_eq!(
             trainer_buy_check(true, 10, 1, 1000, 10),
             Err(TrainerRefusal::AlreadyKnown)
         );
-        // then the level gate
         assert_eq!(
             trainer_buy_check(false, 2, 6, 1000, 10),
             Err(TrainerRefusal::LevelTooLow)
         );
-        // then the money gate
         assert_eq!(
             trainer_buy_check(false, 10, 1, 5, 10),
             Err(TrainerRefusal::NotEnoughMoney)
         );
-        // all good → Ok
         assert_eq!(trainer_buy_check(false, 10, 6, 100, 10), Ok(()));
-        // exact level + exact money → Ok (boundaries inclusive)
         assert_eq!(trainer_buy_check(false, 6, 6, 10, 10), Ok(()));
     }
 
-    /// PROFESSION REBUY CAP: the already-known gate for a profession offering compares the character's
-    /// STORED max_rank against THIS offering's cap. Exactly meeting the cap is already-known (rejected,
-    /// no re-charge); one rank below it is not (the buy proceeds and lifts the ceiling); never having
-    /// trained the line at all (`None`) is never capped.
     #[test]
     fn profession_already_capped_compares_stored_max_rank_against_the_offering_cap() {
         assert!(
@@ -669,26 +570,15 @@ mod tests {
         );
     }
 
-    /// WEAPON-LEARN PRESENCE-KNOWN semantics: unlike a profession offering (known = a CAP
-    /// comparison), a weapon offering's "known" is mere ROW PRESENCE — feeding `trainer_buy_check` a bare
-    /// `known` bool either way, so the SAME gate enforces both: a class-seeded weapon line (row present,
-    /// regardless of its stored cap) refuses as already-known; a lacked line (no row at all) proceeds.
     #[test]
     fn weapon_learn_known_is_row_presence_not_a_cap_comparison() {
-        // Present (seeded by ensure_player_skills at character creation) -> already-known, rejected.
         assert_eq!(
             trainer_buy_check(true, 40, 1, 1000, 100),
             Err(TrainerRefusal::AlreadyKnown)
         );
-        // Absent (never seeded/learned) -> proceeds regardless of what a stale cap column might say.
         assert_eq!(trainer_buy_check(false, 40, 1, 1000, 100), Ok(()));
     }
 
-    // --- the riding fork ------------------------------------------------------------------
-
-    /// A riding purchase is TIER-gated the same way a profession is: Apprentice-75 has not met the
-    /// Journeyman-150 offering, so the second tier is buyable exactly once, and re-buying the tier you
-    /// already hold is refused with no re-charge. That is what stops a player paying twice for riding.
     #[test]
     fn a_riding_tier_is_buyable_once_and_the_next_tier_still_sells() {
         assert!(
@@ -709,16 +599,9 @@ mod tests {
         );
     }
 
-    /// THE IDEMPOTENT RE-LEARN: the profession buy keys its already-known gate on the
-    /// PRESENCE of a `game_player_skill` row for the line (the `known` flag the buy path derives), and feeds
-    /// it through the SAME `trainer_buy_check`. So a re-buy of an already-learned profession is rejected with
-    /// `TrainerRefusal::AlreadyKnown` (no re-charge, no duplicate/reset row) — identical to a re-bought known spell.
     #[test]
     fn profession_rebuy_is_rejected_as_already_known() {
-        // First learn: no skill row yet (known=false), cost 0, level 1 → the gate ALLOWS the grant.
         assert_eq!(trainer_buy_check(false, 1, 1, 0, 0), Ok(()));
-        // Re-buy: the skill row now exists (known=true) → rejected as already-known, even though cost is 0
-        // and the level is fine (the idempotent no-op — the row is never reset or duplicated).
         assert_eq!(
             trainer_buy_check(true, 1, 1, 0, 0),
             Err(TrainerRefusal::AlreadyKnown)

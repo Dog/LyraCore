@@ -86,7 +86,6 @@ fn inventory_changes_preserve_accepted_trade_items() {
     shard.assert_sql("UPDATE game_spell SET cast_time_ms = 1000, cost = 10, power_type = 1 WHERE spell_id = 5090171");
     shard.assert_sql("UPDATE game_spell_reagent SET item_entry = 5090054 WHERE id = 40721368");
     shard.assert_sql("INSERT INTO game_spell_reagent (id,spell_id,item_entry,count) VALUES (40721369,5090171,5090052,1)");
-    // Keep regeneration separate from the scheduled craft's power accounting.
     shard.assert_sql("DELETE FROM game_creature_move_schedule");
     shard.assert_sql("UPDATE game_world_entity SET power = 100 WHERE guid = 1");
     let before_craft = shard.query_rows("SELECT * FROM game_item_instance");
@@ -141,7 +140,6 @@ fn inventory_changes_preserve_accepted_trade_items() {
     shard.assert_call("gw_accept_trade", &[&buyer]);
     shard.assert_sql("INSERT INTO game_spell_effect (id,spell_id,effect_index,kind,base_points,die_sides,per_level,period_ms,target,radius_yd,chain_targets,trigger_spell,effect_mechanic,p0,p0_kind,p1,script_id,enters_combat) VALUES (20360685,5090171,1,7,1,0,0.0,0,0,0.0,0,0,0,5090999,8,0,0,false)");
     let before_failed_product = shard.query_rows("SELECT * FROM game_item_instance");
-    // Retain offer events while the test inspects their final quantities.
     shard.assert_sql("DELETE FROM game_event_reaper_schedule");
     shard.assert_sql("DELETE FROM game_trade_event");
     shard.assert_call("debug_begin_cast", &["1", "5090171", "1"]);

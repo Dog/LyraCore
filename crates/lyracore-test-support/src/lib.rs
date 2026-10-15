@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The Core checkout whose Module and Gateway the private fixtures exercise.
-/// Package runners set this explicitly; Core tests use this crate's own workspace.
 pub fn core_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -33,26 +31,17 @@ pub fn core_root() -> &'static Path {
     })
 }
 
-/// How often every wait in this suite re-checks its condition.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The deadline every wait uses unless it says otherwise. Deliberately generous: a wait that gives
-/// up early is a flake, and a condition that is already true costs one poll either way.
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many times a publish may be retried past a node that died launching the module.
 const PUBLISH_ATTEMPTS: usize = 3;
 
-/// Where each standalone's own stdout and stderr land. Outside the data directory on purpose — the
-/// data directory goes away with the node, and a crash is exactly when the log is worth reading.
-/// CI collects this directory as an artifact.
 pub fn log_dir() -> PathBuf {
     std::env::temp_dir().join("lyracore-standalone-logs")
 }
 
-/// Poll `probe` every [`POLL_INTERVAL`] until it answers `true` within `timeout`. The timeout is the
-/// full budget from this call until a successful probe returns. A probe runs synchronously and must
-/// return on its own; this helper can refuse a late result but cannot interrupt a blocked probe.
+// A synchronous probe must return on its own; the deadline cannot interrupt it.
 pub fn poll_until(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -159,8 +148,7 @@ impl Standalone {
         let spacetime = std::env::var_os("SPACETIME_BIN").unwrap_or_else(|| "spacetime".into());
         let address = format!("127.0.0.1:{port}");
         let server = format!("http://{address}");
-        // Nodes in one fixture must accept the same Owner Token. Keep their signing keys private
-        // and wait for the first node to finish creating the pair before another node reads it.
+        // The first node must finish creating shared signing keys before the next reads.
         let signing_keys = signing_keys();
         let startup = signing_keys
             .startup
@@ -234,7 +222,6 @@ impl Standalone {
         self.publish_module_bytes(module_bytes());
     }
 
-    /// Copy built Wasm bytes into this Standalone's private directory and publish that copy.
     pub fn publish_module_bytes(&mut self, wasm: &[u8]) {
         self.publish_bytes(wasm, &[]);
     }
@@ -250,7 +237,6 @@ impl Standalone {
         self.publish(&database, &["--bin-path", path.to_str().unwrap()], extra);
     }
 
-    /// Publish the same private Wasm onto another database owned by this persistent node.
     pub fn publish_named_module_bytes(&mut self, database: &str, wasm: &[u8]) {
         assert!(
             self.storage == Storage::Disk,
@@ -261,8 +247,6 @@ impl Standalone {
         self.publish(database, &["--bin-path", path.to_str().unwrap()], &[]);
     }
 
-    /// The published schema as `spacetime describe --json` prints it: tables, reducers and the
-    /// typespace their types refer into.
     pub fn describe(&self) -> serde_json::Value {
         let output = self
             .command()
@@ -284,7 +268,6 @@ impl Standalone {
         command.output().expect("failed to call reducer")
     }
 
-    /// Capture committed transactions after the subscription's initial result is visible.
     pub fn capture_updates(
         &self,
         query: &str,
@@ -319,8 +302,7 @@ impl Standalone {
         assert!(reader.read_line(&mut initial).unwrap() > 0);
         serde_json::from_str::<serde_json::Value>(&initial).expect("initial subscription result");
         action();
-        // Keep the CLI alive until its output is read. Its update limit can exit before the
-        // final asynchronous stdout write reaches this pipe.
+        // Keep the CLI alive until its asynchronous stdout write reaches the pipe.
         let updates: Vec<_> = reader
             .lines()
             .take(count as usize)
@@ -378,8 +360,6 @@ impl Standalone {
         parse_text_rows(&String::from_utf8(output.stdout).expect("SQL output was not UTF-8"))
     }
 
-    /// Wait for a reducer that refuses until the durable state it checks has settled. The reducer
-    /// itself is the condition, so the test waits exactly as long as the schedule behind it needs.
     pub fn wait_until_call_succeeds(&self, reducer: &str, args: &[&str]) {
         let mut last = None;
         let settled = poll_until(POLL_TIMEOUT, || {
@@ -396,13 +376,7 @@ impl Standalone {
         );
     }
 
-    /// Publish the module, restarting a fresh node when it dies mid-publish.
-    ///
-    /// `spacetimedb-standalone` 2.7.1 segfaults while launching this module roughly once in a dozen
-    /// publishes (SIGSEGV, no log line past `launching module`). Before the first successful publish
-    /// no fixture has staged gameplay in that database. A disk fixture may also restart while
-    /// publishing a new named database because previously published databases survive that owned
-    /// process replacement. Republishing any existing database remains fail-fast.
+    // SpacetimeDB 2.7.1 can segfault at launch; retry only for a new database.
     fn publish(&mut self, database: &str, source: &[&str], extra: &[&str]) {
         let workspace = core_root();
         let mut attempts = Vec::new();
@@ -448,8 +422,6 @@ impl Standalone {
         self.child.id()
     }
 
-    /// Replace the owned process with the same storage, address and signing keys. The published
-    /// Module and its rows must survive without republishing or reseeding.
     pub fn restart_persistent(&mut self) {
         assert!(self.storage == Storage::Disk, "restart needs disk storage");
         assert!(self.published, "restart needs a published Module");
@@ -457,7 +429,6 @@ impl Standalone {
         self.restart();
     }
 
-    /// Start a replacement node on the same address, appending to the same log.
     fn restart(&mut self) {
         let _ = self.child.wait();
         self.child = spawn_node(
@@ -472,8 +443,6 @@ impl Standalone {
         self.wait_for_server();
     }
 
-    /// Not `poll_until`: a node that has already exited never starts listening, so this one waits
-    /// on two outcomes and reports the exit rather than burning the whole deadline on it.
     fn wait_for_server(&mut self) {
         let deadline = Instant::now() + POLL_TIMEOUT;
         loop {
@@ -545,8 +514,6 @@ impl Standalone {
         );
     }
 
-    /// The end of this node's own log, appended to every failure. A publish that reports only
-    /// "connection closed" says nothing; the node's last lines say why it closed it.
     fn log_tail(&self) -> String {
         let Ok(log) = fs::read_to_string(&self.log_path) else {
             return String::new();
@@ -565,7 +532,6 @@ impl Drop for Standalone {
     }
 }
 
-/// Start one standalone node, appending its stdout and stderr to `log_path`.
 fn spawn_node(
     spacetime: &OsString,
     cli_config: &Path,
@@ -669,8 +635,6 @@ fn text_row_cells(line: &str) -> Vec<&str> {
     cells
 }
 
-/// `spacetime sql --format text` prints a string column inside double quotes. Callers compare
-/// against the value, not against its rendering, so the quotes come off here once.
 fn unquote(value: &str) -> String {
     value
         .strip_prefix('"')
@@ -679,7 +643,6 @@ fn unquote(value: &str) -> String {
         .to_string()
 }
 
-/// An Operator request for a fixture Character without a World Session.
 pub fn actor(guid: &str) -> String {
     let guid: u64 = guid.parse().expect("fixture Character guid");
     format!(r#"{{"guid":{guid},"ownership":null}}"#)

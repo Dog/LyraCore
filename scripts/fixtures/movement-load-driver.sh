@@ -1,5 +1,4 @@
 #!/bin/sh
-# Deterministic fixture for movement-batch-acceptance-test.sh. A real driver emits this same contract.
 printf '%s\n' \
   'seated_movers=@SEATED@' \
   'submitted_entries=@ENTRIES@' \

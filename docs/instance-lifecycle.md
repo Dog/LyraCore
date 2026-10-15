@@ -40,3 +40,9 @@ Group projection. `expire_instance_removal` checks the rule again before moving 
 
 All tables are private. The Coordinator subscribes to leases for Transfer admission and removal
 rows for countdown messages. Character bindings have no subscription.
+
+Grow an Instance Pool only while it is idle. The Gateway keeps a Character already inside a live
+Instance on its holder Shard if that Shard remains in the pool. A Group member who has not entered
+still follows the current bucket assignment. Reassigning that bucket during a run can send the
+member to a separate copy of the Instance. There is no realm-wide Instance-to-Shard index to join
+those routing decisions.

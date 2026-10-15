@@ -1,39 +1,11 @@
-//! The **Base Snapshot**: the `game_spell` / `game_spell_effect` rows the DBC import derives,
-//! written as canonical JSON so a Datascript can read base data without a shard and without client
-//! files.
-//!
-//! # Why the rows are typed here
-//!
-//! The import emits SQL. A Datascript needs the same values as data. Rather than parse the SQL back,
-//! both come from one typed row: [`SpellHeaderRow`] and [`SpellEffectRow`] carry the derived values,
-//! [`SpellHeaderRow::sql_values`] spells them as an SQL tuple, and [`write_snapshot`] spells them as
-//! JSON. One row, two spellings, no drift.
-//!
-//! # Licensing
-//!
-//! A snapshot holds DERIVED `game_*` values, never client bytes, and it is written only where the
-//! operator asks. The author-facing target (`datascripts/generated/`) is git-ignored. See the
-//! firewall note at the top of `dbc.rs`.
-//!
-//! # Canonical form
-//!
-//! The same rules as a Package Delta artifact (`lyracore-package-delta`'s `canonical` module): no
-//! whitespace, no trailing newline, a fixed member order, integers in plain decimal, an unsigned
-//! 64-bit value as a decimal string, a float as the shortest decimal that reads back as the same
-//! `f32`. Every scalar is spelled by `FieldValue`'s `Display`, which IS that writer, so a snapshot
-//! and a delta agree on every value by construction. Rows are primary-key sorted, so the same client
-//! data always produces the same bytes.
-
 use std::collections::BTreeMap;
 
 use lyracore_package_delta::{packed_spell_effect_id, FieldValue};
 
 use crate::sql_text;
 
-/// The snapshot format this build writes.
 const SNAPSHOT_VERSION: u32 = 1;
 
-/// One `game_spell` row, before it becomes either SQL or JSON.
 pub(crate) struct SpellHeaderRow {
     pub(crate) spell_id: u32,
     pub(crate) name: String,
@@ -63,8 +35,6 @@ pub(crate) struct SpellHeaderRow {
 }
 
 impl SpellHeaderRow {
-    /// The row's columns in the table's declaration order, which is also the order the INSERT names
-    /// them in.
     fn columns(&self) -> Vec<(&'static str, FieldValue)> {
         vec![
             ("spell_id", FieldValue::U32(self.spell_id)),
@@ -95,14 +65,11 @@ impl SpellHeaderRow {
         ]
     }
 
-    /// The `VALUES` tuple for the reload INSERT.
     pub(crate) fn sql_values(&self) -> String {
         sql_tuple(&self.columns())
     }
 }
 
-/// One `game_spell_effect` row. The packed durable key is derived from the spell and the effect
-/// index, never carried, so the two can never disagree.
 pub(crate) struct SpellEffectRow {
     pub(crate) spell_id: u32,
     pub(crate) effect_index: u8,
@@ -124,13 +91,10 @@ pub(crate) struct SpellEffectRow {
 }
 
 impl SpellEffectRow {
-    /// `(spell_id << 2) | effect_index`, the deterministic primary key the Module and the importer
-    /// have always used.
     pub(crate) fn row_id(&self) -> u64 {
         packed_spell_effect_id(self.spell_id, self.effect_index)
     }
 
-    /// The row's columns in declaration order, without the derived `id`.
     fn columns(&self) -> Vec<(&'static str, FieldValue)> {
         vec![
             ("spell_id", FieldValue::U32(self.spell_id)),
@@ -153,7 +117,6 @@ impl SpellEffectRow {
         ]
     }
 
-    /// The `VALUES` tuple for the reload INSERT, whose first column is the derived key.
     pub(crate) fn sql_values(&self) -> String {
         let mut columns = self.columns();
         columns.insert(0, ("id", FieldValue::U64(self.row_id())));
@@ -161,11 +124,6 @@ impl SpellEffectRow {
     }
 }
 
-/// The SQL `VALUES` tuple for one row.
-///
-/// Two spellings differ from the canonical JSON one: a string is SQL-quoted rather than
-/// JSON-quoted, and an unsigned 64-bit value is a bare number rather than a decimal string. Every
-/// other type has the same literal in both, which is why `Display` carries them.
 fn sql_tuple(columns: &[(&'static str, FieldValue)]) -> String {
     let mut out = String::from("(");
     for (index, (_, value)) in columns.iter().enumerate() {
@@ -182,30 +140,18 @@ fn sql_tuple(columns: &[(&'static str, FieldValue)]) -> String {
     out
 }
 
-/// Everything one DBC spell pass derived, in the order the reload statements name it.
-///
-/// The typed halves feed both the SQL and the snapshot. The remaining families are SQL-only: they
-/// are not Package Delta tables, so no Datascript can read or claim them.
 #[derive(Default)]
 pub(crate) struct SpellRows {
-    /// `game_spell` headers, in DBC order.
     pub(crate) headers: Vec<SpellHeaderRow>,
-    /// `game_spell_effect` rows the DBC mapping produced, including the curated synthetic additions.
     pub(crate) effects: Vec<SpellEffectRow>,
-    /// The curated fishing marker rows, which the reload writes by key AFTER the bulk insert and so
-    /// replace any DBC-derived row at the same key.
+    // Fishing markers replace DBC effects at the same key after the bulk insert.
     pub(crate) fishing: Vec<SpellEffectRow>,
-    /// `game_spell_reagent` value tuples.
     pub(crate) reagents: Vec<String>,
-    /// `game_creature_ai_spell_metadata` value tuples.
     pub(crate) eventai_metadata: Vec<String>,
-    /// `game_trainer_spell` value tuples for the curated override rows.
     pub(crate) trainers: Vec<String>,
 }
 
 impl SpellRows {
-    /// The effect rows a shard ends up holding, primary-key sorted, with a fishing marker replacing
-    /// whatever the DBC put at its key — exactly what the reload statements leave behind.
     fn resolved_effects(&self) -> BTreeMap<u64, &SpellEffectRow> {
         let mut resolved = BTreeMap::new();
         for row in self.effects.iter().chain(&self.fishing) {
@@ -214,13 +160,11 @@ impl SpellRows {
         resolved
     }
 
-    /// The headers a shard ends up holding, primary-key sorted.
     fn resolved_headers(&self) -> BTreeMap<u32, &SpellHeaderRow> {
         self.headers.iter().map(|row| (row.spell_id, row)).collect()
     }
 }
 
-/// The Base Snapshot for these rows, in canonical form.
 pub(crate) fn write_snapshot(rows: &SpellRows) -> String {
     let mut out = format!("{{\"version\":{SNAPSHOT_VERSION},\"game_spell\":[");
     for (index, header) in rows.resolved_headers().values().enumerate() {
@@ -240,8 +184,6 @@ pub(crate) fn write_snapshot(rows: &SpellRows) -> String {
     out
 }
 
-/// One row as a JSON object. `FieldValue`'s `Display` is the Package Delta canonical writer, so
-/// every scalar here is spelled exactly as a claim on the same column would spell it.
 fn write_row(out: &mut String, columns: &[(&'static str, FieldValue)]) {
     out.push('{');
     for (index, (name, value)) in columns.iter().enumerate() {
@@ -314,9 +256,6 @@ mod tests {
         }
     }
 
-    /// The snapshot column list IS the durable schema the Package Delta catalogue names. A column
-    /// added to one and not the other would let a Datascript claim a field its base data never
-    /// carries, or read a field no claim can set.
     #[test]
     fn the_snapshot_names_every_claimable_column_of_both_tables() {
         let header_names: Vec<&str> = header(133, "Fireball")
@@ -344,7 +283,6 @@ mod tests {
         assert_eq!(effect(133, 2).row_id(), (133 << 2) | 2);
     }
 
-    /// SQL and JSON disagree about exactly two spellings, and about nothing else.
     #[test]
     fn sql_quotes_text_and_writes_a_bare_unsigned_64_bit_value() {
         let sql = header(133, "Fireball").sql_values();
@@ -374,8 +312,6 @@ mod tests {
         assert!(json.contains(r#""is_negative":true"#), "{json}");
     }
 
-    /// A float always carries a decimal point, so a float column stays distinct from an integer one
-    /// in both spellings.
     #[test]
     fn a_float_column_always_carries_a_decimal_point() {
         let rows = SpellRows {
@@ -433,9 +369,6 @@ mod tests {
         assert_eq!(write_snapshot(&rows), write_snapshot(&rows));
     }
 
-    /// The reload writes the fishing marker by key after the bulk insert, so a shard holds the
-    /// marker and not the DBC row it landed on. The snapshot has to describe the shard, not the
-    /// intermediate.
     #[test]
     fn a_curated_fishing_marker_replaces_the_row_it_lands_on() {
         let mut marker = effect(7620, 0);

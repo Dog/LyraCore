@@ -1,7 +1,3 @@
-//! The spellmeta family's identifier policy. `game_spell_learn` follows the loot shape on its own
-//! band. `game_spell_chain` and `game_spell_proc_event` key on a spell identifier instead, so what
-//! a Package may invent there is exactly what it may invent in `game_spell`.
-
 mod common;
 
 use common::{
@@ -69,8 +65,6 @@ fn a_spell_learn_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// A rank-chain row's key IS a spell identifier, so a Package may only invent one for a spell it
-/// could have invented itself. The spellmeta band does not apply here and must not.
 #[test]
 fn a_spell_chain_insert_takes_the_package_spell_band() {
     for spell_id in [PACKAGE_SPELL_ID_FLOOR, PACKAGE_SPELL_ID_CEIL] {
@@ -100,8 +94,6 @@ fn a_spell_chain_insert_takes_the_package_spell_band() {
     );
 }
 
-/// A proc overlay for a real vanilla spell can be tuned but never invented: the base import owns
-/// that row's identifier, so an inserted one could neither be reconciled nor survive a reload.
 #[test]
 fn a_proc_overlay_for_a_real_spell_is_updatable_but_not_insertable() {
     let update = artifact(
@@ -147,8 +139,6 @@ fn an_update_may_name_a_real_imported_spell_learn_row() {
     assert_eq!(delta.claims()[0].key().row_id(), REAL_SPELL_LEARN);
 }
 
-/// A spell-keyed spellmeta row inherits the spell family's fixture cluster too, not only the
-/// project-wide band.
 #[test]
 fn no_operation_may_claim_a_fixture_spells_metadata() {
     for spell_id in [50_000u32, 50_500, 50_999, 5_090_000, 5_099_999] {

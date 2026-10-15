@@ -2,16 +2,10 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct LootWindowState {
-    /// The lootable copper `loot_target_money` reports for any target (default 0).
     pub(crate) corpse_money: u32,
-    /// Recorded `loot_money` targets — CMSG_LOOT_MONEY must drive the TRACKED guid.
     pub(crate) money_looted: std::sync::Mutex<Vec<u64>>,
-    /// Recorded `take_loot` calls as (target guid, slot): a take must act on the open target.
     pub(crate) items_taken: std::sync::Mutex<Vec<(u64, u8)>>,
-    /// Recorded `use_gameobject` target guids.
     pub(crate) gameobjects_used: std::sync::Mutex<Vec<u64>>,
-    /// Per-VIEWER corpse loot fixture for `corpse_loot(corpse_guid, viewer_guid)`, keyed by viewer
-    /// guid. Empty by default, so a test that never sets it sees an empty window.
     pub(crate) corpse_loot_by_viewer: std::collections::HashMap<u64, Vec<codec::LootItemView>>,
 }
 

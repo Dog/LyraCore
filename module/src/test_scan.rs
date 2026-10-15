@@ -1,22 +1,11 @@
-//! Source-scan primitives for this crate's Architecture Tests (`tripwires.rs`,
-//! `publish_safety.rs`) and the Package API's `package_test` root. Test-only.
-//!
-//! The Rust body scanners (`code_of`, `shape_of`) live in `lyracore_test_support::source_scan`.
-
 use std::io::Write;
-
-// The engine behind the spatial-scan and transfer-fence Architecture Tests. The two callers differ
-// only in which accessors they watch and what counts as opening a read.
 
 pub(crate) use lyracore_test_support::source_scan::in_comment as on_comment_line;
 
-/// 1-based line number of `byte_idx`.
 pub(crate) fn line_of(content: &str, byte_idx: usize) -> usize {
     content[..byte_idx].matches('\n').count() + 1
 }
 
-/// `name` at `byte_idx` is a standalone identifier, not a substring of a longer one and not a
-/// field access (`self.entities` is somebody else's business).
 fn is_standalone_ident(content: &str, byte_idx: usize, name: &str) -> bool {
     let before_ok = content[..byte_idx]
         .chars()
@@ -31,19 +20,6 @@ fn is_standalone_ident(content: &str, byte_idx: usize, name: &str) -> bool {
     before_ok && after_ok
 }
 
-/// Every `(line, accessor)` in `content` where one of `accessors` is read through a call matching
-/// `opens` — either straight off the accessor (`ctx.db.<accessor>().<opens-shaped tail>`) or off a
-/// local handle bound from it one line earlier (`let entities = ctx.db.<accessor>();` ...
-/// `entities.<...>`, this codebase's DOMINANT binding idiom — ~120 bindings vs ~18 inline calls, so
-/// a scanner that only matched the inline form would wave through most of the real reads).
-/// `opens(content, byte_idx)` decides whether the text starting right where the accessor call or
-/// handle name ends is a read the caller cares about: `.iter()`/`.count()` for a whole-table scan,
-/// `.guid().find(` for a raw point lookup — the only thing that differs between the two tripwires
-/// built on this.
-///
-/// Ceiling (inherited by both callers): still a text scan — a handle passed to another fn, or an
-/// accessor name assembled by a macro, defeats it. That is a deliberate trade, not an oversight: the
-/// job is to make the LAZY path (copy the code next to you) fail, not to be a sound analysis.
 pub(crate) fn raw_table_reads(
     content: &str,
     accessors: &[&'static str],
@@ -52,8 +28,6 @@ pub(crate) fn raw_table_reads(
     let code = lyracore_test_support::source_scan::code_only(content);
     let content = code.as_str();
     let mut out = Vec::new();
-    // `(local handle name, accessor it was bound from)`, deduped by name so a file that binds
-    // `entities` a dozen times doesn't count each downstream read a dozen times.
     let mut handles: Vec<(String, &'static str)> = Vec::new();
     for accessor in accessors {
         let call = format!("{accessor}()");
@@ -64,7 +38,6 @@ pub(crate) fn raw_table_reads(
         }
         let bind = format!("ctx.db.{accessor}();");
         for (idx, _) in content.match_indices(&bind) {
-            // Walk back over `let [mut] NAME =` on the same line to name the handle.
             let line_start = content[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let Some(head) = content[line_start..idx].trim_end().strip_suffix('=') else {
                 continue;
@@ -98,28 +71,6 @@ pub(crate) fn raw_table_reads(
     out
 }
 
-// ================================================================================================
-//  Resolving a scanned file that may legitimately not be in this checkout.
-// ================================================================================================
-//
-// Not every tree this crate's tripwires scan is present in every checkout, and that is a DESIGNED
-// state, not a broken one:
-//
-// * `packages/<name>/` is an optional drop-in. `module/build.rs` discovers packages at build time
-//   and compiles in whatever it finds; a checkout with none builds a perfectly good module.
-// * `scripts/`, `tools/`, `adapters/` and `client-patch/` are private-only tooling. The public
-//   mirror (LyraCoreProject/LyraCore) is an allowlist-filtered history that ships `module/`,
-//   `gateway/`, `importer/` and `crates/` and none of those four — so a cold clone of the mirror
-//   has to compile and test green without them.
-//
-// A `include_str!` on such a path is a COMPILE-TIME hard requirement, which is how the mirror's
-// cold clone stopped building at all. These helpers move the requirement to run time with one
-// exact rule, so a tripwire never loses its teeth to make a filtered checkout happy:
-//
-//   skip ONLY when the whole optional directory is absent — if the directory is there and the
-//   named file is not, that is a PATH TYPO, and the tripwire must fail on it.
-
-/// The repo root: `module/`'s parent.
 pub(crate) fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -127,11 +78,7 @@ pub(crate) fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// The optional directory a repo-relative path belongs to, if any — the ONLY directory whose
-/// absence licenses skipping that path.
-///
-/// Each installed Package owns its paths. A missing file within an installed Package is a defect;
-/// an absent Package is optional. The private tooling roots below are optional as a whole.
+// A missing file is optional only when its entire owning Package or private tooling root is absent.
 fn optional_owner(rel: &str) -> Option<String> {
     let mut segs = rel.split('/');
     match segs.next()? {
@@ -141,20 +88,10 @@ fn optional_owner(rel: &str) -> Option<String> {
     }
 }
 
-/// True when `rel`'s owning optional directory exists in this checkout — i.e. whatever lives under
-/// it is expected to be there. A path with no optional owner is always expected.
 pub(crate) fn is_installed(rel: &str) -> bool {
     optional_owner(rel).is_none_or(|dir| repo_root().join(dir).is_dir())
 }
 
-/// Read a repo-relative source file for a scan.
-///
-/// * `Some(contents)` — scan it, exactly as an `include_str!` would have.
-/// * `None` — the file's whole optional directory is not installed in this checkout; a one-line
-///   note is printed so a skip is never silent in the test output.
-///
-/// Panics if the file is missing while its directory IS installed: that is the path-typo case, and
-/// a scan that cannot find its target has lost its pin, not passed it.
 pub(crate) fn read_scanned(rel: &str) -> Option<String> {
     match std::fs::read_to_string(repo_root().join(rel)) {
         Ok(src) => Some(src),
@@ -193,10 +130,6 @@ mod tests {
         assert_eq!(found, [(5, "game_world_entity")]);
     }
 
-    // ---- the optional-tree resolver ------------------------------------------------------------
-
-    /// A drop-in package is optional one PACKAGE at a time; the private-only tooling trees are
-    /// optional wholesale; everything the mirror ships is never optional.
     #[test]
     fn optional_owner_scopes_a_package_to_its_own_directory() {
         assert_eq!(
@@ -215,7 +148,6 @@ mod tests {
         assert_eq!(optional_owner("crates/lyracore-shared/src/lib.rs"), None);
     }
 
-    /// A file the mirror ships always reads — no skip path exists for it at all.
     #[test]
     fn read_scanned_reads_a_shipped_file() {
         let src = read_scanned("module/src/test_scan.rs")
@@ -226,18 +158,12 @@ mod tests {
         );
     }
 
-    /// The typo case the tripwires must keep catching: the directory is installed, the named file
-    /// is not. Skipping here would let a whitelist entry rot into a pin over nothing.
     #[test]
     #[should_panic(expected = "path typo")]
     fn read_scanned_panics_on_a_missing_file_whose_directory_is_installed() {
         let _ = read_scanned("module/src/no-such-file-exists.rs");
     }
 
-    /// The skip case: an uninstalled optional tree. `packages/definitely-not-installed/` cannot
-    /// exist (a real package folder would have to be a valid Rust identifier and be checked in), so
-    /// this exercises the branch a mirror cold clone takes without depending on which packages the
-    /// running checkout happens to have.
     #[test]
     fn read_scanned_skips_a_package_that_is_not_installed() {
         assert!(

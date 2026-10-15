@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`TaxiActionStore`] adapter.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +11,6 @@ use crate::stdb::Coordinator;
 use crate::world::{Actor, TaxiActionStore};
 
 impl TaxiActionStore for Coordinator {
-    /// Cohesive status request: module resolution + policy runs before this returns one known bit.
     fn taxi_node_status(
         &self,
         actor: Actor,
@@ -61,8 +58,6 @@ impl TaxiActionStore for Coordinator {
             }))
     }
 
-    /// Cohesive direct-flight activation. The module commits every gameplay outcome as a stable
-    /// result code; only a failed Durable Request escapes as `Err`.
     fn activate_taxi(
         &self,
         actor: Actor,
@@ -113,9 +108,7 @@ impl Coordinator {
         operation: u8,
     ) -> Result<Option<TaxiServiceReply>> {
         let character_guid = actor.guid();
-        // Reducer completion and subscription propagation travel on the same SDK connection but
-        // are separate events. Poll by the caller-chosen id so an older cached reply can never be
-        // mistaken for this operation's result.
+        // Subscription propagation can lag completion; correlate replies by this request's id.
         for _ in 0..100 {
             let reply = self
                 .0
@@ -128,8 +121,7 @@ impl Coordinator {
             if let Some(reply) =
                 reply.filter(|reply| taxi_reply_matches(reply, character_guid, npc_guid, operation))
             {
-                // Copy the cache row before acknowledging it. The ack deletes only this request's
-                // module row; a failed ack is infrastructure loss and remains session-fatal.
+                // Copy before acknowledging; the acknowledgement deletes the durable reply.
                 call_reducer!(
                     self.0.call_pipe().conn.reducers,
                     "gw_ack_taxi_reply",

@@ -1,19 +1,3 @@
-//! Land mounts — the ground-mount state model. A mount is an ordinary cancelable self aura: the
-//! `A_MOUNTED` aura row IS the mounted state, and `WorldEntity.mount_display_id` is a PROJECTION of
-//! that aura set for the client's `UNIT_FIELD_MOUNTDISPLAYID`, never a second state machine.
-//!
-//! The module has no single aura-deletion boundary — auras are removed by `do_cancel_aura`, the
-//! expiry reap, dispel, the spellbook unlearn path and the death shed. Rather than teach each of
-//! those to undo a mount, every one of them converges on [`recompute_mount`], which RE-DERIVES the
-//! projection from whatever aura rows remain. That is the same collect-a-predicate-then-recompute
-//! shape the crate
-//! already uses for `aura_moves_vitals` + `recompute_vitals`, and it is what makes every dismount
-//! trigger idempotent by construction: running it twice, or on an unmounted player, converges on the
-//! same state and writes nothing the second time.
-//!
-//! TAXI BOUNDARY: a taxi flight owns `mount_display_id` for its whole duration (`taxi.rs`), and the
-//! two mechanics share one field. Both entry points here refuse to touch a player in flight. [entity]
-
 use spacetimedb::ReducerContext;
 
 use crate::game_aura;
@@ -24,19 +8,10 @@ use crate::game_world_entity;
 use crate::spell::{SpellEffect, A_MOD_SPEED, A_MOUNTED, SPEED_MOUNTED};
 use crate::WorldEntity;
 
-/// Can applying or removing this aura effect move the mount projection? True for the mount state
-/// itself, and for the mounted-speed effect that rides alongside it (the speed fold reads that aura
-/// only while an `A_MOUNTED` aura is present, so gaining or losing it is also a mount-projection
-/// event). Every aura-removal site collects this per deleted row and calls [`recompute_mount`] once
-/// afterwards. Pure — the two-argument shape mirrors `aura_moves_vitals(kind, p0)`.
 pub(crate) fn mount_aura_moves_mount(eff_kind: u8, eff_p0: i32) -> bool {
     eff_kind == A_MOUNTED || (eff_kind == A_MOD_SPEED && eff_p0 == SPEED_MOUNTED as i32)
 }
 
-/// The mount display an aura set projects: the display frozen on an `A_MOUNTED` aura's `p0`, or 0
-/// when the set holds none. A negative or absent value reads as 0 (unmounted) so unauthored data can
-/// never write a nonsense display. Pure over `(eff_kind, eff_p0)` pairs, so the projection rule is
-/// unit-testable without a reducer context.
 pub(crate) fn projected_mount_display(effects: impl IntoIterator<Item = (u8, i32)>) -> u32 {
     effects
         .into_iter()
@@ -45,8 +20,7 @@ pub(crate) fn projected_mount_display(effects: impl IntoIterator<Item = (u8, i32
         .unwrap_or(0)
 }
 
-/// The spell id of `guid`'s active land mount, or `None` when it is not mounted. The one test callers
-/// should use — mounted state lives in the aura set, not in `mount_display_id`.
+// The aura set owns mounted state; mount_display_id is only its projection.
 pub(crate) fn active_mount_spell(ctx: &ReducerContext, guid: u64) -> Option<u32> {
     ctx.db
         .game_aura()
@@ -57,18 +31,6 @@ pub(crate) fn active_mount_spell(ctx: &ReducerContext, guid: u64) -> Option<u32>
         .map(|a| a.spell_id)
 }
 
-/// Re-derive `guid`'s `mount_display_id` AND relayed run speed from its current aura rows. Zero
-/// `A_MOUNTED` auras clears the display; one restores the value frozen on it. The speed side reuses
-/// `combat::effective_move_speed` at base 1.0 with the current movement effects, so
-/// `run_speed_mult_bp` carries the exact multiplier — 16 000 for a 60% mount, 10 000 for an unmounted
-/// rider with no other speed aura — and the existing `run_speed_mult_bp` subscription diff (shared with
-/// GM `.speed`) turns that into `SMSG_FORCE_RUN_SPEED_CHANGE` with no gateway change needed. NEVER a
-/// delta — that is what makes every caller idempotent. Both fields are read-modify-written TOGETHER and
-/// the row is only written when at least one actually changed, because the gateway's subscription diff
-/// fires on every write and a redundant write would relay a spurious VALUES / force-run-speed update.
-///
-/// A player in a taxi flight is left completely alone: `taxi.rs` owns the shared display field for the
-/// duration of the flight and clears it itself on landing.
 pub(crate) fn recompute_mount(ctx: &ReducerContext, guid: u64) {
     if crate::taxi::is_in_flight(ctx, guid) {
         return;
@@ -93,14 +55,6 @@ pub(crate) fn recompute_mount(ctx: &ReducerContext, guid: u64) {
     entities.guid().update(e);
 }
 
-/// The one shared land-dismount operation. Removes EVERY aura row belonging to the active mount spell
-/// — so the paired mounted-speed effect goes with the mount itself — then recomputes the projection.
-/// A no-op (and never an error) when `guid` is not mounted, so an action chokepoint can call it
-/// unconditionally, and calling it twice changes nothing the second time.
-///
-/// Every dismount trigger routes here: `E_DISMOUNT` resolution, mount replacement, and the accepted
-/// action / indoor-transition hooks. Manual `CMSG_CANCEL_AURA`, natural expiry and DEATH reach the same
-/// end state through ordinary aura removal plus [`recompute_mount`].
 pub(crate) fn dismount(ctx: &ReducerContext, guid: u64) {
     if crate::taxi::is_in_flight(ctx, guid) {
         return;
@@ -121,32 +75,12 @@ pub(crate) fn dismount(ctx: &ReducerContext, guid: u64) {
     recompute_mount(ctx, guid);
 }
 
-/// Restore the land-mount projection onto a FRESHLY REBUILT player entity. A mount is an ordinary
-/// aura row, so it outlives the despawn/rebuild that a relog, a WORLDPORT_ACK map change or a shard
-/// handoff performs (`sweep_transfer_game_aura` carries the rows across a database boundary), while
-/// `build_player_entity` always constructs at display 0 and 1x. Without this the rider comes back on
-/// foot with an active mount buff.
-///
-/// Guarded on actually being mounted: an ordinary login must leave the GM `.speed` carry
-/// (`Character::pending_run_speed_mult_bp`) that `build_player_entity` just read alone. Idempotent —
-/// `recompute_mount` writes nothing when the rebuilt row already agrees.
 pub(crate) fn restore_mount_on_rebuild(ctx: &ReducerContext, guid: u64) {
     if active_mount_spell(ctx, guid).is_some() {
         recompute_mount(ctx, guid);
     }
 }
 
-// ===========================================================================================
-//  Mount eligibility — the cast gate. [entity]
-//
-//  Every check below is READ-ONLY, and the whole sweep runs inside `check_cast_gates`, which sits
-//  strictly before the cast core spends anything. So a refused mount leaves the item, the aura set,
-//  the display, run speed, cooldowns and combat state byte-identical.
-// ===========================================================================================
-
-/// Does casting `spell_id` mount its target? Keyed on the presence of an `A_MOUNTED` effect, never a
-/// spell id or name — the same data-driven classification `items::ops::apply_item_use` reads to keep a
-/// mount item in the bag, so onboarding another mount is data alone. [entity]
 pub(crate) fn spell_is_mount(ctx: &ReducerContext, spell_id: u32) -> bool {
     ctx.db
         .game_spell_effect()
@@ -155,27 +89,14 @@ pub(crate) fn spell_is_mount(ctx: &ReducerContext, spell_id: u32) -> bool {
         .any(|e| e.kind == A_MOUNTED)
 }
 
-/// Does a `SkillAbility` race/class mask admit `id`? A 0 mask is the DBC's "everyone" row; otherwise
-/// `id`'s bit must be set. Races and classes are 1-based, so id 1 is bit 0 and anything outside 1..=32
-/// can never match. Pure — this is what makes a mount tied to another race's riding tradition refuse.
 fn mask_admits(mask: u32, id: u8) -> bool {
     mask == 0 || ((1..=32).contains(&id) && mask & (1 << (id - 1)) != 0)
 }
 
-/// Does a learned rank meet a `SkillAbility` row's `min_skill`? Where vanilla's 75 (Apprentice) and 150
-/// (Journeyman) riding tiers live: the threshold is inclusive, so exactly 75 rides a rank-75 mount and 74
-/// does not. A negative/unauthored `min_skill` reads as 0 (no requirement). Pure.
 fn rank_satisfies(rank: u16, min_skill: i32) -> bool {
     i32::from(rank) >= min_skill.max(0)
 }
 
-/// Is `guid` TRAINED for `spell_id`? True when one of the character's learned skill lines carries a
-/// `game_skill_ability` row naming the spell, whose race/class masks admit the character, and whose
-/// `min_skill` the learned rank meets. Walking the player's own lines (a handful) and probing the
-/// `by_skill_line` index keeps this off a full scan of vanilla's ~10k ability rows.
-///
-/// Fails CLOSED: a mount whose skill-line data was never imported is uncastable rather than free, which
-/// is the whole point of the gate — owning the item must not bypass riding training.
 fn trained_for_spell(ctx: &ReducerContext, guid: u64, spell_id: u32, race: u8, class: u8) -> bool {
     let abilities = ctx.db.game_skill_ability();
     ctx.db
@@ -199,13 +120,6 @@ pub(crate) fn indoor_check_is_due(old_move_ms: u32, move_time_ms: u32) -> bool {
     move_time_ms / 100 != old_move_ms / 100
 }
 
-/// May a land mount be used at `(x, y, z)`? The ONE shared indoor predicate — the cast gate, the movement
-/// heartbeat and the teleport path all read it rather than interpreting MOGP flags themselves, so there is
-/// a single place for the WMO rule to be right.
-///
-/// FAILS OPEN by construction: `vmap::is_indoor` answers `false` when vmap is disabled, when no generation
-/// is active, when the cell carries no indoor-presence marker, and when the probe finds no WMO group. All
-/// four read as outdoors, so the mount feature is fully shippable and correct with vmap off.
 pub(crate) fn mount_cast_allowed_here(
     ctx: &ReducerContext,
     map_id: u32,
@@ -216,9 +130,6 @@ pub(crate) fn mount_cast_allowed_here(
     !crate::vmap::is_indoor(ctx, map_id, x, y, z)
 }
 
-/// Is `entity`'s head under a liquid surface? The SAME predicate player breath uses
-/// (`terrain::liquid_level_at` + `env::is_submerged`), not a second water-position interpretation:
-/// wading through shallow water, or floating at the surface, is not submerged and never refuses a mount.
 fn is_submerged_here(ctx: &ReducerContext, entity: &WorldEntity) -> bool {
     let level = crate::terrain::liquid_level_at(ctx, entity.map_id, entity.x, entity.y);
     lyracore_shared::env::is_submerged(
@@ -229,13 +140,6 @@ fn is_submerged_here(ctx: &ReducerContext, entity: &WorldEntity) -> bool {
     )
 }
 
-/// The land-mount cast gate: refuse a mount spell unless the caster is a trained rider of the right line
-/// and rank, alive, out of combat, outdoors and not submerged. `Ok(())` for every spell that carries no
-/// `A_MOUNTED` effect, so the cast core calls this unconditionally.
-///
-/// Only PLAYERS are gated. A creature has no `game_player_skill` rows and no riding concept, so gating it
-/// would refuse every scripted mount a mob is given, exactly like the level and cost gates' `is_player()`
-/// carve-outs beside this one.
 pub(crate) fn check_mount_cast(
     ctx: &ReducerContext,
     caster: &WorldEntity,
@@ -248,13 +152,9 @@ pub(crate) fn check_mount_cast(
     if !trained_for_spell(ctx, caster.guid, spell_id, caster.race(), caster.class()) {
         return Err(format!("spell {spell_id} requires riding training"));
     }
-    // A corpse and a ghost are both refused. `caster.dead` is already checked by the shared cast gate;
-    // the GHOST player flag is the released-spirit state that outlives it.
     if caster.dead || caster.player_flags & lyracore_shared::constants::player_flags::GHOST != 0 {
         return Err("you cannot mount while dead".to_string());
     }
-    // The module's authoritative engagement state, never a gateway session flag — a mount is not a
-    // combat escape.
     if crate::combat::is_engaged(ctx, caster.guid) {
         return Err("you cannot mount while in combat".to_string());
     }
@@ -275,9 +175,6 @@ mod tests {
         SPEED_SWING,
     };
 
-    /// The removal-convergence predicate every aura-deletion site collects. Only the mount state and
-    /// its paired mounted-speed effect move the projection; an ordinary buff, a DoT, or a NON-mounted
-    /// speed aura (a snare, a haste) must not drag a recompute onto every unrelated aura removal.
     #[test]
     fn mount_aura_moves_mount_covers_the_mount_pair_only() {
         assert!(mount_aura_moves_mount(A_MOUNTED, 0));
@@ -290,9 +187,6 @@ mod tests {
         assert!(!mount_aura_moves_mount(A_PERIODIC_DAMAGE, 0));
     }
 
-    /// The projection rule: the display comes off the `A_MOUNTED` aura's frozen `p0`, and an aura set
-    /// without one projects 0. Unauthored (negative) data reads as unmounted rather than as a garbage
-    /// display id.
     #[test]
     fn projected_mount_display_reads_the_mount_aura_only() {
         assert_eq!(projected_mount_display([]), 0);
@@ -307,9 +201,6 @@ mod tests {
         assert_eq!(projected_mount_display([(A_MOUNTED, -3)]), 0);
     }
 
-    /// Mount replacement (story 28): applying a second mount dismounts the first, so the aura set is
-    /// never allowed to hold two `A_MOUNTED` rows. Should one appear anyway, the projection stays
-    /// deterministic rather than flickering between displays.
     #[test]
     fn projected_mount_display_is_deterministic_with_a_stray_second_mount() {
         assert_eq!(
@@ -318,10 +209,6 @@ mod tests {
         );
     }
 
-    /// The riding rank tiers (stories 13/14), asserted on the boundary the gate actually compares:
-    /// `min_skill` is inclusive, so 74 fails a rank-75 mount and 75 rides it, 149 fails a rank-150
-    /// mount and 150 rides it. Unauthored (negative) data imposes no requirement rather than becoming
-    /// an unreachable threshold.
     #[test]
     fn rank_satisfies_is_inclusive_at_the_vanilla_riding_tiers() {
         assert!(!rank_satisfies(74, 75));
@@ -335,10 +222,6 @@ mod tests {
         assert!(rank_satisfies(0, -1));
     }
 
-    /// The race/class gate on a `SkillAbility` row (story 15): a 0 mask is the DBC's universal row, a
-    /// populated one admits only its own bits, and an out-of-range id can never match. Races and classes
-    /// are 1-based, so Human (1) is bit 0 — an off-by-one here would let every race ride every
-    /// race-specific line.
     #[test]
     fn mask_admits_treats_race_and_class_ids_as_one_based_bits() {
         assert!(mask_admits(0, 1));
@@ -361,7 +244,6 @@ mod tests {
         assert!(indoor_check_is_due(1_099, 1_100));
         assert!(!indoor_check_is_due(1_100, 1_199));
         assert!(indoor_check_is_due(1_100, 5_000));
-        // A client clock that rolls backwards still reads as a crossing rather than wedging the check.
         assert!(indoor_check_is_due(5_000, 1_100));
     }
 }

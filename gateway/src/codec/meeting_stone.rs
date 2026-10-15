@@ -1,13 +1,9 @@
-//! Meeting Stone Queue messages. `SMSG_MEETINGSTONE_COMPLETE` and `_IN_PROGRESS` are empty, so
-//! they need no builder.
-
 use wow_world_messages::vanilla::{
     Area, MSG_LOOKING_FOR_GROUP_Server, MeetingStoneFailure, MeetingStoneStatus,
     SMSG_MEETINGSTONE_JOINFAILED, SMSG_MEETINGSTONE_MEMBER_ADDED, SMSG_MEETINGSTONE_SETQUEUE,
 };
 use wow_world_messages::Guid;
 
-/// `None` when `wow_world_messages` has no `Area` for the id or knows no such status.
 pub fn build_meetingstone_setqueue(area_id: u32, status: u8) -> Option<SMSG_MEETINGSTONE_SETQUEUE> {
     Some(SMSG_MEETINGSTONE_SETQUEUE {
         area: Area::try_from(area_id).ok()?,
@@ -15,22 +11,19 @@ pub fn build_meetingstone_setqueue(area_id: u32, status: u8) -> Option<SMSG_MEET
     })
 }
 
-/// `None` for a reason byte outside 1 to 3.
 pub fn build_meetingstone_joinfailed(reason: u8) -> Option<SMSG_MEETINGSTONE_JOINFAILED> {
     Some(SMSG_MEETINGSTONE_JOINFAILED {
         reason: MeetingStoneFailure::try_from(reason).ok()?,
     })
 }
 
-/// A Stone Add, told to the members already in the Party.
 pub fn build_meetingstone_member_added(guid: u64) -> SMSG_MEETINGSTONE_MEMBER_ADDED {
     SMSG_MEETINGSTONE_MEMBER_ADDED {
         guid: Guid::new(guid),
     }
 }
 
-/// The answer to `MSG_LOOKING_FOR_GROUP`. vmangos sends 0 (vm:Handlers/MiscHandler.cpp:277-282),
-/// and the stock UI never reads it.
+/// Vanilla sends zero here; the stock UI never reads it.
 pub fn build_looking_for_group() -> MSG_LOOKING_FOR_GROUP_Server {
     MSG_LOOKING_FOR_GROUP_Server { unknown1: 0 }
 }
@@ -47,7 +40,6 @@ mod tests {
         framed.split_off(4)
     }
 
-    /// cm:LFG/LFGHandler.cpp:146-152 writes the area as a u32 and the status as a u8.
     #[test]
     fn setqueue_is_the_area_then_the_status_byte() {
         let packet = build_meetingstone_setqueue(1581, queue_status::JOINED_QUEUE).unwrap();
@@ -57,7 +49,6 @@ mod tests {
         assert!(build_meetingstone_setqueue(1581, 6).is_none());
     }
 
-    /// The shared status and failure bytes are the `wow_world_messages` values.
     #[test]
     fn the_shared_bytes_match_the_wire_enums() {
         use queue_status::*;

@@ -1,7 +1,5 @@
 use super::super::*;
 
-/// The Meeting Stone family is tested against its own Fake in `handlers/meeting_stone.rs`. Here no
-/// stone exists and nobody is queued.
 impl MeetingStoneActionStore for WorldFake {
     fn admit_meeting_stone(&self, _actor: Actor, _go_guid: u64) -> Result<MeetingStoneOutcome> {
         Ok(MeetingStoneOutcome::Refused(

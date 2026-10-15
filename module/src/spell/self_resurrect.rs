@@ -1,10 +1,3 @@
-//! Self-resurrection: the Self-Resurrection Option a dead Character holds, and its use.
-//!
-//! The option is chosen once, at death, from the Character's `A_SELF_RESURRECT` auras (a Soulstone).
-//! Those auras do not survive death, so the option row is the only record that remains. Using the
-//! option reads the named spell's `E_SELF_RESURRECT` effect and revives the Character in place, with
-//! no Resurrection Sickness.
-
 use lyracore_shared::packing::power_type;
 use spacetimedb::{ReducerContext, Table};
 
@@ -14,9 +7,7 @@ use super::{
 };
 use crate::game_world_entity;
 
-/// Choose `character_guid`'s Self-Resurrection Option from its auras. Call it at death, before the
-/// death aura shed removes the Soulstone aura. The highest `A_SELF_RESURRECT` spell wins. Without one,
-/// any row left from an earlier death is deleted, so a stale option never outlives its source.
+// Record the option before death removes the Soulstone aura.
 pub(crate) fn record_self_resurrect_option(ctx: &ReducerContext, character_guid: u64) {
     let chosen = auras_on(ctx, character_guid)
         .filter(|a| a.eff_kind == A_SELF_RESURRECT && a.eff_p0 > 0)
@@ -32,10 +23,6 @@ pub(crate) fn record_self_resurrect_option(ctx: &ReducerContext, character_guid:
     }
 }
 
-/// Use `character_guid`'s Self-Resurrection Option: revive in place at the option spell's vitals,
-/// clear the dead and ghost state, remove the corpse, and spend the option. One transaction. A
-/// Refusal (not in the world, not dead, no option, or an option spell without an
-/// `E_SELF_RESURRECT` effect) changes nothing.
 pub(crate) fn do_self_resurrect(ctx: &ReducerContext, character_guid: u64) -> Result<(), String> {
     let entities = ctx.db.game_world_entity();
     let mut character = entities
@@ -73,10 +60,6 @@ pub(crate) fn do_self_resurrect(ctx: &ReducerContext, character_guid: u64) -> Re
     Ok(())
 }
 
-/// The health and power a self-resurrection restores, per the `E_SELF_RESURRECT` rule: a negative
-/// `base_points` is a flat health amount with `flat_mana` mana, otherwise a percent of max health and
-/// max mana. Health lands in `1..=max_health`. A mana user gets the computed mana capped at its max,
-/// an energy user a full bar, and every other power type 0.
 pub(crate) fn self_resurrect_vitals(
     max_health: u32,
     max_power: u32,
@@ -99,8 +82,6 @@ pub(crate) fn self_resurrect_vitals(
     (health.min(max_health).max(1), power)
 }
 
-/// Delete `character_guid`'s pending resurrect request from another Character. Release Spirit uses
-/// this alone: a ghost keeps its Self-Resurrection Option.
 pub(crate) fn clear_resurrect_request(ctx: &ReducerContext, character_guid: u64) {
     ctx.db
         .game_resurrect_request()
@@ -108,8 +89,6 @@ pub(crate) fn clear_resurrect_request(ctx: &ReducerContext, character_guid: u64)
         .delete(character_guid);
 }
 
-/// Delete both ways back `character_guid` may hold: the resurrect request and the
-/// Self-Resurrection Option. Every resurrection and leaving the world use this.
 pub(crate) fn clear_resurrect_request_and_option(ctx: &ReducerContext, character_guid: u64) {
     clear_resurrect_request(ctx, character_guid);
     ctx.db
@@ -123,7 +102,7 @@ mod tests {
     use super::self_resurrect_vitals;
     use lyracore_shared::packing::power_type::{ENERGY, MANA, RAGE};
 
-    /// Minor Soulstone (3026): raw base -401, so 400 health and its 700 mana, capped at max mana.
+    // Minor Soulstone 3026 stores raw base -401 for 400 health and 700 mana.
     #[test]
     fn a_negative_base_is_flat_health_and_flat_mana() {
         assert_eq!(
@@ -136,7 +115,7 @@ mod tests {
         );
     }
 
-    /// Reincarnation (21169): raw base 19, so 20 percent of max health and max mana.
+    // Reincarnation 21169 stores raw base 19 for 20 percent of each maximum.
     #[test]
     fn a_positive_base_is_a_percent_of_max() {
         assert_eq!(self_resurrect_vitals(1000, 600, MANA, 20, 0), (200, 120));

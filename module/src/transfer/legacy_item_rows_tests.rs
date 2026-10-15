@@ -313,7 +313,6 @@ fn a_mail_escrow_that_travelled_untagged_arrives_with_no_letter_text() {
     assert_eq!(row.item_text_id, 0);
 }
 
-/// The encoded field names of `T`, in order.
 fn field_names<T: SpacetimeType>() -> Vec<String> {
     use spacetimedb::sats::{typespace::TypespaceBuilder, AlgebraicType};
     struct Inline;
@@ -337,8 +336,6 @@ fn field_names<T: SpacetimeType>() -> Vec<String> {
     }
 }
 
-/// Transfer Escrow keeps `game_mail` rows as bytes, so a new column must come with a new tag in
-/// `FORMATS` and a struct for the shape before it. This pins the shape the current tag names.
 #[test]
 fn game_mail_has_the_shape_its_transfer_tag_names() {
     let tag = FORMATS
@@ -386,7 +383,6 @@ fn game_mail_has_the_shape_its_transfer_tag_names() {
     );
 }
 
-/// [`game_mail_has_the_shape_its_transfer_tag_names`]'s twin for `game_mail_escrow`.
 #[test]
 fn game_mail_escrow_has_the_shape_its_transfer_tag_names() {
     let tag = FORMATS
@@ -437,8 +433,6 @@ fn game_mail_escrow_has_the_shape_its_transfer_tag_names() {
     );
 }
 
-/// [`game_mail_has_the_shape_its_transfer_tag_names`]'s twin for the listing Hold. It first
-/// travelled in this shape, so there is no older one to decode.
 #[test]
 fn game_auction_hold_has_the_shape_its_transfer_tag_names() {
     let tag = FORMATS
@@ -479,7 +473,6 @@ fn game_auction_hold_has_the_shape_its_transfer_tag_names() {
     );
 }
 
-/// [`game_mail_has_the_shape_its_transfer_tag_names`]'s twin for `game_item_instance`.
 #[test]
 fn game_item_instance_has_the_shape_its_transfer_tag_names() {
     let tag = FORMATS

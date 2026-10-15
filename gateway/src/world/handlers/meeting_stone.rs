@@ -1,9 +1,3 @@
-//! Meeting Stone dispatcher: join, leave, the queue status query and `MSG_LOOKING_FOR_GROUP`.
-//!
-//! A JOIN is two Durable Requests: the Home Shard admits the actor at the stone, then the party
-//! authority queues it with the Seekers' race and class, read realm-wide. Queue notices arrive on
-//! the group event relay; only a refused party JOIN is answered here.
-
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
 use lyracore_shared::group::GROUP_MAX_MEMBERS;
@@ -19,7 +13,6 @@ pub(crate) struct SeekerFacts {
     pub(crate) class: u8,
 }
 
-/// A timeout, transport or SDK failure stays an `Err` with an unknown outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeetingStoneOutcome {
     Ran,
@@ -27,15 +20,10 @@ pub(crate) enum MeetingStoneOutcome {
 }
 
 pub(crate) trait MeetingStoneActionStore {
-    /// Durable Request on the actor's Home Shard. Writes nothing.
     fn admit_meeting_stone(&self, actor: Actor, go_guid: u64) -> Result<MeetingStoneOutcome>;
-    /// Durable Read of the Home Shard cache.
     fn meeting_stone_area(&self, go_guid: u64) -> Result<Option<u32>>;
-    /// Durable Read of the party authority, in join order. `None` outside a party.
     fn party_members(&self, actor_guid: u64) -> Result<Option<Vec<u64>>>;
-    /// One Seeker's race and class, from whichever World Shard holds it.
     fn seeker_facts(&self, character_guid: u64) -> Result<Option<SeekerFacts>>;
-    /// Durable Request on the party authority.
     fn meeting_stone_op(
         &self,
         actor: Actor,
@@ -43,11 +31,9 @@ pub(crate) trait MeetingStoneActionStore {
         area_id: u32,
         seekers: Vec<SeekerFacts>,
     ) -> Result<MeetingStoneOutcome>;
-    /// Durable Read of the party authority.
     fn queued_area(&self, character_guid: u64) -> Result<Option<u32>>;
 }
 
-/// Handle Meeting Stone requests, silently outside the world.
 pub(crate) struct MeetingStone;
 
 impl<St: MeetingStoneActionStore + ?Sized> ProtocolFamily<St> for MeetingStone {
@@ -97,8 +83,6 @@ enum Action {
     LookingForGroup,
 }
 
-/// Only a Transport Loss ends the World Session. A Refusal is logged and answered with nothing,
-/// because the client has no message for it.
 fn recoverable<T>(what: &str, account_id: u64, result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -112,8 +96,6 @@ fn recoverable<T>(what: &str, account_id: u64, result: Result<T>) -> Result<Opti
     }
 }
 
-/// Every failure before the queue is silent, as in both cores. A refused party JOIN answers
-/// `SMSG_MEETINGSTONE_JOINFAILED`.
 fn join<St: MeetingStoneActionStore + ?Sized>(
     store: &St,
     account_id: u64,
@@ -143,7 +125,6 @@ fn join<St: MeetingStoneActionStore + ?Sized>(
     else {
         return Ok(Vec::new());
     };
-    // Only the Gateway knows which areas the client protocol can name.
     if Area::try_from(area_id).is_err() {
         log::debug!("world: meeting stone {go_guid} names unknown area {area_id}");
         return Ok(Vec::new());
@@ -168,8 +149,6 @@ fn join<St: MeetingStoneActionStore + ?Sized>(
         .collect())
 }
 
-/// The Seeker facts a JOIN conveys: the actor's, or every member's of its Party. The queue refuses
-/// a Raid, so a Raid's actor conveys only its own.
 fn facts_for_join<St: MeetingStoneActionStore + ?Sized>(
     store: &St,
     actor: Actor,
@@ -185,7 +164,6 @@ fn facts_for_join<St: MeetingStoneActionStore + ?Sized>(
     Ok(facts)
 }
 
-/// `None` when the op failed short of a transport loss.
 fn run_op<St: MeetingStoneActionStore + ?Sized>(
     store: &St,
     account_id: u64,
@@ -208,8 +186,6 @@ fn run_op<St: MeetingStoneActionStore + ?Sized>(
     Ok(outcome)
 }
 
-/// `CMSG_MEETINGSTONE_INFO`, sent after a loading screen: JOINED for a Seeker's area, else NONE.
-/// Both cores read a restore map nothing fills; this reports the real state.
 fn info<St: MeetingStoneActionStore + ?Sized>(
     store: &St,
     account_id: u64,
@@ -248,25 +224,19 @@ mod tests {
 
     const ACTOR: u64 = 7;
     const STONE: u64 = 900;
-    /// The Deadmines.
     const AREA: u32 = 1581;
     const HUMAN: u8 = 1;
     const ORC: u8 = 2;
     const WARRIOR: u8 = 1;
     const PRIEST: u8 = 5;
 
-    /// One `meeting_stone_op` call: actor, op, area and the conveyed facts.
     type QueueOp = (u64, u8, u32, Vec<SeekerFacts>);
 
-    /// Records which database each call is meant for: `home` is the actor's Home Shard and
-    /// `authority` the party authority. The Coordinator maps both to its one database on an
-    /// unsharded realm.
     #[derive(Default)]
     struct FakeMeetingStones {
         admission: Option<MeetingStoneOutcome>,
         stone_area: Option<u32>,
         party: Option<Vec<u64>>,
-        /// Facts by guid, as the World Shards hold them.
         facts: HashMap<u64, SeekerFacts>,
         op_outcome: Option<Result<MeetingStoneOutcome, fn() -> anyhow::Error>>,
         queued: Option<u32>,
@@ -422,7 +392,6 @@ mod tests {
         );
     }
 
-    /// Each party Refusal answers with cmangos's failure byte.
     #[test]
     fn each_party_refusal_answers_its_join_failure_byte() {
         for (refusal, reason) in [
@@ -460,8 +429,6 @@ mod tests {
         assert_eq!(store.calls(), [("home", "admit"), ("home", "stone_area")]);
     }
 
-    /// The members stand on different World Shards; the Fake's facts table is that realm-wide
-    /// read. A member no Shard can name is left out, and the Module gives it class 0.
     #[test]
     fn a_party_join_carries_every_members_facts() {
         const PRIEST_GUID: u64 = 8;
@@ -487,7 +454,6 @@ mod tests {
         );
     }
 
-    /// A Raid's 40 members are not read for a JOIN the queue refuses anyway.
     #[test]
     fn a_raid_join_carries_only_the_actors_facts() {
         let store = FakeMeetingStones {
@@ -533,7 +499,6 @@ mod tests {
         );
     }
 
-    /// vmangos answers 0.
     #[test]
     fn looking_for_group_answers_zero() {
         let store = FakeMeetingStones::default();
@@ -564,7 +529,6 @@ mod tests {
         assert!(store.calls().is_empty());
     }
 
-    /// A Refusal the Module did not tag keeps the World Session; a Transport Loss ends it.
     #[test]
     fn only_a_transport_loss_ends_the_session() {
         let untagged = FakeMeetingStones {

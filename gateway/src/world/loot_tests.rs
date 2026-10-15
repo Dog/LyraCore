@@ -1,12 +1,3 @@
-//! Realm-wide loot rolls — the routing + relay tests.
-//!
-//! What EXECUTES here is production `world::loot`, against the same in-memory multi-database
-//! topology the group/whisper slices use (`party_tests::party_topology`). What the fakes stand in
-//! for is named at each seam: `realm_loot_ops` is exactly the tuple the operator-gated
-//! `realm_loot_op` reducer was handed, `pending_rolls` is a world shard's own `game_loot_roll`
-//! staging table, `settled_rolls`/`cleared_rolls` are what the corresponding operator reducers were
-//! asked to do, and `won_events` stands in for realm-core's `game_group_event` `ROLL_WON` queue.
-
 use super::loot;
 use super::party;
 use super::party_tests::{form_split_party, party_topology, GINGER, TRIN, VIM};
@@ -73,10 +64,6 @@ fn loot_promotion_waits_for_realm_core_recovery() {
     assert_eq!(realm.loot_roll.realm_loot_ops.lock().unwrap().len(), 1);
 }
 
-// ---- `run_vote` (CMSG_LOOT_ROLL routing) ----
-
-/// Unsharded → the shard-local loot path, verbatim: the vote runs on the player's own reducer, and
-/// realm-core (there isn't one) never hears about it.
 #[test]
 fn an_unsharded_store_routes_the_vote_through_the_players_own_reducer() {
     let store = WorldFake::default();
@@ -99,9 +86,6 @@ fn an_unsharded_store_routes_the_vote_through_the_players_own_reducer() {
     );
 }
 
-/// Sharded → the vote is authorized by the guid the GATEWAY authenticated for this socket
-/// (`self_guid`), never a value the client's packet could supply — `CMSG_LOOT_ROLL` carries no actor
-/// field at all.
 #[test]
 fn a_sharded_store_routes_the_vote_to_realm_core_with_the_authenticated_guid() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -137,8 +121,6 @@ fn a_sharded_store_routes_the_vote_to_realm_core_with_the_authenticated_guid() {
     );
 }
 
-/// A client can vote as soon as `SMSG_LOOT_START_ROLL` arrives, before the next relay tick. The
-/// vote must reach realm-core after the roll's promotion, or realm-core has no roll to count it on.
 #[test]
 fn a_vote_on_a_staged_roll_reaches_realm_core_after_its_promotion() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -174,10 +156,6 @@ fn a_vote_on_a_staged_roll_reaches_realm_core_after_its_promotion() {
     assert_eq!(*world.loot_roll.cleared_rolls.lock().unwrap(), vec![77]);
 }
 
-// ---- `relay_tick` (promotion + settlement) ----
-
-/// Unsharded → no-op, before even reading a shard's pending rolls: `realm_store()` answers `Ok(None)`
-/// and `relay_tick` returns before `world_stores()` is ever consulted.
 #[test]
 fn an_unsharded_store_does_nothing_even_with_pending_rolls_on_a_connected_peer() {
     let peer = std::sync::Arc::new(WorldFake {
@@ -216,9 +194,6 @@ fn an_unsharded_store_does_nothing_even_with_pending_rolls_on_a_connected_peer()
     );
 }
 
-/// A world shard's freshly kill-time-created staging roll is promoted onto realm-core — WITH its
-/// original deadline (never restarting the 60s clock) and its full recipient snapshot — and then the
-/// staging copy is cleared so it cannot ALSO run its own vote/resolution locally.
 #[test]
 fn relay_tick_promotes_a_staging_roll_and_clears_it() {
     let (realm, world, instances, _calls) = party_topology();
@@ -306,9 +281,6 @@ fn a_refused_promotion_keeps_its_source_identity_and_staging_row_for_retry() {
     assert_eq!(attempts[0].10, 78);
 }
 
-/// A resolved roll's winner is settled on EVERY connected world shard — the module's own `withheld`
-/// guard (not the relay) is what makes the wrong shards' calls harmless, so the relay fans out rather
-/// than trying to guess which shard holds the corpse.
 #[test]
 fn relay_tick_settles_every_connected_shard_for_a_resolved_roll() {
     let (realm, world, instances, _calls) = party_topology();
@@ -330,7 +302,6 @@ fn relay_tick_settles_every_connected_shard_for_a_resolved_roll() {
         "the watermark must advance past the one event just settled"
     );
 
-    // A second tick with the SAME advanced watermark must not re-settle the same win.
     loot::relay_tick(world.as_ref(), &mut watermark);
     assert_eq!(
         world.loot_roll.settled_rolls.lock().unwrap().len(),
@@ -384,19 +355,10 @@ fn a_failed_settlement_retries_after_the_shard_recovers() {
     );
 }
 
-/// **AC: a disband-capable op promotes every connected shard's pending rolls BEFORE it reaches
-/// realm-core.** Without this, `remove_member`'s disband branch (on realm-core) cannot see a roll
-/// that is still a local staging copy, and the periodic relay's own 200ms cadence is not fast enough
-/// to guarantee it lands first — the exact gap "someone gets kicked right after a kill" falls into.
-///
-/// The pending roll is staged on `world`, but the LEAVE is dispatched through `instances` (Vim's own
-/// connection) — proving the flush covers EVERY connected shard, not just the caller's own, which
-/// matters because a party's members (and therefore the corpses their kills stage rolls on) can be
-/// split across shards.
 #[test]
 fn a_leave_flushes_every_connected_shards_pending_rolls_before_the_disband_reaches_realm_core() {
     let (realm, world, instances, calls) = party_topology();
-    form_split_party(&world, &instances); // Ginger (world) + Vim (instances) — a 2-member party
+    form_split_party(&world, &instances);
     *world.loot_roll.pending_rolls.lock().unwrap() = vec![loot::PendingLootRoll {
         promotion_source: SOURCE,
         roll_id: 99,
@@ -408,8 +370,6 @@ fn a_leave_flushes_every_connected_shards_pending_rolls_before_the_disband_reach
         random_property_id: 0,
     }];
 
-    // Vim leaving a 2-member party disbands it (vanilla: a party of one is no party) — the exact
-    // shape `remove_member`'s disband branch, and therefore `force_resolve_rolls_for_disband`, needs.
     party::run(
         instances.as_ref(),
         Actor::new(VIM).unwrap(),
@@ -440,12 +400,6 @@ fn a_leave_flushes_every_connected_shards_pending_rolls_before_the_disband_reach
         "the staging copy must be cleared once promoted, same as a periodic relay tick would"
     );
 
-    // ORDERING is the whole point: a promotion that landed AFTER the disband would still be an
-    // orphaned roll naming a group that no longer exists — the disband-mid-roll defect this flush
-    // exists to close.
-    // `rposition` for the disband dispatch: `form_split_party` above already made two of its own
-    // `realm_group_op` calls (the invite, the accept) BEFORE the LEAVE under test — the disband is
-    // the LAST one in the log, not the first.
     let log = calls.lock().unwrap().clone();
     let flush_at = log
         .iter()
@@ -461,8 +415,6 @@ fn a_leave_flushes_every_connected_shards_pending_rolls_before_the_disband_reach
     );
 }
 
-/// A plain party op that CANNOT disband anything (Accept, Decline, LootMethod, and the surviving half
-/// of an Invite) must not pay for a flush it does not need — only LEAVE/UNINVITE do.
 #[test]
 fn a_non_disband_capable_op_never_flushes_pending_rolls() {
     let (realm, world, _instances, _calls) = party_topology();
@@ -535,8 +487,6 @@ fn loot_master_give_dispatches_the_corpse_slot_and_target() {
 
 #[test]
 fn loot_roll_rejection_is_logged_and_ignored_not_session_fatal() {
-    // A rejection (no roll open / already voted / not eligible) must not tear the connection down —
-    // the SAME session keeps working afterward (mirrors take_loot's per-action ignore discipline).
     let mut s = quest_store();
     s.loot_roll.loot_action_refusal = Some(LootRefusal::RollUnavailable);
     let store = std::sync::Arc::new(s);
@@ -548,7 +498,6 @@ fn loot_roll_rejection_is_logged_and_ignored_not_session_fatal() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // The session survives: a subsequent CMSG_LOOT still gets a normal reply.
     CMSG_LOOT {
         guid: Guid::new(61),
     }

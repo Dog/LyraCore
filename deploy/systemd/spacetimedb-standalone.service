@@ -1,4 +1,3 @@
-# The pinned lyracore CLI reads this unit from this path for `lyracore service reconcile`.
 [Unit]
 Description=LyraCore SpacetimeDB standalone
 Wants=network-online.target

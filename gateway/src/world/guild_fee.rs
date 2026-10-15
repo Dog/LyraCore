@@ -1,20 +1,8 @@
-//! The Gateway half of the Fee Hold. It puts the three Durable Requests of a guild fee in order:
-//! hold on the actor's Home Shard, decide on Realm-core, finish on the Home Shard. Every Gate and
-//! the exactly-once rules live in the Module (`module/src/guild/fee.rs`).
-//!
-//! Recovery is forward only. A Hold that a crash or a lost connection left behind is decided from
-//! its own terms and finished, at the next world entry and before the next fee. It is never
-//! dropped. A Character has one Fee Hold at a time, on whichever Shard holds the Character.
-//!
-//! A hold call mints its own operation id and is never retried, so no Hold is taken twice for one
-//! id. After a lost answer the Hold is found by its payer and re-driven, not held again.
-
 use anyhow::Result;
 use lyracore_shared::guild::GuildRefusal;
 
 use super::Actor;
 
-/// The five tabard design values of a Guild Emblem, in wire order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Emblem {
     pub(crate) emblem_style: u32,
@@ -24,62 +12,44 @@ pub(crate) struct Emblem {
     pub(crate) background_color: u32,
 }
 
-/// What the actor asks to pay for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FeeRequest {
-    /// Save `emblem` at the Tabard Designer `npc_guid`.
     Emblem { npc_guid: u64, emblem: Emblem },
-    /// Buy a Guild Charter for a Guild named `name` at the Petitioner `npc_guid`.
     Charter { npc_guid: u64, name: String },
 }
 
-/// What Realm-core decides on, as a Fee Hold records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FeeTerms {
     Emblem(Emblem),
-    /// The Guild Charter the Hold created.
     Charter {
         charter_item_guid: u64,
         name: String,
     },
 }
 
-/// One Fee Hold on the actor's Home Shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FeeHold {
     pub(crate) operation_id: u64,
     pub(crate) terms: FeeTerms,
 }
 
-/// Realm-core's decision on a guild fee.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeeOutcome {
     Accepted,
     Refused(GuildRefusal),
 }
 
-/// The Durable Requests and reads of a guild fee. `self` is the actor's Home Shard; decisions go
-/// to Realm-core.
 pub(crate) trait GuildFeeStore: Send + Sync {
-    /// The actor's Fee Hold on its Home Shard, if one is left.
     fn guild_fee_held(&self, actor: Actor) -> Result<Option<FeeHold>>;
-    /// Move the fee for `request` from the actor's purse into a new Fee Hold under a fresh
-    /// operation id. `Ok(Err(_))` is a hold Refusal, and nothing changed.
     fn guild_fee_hold(
         &self,
         actor: Actor,
         request: FeeRequest,
     ) -> Result<Result<FeeHold, GuildRefusal>>;
-    /// Realm-core's one decision for `hold`, committed now unless it already exists.
     fn guild_fee_decide(&self, actor: Actor, hold: FeeHold) -> Result<FeeOutcome>;
-    /// Spend the Hold when `accepted`, refund it otherwise, then delete it. Without a Hold for
-    /// `operation_id` this changes nothing.
     fn guild_fee_finish(&self, actor: Actor, operation_id: u64, accepted: bool) -> Result<()>;
 }
 
-/// Pay a guild fee. A leftover Hold is finished first. A hold Refusal (the NPC, the purse)
-/// returns before any copper moved. Any other answer is Realm-core's decision, and the Hold has
-/// been spent or refunded to match it. `Err` leaves any Hold for the next re-drive.
 pub(crate) fn pay<St: GuildFeeStore + ?Sized>(
     store: &St,
     actor: Actor,
@@ -92,8 +62,6 @@ pub(crate) fn pay<St: GuildFeeStore + ?Sized>(
     }
 }
 
-/// Finish the actor's leftover Fee Hold at world entry. A failure logs and leaves the Hold for
-/// the next attempt.
 pub(crate) fn redrive<St: GuildFeeStore + ?Sized>(store: &St, actor_guid: u64) {
     let Some(actor) = Actor::new(actor_guid) else {
         return;
@@ -157,8 +125,6 @@ mod tests {
         }
     }
 
-    /// The Durable Request after which the Gateway loses its answer: the reducer committed, the
-    /// Gateway heard an error.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Step {
         Hold,
@@ -166,7 +132,6 @@ mod tests {
         Finish,
     }
 
-    /// Realm-core, shared by every Home Shard of the realm.
     #[derive(Default)]
     struct Realm {
         leader: u64,
@@ -175,8 +140,6 @@ mod tests {
         emblems_saved: usize,
     }
 
-    /// One Home Shard: purses, the Fee Holds keyed by payer, and a step that fails once after
-    /// committing.
     struct Shard {
         realm: Arc<Mutex<Realm>>,
         purses: Mutex<Vec<(u64, u32)>>,
@@ -228,7 +191,6 @@ mod tests {
             Ok(())
         }
 
-        /// Move the actor's Hold to `other`, as a Transfer carries it with the Character.
         fn transfer_holds_to(&self, other: &Shard) {
             other
                 .holds
@@ -375,8 +337,6 @@ mod tests {
         assert!(realm.lock().unwrap().decisions.is_empty());
     }
 
-    /// A crash after each step leaves one Hold. The next world entry finishes it with exactly
-    /// one outcome: the copper is spent or refunded once, and the Guild agrees.
     #[test]
     fn world_entry_finishes_a_hold_left_after_any_step_exactly_once() {
         for step in [Step::Hold, Step::Decide, Step::Finish] {

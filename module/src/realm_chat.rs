@@ -1,67 +1,39 @@
-//! Realm Chat: non-proximity chat committed on Realm-core with its complete recipient list.
-//!
-//! The Module decides who hears a line, in the transaction that validates it, and writes the whole
-//! audience on one [`RealmChatEvent`] row. Every Gateway receives that row once and delivers it to
-//! its own World Sessions on any Shard. The Gateway reads the Speaker Facts on the speaker's Home
-//! Shard before the call, because Realm-core holds no Characters and no live entities.
-//!
-//! A new Chat Kind adds one arm to [`audience`] and an audience rule in its family's own file. The
-//! table, the reducer and the Relay stay as they are. On an unsharded Realm, Realm-core is the one
-//! database, so both deployments run this same path. A whisper is several lines to two parties,
-//! so it has its own reducer, [`realm_whisper`], and its own line plan, [`whisper_lines`].
-
 use spacetimedb::{reducer, table, ReducerContext, SpacetimeType, Table, Timestamp};
 
 use lyracore_shared::chat::{chat_kind, chat_tag, language, speakable_language, ChatRefusal};
 
-/// One Realm Chat Line. Private: the owner-token Coordinator is its only reader. Reaped by the
-/// shared event GC. [event]
 #[table(accessor = game_realm_chat_event)]
 pub struct RealmChatEvent {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    /// `lyracore_shared::chat::chat_kind`, the `ChatMsg` wire value.
     pub kind: u8,
-    /// The guid the packet names. For WHISPER_INFORM, AFK, DND and IGNORED that is the other party.
     pub speaker_guid: u64,
-    /// The wire `Language`. The addon language is `0xFFFF_FFFF`.
     pub language: u32,
-    /// `lyracore_shared::chat::chat_tag`: 0 none, 1 AFK, 2 DND.
     pub chat_tag: u8,
-    /// The CHANNEL display name. Empty for every other kind.
     pub channel_name: String,
     pub message: String,
-    /// Character guids: the Relay's whole audience.
     pub recipients: Vec<u64>,
-    /// A recipient who ignores `speaker_guid` does not get the line.
     pub ignorable: bool,
     pub created_at: Timestamp,
 }
 
-/// What the Gateway read about the speaker on its Home Shard.
 #[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeakerFacts {
-    /// `game_character.race`. Decides the languages the speaker knows.
     pub race: u8,
-    /// `lyracore_shared::chat::chat_tag_for` of the live entity's `PLAYER_FLAGS`.
     pub chat_tag: u8,
 }
 
-/// One chat line a client sent, with the facts only the Gateway can read.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct RealmChatRequest {
     pub kind: u8,
     pub language: u32,
-    /// CHANNEL only.
     pub channel_name: String,
-    /// IGNORED only: the Character the ignorer's client dropped a line from.
     pub target_guid: u64,
     pub message: String,
     pub speaker: SpeakerFacts,
 }
 
-/// Who hears one line, as a family's audience rule answers it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChatAudience {
     pub(crate) recipients: Vec<u64>,
@@ -69,7 +41,6 @@ pub(crate) struct ChatAudience {
     pub(crate) channel_name: String,
 }
 
-/// A [`RealmChatEvent`] without `id` and `created_at`. [`emit`] stamps both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RealmChatLine {
     pub(crate) kind: u8,
@@ -82,11 +53,6 @@ pub(crate) struct RealmChatLine {
     pub(crate) ignorable: bool,
 }
 
-/// Commit one Realm Chat Line for `request_actor`.
-///
-/// Operator-gated because the speaker is an argument: Realm-core has no live entity to derive it
-/// from, so any other caller could speak as anybody in the Realm. A Refusal rolls the transaction
-/// back and returns its stable tag.
 #[reducer]
 pub fn realm_chat(
     ctx: &ReducerContext,
@@ -103,8 +69,6 @@ pub fn realm_chat(
     Ok(())
 }
 
-/// Validate one request and build its line. The message is checked first, then the language, then
-/// the audience, so a line that fails two Gates reports the same Refusal every time.
 fn compose(
     speaker_guid: u64,
     request: RealmChatRequest,
@@ -118,7 +82,6 @@ fn compose(
     .ok_or(ChatRefusal::EmptyMessage)?;
     let language = speakable_language(request.kind, request.speaker.race, request.language)?;
     let audience = audience(&request)?;
-    // The IGNORED notice carries no tag (cm:ChatHandler.cpp:813).
     let chat_tag = if request.kind == chat_kind::IGNORED {
         chat_tag::NONE
     } else {
@@ -136,7 +99,6 @@ fn compose(
     })
 }
 
-/// One arm per audience family. Each family's own file owns its rule.
 fn audience(
     ctx: &ReducerContext,
     speaker_guid: u64,
@@ -161,8 +123,6 @@ fn audience(
     }
 }
 
-/// IGNORED: the ignorer's client dropped a line from `target_guid` and says so
-/// (cm:ChatHandler.cpp:801-815). The notice goes to that Character alone. Nobody holds guid 0.
 fn ignored_audience(request: &RealmChatRequest) -> Result<ChatAudience, ChatRefusal> {
     if request.target_guid == 0 {
         return Err(ChatRefusal::UnsupportedKind);
@@ -174,28 +134,16 @@ fn ignored_audience(request: &RealmChatRequest) -> Result<ChatAudience, ChatRefu
     })
 }
 
-// ===========================================================================================
-//  Whisper
-// ===========================================================================================
-
-/// What the Gateway read about a whisper's target on whichever World Shard holds it. Realm-core
-/// holds no Characters, contact rows or live entities.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct WhisperTargetFacts {
     pub guid: u64,
-    /// `game_character.race`. Decides the team.
     pub race: u8,
-    /// The canonical spelling. The IGNORED notice carries it.
     pub name: String,
-    /// The target has the speaker on its ignore list.
     pub ignores_speaker: bool,
-    /// 0, `chat_kind::AFK` or `chat_kind::DND`, from the live entity's `PLAYER_FLAGS`.
     pub away_kind: u8,
-    /// The stored Auto-Reply. Empty means the default text.
     pub away_message: String,
 }
 
-/// One whisper a client sent, with the facts only the Gateway can read.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct WhisperRequest {
     pub language: u32,
@@ -204,10 +152,6 @@ pub struct WhisperRequest {
     pub target: WhisperTargetFacts,
 }
 
-/// Commit the lines of one whisper from `request_actor`.
-///
-/// Operator-gated for the same reason as [`realm_chat`]: the speaker is an argument. A Refusal
-/// rolls the transaction back and returns its stable tag, so a refused whisper writes no row.
 #[reducer]
 pub fn realm_whisper(
     ctx: &ReducerContext,
@@ -224,19 +168,6 @@ pub fn realm_whisper(
     Ok(())
 }
 
-/// The lines one whisper produces, in the order the speaker sees them (cm:Player.cpp:16601-16645,
-/// cm:ChatHandler.cpp:801-815):
-///
-/// 1. WHISPER to the target, naming the speaker, with the speaker's chat tag. Not sent when the
-///    target ignores the speaker.
-/// 2. WHISPER_INFORM to the speaker, naming the target, with no tag.
-/// 3. AFK or DND to the speaker, naming the target, with the Auto-Reply, when the target has an
-///    Away Status.
-/// 4. IGNORED to the speaker, naming the target, with the target's name, when the target ignores
-///    the speaker. The speaker's client prints "X is ignoring you."
-///
-/// The Gates run in the order [`compose`] uses: the message, the language (always Universal, and
-/// the addon language is refused), then the team (cm:ChatHandler.cpp:268-275).
 pub(crate) fn whisper_lines(
     speaker_guid: u64,
     request: WhisperRequest,
@@ -301,8 +232,6 @@ pub(crate) fn whisper_lines(
     Ok(lines)
 }
 
-/// The only writer of `game_realm_chat_event`. A kind with several packets per request calls it
-/// once per line.
 pub(crate) fn emit(ctx: &ReducerContext, line: RealmChatLine) {
     ctx.db.game_realm_chat_event().insert(RealmChatEvent {
         id: 0,
@@ -318,7 +247,6 @@ pub(crate) fn emit(ctx: &ReducerContext, line: RealmChatLine) {
     });
 }
 
-/// Reducer edge: only the tag crosses to the Gateway; the detail stays in Module logs.
 fn refused_chat(refusal: ChatRefusal, speaker_guid: u64) -> String {
     let tag = refusal.as_tag();
     spacetimedb::log::info!("chat refused {tag}: speaker {speaker_guid}");
@@ -375,8 +303,6 @@ mod tests {
         );
     }
 
-    /// cm:ChatHandler.cpp:306-318 reads an addon payload raw. A trim would change the frame another
-    /// addon parses.
     #[test]
     fn an_addon_line_keeps_its_payload_untrimmed() {
         let line = compose(
@@ -431,8 +357,6 @@ mod tests {
         }
     }
 
-    /// cm:ChatHandler.cpp:801-815: the notice names the ignorer, carries the ignorer's name and
-    /// no tag, and goes to the Character whose line was dropped.
     #[test]
     fn an_ignored_notice_goes_to_the_dropped_speaker_alone() {
         let line = compose(30, ignored(10), ignored_audience).unwrap();
@@ -499,8 +423,6 @@ mod tests {
         }
     }
 
-    /// cm:Player.cpp:16601-16622: the target hears the line in Universal with the speaker's tag,
-    /// and the speaker gets the echo naming the target with no tag.
     #[test]
     fn a_whisper_is_the_incoming_line_then_the_echo() {
         assert_eq!(
@@ -512,7 +434,6 @@ mod tests {
         );
     }
 
-    /// cm:Player.cpp:16630-16644: an away target adds its Auto-Reply after the echo.
     #[test]
     fn an_afk_target_adds_its_auto_reply_after_the_echo() {
         assert_eq!(
@@ -536,8 +457,6 @@ mod tests {
         assert_eq!(lines[2], line(0x15, TARGET, 0, "Do not Disturb", SPEAKER));
     }
 
-    /// cm:ChatHandler.cpp:801-815, fx:ChatFrame.lua:1403-1404: the ignorer gets nothing, and the
-    /// speaker keeps the echo and learns "Target is ignoring you."
     #[test]
     fn an_ignoring_target_gets_nothing_and_the_speaker_learns_it() {
         assert_eq!(
@@ -561,7 +480,6 @@ mod tests {
         );
     }
 
-    /// cm:ChatHandler.cpp:268-275: a Human whispering an Orc is refused.
     #[test]
     fn a_whisper_to_the_other_team_is_refused() {
         assert_eq!(
@@ -580,7 +498,6 @@ mod tests {
         );
     }
 
-    /// `SendAddonMessage` in 1.12 has no whisper target.
     #[test]
     fn an_addon_whisper_is_refused() {
         let mut request = whisper(1, 0, "", false);

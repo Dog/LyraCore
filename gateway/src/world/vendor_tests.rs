@@ -1,5 +1,3 @@
-//! Vendor replies through the Protocol Family and encrypted World Session.
-
 use super::handlers::{InMemoryVendorActions, Vendor};
 use super::*;
 
@@ -15,8 +13,6 @@ fn run(actions: &InMemoryVendorActions, msg: impl Into<ClientOpcodeMessage>) -> 
 
 #[test]
 fn buy_item_err_sends_smsg_buy_failed() {
-    // When `buy_item` returns Err (e.g. "not enough money"), the gateway must send SMSG_BUY_FAILED
-    // with the matching BuyResult code so the player gets an on-screen error.
     let actions = InMemoryVendorActions {
         buy_error: Some(|| {
             crate::stdb::ReducerCallError::refused(
@@ -50,10 +46,6 @@ fn buy_item_err_sends_smsg_buy_failed() {
 
 #[test]
 fn login_replays_a_persisted_buyback_ring_after_the_login_sequence() {
-    // The ring survives logout, so world entry rebuilds the tab: one fabricated item CREATE per
-    // entry, then the raw descriptor update. (An EMPTY ring emits nothing — every other login test
-    // reads the login sequence and then EOF, which is that case.) This stays a socket test because
-    // the replay's place in the world entry sequence is the fact under test.
     let store = std::sync::Arc::new({
         let base = quest_store();
         WorldFake {
@@ -71,8 +63,6 @@ fn login_replays_a_persisted_buyback_ring_after_the_login_sequence() {
             other => panic!("expected a fabricated buyback item CREATE, got {other}"),
         }
     }
-    // The descriptor update is a hand-rolled partial VALUES mask gtker cannot decode; the frame is
-    // consumed either way, and EOF after it proves nothing else was sent.
     let _ = ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec);
     assert!(ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).is_err());
     drop(client);
@@ -81,9 +71,6 @@ fn login_replays_a_persisted_buyback_ring_after_the_login_sequence() {
 
 #[test]
 fn buyback_maps_the_wire_slot_enum_to_zero_based_ring_slots() {
-    // BuybackSlot rides as 69..=81 on the wire; the ring is 0-based, so Slot1 (69) takes entry 0
-    // and Slot13 (81) takes entry 12. The ring holds 13 entries so both ends name a real one, and
-    // the later slot goes first so the earlier take does not shift it.
     let ring: Vec<(u32, u32, u32, u32)> = (0..13).map(|i| (100 + i, 1, 10, 0)).collect();
     let actions = InMemoryVendorActions {
         ring: std::sync::Mutex::new(ring.clone()),

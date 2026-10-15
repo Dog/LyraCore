@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`CharacterStore`] adapter.
-
 use lyracore_shared::spell::taxonomy::{A_SPELLMOD_FLAT, A_SPELLMOD_PCT};
 
 use anyhow::Result;
@@ -42,9 +40,6 @@ fn durable_character_presence_snapshots(
 }
 
 impl CharacterStore for Coordinator {
-    /// Union the account's Characters across connected World Shards. Deduplicate by guid
-    /// during interrupted Transfers, keeping the first copy in default-first probe order.
-    /// Guild membership comes from Realm-core; an unavailable authority leaves guild names empty.
     fn characters(&self, account_id: u64) -> Result<Vec<codec::CharacterView>> {
         let mut out: Vec<codec::CharacterView> = if self.is_sharded() {
             let mut out: Vec<codec::CharacterView> = Vec::new();
@@ -70,36 +65,6 @@ impl CharacterStore for Coordinator {
         Ok(out)
     }
 
-    /// Create a character on `self` — the DEFAULT/realm shard — always, even when the race's start
-    /// position (`module/src/auth.rs`'s per-race spawn table) routes to a DIFFERENT world shard
-    /// under the configured `LYRACORE_SHARD_MAP` (e.g. an Orc/Tauren/Troll/Night Elf's Kalimdor
-    /// start position on a two-continent split). The DECISION, made explicit:
-    ///
-    /// **Create-then-transfer-on-first-login, not create-directly-on-the-owning-shard.** The row
-    /// lands on `self` and stays there until the character's very first `CMSG_PLAYER_LOGIN` runs
-    /// `route_home`/`settle_home_shard` — the SAME resolve-and-transfer every OTHER
-    /// login already goes through, freshly created or not. Creating directly on the owning shard
-    /// instead would need its own routing resolved BEFORE the character exists (nothing to look up
-    /// in the character→shard index yet), built from scratch for a path that runs exactly once per
-    /// character and is not latency-sensitive the way login is.
-    ///
-    /// This costs nothing NEW: the escrowed transfer it rides is the one already proven against a
-    /// full gateway-kill crash matrix
-    /// (`a_gateway_kill_at_every_transfer_step_recovers_to_exactly_one_whole_copy`,
-    /// `world/transfer_tests.rs`), and a fresh character has no live history to lose in transit — if
-    /// anything the simplest case that machinery handles. What it did NOT have at first is a
-    /// test that the first login of a freshly created character actually drives that transfer
-    /// end-to-end rather than merely reusing already-tested machinery by assumption:
-    /// `a_freshly_created_characters_first_login_transfers_off_the_default_shard`
-    /// (`world/shard_routing_tests.rs`).
-    ///
-    /// Runs on the VISIBILITY pipe (`visibility_pipe`), not a call pipe: the client re-sends
-    /// `CMSG_CHAR_ENUM` the instant it sees `SMSG_CHAR_CREATE` success, and that read hits the
-    /// Coordinator's `game_character` subscription cache. A call pipe carries only the liveness
-    /// subscription, so its return does not order the insert ahead of the read and the fresh
-    /// character is missing until the update lands on the Coordinator (or the next login). The
-    /// subscribed pipe returns only after the SDK has applied the committed row to that cache.
-    /// A Refusal maps to a game outcome; a Transport Loss is `Err`.
     fn create_character(
         &self,
         account_id: u64,
@@ -109,8 +74,6 @@ impl CharacterStore for Coordinator {
         gender: u8,
         appearance: codec::Appearance,
     ) -> Result<codec::CharCreateOutcome> {
-        // The SpacetimeDB-generated reducer binding takes the five appearance bytes positionally;
-        // unbundle `Appearance` here, at the single generated-boundary call.
         let coordinator = self.0.visibility_pipe();
         let result = call_reducer!(
             coordinator.conn.reducers,
@@ -131,31 +94,6 @@ impl CharacterStore for Coordinator {
         create_outcome(result, self.shard_name())
     }
 
-    /// Delete a character wherever it actually LIVES, not only on `self`.
-    ///
-    /// `characters()` above is a cross-shard UNION: a character resident on ANY connected
-    /// shard shows at char-select. `delete_character` did not match that — the reducer
-    /// call only ever ran on `self`, so a character resident on a non-default shard was NOT_FOUND
-    /// there (surfaced as `Failed`) even though the row was real and deletable.
-    /// The resolution is `realm_core::resolve_delete_shard` — the SAME index-first
-    /// lookup (`locate_home_shard`) the world-entry path already trusts, not a second routing
-    /// mechanism — and delete runs EXACTLY ONCE, on the resolved owner: turning "the wrong shard"
-    /// into "every shard" would trade a correctness bug for a data-loss footgun. A character caught
-    /// mid-transfer (an in-flight escrow) is refused rather than raced — see
-    /// `resolve_delete_shard`'s own doc for why.
-    ///
-    /// `account_id` is forwarded UNCHANGED to whichever shard `resolve_delete_shard` names — not
-    /// re-resolved for that database. This is safe, not merely assumed: `game_character.account_id`
-    /// is a per-database `#[auto_inc]` surrogate in general (`realm_core::lookup_session`'s doc
-    /// covers that boundary — the REALM-CORE ↔ world-shard one, where ids legitimately differ), but
-    /// a character can only ever REACH a non-default world shard through the escrowed transfer
-    /// (`create_character` never targets one directly — see its own doc comment), and
-    /// `ensure_shadow_account` (`module/src/auth.rs`) creates that shard's shadow `game_account` row
-    /// with the EXACT numeric id carried in the import blob, bypassing `#[auto_inc]` — so
-    /// `account_id` is preserved bit-for-bit, world-shard to world-shard, across every transfer.
-    /// `characters()`'s cross-shard union above and `route_home`'s `bind_shard_session` already
-    /// rely on this same invariant (`world/mod.rs`), so this is the established precedent, not a
-    /// new assumption introduced here.
     fn delete_character(
         &self,
         account_id: u64,
@@ -205,9 +143,6 @@ impl CharacterStore for Coordinator {
         self.effective_magic_resistances(guid)
     }
 
-    /// The character's active SPELL-MODIFIER auras as raw `(family_mask, op, amount, is_pct)`
-    /// rows — the client-mirror source for SMSG_SET_FLAT/PCT_SPELL_MODIFIER (aggregation by
-    /// (op, mask-bit) happens in the codec helper; mangos sends the TOTAL per bit).
     fn spell_modifiers(&self, character_guid: u64) -> Vec<(u32, u8, i32, bool)> {
         self.0
             .coord()
@@ -230,9 +165,6 @@ impl CharacterStore for Coordinator {
             .collect()
     }
 
-    /// The player's LEARNED spells — `game_player_spell` rows for this character (the coordinator
-    /// bypasses RLS so it reads any player's). Chained into the login spellbook so a taught ability
-    /// (Auto Shot) reaches the client and `CastSpellByName` can fire it.
     fn player_learned_spells(&self, player_guid: u64) -> Result<Vec<u32>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -242,11 +174,6 @@ impl CharacterStore for Coordinator {
             .filter(|s| s.character_guid == player_guid)
             .map(|s| s.spell_id)
             .collect();
-        // 258 rank collapse: drop a known rank that another KNOWN spell supersedes (a game_spell_chain
-        // row whose prev_spell is this id) — GATED on the same cmangos stacking rule as
-        // superseded_old_rank (operator-corrected): MANA spells keep every rank in the book
-        // (downranking Holy Light is a real thing); only non-mana/passive chains collapse
-        // (Heroic Strike). One pass suffices: each superseded rank is prev of its own successor.
         let known_set: std::collections::HashSet<u32> = known.iter().copied().collect();
         let superseded: std::collections::HashSet<u32> = db
             .game_spell_chain()
@@ -265,11 +192,6 @@ impl CharacterStore for Coordinator {
             .collect())
     }
 
-    /// The player's IMPORTED action-bar rows as `(button, action, action_type)` triples —
-    /// `game_player_action` rows copied at character creation from `game_createinfo_action` (empty when
-    /// no dump has been imported, the common case today). Chained into the login codec
-    /// (`login_sequence_messages`), which builds the bar from these when non-empty and falls back to
-    /// the spellbook synth otherwise. RLS-bypassed read, like `player_learned_spells`.
     fn player_actions(&self, player_guid: u64) -> Result<Vec<(u8, u32, u8)>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -281,11 +203,6 @@ impl CharacterStore for Coordinator {
             .collect())
     }
 
-    /// The player's persisted reputation standings as `(reputation_index, standing,
-    /// at_war)` triples — chained into the login `SMSG_INITIALIZE_FACTIONS` so a relog carries the
-    /// real standing + the At-War checkbox instead of the all-neutral stub. Rows with
-    /// `reputation_index < 0` (stale pre-migration filler) are skipped — there is no slot to
-    /// address. RLS-bypassed read, like `player_learned_spells`.
     fn player_reputations(&self, player_guid: u64) -> Result<Vec<(i32, i32, bool)>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -299,10 +216,6 @@ impl CharacterStore for Coordinator {
 }
 
 impl Coordinator {
-    /// Read an account's characters for the character-select screen. In production
-    /// this reads the per-player `game_character` subscription cache (RLS-restricted to owner).
-    /// Equipment slots (0..=18) are populated from `game_item_instance` + `game_item_template`
-    /// so the client renders the character's gear on the select screen instead of all-naked.
     pub fn characters(&self, account_id: u64) -> Result<Vec<crate::codec::CharacterView>> {
         use wow_world_messages::vanilla::{CharacterGear, InventoryType};
         let guard = self.0.coord();
@@ -313,9 +226,6 @@ impl Coordinator {
             .filter(|c| c.account_id == account_id)
             .map(character_view)
             .collect();
-        // Fill equipment slots 0..=18 from item instances.  Slots ≥ 19 are backpack/bag slots;
-        // skip them.  An unknown inventory_type degrades to InventoryType::default (Non) which
-        // the client treats the same as display_id=0 — no model shown, no crash.
         for view in &mut views {
             for item in db
                 .game_item_instance()
@@ -336,9 +246,6 @@ impl Coordinator {
         Ok(views)
     }
 
-    /// Read a single character by guid (any owner) for a `CMSG_NAME_QUERY` reply. The queried guid
-    /// is usually a *peer*, so this reads across owners via the privileged cache (no RLS on the
-    /// owner connection), unlike `characters` which filters to one account.
     pub fn character_by_guid(&self, guid: u64) -> Result<Option<crate::codec::CharacterView>> {
         Ok(self
             .0
@@ -351,10 +258,6 @@ impl Coordinator {
             .map(character_view))
     }
 
-    /// folded from the coordinator's privileged cache: base (`game_world_entity.armor`) + worn gear armor.
-    /// The coordinator isn't subscribed to `game_aura`, so the aura term is 0 here — login-present armor
-    /// auras are pushed by the on_aura relay the instant they insert. Delegates to the shared
-    /// `stdb::armor::effective_armor` so CREATE and the relays compute the IDENTICAL fold.
     pub fn effective_armor(&self, guid: u64) -> u32 {
         let guard = self.0.coord();
         super::super::armor::effective_armor(&guard.conn.db, guid)
@@ -365,7 +268,6 @@ impl Coordinator {
         super::super::armor::effective_magic_resistances(&guard.conn.db, guid)
     }
 
-    /// Does `character_guid` sell, or lead the bidding on, an Auction on THIS handle?
     fn has_auction(&self, character_guid: u64) -> bool {
         let auctions = self.auction_keys(|index| &index.auctions, character_guid);
         let guard = self.0.coord();
@@ -380,10 +282,6 @@ impl Coordinator {
         })
     }
 
-    /// Delete `character` on THIS handle via the `delete_character` reducer (owner connection — the
-    /// reducer is operator-gated, mirroring `create_character`). Ownership is enforced module-side
-    /// (`NOT_OWNER` if `character` isn't `account_id`'s), so a malicious/buggy client can't delete
-    /// another account's character. A Refusal maps to `Failed`; a Transport Loss is `Err`.
     fn delete_here(
         &self,
         account_id: u64,
@@ -426,7 +324,6 @@ impl Coordinator {
     }
 }
 
-/// A create Refusal is an outcome the client renders; a Transport Loss stays `Err`.
 fn create_outcome(result: Result<()>, shard_name: &str) -> Result<codec::CharCreateOutcome> {
     use codec::CharCreateOutcome;
     let Err(error) = result else {
@@ -440,10 +337,6 @@ fn create_outcome(result: Result<()>, shard_name: &str) -> Result<codec::CharCre
         DurableFailure::Refusal { reason } if reason.contains("SERVER_LIMIT") => {
             Ok(CharCreateOutcome::ServerLimit)
         }
-        // The 5875 client has no code for "this database may not mint guids", so the outcome is
-        // the generic failure — but the REASON must not be swallowed: the whole point of
-        // guid-range licensing is that an unlicensed shard fails loudly instead of minting
-        // into someone else's range.
         DurableFailure::Refusal { .. } => {
             log::warn!("create_character on {shard_name} failed: {error:#}");
             Ok(CharCreateOutcome::Failed)
@@ -451,15 +344,11 @@ fn create_outcome(result: Result<()>, shard_name: &str) -> Result<codec::CharCre
     }
 }
 
-/// A delete Refusal answers `Failed`; a Transport Loss stays `Err`.
 fn delete_outcome(result: Result<()>, character_guid: u64) -> Result<codec::CharDeleteOutcome> {
     let Err(error) = result else {
         return Ok(codec::CharDeleteOutcome::Success);
     };
     match classify(&error) {
-        // The 1.12 client has one reason for every refusal, so the reason goes to the log:
-        // CHAR_HAS_GUILD_FEE_HOLD clears when the Character next enters the world and the
-        // Gateway finishes its Fee Hold.
         DurableFailure::Refusal { .. } => {
             log::info!("delete_character: {character_guid} not deleted: {error:#}");
             Ok(codec::CharDeleteOutcome::Failed)

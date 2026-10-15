@@ -1,10 +1,5 @@
-//! NPC and query opcodes over an encrypted World Session: item and NPC text queries, inspect, and
-//! gossip menus.
-
 use super::*;
 
-/// A restrictive imported equipment template. The query response is cached by the client and is
-/// shared by inventory, vendor, and quest-reward screens, so one socket test pins that definition.
 fn human_warrior_sword_template() -> codec::ItemTemplateView {
     codec::ItemTemplateView {
         entry: 910_261,
@@ -23,12 +18,12 @@ fn human_warrior_sword_template() -> codec::ItemTemplateView {
         damage_min: 9.0,
         damage_max: 17.0,
         delay_ms: 2_400,
-        required_skill: 43, // Swords
+        required_skill: 43,
         required_skill_rank: 150,
         required_reputation_faction: 72,
         required_reputation_rank: 5,
-        allowed_class: 0x01, // Warrior
-        allowed_race: 0x01,  // Human
+        allowed_class: 0x01,
+        allowed_race: 0x01,
         ..Default::default()
     }
 }
@@ -74,8 +69,6 @@ fn item_query_preserves_imported_eligibility_through_the_encrypted_world_session
         template.required_reputation_rank
     );
 
-    // These are client-local eligibility terms, deliberately limited to the fields this cached
-    // definition contains. They prove the fixture is restrictive rather than an all-bits mask.
     let client_can_use = |class: u32, race: u32, skill: Option<(u32, u32)>| {
         found.allowed_class.as_int() & class != 0
             && found.allowed_race.as_int() & race != 0
@@ -83,10 +76,10 @@ fn item_query_preserves_imported_eligibility_through_the_encrypted_world_session
                 id == u32::from(found.required_skill.as_int()) && rank >= found.required_skill_rank
             })
     };
-    assert!(client_can_use(0x01, 0x01, Some((43, 150)))); // Human Warrior with Swords 150
-    assert!(!client_can_use(0x80, 0x01, Some((43, 150)))); // excluded Mage
-    assert!(!client_can_use(0x01, 0x02, Some((43, 150)))); // excluded Orc
-    assert!(!client_can_use(0x01, 0x01, None)); // missing sword proficiency
+    assert!(client_can_use(0x01, 0x01, Some((43, 150))));
+    assert!(!client_can_use(0x80, 0x01, Some((43, 150))));
+    assert!(!client_can_use(0x01, 0x02, Some((43, 150))));
+    assert!(!client_can_use(0x01, 0x01, None));
 
     drop(client);
     server.join().unwrap();
@@ -109,8 +102,6 @@ fn inspect_in_range_friendly_target_replies_smsg_inspect_with_the_target_guid() 
     server.join().unwrap();
 }
 
-/// `enter_world` for a test that needs to see how the session ended: the server thread hands back
-/// its verdict instead of unwrapping it.
 fn enter_world_unjoined(
     store: std::sync::Arc<WorldFake>,
     guid: u64,
@@ -132,8 +123,6 @@ fn enter_world_unjoined(
     (client, c_enc, c_dec, server)
 }
 
-/// A Transport Loss leaves the inspect gate's outcome unknown, so it ends the World Session. A
-/// Refusal (above) only drops the request.
 #[test]
 fn inspect_transport_loss_ends_the_world_session() {
     let mut s = quest_store();
@@ -158,8 +147,6 @@ fn inspect_transport_loss_ends_the_world_session() {
     );
 }
 
-/// Say, yell and `/e` lines go to the speaker's Home Shard. A lost transport leaves the line's
-/// fate unknown, so it ends the World Session.
 #[test]
 fn a_say_lost_to_a_transport_loss_ends_the_world_session() {
     let mut s = quest_store();
@@ -180,8 +167,6 @@ fn a_say_lost_to_a_transport_loss_ends_the_world_session() {
     );
 }
 
-/// The Gateway finds a mistyped GM Account itself. The GM reads the reason as a system line and
-/// the World Session goes on.
 #[test]
 fn a_gm_command_for_an_unknown_account_answers_a_system_line_and_keeps_the_session() {
     let mut s = quest_store();
@@ -213,8 +198,6 @@ fn a_gm_command_for_an_unknown_account_answers_a_system_line_and_keeps_the_sessi
 
 #[test]
 fn inspect_refused_target_sends_no_reply() {
-    // CMSG_PLAYED_TIME (below) always replies as long as `character_by_guid` resolves the caller's
-    // own guid, so give the store a character row for guid 1 (quest_store() has none).
     let store = std::sync::Arc::new({
         let base = quest_store();
         WorldFake {
@@ -226,18 +209,14 @@ fn inspect_refused_target_sends_no_reply() {
         }
     });
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store, 1);
-    // guid 0 is the mock store's stand-in for "out of range / no such target" — the gate rejects it
-    // and the handler drops the request silently (mirrors CMSG_GAMEOBJ_USE/CMSG_AREATRIGGER).
     CMSG_INSPECT { guid: Guid::new(0) }
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
-    // Sentinel: a follow-up request with a guaranteed reply. If the refused CMSG_INSPECT had
-    // wrongly produced an SMSG_INSPECT, it would arrive first and this match would fail.
     CMSG_PLAYED_TIME {}
         .write_encrypted_client(&mut client, &mut c_enc)
         .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
-        ServerOpcodeMessage::SMSG_PLAYED_TIME(_) => {} // no SMSG_INSPECT was sent for the refused target
+        ServerOpcodeMessage::SMSG_PLAYED_TIME(_) => {}
         other => {
             panic!("expected SMSG_PLAYED_TIME (no SMSG_INSPECT for refused target), got {other}")
         }
@@ -306,8 +285,6 @@ fn gossip_select_on_a_petitioner_option_opens_the_charter_list() {
 
 #[test]
 fn gossip_select_on_a_vendor_opens_the_inventory_window() {
-    // Option 0 on a stocked NPC is "browse goods" → the RAW SMSG_LIST_INVENTORY, same as the
-    // direct CMSG_LIST_INVENTORY path.
     let mut s = quest_store();
     s.vendor.vendor_stock = vec![codec::VendorItemView {
         item_entry: 4540,
@@ -343,7 +320,6 @@ fn gossip_select_on_a_vendor_opens_the_inventory_window() {
 
 #[test]
 fn gossip_select_on_an_innkeeper_binds_home_and_completes() {
-    // A non-vendor innkeeper's "Make this inn your home." is option 0 → bind_home + GOSSIP_COMPLETE.
     let mut s = quest_store();
     s.npc.innkeeper = true;
     let store = std::sync::Arc::new(s);
@@ -390,7 +366,6 @@ fn gossip_select_on_an_innkeeper_binds_home_and_completes() {
 
 #[test]
 fn gossip_select_of_any_other_option_completes_without_binding() {
-    // Farewell (option 1 on an innkeeper NPC) → GOSSIP_COMPLETE only; no bind, no vendor window.
     let mut s = quest_store();
     s.npc.innkeeper = true;
     let store = std::sync::Arc::new(s);
@@ -417,9 +392,6 @@ fn gossip_select_of_any_other_option_completes_without_binding() {
 
 #[test]
 fn gossip_hello_renders_imported_options_verbatim_with_a_trailing_farewell() {
-    // The 217 acceptance criterion: an Elwynn-innkeeper-shaped NPC with 3 imported options (chat,
-    // browse goods, make-home) renders them VERBATIM (real dump text, not the hardcoded fallback
-    // strings) — the vendor/innkeeper flags are ignored entirely once options are imported.
     use lyracore_shared::constants::gossip_option;
     let mut s = quest_store();
     s.npc.gossip_opts = vec![
@@ -431,7 +403,6 @@ fn gossip_hello_renders_imported_options_verbatim_with_a_trailing_farewell() {
             gossip_option::INNKEEPER,
         ),
     ];
-    // Fallback signals present too — must be ignored while options are imported.
     s.vendor.vendor_stock = vec![codec::VendorItemView {
         item_entry: 1,
         ..Default::default()
@@ -561,7 +532,6 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
         always.row_id = 4002;
         vec![gated, always]
     };
-    // Viewer A has not taken quest 60 → the gated row is hidden, so "Stay here." renders at 0.
     let mut a = quest_store();
     a.npc.gossip_opts = menu();
     let a = std::sync::Arc::new(a);
@@ -583,7 +553,6 @@ fn the_same_option_row_reaches_the_module_by_row_id_from_either_viewer() {
     drop(client);
     server.join().unwrap();
 
-    // Viewer B HAS taken it → the gated row renders first and pushes "Stay here." to position 1.
     let mut b = quest_store();
     b.npc.gossip_opts = menu();
     b.quest.quest_log = vec![(60, false)].into();
@@ -630,11 +599,8 @@ fn a_quest_taken_while_the_window_is_open_does_not_shift_the_click() {
     s.npc.gossip_opts = vec![gated, inn];
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
-    // Rendered while the quest is untaken: the gated line is hidden, "Stay here." is position 0.
     let rendered = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
     assert_eq!(rendered.gossips[0].message, "Stay here.");
-    // The player accepts quest 60 elsewhere (another window, a party member's turn-in) — a fresh
-    // filter would now put the gated line at 0 and push "Stay here." to 1.
     store.quest.quest_log.lock().unwrap().push((60, false));
     CMSG_GOSSIP_SELECT_OPTION {
         guid: Guid::new(90),
@@ -687,7 +653,6 @@ fn a_select_with_no_open_menu_just_closes_the_window() {
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
-    // Same position, a DIFFERENT npc — the open menu is 90's, so this selects nothing.
     CMSG_GOSSIP_SELECT_OPTION {
         guid: Guid::new(91),
         gossip_list_id: 0,
@@ -788,9 +753,6 @@ fn an_imported_menu_missing_its_bind_row_still_offers_the_hearth() {
         .load(std::sync::atomic::Ordering::SeqCst));
 }
 
-/// A `quest_store()` fixture whose logged-in character (guid 1) reports `level`, so
-/// `filtered_gossip_options`' level gate has something to read (`quest_store()` itself leaves
-/// `characters` empty, which reads as level 0 — every below-10 test can lean on that default).
 fn quest_store_at_level(level: u8) -> WorldFake {
     let base = quest_store();
     WorldFake {
@@ -805,9 +767,6 @@ fn quest_store_at_level(level: u8) -> WorldFake {
 
 #[test]
 fn gossip_hello_hides_unlearn_talents_below_level_10() {
-    // The imported "I wish to unlearn my talents." row (reclassified by the importer to
-    // `UNLEARNTALENTS`, since the raw dump column never carries it) must not render for a character
-    // who cannot yet have a talent point.
     use lyracore_shared::constants::gossip_option;
     let mut s = quest_store_at_level(5);
     s.npc.gossip_opts = vec![
@@ -873,7 +832,6 @@ fn gossip_hello_shows_unlearn_talents_at_level_10_and_select_routes_to_reset_tal
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
     }
-    // Selecting the option quotes the cost without changing talents.
     CMSG_GOSSIP_SELECT_OPTION {
         guid: Guid::new(90),
         gossip_list_id: 1,
@@ -913,15 +871,12 @@ fn gossip_hello_shows_unlearn_talents_at_level_10_and_select_routes_to_reset_tal
 
 #[test]
 fn gossip_hello_shows_a_quest_gated_option_once_the_quest_is_taken() {
-    // The socket-level contract: the player's quest state reaches the gossip filter through the
-    // quest seam's `quest_gate_state`, and the gated row is assembled into the gossip message the
-    // client actually receives. The hidden case is covered by the position-alignment test below.
     use lyracore_shared::constants::{gossip_condition, gossip_option};
     let mut s = quest_store();
     s.npc.gossip_opts = vec![opt(0, "About that favor...", gossip_option::GOSSIP)];
     s.npc.gossip_opts[0].cond_type = gossip_condition::QUEST_TAKEN;
     s.npc.gossip_opts[0].cond_value1 = 60;
-    s.quest.quest_log = vec![(60, false)].into(); // taken, not yet turned in
+    s.quest.quest_log = vec![(60, false)].into();
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store, 1);
     CMSG_GOSSIP_HELLO {
@@ -942,20 +897,16 @@ fn gossip_hello_shows_a_quest_gated_option_once_the_quest_is_taken() {
 
 #[test]
 fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() {
-    // The sharpest trap (danger-zones-adjacent): 3 imported options where the MIDDLE one is
-    // quest-gated and hidden. HELLO sends only 2 lines (positions 0,1); a SELECT of position 1 MUST
-    // route to the THIRD raw option (innkeeper), not the hidden middle one — proving
-    // `filtered_gossip_options` re-derives the IDENTICAL list rather than indexing the raw rows.
     use lyracore_shared::constants::{gossip_condition, gossip_option};
     let mut s = quest_store();
     s.npc.innkeeper = true;
     s.npc.gossip_opts = vec![
-        opt(0, "Chat.", gossip_option::GOSSIP), // raw index 0 -> rendered index 0
-        opt(0, "Hidden favor.", gossip_option::GOSSIP), // raw index 1 -> HIDDEN (quest-gated)
-        opt(0, "Stay here.", gossip_option::INNKEEPER), // raw index 2 -> rendered index 1
+        opt(0, "Chat.", gossip_option::GOSSIP),
+        opt(0, "Hidden favor.", gossip_option::GOSSIP),
+        opt(0, "Stay here.", gossip_option::INNKEEPER),
     ];
     s.npc.gossip_opts[1].cond_type = gossip_condition::QUEST_TAKEN;
-    s.npc.gossip_opts[1].cond_value1 = 60; // never taken in this store
+    s.npc.gossip_opts[1].cond_value1 = 60;
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     CMSG_GOSSIP_HELLO {
@@ -965,14 +916,12 @@ fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() 
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
-            assert_eq!(m.gossips.len(), 3, "2 visible + Farewell: {:?}", m.gossips); // hidden option excluded
+            assert_eq!(m.gossips.len(), 3, "2 visible + Farewell: {:?}", m.gossips);
             assert_eq!(m.gossips[0].message, "Chat.");
             assert_eq!(m.gossips[1].message, "Stay here.");
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
     }
-    // Click rendered position 1 ("Stay here.") — must bind home, NOT be swallowed by the hidden
-    // middle option that was never actually sent to the client.
     CMSG_GOSSIP_SELECT_OPTION {
         guid: Guid::new(90),
         gossip_list_id: 1,
@@ -1041,7 +990,7 @@ fn npc_text_query_ships_the_imported_8_slot_view() {
             assert_eq!(u.texts[0].probability, 0.6);
             assert_eq!(u.texts[3].texts[0], "Watch yourself.");
             assert_eq!(u.texts[3].probability, 0.4);
-            assert_eq!(u.texts[1].probability, 0.0); // untouched slot stays silent
+            assert_eq!(u.texts[1].probability, 0.0);
         }
         other => panic!("expected SMSG_NPC_TEXT_UPDATE, got {other}"),
     }
@@ -1096,8 +1045,6 @@ fn gossip_training_selection_sends_the_profession_list_type() {
 #[test]
 fn gossip_hides_the_train_and_unlearn_options_for_a_class_the_trainer_does_not_serve() {
     use lyracore_shared::constants::gossip_option;
-    // Level 20 matters: the respec option is independently hidden below level 10, so at the default
-    // fixture level this would pass without the class gate doing any work.
     let mut s = quest_store_at_level(20);
     s.npc.gossip_opts = vec![
         opt(0, "Well met, traveler.", gossip_option::GOSSIP),
@@ -1128,7 +1075,6 @@ fn gossip_hides_the_train_and_unlearn_options_for_a_class_the_trainer_does_not_s
                 !lines.contains(&"I wish to unlearn my talents."),
                 "the respec option must be hidden too: {lines:?}"
             );
-            // The NPC is not silenced — it still talks, and still sells.
             assert!(
                 lines.contains(&"Well met, traveler."),
                 "plain gossip lines survive: {lines:?}"
@@ -1147,7 +1093,6 @@ fn gossip_hides_the_train_and_unlearn_options_for_a_class_the_trainer_does_not_s
 #[test]
 fn gossip_keeps_the_train_and_unlearn_options_for_a_class_the_trainer_serves() {
     use lyracore_shared::constants::gossip_option;
-    // Same level as its counterpart, so the only difference between the two tests is the gate.
     let mut s = quest_store_at_level(20);
     s.npc.gossip_opts = vec![
         opt(0, "Well met, traveler.", gossip_option::GOSSIP),
@@ -1159,7 +1104,7 @@ fn gossip_keeps_the_train_and_unlearn_options_for_a_class_the_trainer_serves() {
         ),
         opt(1, "I'd like to browse your goods.", gossip_option::VENDOR),
     ];
-    let store = std::sync::Arc::new(s); // trainer_refuses_class stays false (derive-Default)
+    let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store, 1);
     CMSG_GOSSIP_HELLO {
         guid: Guid::new(90),

@@ -7,8 +7,6 @@ use std::sync::{Arc, Mutex};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::Vector3d;
 
-// ---- Cross-map teleport relay --------------------------------------------
-
 #[test]
 fn teleport_relay_same_map_is_byte_identical_to_the_pre_224_ack() {
     let out = build_teleport_relay(true, 7, 0, 1.0, 2.0, 3.0, 0.5).unwrap();
@@ -66,8 +64,6 @@ fn teleport_relay_cross_map_sends_transfer_pending_then_new_world() {
 
 #[test]
 fn teleport_relay_rejects_a_map_id_the_client_enum_does_not_know() {
-    // `Map` is a closed vanilla enum; an id past its known range must surface as an Err (never
-    // silently drop the whole relay or panic).
     assert!(build_teleport_relay(false, 7, u32::MAX, 0.0, 0.0, 0.0, 0.0).is_err());
 }
 
@@ -261,9 +257,6 @@ fn resident_facing_replay_follows_create_even_after_its_timestamp() {
     );
 }
 
-/// a `facing`-flagged `game_creature_spline` row relays as `SMSG_MONSTER_MOVE`'s
-/// `FacingAngle` variant, not the `Normal` one every other leg uses — the whole point being that
-/// a stationary creature otherwise has no wire-level way to tell the client its heading changed.
 #[test]
 fn a_facing_leg_relays_as_the_facing_angle_variant() {
     let created = Arc::new(Mutex::new(HashSet::from([42u64])));
@@ -300,7 +293,6 @@ fn a_facing_leg_relays_as_the_facing_angle_variant() {
     );
     assert_eq!(msg.duration, 0);
 
-    // A non-facing leg keeps the Normal variant unchanged.
     let mut normal_row = row.clone();
     normal_row.facing = false;
     normal_row.dur_ms = 500;

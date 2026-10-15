@@ -41,6 +41,7 @@ In `.github/workflows/runtime-scripts.yml`, when the change reaches `datascripts
 
 Other checks:
 
+- [ ] Comment review per `CODING_STANDARDS.md#comment-review`: state the scope and result.
 - [ ] Module or schema changes: a plain `spacetime publish` against your local stack migrates cleanly (**never** `publish -c`)
 - [ ] `shellcheck --severity=warning` on any shell script you changed
 - [ ] Markdown links you added resolve

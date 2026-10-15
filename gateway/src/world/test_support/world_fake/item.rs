@@ -1,6 +1,5 @@
 use super::super::*;
 
-/// Item actions shared by the family and Benilla World Session tests.
 impl ItemActionStore for WorldFake {
     fn destroy_item(&self, _actor: Actor, _slot: u8, _count: u32) -> Result<ItemActionResult> {
         Ok(lyracore_shared::item::ItemRefusal::ItemNotFound.into())

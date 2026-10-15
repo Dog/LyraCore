@@ -1,8 +1,3 @@
-//! Taxi discovery and direct-flight activation. This module is the policy boundary for resolving a
-//! flight master, reading or adding character progression, validating supported direct routes, and
-//! atomically starting a paid flight. The gateway only requests an operation and encodes its reply
-//! into the vanilla wire format. [entity]
-
 use spacetimedb::{table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::{
@@ -10,17 +5,9 @@ use crate::{
     GameTaxiNode, GameTaxiPath, GameTaxiPathNode, WorldEntity,
 };
 
-/// Normal NPC interaction distance: (10 yd)², shared in value with vendor/trainer/quest gates.
 const TAXI_INTERACTION_RANGE_SQ: f32 = 100.0;
-/// A spawned flight master resolves to the nearest catalogue node on its map. Real DBC node
-/// positions and creature spawns are close but not necessarily identical, so use the same 10-yard
-/// tolerance as the player-to-NPC interaction instead of exact float equality.
 const TAXI_NODE_RESOLVE_RANGE_SQ: f32 = 100.0;
 
-/// One durable known-node record. `node_id` is the server-side storage id; the client-facing id is
-/// resolved only when an operation reply is built. The logical key is `(character_guid, node_id)`;
-/// reducers insert only after an indexed per-character dedup scan, and SpacetimeDB serializes the
-/// transaction so concurrent opens cannot create two rows. [entity]
 #[table(
     accessor = game_character_taxi_node,
     index(accessor = by_character, btree(columns = [character_guid]))
@@ -33,10 +20,6 @@ pub struct CharacterTaxiNode {
     pub node_id: u32,
 }
 
-/// One authoritative in-progress direct flight. The character guid is the primary key, so the
-/// serialized reducer transaction can never create two active flights or debit one activation
-/// twice. Scheduled progression and landing extend/consume this row in the next slice; activation
-/// records only the immutable route, mount, fare, and starting cursor. [entity]
 #[derive(Clone)]
 #[table(accessor = game_active_taxi_flight)]
 pub struct ActiveTaxiFlight {
@@ -51,8 +34,6 @@ pub struct ActiveTaxiFlight {
     pub started_micros: i64,
 }
 
-/// Scheduled authority loop for one passenger. The key is the character guid, so activation can
-/// arm exactly one loop and landing can remove it without a scan.
 #[table(accessor = game_taxi_flight_schedule, scheduled(advance_taxi_flight))]
 pub struct TaxiFlightSchedule {
     #[primary_key]
@@ -60,10 +41,6 @@ pub struct TaxiFlightSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// Dedicated passenger spline carrier. Unlike ordinary player motion it includes the passenger,
-/// and unlike `game_creature_spline` it never lends player state to the creature movement engine.
-/// The row is refreshed whenever the authoritative cursor changes AOI cell, which lets a relog or
-/// newly-entered observer receive the remaining route from the cell that actually owns it.
 #[table(accessor = game_taxi_passenger_spline, public)]
 pub struct TaxiPassengerSpline {
     #[primary_key]
@@ -76,7 +53,6 @@ pub struct TaxiPassengerSpline {
     pub start_x: f32,
     pub start_y: f32,
     pub start_z: f32,
-    /// Flattened x/y/z triples, in travel order.
     pub points: Vec<f32>,
     pub duration_ms: u32,
     pub spline_id: u32,
@@ -85,8 +61,7 @@ pub struct TaxiPassengerSpline {
 crate::character_owned!(delete, fn sweep_delete_game_active_taxi_flight(ctx, character_guid) {
     ctx.db.game_active_taxi_flight().character_guid().delete(character_guid);
 });
-// Baseline direct routes never cross a supported shard boundary. A transfer must start without an
-// active flight; carrying the row would strand a route whose NPC/catalogue partition was left behind.
+// A flight cannot cross Shards; its route and catalogue belong to the current hosted map.
 crate::character_owned!(not_transported, fn sweep_transfer_game_active_taxi_flight());
 
 crate::character_owned!(delete, fn sweep_delete_game_taxi_flight_schedule(ctx, character_guid) {
@@ -106,17 +81,12 @@ crate::character_owned!(delete, fn sweep_delete_game_character_taxi_node(ctx, ch
     }
 });
 
-// Taxi discoveries are durable progression. Surrogate ids are local to one database and must be
-// minted again when the character crosses a shard boundary.
 crate::character_owned!(transfer, fn sweep_transfer_game_character_taxi_node(ctx, character_guid, io) {
     table = game_character_taxi_node,
     by = by_character,
     remint = id,
 });
 
-/// The result mailbox for a cohesive taxi operation. `request_id` lets the gateway distinguish the
-/// committed answer from an older cache row. Failed gameplay gates are represented by `accepted =
-/// false` and COMMIT, rather than reducer errors that would roll the reply back. [server]
 #[table(
     accessor = game_taxi_service_reply,
     index(accessor = by_character, btree(columns = [character_guid]))
@@ -133,8 +103,6 @@ pub struct TaxiServiceReply {
     pub available_client_node_ids: Vec<u32>,
     pub refusal: String,
     pub created_micros: i64,
-    /// Stable primitive result for activation replies. Status/open callers ignore it. End-appended
-    /// with a default so publishing over the mailbox schema is migration-safe.
     #[default(0)]
     pub result_code: u8,
 }
@@ -240,8 +208,6 @@ fn flight_master_is_selectable(unit_flags: u32) -> bool {
     unit_flags & lyracore_shared::constants::unit_flags::NOT_SELECTABLE == 0
 }
 
-/// Resolve every fact needed by status/open at one chokepoint. Source lookup deliberately returns
-/// the storage-id row; only operation results expose `client_node_id`.
 fn resolve_flight_master(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -294,9 +260,6 @@ fn resolve_flight_master(
     Ok((player, source))
 }
 
-/// The small state machine at the atomic activation boundary. It owns every player-local gate and
-/// computes the purse/presentation mutation without touching storage. The reducer persists this
-/// state only after all NPC, catalogue, topology, and discovery checks have also succeeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivationPlayerState {
     has_active_flight: bool,
@@ -336,7 +299,6 @@ impl ActivationPlayerState {
         if self.movement_flags != 0 {
             return Err(TaxiGateDenied::PlayerMoving);
         }
-        // Warrior stances remain taxi eligible; only the Druid-form range is a shape shift.
         if self.stance >= crate::spell::STANCE_BEAR {
             return Err(TaxiGateDenied::PlayerShapeShifted);
         }
@@ -428,10 +390,6 @@ fn should_insert_discovery(already_known: bool) -> bool {
     !already_known
 }
 
-/// A direct route is offerable only when all geometry exists in one hosted map and its point
-/// indices are a complete zero-based sequence. This rules out missing point batches and every
-/// loading-screen/cross-map approximation. Delays and point flags have client semantics this
-/// baseline does not emulate, so routes containing either are rejected rather than approximated.
 fn route_is_supported(
     source: &GameTaxiNode,
     destination: &GameTaxiNode,
@@ -480,8 +438,6 @@ fn route_duration_micros(points: &[GameTaxiPathNode]) -> Option<i64> {
     })
 }
 
-/// Evaluate the route directly from authoritative elapsed time. No client delta or previous tick
-/// participates, so delayed scheduler firings catch up instead of accumulating drift.
 fn route_position(points: &[GameTaxiPathNode], elapsed_micros: i64) -> Option<RoutePosition> {
     let total = route_duration_micros(points)?;
     let elapsed = elapsed_micros.max(0);
@@ -624,7 +580,6 @@ trait FlightEndSink {
 
 fn apply_flight_end(sink: &mut impl FlightEndSink, plan: FlightEndPlan) {
     if !sink.take_active() {
-        // Repair harmless orphan presentation rows left by an interrupted older build.
         sink.clear_spline();
         sink.clear_schedule();
         return;
@@ -658,8 +613,6 @@ impl FlightEndSink for CtxFlightEndSink<'_> {
             player.grid_x = landing.grid_x;
             player.grid_y = landing.grid_y;
             player.cell = landing.cell;
-            // The landing zone lands on the live row too, not just the durable one: the Gateway
-            // reads the entity's zone. An unresolvable landing keeps the zone flown in with.
             if let Some(zone_id) = zone_id {
                 player.zone_id = zone_id;
             }
@@ -785,7 +738,6 @@ fn land_flight(
     );
 }
 
-/// True for every inbound action while this character has module-owned taxi state.
 pub(crate) fn is_in_flight(ctx: &ReducerContext, character_guid: u64) -> bool {
     ctx.db
         .game_active_taxi_flight()
@@ -842,8 +794,6 @@ fn available_client_nodes(
     available
 }
 
-/// The gateway waits at most one second. A much longer fallback window preserves every plausible
-/// in-flight reply while eventually collecting rows left behind by a crashed gateway.
 const TAXI_REPLY_STALE_AFTER_MICROS: i64 = 60_000_000;
 
 fn stale_reply_ids(replies: impl IntoIterator<Item = (u64, i64)>, now_micros: i64) -> Vec<u64> {
@@ -926,7 +876,6 @@ fn activation_reply(
     }
 }
 
-/// Read-only status operation. A valid reply reports the persisted known bit and never discovers.
 #[spacetimedb::reducer]
 pub fn gw_taxi_node_status(
     ctx: &ReducerContext,
@@ -963,8 +912,6 @@ pub fn gw_taxi_node_status(
     Ok(())
 }
 
-/// Open the direct-route map. Discovery and availability are computed in one transaction, so the
-/// newly known source is present in the result immediately and repeated opens stay idempotent.
 #[spacetimedb::reducer]
 pub fn gw_open_taxi(
     ctx: &ReducerContext,
@@ -1004,9 +951,6 @@ pub fn gw_open_taxi(
     Ok(())
 }
 
-/// Activate one direct imported route. Every gameplay refusal commits a stable result mailbox row;
-/// only operator/transport failures return `Err`. SpacetimeDB executes the validation, unique-row
-/// insert, purse debit, presentation mutation, and reply write as one serialized transaction.
 #[spacetimedb::reducer]
 pub fn gw_activate_taxi(
     ctx: &ReducerContext,
@@ -1051,8 +995,7 @@ pub fn gw_activate_taxi(
             mount_display_id,
             fare: path.fare,
             current_node_index: 0,
-            // Zero is the durable "paid but not presented" phase. The gateway queues the OK reply
-            // and only then calls `gw_arm_taxi_flight`, preventing motion from overtaking it.
+            // Queue the paid reply before arming motion so movement cannot overtake it.
             started_micros: 0,
         };
         ctx.db.game_active_taxi_flight().insert(flight);
@@ -1075,8 +1018,6 @@ pub fn gw_activate_taxi(
     Ok(())
 }
 
-/// Enter the presentation/running phase after the gateway has queued `ACTIVATETAXIREPLY(OK)`.
-/// Idempotency supplies crash recovery: a paid-but-unarmed row is resumed on the next login.
 pub(crate) fn arm_taxi_flight(ctx: &ReducerContext, character_guid: u64) {
     let Some(mut flight) = ctx
         .db
@@ -1142,9 +1083,6 @@ pub fn gw_arm_taxi_flight(
     Ok(())
 }
 
-/// Advance one passenger from the authoritative clock. Missing live entities are retained for a
-/// relog; malformed catalogue state cancels at the last authoritative position and never grants the
-/// destination. Normal completion is the only branch that writes the exact destination.
 #[spacetimedb::reducer]
 pub fn advance_taxi_flight(ctx: &ReducerContext, schedule: TaxiFlightSchedule) {
     if ctx.sender() != ctx.database_identity() {
@@ -1222,8 +1160,6 @@ pub fn advance_taxi_flight(ctx: &ReducerContext, schedule: TaxiFlightSchedule) {
     }
 }
 
-/// Delete an observed reply. Missing rows are an idempotent success; the character check prevents
-/// a request id from acknowledging another character's mailbox entry.
 #[spacetimedb::reducer]
 pub fn gw_ack_taxi_reply(
     ctx: &ReducerContext,
@@ -1255,8 +1191,6 @@ mod tests {
         durable: LandingPosition,
         pending_instance_id: u64,
         zone_id: u32,
-        /// The zone landed on the LIVE entity row, kept apart from the durable `zone_id` above so a
-        /// test can prove the landing reaches both.
         world_zone_id: u32,
         spline: bool,
         schedule: bool,
@@ -1581,10 +1515,10 @@ mod tests {
         let mut source = node(1, 1, 0);
         source.mount_display_horde = 295;
         source.mount_display_alliance = 1147;
-        assert_eq!(faction_mount_display(2, &source), 295); // Orc
-        assert_eq!(faction_mount_display(1, &source), 1147); // Human
+        assert_eq!(faction_mount_display(2, &source), 295);
+        assert_eq!(faction_mount_display(1, &source), 1147);
         source.mount_display_horde = 0;
-        assert_eq!(faction_mount_display(6, &source), 0); // rejected by activation
+        assert_eq!(faction_mount_display(6, &source), 0);
     }
 
     #[test]

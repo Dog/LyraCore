@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`ChannelActionStore`] adapter.
-
 use anyhow::Result;
 use lyracore_shared::channel::{ChannelName, ChannelRefusal};
 
@@ -12,8 +10,6 @@ use crate::world::{
 };
 
 impl ChannelActionStore for Coordinator {
-    /// `realm_channel_op`: run one Chat Channel op on Realm-core, or on the one database of an
-    /// unsharded Realm. The Module applies every channel rule. The actor's name stays here.
     fn channel_op(
         &self,
         actor: Actor,
@@ -40,15 +36,12 @@ impl ChannelActionStore for Coordinator {
         ))
     }
 
-    /// The channel `channel_name` names for `team` on Realm-core, with its members in join order
-    /// and its owner's name from whichever World Shard holds the Character.
     fn channel_roster(&self, team: u32, channel_name: &str) -> Result<Option<ChannelRoster>> {
         let realm = self.realm_core()?;
         let key = ChannelName::normalize(channel_name).key;
         let found = {
             let guard = realm.0.coord();
-            // The index lock is released before the cache read: the pump takes the cache and
-            // then the index in its callbacks.
+            // Release the index lock before cache reads; pump callbacks take cache then index.
             let indexed = {
                 let index = guard.chat_channels.read().unwrap();
                 index
@@ -65,7 +58,6 @@ impl ChannelActionStore for Coordinator {
                 Some((channel, members))
             })
         };
-        // The guard is gone: the owner's name reads other Shards' caches.
         let Some((channel, members)) = found else {
             return Ok(None);
         };
@@ -94,8 +86,6 @@ impl ChannelActionStore for Coordinator {
     }
 }
 
-/// The Module's typed channel Refusal. Only a reducer the Module rejected carries a tag; a timeout,
-/// transport, or SDK failure stays an error with an unknown outcome.
 fn channel_outcome(result: Result<()>) -> Result<ChannelOutcome> {
     match result {
         Ok(()) => Ok(ChannelOutcome::Done),

@@ -1,7 +1,7 @@
 use spacetimedb::{reducer, table, Identity, ReducerContext, Table};
 
 use crate::game_corpse_loot;
-use crate::game_group; // Group row: loot_method/loot_threshold/rr_cursor/master_looter_guid
+use crate::game_group;
 use crate::game_item_template;
 use crate::game_world_entity;
 use lyracore_shared::loot::LootRefusal;
@@ -9,14 +9,7 @@ use lyracore_shared::loot_roll::{event_kind as roll_event_kind, vote_kind};
 
 use super::{refused, CorpseLoot};
 
-/// A member of a kill's loot-eligible set, resolved from the Loot Tag at death. One row per
-/// `(corpse_guid, recipient)`. Private, no
-/// RLS — only the module reads it (roll-vote snapshotting, `loot_master_give`'s recipient gate).
-/// `eligible_guid` (not `character_guid`) deliberately dodges the crate's `character_owned` sweep-
-/// marker tripwire (`tripwires.rs`): these rows are transient, corpse-lifetime data reaped alongside
-/// `game_corpse_loot` on decay (`creatures::tick::pass_decay`) — never durable per-character state, so
-/// they need no delete/restamp sweep on character delete/relog (a stale row just never matches any
-/// live roll again). [entity]
+// Corpse lifetime owns these rows; they are not Character-owned state.
 #[table(accessor = game_corpse_loot_eligible, index(accessor = by_corpse, btree(columns = [corpse_guid])))]
 pub struct CorpseLootEligible {
     #[primary_key]
@@ -26,11 +19,6 @@ pub struct CorpseLootEligible {
     pub eligible_guid: u64,
 }
 
-/// A live NEED/GREED/NBG roll on one `game_corpse_loot` row. Private — the gateway never reads this
-/// (relayed via `game_group_event` instead, see the module doc above). `resolved` is the exactly-once
-/// resolution guard: set the moment `resolve_roll` decides an outcome, checked
-/// FIRST on every entry point (the deadline sweep AND a landing vote can both reach the same roll).
-/// [entity]
 #[derive(Clone)]
 #[table(accessor = game_loot_roll, index(accessor = by_corpse, btree(columns = [corpse_guid])))]
 pub struct LootRoll {
@@ -44,18 +32,11 @@ pub struct LootRoll {
     pub resolved: bool,
     #[default(0)]
     pub random_property_id: u32,
-    /// Source Module identity carried unchanged by promotion retries.
     #[default(Identity::ZERO)]
     pub promotion_source: Identity,
 }
 
-/// One Loot Roll Promotion Receipt per source Module identity, corpse and slot. Resolution keeps
-/// this high-water mark; replacing it with a later source id also covers every older replay.
-///
-/// The source `game_loot_roll` auto-increment sequence orders generations, so content imports must
-/// not replace that table or insert explicit roll ids. Restoring an older copy under the same
-/// identity can reuse ids and needs its own recovery procedure. Receipts never expire: a retired
-/// source can still have delayed requests in flight, and nothing refuses them yet.
+// Keep promotion receipts after resolution; delayed retries must not recreate rolls.
 #[table(accessor = game_loot_roll_promotion_receipt, index(accessor = by_source_slot, btree(columns = [promotion_source, corpse_guid, slot])))]
 pub struct LootRollPromotionReceipt {
     #[primary_key]
@@ -67,14 +48,6 @@ pub struct LootRollPromotionReceipt {
     pub source_roll_id: u64,
 }
 
-/// One eligible member's vote on a [`LootRoll`] — snapshotted (one row per eligible guid) the moment
-/// the roll starts, so a member joining the group later never joins a live roll. `voted=false` rows
-/// auto-pass at resolution (deadline OR all-voted). `rolled` is assigned THE MOMENT a NEED/GREED vote
-/// lands (mirrors real vanilla: `SMSG_LOOT_ROLL`'s roll number is generated at vote time, not
-/// deferred to resolution) — `0` for a pass (real or auto-) and never read for one. Private, no RLS
-/// (the module resolves rolls server-side; the gateway never reads vote state directly). `voter_guid`
-/// (not `character_guid`) dodges the `character_owned` tripwire — same transient-data rationale as
-/// [`CorpseLootEligible`]. [entity]
 #[derive(Clone)]
 #[table(accessor = game_loot_roll_vote, index(accessor = by_roll, btree(columns = [roll_id])))]
 pub struct LootRollVote {
@@ -84,27 +57,17 @@ pub struct LootRollVote {
     pub roll_id: u64,
     pub voter_guid: u64,
     pub voted: bool,
-    pub vote: u8,   // vote_kind::* — meaningful only if `voted`
-    pub rolled: u8, // 1-100 once a NEED/GREED vote lands; 0 otherwise
+    pub vote: u8,   // Meaningful only when voted is true.
+    pub rolled: u8, // 1..=100 for Need or Greed; zero otherwise.
 }
 
-/// Roll-window countdown (vanilla: 60s).
 pub(crate) const ROLL_WINDOW_MICROS: i64 = 60_000_000;
 
-/// Which handling applies to ONE `game_corpse_loot` row under the group's current `method`/
-/// `threshold`, given the row's item `quality`? Pure — the single decision table every group-loot
-/// stamping choice below reduces to; unit-tested as the "threshold split" matrix. An unrecognized
-/// `method` (shouldn't happen — `group_loot_method` validates it) degrades to `Ffa` (never invents a
-/// restriction from a bad value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroupLootDecision {
-    /// No restriction — behaves exactly as before this feature (FFA method, or a bad/unknown value).
     Ffa,
-    /// Round-robin/below-threshold-GROUP: stamp the corpse's one pre-picked designee.
     Designate,
-    /// Above-threshold under GROUP or any row under NEED_BEFORE_GREED: spawn a need/greed/pass roll.
     Roll,
-    /// Above-threshold under MASTER: stamp the master + `master_only`.
     Master,
 }
 
@@ -136,10 +99,6 @@ pub(crate) fn group_loot_decision_for_row(
     }
 }
 
-/// Round-robin cursor advance (trap: "skipping offline members"): given a STABLE
-/// member ordering's online bitmap and the group's current `cursor`, return the chosen member's
-/// INDEX into that same ordering plus the cursor value to persist for NEXT time (wrapping). `None`
-/// if nobody is online (a fully-offline group — degrades to FFA, never panics/blocks looting). Pure.
 pub(crate) fn advance_rr_cursor(online: &[bool], cursor: u32) -> Option<(usize, u32)> {
     let n = online.len();
     if n == 0 {
@@ -155,9 +114,6 @@ pub(crate) fn advance_rr_cursor(online: &[bool], cursor: u32) -> Option<(usize, 
     None
 }
 
-/// Given every ELIGIBLE (voted-or-auto-passed) member's vote kind, which tier contends for the item —
-/// NEED beats GREED, an empty result means everyone passed (the row unlocks FFA-in-group)? Pure.
-/// Returns the CONTENDING members' indices into `votes` (order-preserving).
 pub(crate) fn contending_tier(votes: &[u8]) -> Vec<usize> {
     let need: Vec<usize> = votes
         .iter()
@@ -176,9 +132,6 @@ pub(crate) fn contending_tier(votes: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// Pick the winner among a contending tier's already-rolled 1-100 values: the unique max, or `None`
-/// on a TIE (multiple share the max — cmangos re-rolls internally and re-decides; the caller loops
-/// this with fresh rolls for the tied members until it resolves, then announces ONCE). Pure.
 pub(crate) fn pick_roll_winner(rolls: &[u8]) -> Option<usize> {
     if rolls.is_empty() {
         return None;
@@ -191,20 +144,12 @@ pub(crate) fn pick_roll_winner(rolls: &[u8]) -> Option<usize> {
         .map(|(i, _)| i);
     let first = winners.next()?;
     if winners.next().is_some() {
-        None // a second index shares the max — a tie
+        None
     } else {
         Some(first)
     }
 }
 
-/// KILL-TIME group-loot stamping (module doc above explains the timing choice): called once from
-/// `combat::kill_creature` right after `roll_creature_loot`, for a grouped Loot Tag only. The
-/// corpse-eligibility rows are the one recipient set for designation, master loot, and rolls.
-///
-/// A solo player with method GROUP set must not roll threshold rows: a solo
-/// `recipients` (`len() < 2`, e.g. every other member out of XP range or dead) skips ALL group-loot
-/// handling too — vanilla's "party size 1 -> direct loot" applies to loot exactly like it does to
-/// the XP split, so the same recipient-count gate covers both.
 pub(crate) fn apply_group_loot_rules(ctx: &ReducerContext, corpse_guid: u64, group_id: u64) {
     let recipients = super::tag::corpse_eligible_recipients(ctx, corpse_guid);
     if recipients.len() < 2 {
@@ -218,8 +163,7 @@ pub(crate) fn apply_group_loot_rules(ctx: &ReducerContext, corpse_guid: u64, gro
         return;
     }
 
-    // One STABLE member ordering (sorted by character_guid — deterministic regardless of join
-    // order) so the rr_cursor index means the same thing kill after kill.
+    // Stable GUID order keeps the round-robin cursor meaningful across kills.
     let mut members = recipients.clone();
     members.sort_unstable();
     let online: Vec<bool> = members
@@ -250,11 +194,11 @@ pub(crate) fn apply_group_loot_rules(ctx: &ReducerContext, corpse_guid: u64, gro
         .by_corpse()
         .filter(&corpse_guid)
         .collect();
-    let mut master_rows: Vec<u8> = Vec::new(); // slots stamped master_only, for the MASTER_LIST push
+    let mut master_rows: Vec<u8> = Vec::new();
     let now = ctx.timestamp.to_micros_since_unix_epoch();
     for mut row in rows {
         if row.quest_only {
-            continue; // orthogonal systems — never group-gate a quest drop (module doc invariant)
+            continue;
         }
         let quality = templates
             .entry()
@@ -304,9 +248,6 @@ pub(crate) fn apply_group_loot_rules(ctx: &ReducerContext, corpse_guid: u64, gro
     }
 }
 
-/// Create one Loot Roll and its votes, or return the existing roll for this corpse and slot.
-/// Repeated starts preserve votes, recipients and deadline. No event is emitted here.
-/// Promotion checks its durable receipt before reaching this local row creation path.
 #[allow(clippy::too_many_arguments)]
 fn insert_roll_rows(
     ctx: &ReducerContext,
@@ -350,14 +291,6 @@ fn insert_roll_rows(
     roll.id
 }
 
-/// Spawn a NEED/GREED/NBG roll at KILL TIME: [`insert_roll_rows`] + `ROLL_START` to every recipient.
-///
-/// This ALWAYS runs on the corpse's own WORLD SHARD — kill-time combat resolution has no
-/// path to another database — so in a SHARDED deployment the row it creates is a TRANSIENT staging
-/// copy: the gateway's loot-roll relay (`gateway/src/world/loot.rs::relay_tick`) promotes it onto
-/// realm-core and clears this copy (`clear_promoted_loot_roll`) so voting/resolution never runs
-/// twice. Unsharded, nothing promotes or clears it — it just IS the roll, byte-identical to before
-/// this issue.
 fn start_roll(
     ctx: &ReducerContext,
     corpse_guid: u64,
@@ -389,7 +322,6 @@ fn start_roll(
     }
 }
 
-/// Stage a reserved Loot Roll through the same creation path as a killing blow.
 #[cfg(feature = "debug_reducers")]
 #[reducer]
 pub fn debug_stage_loot_roll_fixture(ctx: &ReducerContext) -> Result<(), String> {
@@ -406,13 +338,6 @@ pub fn debug_stage_loot_roll_fixture(ctx: &ReducerContext) -> Result<(), String>
     Ok(())
 }
 
-/// The identity-free vote core (mirrors `group.rs`'s `*_on` cores): shared by the player
-/// reducer above (the world shard the voter is physically standing on) and `realm_loot_op`'s VOTE arm
-/// (realm-core, once the roll has been promoted there). Same gates, same resolution, in the same
-/// order — `loot_roll` is byte-identical for clients. Unlike a group op, nothing about a vote's RULES
-/// differs by which database it runs on, only which one `game_loot_roll`'s `ctx.db` resolves to — the
-/// caller already picked that by calling this on the right connection, so (smalls) there is
-/// no `plane` parameter to thread through.
 pub(crate) fn cast_vote_on(
     ctx: &ReducerContext,
     corpse_guid: u64,
@@ -446,7 +371,7 @@ pub(crate) fn cast_vote_on(
     } else {
         (ctx.random::<u32>() % 100 + 1) as u8
     };
-    let my_rolled = my_vote.rolled; // captured before `my_vote` moves into `update` below
+    let my_rolled = my_vote.rolled;
     votes.id().update(my_vote);
 
     let all: Vec<LootRollVote> = votes.by_roll().filter(&roll.id).collect();
@@ -475,22 +400,6 @@ pub(crate) fn cast_vote_on(
     Ok(())
 }
 
-/// Grant a resolved roll's item to its winner, on WHICHEVER database holds the corpse.
-///
-/// Called inline by [`resolve_roll`] / [`force_resolve_rolls_for_disband`], wherever they execute —
-/// a single database, or REALM-CORE in a sharded one — and by the [`settle_loot_roll`] operator
-/// reducer, which the gateway's loot-roll relay calls on the corpse's OWN world shard after observing
-/// the `ROLL_WON` event realm-core just pushed. All three call sites are safe to call
-/// unconditionally: there is nothing to settle where no row matches at all (REALM-CORE never has
-/// `game_corpse_loot` rows — no kills happen there — so the two inline callers no-op for free there),
-/// and nothing to settle a second time (the row is gone after the first successful grant).
-///
-/// `withheld` is checked FIRST — the roll's own lock on the row, the same gate
-/// [`super::group_loot_take_allowed`] uses — so a `(corpse_guid, slot)` pair that merely COINCIDES with
-/// an unrelated row on another shard (`corpse_guid` is a per-shard `game_world_entity` sequence, not
-/// realm-unique — the tail risk this issue's cross-shard-routing note accepts, same class as
-/// character-name collisions elsewhere in this codebase) can never be mistaken for the row that just
-/// resolved: a row that is not mid-roll is never touched by this function, however its numbers land.
 pub(crate) fn settle_roll_grant(
     ctx: &ReducerContext,
     corpse_guid: u64,
@@ -503,11 +412,7 @@ pub(crate) fn settle_roll_grant(
         .filter(&corpse_guid)
         .find(|l| l.slot == slot)
     else {
-        //
-        // It cannot be an error, because the gateway fans `settle_loot_roll` out to every shard and
-        // "no row here" is the normal answer on all but one. So it is logged at INFO and worded so
-        // the two cases are TELLABLE APART BY CONTEXT — exactly one shard should have held this
-        // corpse, so if NO shard logs a grant for a settled roll, this line is where the item went.
+        // Settlement fans out to every World Shard, so a missing corpse row is expected.
         spacetimedb::log::info!(
             "settle_roll_grant: corpse {corpse_guid} slot {slot} — no loot row on this database \
              (expected on every shard but the corpse's owner; if NO shard granted, the corpse was \
@@ -516,13 +421,11 @@ pub(crate) fn settle_roll_grant(
         return;
     };
     if !row.withheld {
-        // Not mid-roll: this row belongs to some other corpse/slot pairing on this shard, or the
-        // roll already settled here. Distinct from the branch above — the row EXISTS.
         spacetimedb::log::info!(
             "settle_roll_grant: corpse {corpse_guid} slot {slot} — row is not withheld, so no roll \
              is open on it here; nothing granted"
         );
-        return; // not a live roll's row on THIS database — see the doc above
+        return;
     }
     match crate::items::grant_item_property(
         ctx,
@@ -536,7 +439,6 @@ pub(crate) fn settle_roll_grant(
             super::refresh_lootable(ctx, corpse_guid);
         }
         Err(_) => {
-            // Inventory-full fallback: leave the row, exclusively reserved for the winner.
             row.withheld = false;
             row.reserved_for = winner_guid;
             row.designated_looter_guid = 0;
@@ -546,16 +448,9 @@ pub(crate) fn settle_roll_grant(
     }
 }
 
-/// Resolve exactly once (the `resolved` flag guard, trap): any NEED beats any GREED;
-/// a TIE within the winning tier re-rolls JUST the tied members internally (bounded — 1-100 rolls
-/// collide vanishingly rarely, `MAX_TIE_REROLLS` is generous headroom) and announces once; all-pass
-/// unlocks the row FFA-in-group (no `ROLL_WON` — vanilla shows no "won" line either). The winner is
-/// granted via `items::grant_item`; on `Err` (inventory full) the row is LEFT, `reserved_for` stamped
-/// to the winner (documented winner-locked fallback — mail delivery is the eventual fix).
-/// `votes`/`recipients` are the FULL snapshot (already auto-passed by the caller where needed).
 fn resolve_roll(ctx: &ReducerContext, roll: &LootRoll, votes: &[LootRollVote], recipients: &[u64]) {
     if roll.resolved {
-        return; // exactly-once guard
+        return;
     }
     ctx.db.game_loot_roll().id().update(LootRoll {
         resolved: true,
@@ -581,21 +476,15 @@ fn resolve_roll(ctx: &ReducerContext, roll: &LootRoll, votes: &[LootRollVote], r
         attempts += 1;
     }
     let Some(w) = winner_in_tier else {
-        // Astronomically unlikely (20 straight all-tied re-rolls); fail safe to the first tied
-        // member rather than looping forever or panicking.
         unlock_row_ffa(ctx, roll.corpse_guid, roll.slot);
         cleanup_roll(ctx, roll.id);
         return;
     };
     let winning_roll = rolls[w];
     let winner_guid = votes[tier[w]].voter_guid;
-    let winning_vote = votes[tier[w]].vote; // The winning tier determines whether the vote was Need or Greed.
+    let winning_vote = votes[tier[w]].vote;
 
-    // Grant, then finalize the CorpseLoot row per the outcome (module doc: 068 mail is deferred).
-    // On a single database this runs inline, right here, exactly as before. On REALM-CORE
-    // (sharded) `game_corpse_loot` is always empty — no kills happen there — so this no-ops for free,
-    // and the ACTUAL grant happens on the corpse's own world shard via `settle_loot_roll`, which the
-    // gateway's loot-roll relay calls after observing the `ROLL_WON` event pushed below.
+    // Realm-core has no corpse loot; its ROLL_WON Relay settles on the owning World Shard.
     settle_roll_grant(ctx, roll.corpse_guid, roll.slot, winner_guid);
     let payload = lyracore_shared::loot_roll::encode_won(
         roll.corpse_guid,
@@ -617,9 +506,6 @@ fn resolve_roll(ctx: &ReducerContext, roll: &LootRoll, votes: &[LootRollVote], r
     cleanup_roll(ctx, roll.id);
 }
 
-/// All-pass unlock: clear `withheld` so the row becomes an ordinary FFA-in-group row (any current
-/// group member may loot it via the plain path — `designated_looter_guid`/`master_only` stay at
-/// their defaults, so there is no further restriction).
 fn unlock_row_ffa(ctx: &ReducerContext, corpse_guid: u64, slot: u8) {
     let loot = ctx.db.game_corpse_loot();
     if let Some(mut row) = loot
@@ -632,7 +518,6 @@ fn unlock_row_ffa(ctx: &ReducerContext, corpse_guid: u64, slot: u8) {
     }
 }
 
-/// Delete a resolved roll's vote rows + the roll row itself — nothing left to sweep/orphan.
 fn cleanup_roll(ctx: &ReducerContext, roll_id: u64) {
     let votes = ctx.db.game_loot_roll_vote();
     let stale: Vec<u64> = votes.by_roll().filter(&roll_id).map(|v| v.id).collect();
@@ -642,12 +527,6 @@ fn cleanup_roll(ctx: &ReducerContext, roll_id: u64) {
     ctx.db.game_loot_roll().id().delete(roll_id);
 }
 
-/// Deadline sweep ("disconnected member mid-roll: their vote auto-passes at
-/// deadline"): scans every UNRESOLVED roll whose deadline has elapsed, auto-passes any still-`!voted`
-/// member (in place — never blocks), then resolves. `pub(crate)` — exposed for the orchestrator's
-/// scheduled-GC tick (`gc.rs`, NOT edited here per instructions): wire one call
-/// `crate::loot::sweep_loot_rolls(ctx);` into `reap_movement_events` (it already runs every
-/// `EVENT_TTL_MICROS` = 1s, ample granularity for a 60s roll window).
 pub(crate) fn sweep_loot_rolls(ctx: &ReducerContext) {
     let now = ctx.timestamp.to_micros_since_unix_epoch();
     let due: Vec<LootRoll> = ctx
@@ -672,13 +551,6 @@ pub(crate) fn sweep_loot_rolls(ctx: &ReducerContext) {
     }
 }
 
-/// Disband mid-roll ("resolve to sole member"): called from
-/// `group::remove_member`'s full-disband branch with the FULL former membership (`member_guids`,
-/// leaver included) and the sole survivor if exactly one remains. Force-resolves every UNRESOLVED
-/// roll whose ENTIRE voter set belonged to the disbanding group: with a sole survivor, grants them
-/// the item directly (bypassing need/greed entirely — vanilla's behavior); with none (or more than
-/// one — shouldn't happen, disband implies <2 remain), just unlocks FFA (nothing left to award to,
-/// or the caller mis-invoked with a still-live group).
 pub(crate) fn force_resolve_rolls_for_disband(
     ctx: &ReducerContext,
     member_guids: &[u64],
@@ -694,7 +566,7 @@ pub(crate) fn force_resolve_rolls_for_disband(
         let votes_tab = ctx.db.game_loot_roll_vote();
         let all: Vec<LootRollVote> = votes_tab.by_roll().filter(&roll.id).collect();
         if all.is_empty() || !all.iter().all(|v| member_guids.contains(&v.voter_guid)) {
-            continue; // not this group's roll
+            continue;
         }
         ctx.db.game_loot_roll().id().update(LootRoll {
             resolved: true,
@@ -702,13 +574,8 @@ pub(crate) fn force_resolve_rolls_for_disband(
         });
         match survivor.filter(|s| all.iter().any(|v| v.voter_guid == *s)) {
             Some(winner_guid) => {
-                // Inline on a single database (unchanged), a free no-op on REALM-CORE
-                // (no local `game_corpse_loot` row there) — the real grant then settles onto the
-                // corpse's own world shard via `settle_loot_roll`, driven by the gateway's loot-roll
-                // relay off the `ROLL_WON` event pushed below. See `settle_roll_grant`'s own doc.
                 settle_roll_grant(ctx, roll.corpse_guid, roll.slot, winner_guid);
-                // Forced disband resolution: no contest happened — label it NEED (the sole
-                // survivor takes by default; there is no honest greed/need distinction here).
+                // Forced disband has no contest; Need is the label sent for the sole survivor.
                 let payload = lyracore_shared::loot_roll::encode_won(
                     roll.corpse_guid,
                     roll.slot,
@@ -731,21 +598,8 @@ pub(crate) fn force_resolve_rolls_for_disband(
     }
 }
 
-// ===========================================================================================
-//  REALM-CORE plane — mirrors `group.rs`'s realm-core section for the roll itself.
-// ===========================================================================================
-
-// `#[reducer]`: SpacetimeDB reducers take their arguments FLAT off the wire, so a parameter struct is not available.
 #[allow(clippy::too_many_arguments)]
-/// The realm-wide loot-roll ops, as ONE operator-gated reducer keyed by
-/// [`lyracore_shared::loot_roll::loot_op`] — the same one-reducer-not-several trade `realm_group_op`
-/// made (`lyracore_shared::group::realm_op`'s doc), for the same reason: every gateway-callable reducer
-/// needs a hand-maintained SDK binding (`docs/danger-zones.md` §1.2).
-///
-/// **Operator-gated, and it has to be**: both ops act on realm-core, which has no live entity to
-/// derive an actor from. START's `recipients` are a snapshot the WORLD SHARD already computed
-/// spatially at kill time (`kill_reward_recipients`); VOTE's `actor_guid` is the guid the gateway
-/// authenticated for the calling socket (`InWorld::self_guid`), never a client-supplied literal.
+// Realm-core has no live Actor; the Operator must authenticate the supplied guid.
 #[reducer]
 pub fn realm_loot_op(
     ctx: &ReducerContext,
@@ -781,8 +635,6 @@ pub fn realm_loot_op(
     }
 }
 
-/// A replay is an acknowledged no-op, even after resolution. A newer generation waits for the
-/// current roll to resolve. Both outcomes leave that current roll and its votes unchanged.
 #[allow(clippy::too_many_arguments)]
 fn accept_promotion(
     ctx: &ReducerContext,
@@ -849,10 +701,6 @@ fn accept_promotion(
     Ok(())
 }
 
-/// Grant a resolved roll's item on the WORLD SHARD that actually holds the corpse. The
-/// gateway's loot-roll relay calls this on every connected world shard after observing realm-core's
-/// `ROLL_WON` event — [`settle_roll_grant`]'s own guards make every wrong-shard call a harmless
-/// no-op, so the relay never needs to know in advance WHICH shard holds the corpse.
 #[reducer]
 pub fn settle_loot_roll(
     ctx: &ReducerContext,
@@ -867,10 +715,7 @@ pub fn settle_loot_roll(
     Ok(())
 }
 
-/// Delete a STAGING roll's rows on the WORLD SHARD that created them, once the gateway's loot-roll
-/// relay has promoted the roll onto realm-core — [`cleanup_roll`], the same delete a
-/// resolved roll already used, called here for an UNRESOLVED one that just changed which database is
-/// authoritative for it.
+// Clear staging only after promotion succeeds on Realm-core.
 #[reducer]
 pub fn clear_promoted_loot_roll(
     ctx: &ReducerContext,
@@ -883,9 +728,6 @@ pub fn clear_promoted_loot_roll(
     Ok(())
 }
 
-/// The identity-free master-give core (the `cast_vote_on` shape): everything
-/// [`loot_master_give`] does after resolving WHO the master looter is. `gw::gw_loot_master_give` is
-/// the other entry.
 pub(crate) fn apply_master_give(
     ctx: &ReducerContext,
     master_guid: u64,
@@ -936,7 +778,6 @@ pub(crate) fn apply_master_give(
     Ok(())
 }
 
-/// Convert the stable capacity refusal. Missing templates and other grant failures remain errors.
 fn master_delivery_error(error: String) -> String {
     if error == lyracore_shared::mail::INVENTORY_FULL {
         refused(LootRefusal::RecipientInventoryFull, &error)
@@ -961,24 +802,17 @@ mod tests {
         );
     }
 
-    /// `group_loot_decision_for_row` — the threshold-split matrix: FFA never restricts; ROUND_ROBIN
-    /// always designates regardless of quality; GROUP splits on the threshold (below → designate,
-    /// at/above → roll); NEED_BEFORE_GREED always rolls regardless of quality; MASTER splits on the
-    /// threshold (below → designate, at/above → master-only). An unrecognized method degrades to Ffa.
     #[test]
     fn group_loot_decision_matches_the_threshold_split_matrix() {
         use crate::group::loot_method::*;
         use GroupLootDecision::*;
 
-        // FFA: never restricts, at any quality.
         assert_eq!(group_loot_decision_for_row(FFA, 0, 2), Ffa);
         assert_eq!(group_loot_decision_for_row(FFA, 6, 2), Ffa);
 
-        // ROUND_ROBIN: always designate, below AND at/above the threshold.
         assert_eq!(group_loot_decision_for_row(ROUND_ROBIN, 0, 2), Designate);
         assert_eq!(group_loot_decision_for_row(ROUND_ROBIN, 6, 2), Designate);
 
-        // GROUP: the threshold split — below designates, AT (inclusive) and above rolls.
         assert_eq!(
             group_loot_decision_for_row(GROUP, 1, 2),
             Designate,
@@ -995,42 +829,31 @@ mod tests {
             "well above the threshold rolls"
         );
 
-        // NEED_BEFORE_GREED: always rolls, ignoring the threshold entirely.
         assert_eq!(group_loot_decision_for_row(NEED_BEFORE_GREED, 0, 2), Roll);
         assert_eq!(group_loot_decision_for_row(NEED_BEFORE_GREED, 6, 6), Roll);
 
-        // MASTER: the same threshold split as GROUP, but Master instead of Roll.
         assert_eq!(group_loot_decision_for_row(MASTER, 1, 2), Designate);
         assert_eq!(group_loot_decision_for_row(MASTER, 2, 2), Master);
         assert_eq!(group_loot_decision_for_row(MASTER, 6, 2), Master);
 
-        // An unrecognized method (shouldn't happen post-validation) never invents a restriction.
         assert_eq!(group_loot_decision_for_row(255, 6, 2), Ffa);
     }
 
-    /// `advance_rr_cursor` — round-robin trap: "skipping offline members". Wraps around a STABLE
-    /// ordering, picks the next ONLINE member from the current cursor (inclusive), and returns
-    /// `None` only when the whole group is offline (never panics/blocks looting).
     #[test]
     fn advance_rr_cursor_skips_offline_members_and_wraps() {
-        // All online: cursor 0 picks index 0, advances to 1.
         assert_eq!(advance_rr_cursor(&[true, true, true], 0), Some((0, 1)));
         assert_eq!(advance_rr_cursor(&[true, true, true], 1), Some((1, 2)));
-        // Wraps past the end back to 0.
         assert_eq!(advance_rr_cursor(&[true, true, true], 2), Some((2, 0)));
-        // Member at the cursor is OFFLINE — skip forward to the next online member.
         assert_eq!(
             advance_rr_cursor(&[true, false, true], 1),
             Some((2, 0)),
             "index 1 is offline, skip to 2"
         );
-        // The skip WRAPS if needed (cursor near the end, only an early member online).
         assert_eq!(
             advance_rr_cursor(&[true, false, false], 2),
             Some((0, 1)),
             "wraps around to the only online member"
         );
-        // Nobody online at all → None (degrades to FFA at the call site, never panics).
         assert_eq!(advance_rr_cursor(&[false, false], 0), None);
         assert_eq!(
             advance_rr_cursor(&[], 0),
@@ -1039,25 +862,16 @@ mod tests {
         );
     }
 
-    /// `contending_tier` — NEED beats GREED unconditionally; an all-pass vote set contends nothing
-    /// (the caller unlocks FFA-in-group). Order-preserving indices into the input slice.
     #[test]
     fn contending_tier_need_beats_greed_and_empty_means_all_passed() {
         use vote_kind::*;
-        // A mix: NEED wins even though GREED/PASS are also present.
         assert_eq!(contending_tier(&[PASS, GREED, NEED, GREED]), vec![2]);
-        // Multiple NEEDs all contend (the tie-break is a separate step, `pick_roll_winner`).
         assert_eq!(contending_tier(&[NEED, PASS, NEED]), vec![0, 2]);
-        // No NEED at all → GREED contends.
         assert_eq!(contending_tier(&[PASS, GREED, GREED]), vec![1, 2]);
-        // Everyone passed → nobody contends (empty).
         assert!(contending_tier(&[PASS, PASS, PASS]).is_empty());
         assert!(contending_tier(&[]).is_empty());
     }
 
-    /// `pick_roll_winner` — the vote-resolution matrix's final step: the unique max roll wins; a
-    /// TIE for the max (two+ share it) returns `None` so the caller re-rolls just the tied members
-    /// (cmangos's internal re-roll) rather than picking arbitrarily.
     #[test]
     fn pick_roll_winner_picks_the_unique_max_or_none_on_a_tie() {
         assert_eq!(pick_roll_winner(&[50, 99, 12]), Some(1));

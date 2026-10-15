@@ -102,7 +102,6 @@ fn duel_winner_projects_names_and_the_terminal_reason() {
                     Outbound::One(ServerOpcodeMessage::SMSG_DUEL_COMPLETE(_)),
                     Outbound::One(ServerOpcodeMessage::SMSG_DUEL_WINNER(message)),
     ..
-                    // `opponent_name` is written first on the wire and must carry the winner.
                 ] if message.reason == wow_world_base::shared::duel_winner_reason_vanilla_tbc_wrath::DuelWinnerReason::Won
                     && message.opponent_name == "Winner"
                     && message.initiator_name == "Loser"

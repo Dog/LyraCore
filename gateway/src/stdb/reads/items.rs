@@ -1,6 +1,3 @@
-//! Item-instance / loot cache-accessor methods — pure code-motion split of the former
-//! `reads.rs`.
-
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -9,12 +6,6 @@ use super::super::connection::Coordinator;
 use lyracore_shared::item_property::client_enchantment_id;
 
 impl Coordinator {
-    /// Read every item a character owns, joined with its template for the CREATE
-    /// descriptors (max-durability). Read from the privileged cache (the coordinator bypasses RLS),
-    /// filtered by `owner_guid` — the SDK exposes only the PK index, so iterate+filter like the other
-    /// row queries. Returns the instance views ready for `build_item_create_object` + inventory slots.
-    /// The character's learned skills as `(skill_line, current, max_rank)` — the self-CREATE
-    /// SkillInfo block's live source. RLS-bypassed cache read like the sibling item read.
     pub fn player_skills(&self, character_guid: u64) -> Result<Vec<(u32, u16, u16)>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -38,10 +29,6 @@ impl Coordinator {
         db.game_item_instance()
             .iter()
             .filter(|i| i.owner_guid == owner_guid)
-            // Skip an instance whose template is absent: a delete-template migration can leave orphaned rows
-            // (e.g. synthetic ids deleted by the real-item remap), and sending a phantom item — blank/unknown
-            // to the client, faulting on use/equip — is worse than dropping it. Defense-in-depth so a future
-            // template delete can never push a broken item to a 5875 client.
             .filter_map(|i| {
                 let tmpl = db.game_item_template().entry().find(&i.entry)?;
                 Some(crate::codec::ItemInstanceView {
@@ -54,11 +41,7 @@ impl Coordinator {
             .collect()
     }
 
-    /// Bag slot of the item instance with `item_guid`, from the privileged cache. The Module
-    /// reducer that uses the slot enforces ownership.
     pub fn item_slot_by_guid(&self, item_guid: u64) -> Option<u8> {
-        // `collect()` forces the iterator to complete (and drop its borrow from `guard`) before `guard`
-        // itself drops — same pattern as `player_items`.
         let guard = self.0.coord();
         let slots: Vec<u8> = guard
             .conn
@@ -72,8 +55,6 @@ impl Coordinator {
     }
 }
 
-/// The view fields an item row holds itself, without template or catalogue reads. The enchantment
-/// is the ID the client resolves, so no send path ships a stored compatibility ID.
 pub(crate) fn view_of_item_row(row: &ItemInstance) -> crate::codec::ItemInstanceView {
     crate::codec::ItemInstanceView {
         guid: row.guid,
@@ -89,8 +70,6 @@ pub(crate) fn view_of_item_row(row: &ItemInstance) -> crate::codec::ItemInstance
     }
 }
 
-/// A Random Property's enchant ids from the cached catalogue; `[0; 3]` for property 0 or an
-/// unknown property.
 pub(crate) fn property_enchant_ids(db: &RemoteTables, random_property_id: u32) -> [u32; 3] {
     db.game_item_random_property()
         .property_id()

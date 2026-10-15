@@ -77,3 +77,15 @@ and a write to an allowed library table is invisible to the next Invocation.
 
 The Host provides no durable script storage, event bindings, damage, items, spawning, scheduling,
 or database queries. Lua state ends with its Invocation.
+
+## Compiler compatibility
+
+Piccolo 0.3.3 passes a trailing table constructor's element count as an extra call argument.
+The Lua printer wraps that argument in a one-parameter function, which returns only the table.
+Parentheses do not fix the call's argument count. Applying this in the Lua printer also covers
+calls emitted by the transpiler and its library helpers.
+
+The builder compiles each Runtime Script separately so legacy `script()` declarations cannot
+collide. It writes an independent compiler configuration with absolute plugin paths because TSTL
+resolves plugins relative to that temporary configuration. The committed fuel workload is compiled
+by the same toolchain and executed by the Module tests.

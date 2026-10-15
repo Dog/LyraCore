@@ -1,12 +1,3 @@
-//! `ForgetDeletedCharacter` on a private Standalone: the Gateway's character-gone reconciliation
-//! sends it as the deleted Character, with no ownership token, once no World Shard holds that
-//! Character. A deleted Guild Leader passes leadership to the highest Guild Rank, earliest join
-//! first (`cm:Guild.cpp:493-552`); the last member disbands the Guild; a deleted owner's Petition
-//! closes and a deleted signer's Signature is struck (`cm:Player.cpp:4061-4062`).
-//!
-//! Each event capture subscribes to rows no earlier step wrote, so a reap of older Guild Events
-//! can never be the transaction it reads.
-
 mod support;
 
 use support::{actor, Standalone};
@@ -24,7 +15,6 @@ const CHARTER: u64 = 5_093_021;
 
 const FORGET: &str = r#"{"forgetDeletedCharacter":{}}"#;
 
-/// Guild Event kinds (`lyracore_shared::guild::event_kind`).
 const LEFT: u64 = 4;
 const LEADER_CHANGED: u64 = 7;
 const DISBANDED: u64 = 8;
@@ -34,7 +24,6 @@ fn forget(realm: &Standalone, guid: u64) {
     realm.assert_call("realm_guild_op", &[&actor(&guid.to_string()), FORGET]);
 }
 
-/// The Guild Event rows one `forget` inserted into the rows `filter` selects.
 fn forget_events(realm: &Standalone, guid: u64, filter: &str) -> Vec<serde_json::Value> {
     let updates = realm.capture_updates(
         &format!("SELECT * FROM game_guild_event WHERE {filter}"),
@@ -66,8 +55,6 @@ fn insert_member(realm: &Standalone, guild_id: &str, guid: u64, name: &str, join
     ));
 }
 
-/// Leader, then two Officers at rank 1: the later one first in guid order, so only the join time
-/// can pick the earlier one. The Leader has invited one more Character.
 fn seeded_guild(realm: &Standalone) -> String {
     realm.assert_call(
         "realm_guild_op",
@@ -106,8 +93,6 @@ fn member_rank(realm: &Standalone, guid: u64) -> Option<String> {
     .map(|row| row["rank_id"].clone())
 }
 
-/// Found a Guild with three members, forget the Guild Leader, and read the succession; forget it
-/// again and see nothing change; forget the rest and see the Guild disband.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_deleted_leaders_guild_passes_on_then_disbands_with_its_last_member() {
@@ -146,7 +131,6 @@ fn a_deleted_leaders_guild_passes_on_then_disbands_with_its_last_member() {
         "the Guild Invite the deleted Leader sent still stands, as in mangos"
     );
 
-    // A replay finds nothing and still succeeds.
     forget(&realm, LEADER);
     assert_eq!(member_rank(&realm, EARLY_OFFICER).as_deref(), Some("0"));
 
@@ -179,8 +163,6 @@ fn a_deleted_leaders_guild_passes_on_then_disbands_with_its_last_member() {
     }
 }
 
-/// A deleted signer's Signature is struck and the owner hears PETITION_CHANGED; a deleted owner's
-/// Petition closes.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_deleted_signer_and_owner_leave_no_petition_behind() {

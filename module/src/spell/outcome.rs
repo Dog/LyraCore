@@ -1,5 +1,3 @@
-//! Cast requests retain the scheduled cast identity through completion and cancellation.
-
 use super::*;
 use spacetimedb::{ReducerContext, ScheduleAt};
 
@@ -18,7 +16,6 @@ pub enum CastRefusalKind {
     BadTargets,
 }
 
-/// The owning Gate supplies the reason. `Other` preserves a Gate with no caller-specific policy.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct CastRefusal {
     pub kind: CastRefusalKind,
@@ -74,7 +71,6 @@ impl From<PendingCast> for CastHandle {
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub enum CastStart {
-    /// Effects dispatched. A projectile or channel may remain active.
     Resolved,
     Started(CastHandle),
     Waiting(CastHandle),
@@ -88,8 +84,6 @@ pub enum CastFinish {
     Expired,
 }
 
-/// Check whether a Character can start a bot-owned cast without changing gameplay state.
-/// Creature and triggered casts use their existing spell-engine entries instead.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn cast_readiness(
     ctx: &ReducerContext,
@@ -125,7 +119,6 @@ pub(crate) fn cast_readiness(
     )
 }
 
-/// A request never replaces a pending cast. Explicit cancellation is a separate operation.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn request_cast(
     ctx: &ReducerContext,

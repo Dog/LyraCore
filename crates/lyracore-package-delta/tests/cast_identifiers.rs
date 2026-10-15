@@ -1,8 +1,3 @@
-//! The casts family's identifier policy: `game_creature_spell` follows the loot shape, with its
-//! band checked against the row's own surrogate `id`. `game_creature_cast` has no Package band
-//! because it is update-only and every `insert` is refused. Both tables refuse the Module's
-//! fixture creature cluster at their own creature-entry boundary.
-
 mod common;
 
 use common::{
@@ -23,8 +18,6 @@ fn artifact(package: &str, claims: &str) -> String {
 
 const A_PRIORITY: &str = r#"{"priority":{"type":"u8","value":20}}"#;
 const A_SPELL_ID: &str = r#"{"spell_id":{"type":"u32","value":200}}"#;
-
-// ---- game_creature_spell: the loot-shaped band ----
 
 #[test]
 fn a_creature_spell_key_is_the_id_itself() {
@@ -165,8 +158,6 @@ fn an_incomplete_creature_spell_insert_is_refused() {
         other => panic!("expected an incomplete insert, got {other}"),
     }
 }
-
-// ---- game_creature_cast: update-only, no band at all ----
 
 #[test]
 fn a_creature_cast_key_is_the_creature_entry_itself() {

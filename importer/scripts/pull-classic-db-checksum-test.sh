@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# pull-classic-db-checksum-test.sh — OFFLINE fixture test for pull-classic-db.sh's `verify_sha256`.
-#
-# Run it from the checkout root, any time, with nothing set up:
-#   bash importer/scripts/pull-classic-db-checksum-test.sh     # prints "[test] OK" when it passes
-#
-# No network, no git clone, no database: it sources the pull script (whose `main` only runs when the
-# file is EXECUTED, not sourced — see that file's tail) and exercises `verify_sha256` directly against
-# a known temp file, asserting the right/wrong-checksum exit codes. Safe to run in CI.
-#
-# WHY IT EXISTS: `verify_sha256` is the guard that stops a silently-changed upstream dump from being
-# imported, and its only real-world exercise is a multi-gigabyte network pull nobody runs on a whim.
-# An untested guard is an assumed guard, so both arms get pinned here instead.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -18,7 +6,7 @@ cd "$(dirname "$0")/../.." || exit 1
 source importer/scripts/pull-classic-db.sh
 
 fail=0
-chk() { # label  expected-exit  actual-exit
+chk() {
   if [ "$3" != "$2" ]; then echo "  FAIL  $1: exit $3, want $2"; fail=1; else echo "  ok    $1: exit $3"; fi
 }
 

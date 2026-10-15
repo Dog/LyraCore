@@ -1,6 +1,3 @@
-//! Account / character / session cache-accessor methods (pure code-motion split of the
-//! former `reads.rs`). See `stdb::reads` for the domain split's overview.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +10,6 @@ use super::super::views::{AccountRow, RealmRow};
 use crate::realm_core::SessionKey;
 
 impl Coordinator {
-    /// Read the single realm row for the realm-list reply.
     pub fn realm(&self) -> Result<RealmRow> {
         self.0
             .coord()
@@ -34,7 +30,6 @@ impl Coordinator {
             .ok_or_else(|| anyhow!("no game_realm row in the coordinator cache"))
     }
 
-    /// Read an account's SRP6 salt/verifier for the logon challenge.
     pub fn account_by_username(&self, username: &str) -> Result<Option<AccountRow>> {
         Ok(self
             .0
@@ -54,7 +49,6 @@ impl Coordinator {
             }))
     }
 
-    /// Count characters on the realm for an account (realm-list character count).
     pub fn character_count(&self, account_id: u64) -> Result<u8> {
         let n = self
             .0
@@ -68,17 +62,6 @@ impl Coordinator {
         Ok(n.min(u8::MAX as usize) as u8)
     }
 
-    /// Where a character IS **on this shard**, as `(map_id, instance_id)` — the input to shard
-    /// routing. Prefers the LIVE entity and falls back to the durable `game_character` row,
-    /// which is what a fresh login (and a mid-teleport character, whose entity was despawned)
-    /// reads. `None` = this shard has no row for that guid, which is also how
-    /// `realm_core::locate_home_shard` finds the shard that does.
-    ///
-    /// The durable fallback reads `pending_instance_id`, NOT a hardcoded 0: that column is
-    /// where `teleport_player` parks the DESTINATION instance for a cross-map hop, so it is the
-    /// whole routing key for instance entry — reading 0 there would route a player walking into
-    /// Deadmines by map alone, which is correct only as long as no shard-map rule ever names a
-    /// bucket (`389:0=pool-a`, see `config::ShardMap`).
     pub fn character_location(&self, guid: u64) -> Option<(u32, u64)> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -91,15 +74,10 @@ impl Coordinator {
             .map(|c| (c.map_id, c.pending_instance_id))
     }
 
-    /// This shard's raw durable `game_character` row for `guid` — the transfer driver needs
-    /// the DESTINATION fields (`pending_instance_id`, position) that `CharacterView` does not carry.
     pub(crate) fn character_row(&self, guid: u64) -> Option<super::super::bindings::Character> {
         self.0.coord().conn.db.game_character().guid().find(&guid)
     }
 
-    /// This shard's escrow row for `guid`, raw. `Coordinator`-level rather than
-    /// `WorldStore`-level because it's needed (via `has_escrow`) before any handle has been chosen
-    /// as the session's home — see `realm_core::locate_home_shard`.
     pub(crate) fn escrow_row(&self, guid: u64) -> Option<super::super::bindings::TransferOut> {
         use spacetimedb_sdk::Table as _;
         self.0
@@ -141,15 +119,10 @@ impl Coordinator {
             }))
     }
 
-    /// The account's bound 32-byte SpacetimeDB identity — DERIVED, not minted by a connection
-    /// (the per-player-connection build this replaced was the ~850/process wall; see
-    /// `synthetic_owner_identity`'s contract). `establish_session` writes it into
-    /// `game_account.identity`, which `gw_player_login` fail-closes on.
     pub fn bound_identity(&self, account_id: u64) -> Result<[u8; 32]> {
         Ok(crate::config::synthetic_owner_identity(account_id))
     }
 
-    /// Read the shared session key K, with its expiry, for the world handshake.
     pub fn session_key(&self, account_id: u64) -> Result<Option<SessionKey>> {
         Ok(self
             .0
@@ -168,13 +141,8 @@ impl Coordinator {
     }
 }
 
-/// The Gateway-side index over `game_character_contact`, keyed by owner and kept current by the
-/// cache's insert, update and delete callbacks. The SDK bindings expose no finder for the table's
-/// `by_owner` index, and a whole-table scan per whisper or guild invite copies every contact row on
-/// the Shard under the lock the pump needs.
 #[derive(Default)]
 pub(crate) struct ContactIndex {
-    /// Owner guid to its contact rows by row id: `(target guid, is_ignore)`.
     by_owner: HashMap<u64, BTreeMap<u64, (u64, bool)>>,
 }
 
@@ -204,21 +172,15 @@ impl ContactIndex {
             .map(|(target_guid, _)| *target_guid)
     }
 
-    /// The guids `owner_guid` ignores.
     pub(crate) fn ignored_by(&self, owner_guid: u64) -> Vec<u64> {
         self.targets(owner_guid, true).collect()
     }
 
-    /// The guids `owner_guid` lists as friends.
     pub(crate) fn friends_of(&self, owner_guid: u64) -> Vec<u64> {
         self.targets(owner_guid, false).collect()
     }
 }
 
-/// The Gateway-side index from lowercase Character name to guid on one Shard, kept current by the
-/// `game_character` callbacks. The bindings' unique `name` finder is case-sensitive, and a typed
-/// name is not; a whole-table scan per whisper and per Shard copies every Character row under the
-/// lock the pump needs.
 #[derive(Default)]
 pub(crate) struct CharacterNameIndex {
     by_name: HashMap<String, BTreeSet<u64>>,
@@ -242,8 +204,6 @@ impl CharacterNameIndex {
         }
     }
 
-    /// The Character `name` names, ASCII case-insensitive. Names are unique per Shard only up to
-    /// case, so two rows that differ only in case answer the lower guid, the same one every time.
     pub(crate) fn guid_named(&self, name: &str) -> Option<u64> {
         self.by_name
             .get(&name.to_ascii_lowercase())
@@ -251,8 +211,6 @@ impl CharacterNameIndex {
     }
 }
 
-/// Keep a [`CharacterNameIndex`] current from the Character callbacks. Initial subscription rows
-/// arrive as inserts.
 pub(crate) fn watch_character_names(conn: &DbConnection) -> Arc<RwLock<CharacterNameIndex>> {
     let index = Arc::new(RwLock::new(CharacterNameIndex::default()));
     let inserted = index.clone();
@@ -274,8 +232,6 @@ pub(crate) fn watch_character_names(conn: &DbConnection) -> Arc<RwLock<Character
     index
 }
 
-/// Keep a [`ContactIndex`] current from the contact callbacks. Initial subscription rows arrive as
-/// inserts.
 pub(crate) fn watch_contacts(conn: &DbConnection) -> Arc<RwLock<ContactIndex>> {
     let index = Arc::new(RwLock::new(ContactIndex::default()));
     let inserted = index.clone();
@@ -363,8 +319,6 @@ mod tests {
         );
     }
 
-    /// `watch_character_names`'s `on_update` callback does exactly this: remove the old name, then
-    /// insert the new one. A rename must not answer to both names, nor to neither.
     #[test]
     fn a_renamed_character_answers_only_to_its_new_name() {
         let mut index = CharacterNameIndex::default();

@@ -1,5 +1,3 @@
-//! Inventory source evidence by numeric world opcode and direction. This does not certify behavior.
-
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,7 +72,6 @@ impl<'ast> Visit<'ast> for SourceScan {
         if !item.path.is_ident("matches") {
             return;
         }
-        // Benilla lists movement relay opcodes in a matches! pattern.
         let parse = |input: syn::parse::ParseStream<'_>| {
             let value: syn::Expr = input.parse()?;
             input.parse::<syn::Token![,]>()?;
@@ -303,7 +300,6 @@ fn inventory() -> Result<Value> {
     for path in rust_files(&benilla_root.join("src/world"))? {
         sends.scan(&path, benilla_repo)?;
     }
-    // Movement sends select their opcodes outside WorldWriter::send_movement.
     let mut movement = SourceScan::default();
     movement.scan(&benilla_root.join("src/messages/movement.rs"), benilla_repo)?;
     movement.scan(

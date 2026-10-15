@@ -1,5 +1,3 @@
-//! Contact lists, realm-wide presence, and party requests.
-
 use super::party::PartyOutcome;
 use super::{
     party, presence, who, Actor, Outbound, ProtocolFamily, ProtocolReply, ProtocolRequest,
@@ -15,88 +13,37 @@ use wow_world_messages::vanilla::opcodes::{ClientOpcodeMessage, ServerOpcodeMess
 use wow_world_messages::vanilla::{MSG_RAID_TARGET_UPDATE_Client, PartyOperation, PartyResult};
 use wow_world_messages::Guid;
 
-/// Per-Shard presence reads and contact lists, behind presence, `/who` and whispers.
 pub(crate) trait SocialStore: Send + Sync {
-    /// This Shard's durable Character row for `guid`: identity plus the session flag. `None` if
-    /// this Shard holds no `game_character` row for it.
-    /// [`presence::of`](super::presence::of) unions it across every connected Shard.
     fn character_identity(&self, guid: u64) -> Result<Option<presence::CharacterIdentity>>;
 
-    /// This Shard's live `game_world_entity` row for `guid`, if any — the Member Stats columns,
-    /// plus level and zone, current unlike the durable row (`persist_entity` only refreshes it on
-    /// logout, cross-map teleport or Transfer). `None` if `guid` has no live entity here.
     fn live_entity(&self, guid: u64) -> Option<codec::MemberEntity>;
 
-    /// Does this Shard show `guid` between two places: its own Character row reading online with
-    /// no live entity here (a map-change loading screen, or a human Transfer's frozen source
-    /// copy — `begin_transfer` persists with `set_offline: false`), or a Transfer Intent naming a
-    /// session-less bot mid-crossing.
     fn character_in_transit(&self, guid: u64) -> bool;
 
-    /// This Shard's stored Auto-Reply for `guid`. `None` when this Shard holds none.
-    /// [`presence::auto_reply`] asks the Shard that holds the live entity.
     fn auto_reply_text(&self, guid: u64) -> Result<Option<String>>;
 
-    /// Does every configured World Shard vouch that it is reachable and healthy enough to trust a
-    /// negative read from? [`presence::of`] asks this before answering `Whereabouts::Offline` or
-    /// `None` — an unreachable or stale-cached Shard could be hiding the Character. A Store
-    /// without a Shard topology answers `Ok(())`.
     fn every_shard_vouches_for_absence(&self) -> Result<()>;
 
-    /// Every in-world player Character on this Shard — the per-Shard input
-    /// [`presence::in_world_characters`](super::presence::in_world_characters) unions, and `/who`'s
-    /// ultimate source. A player is "in world" iff their guid appears in `game_world_entity` with
-    /// `entry == 0` (player entity); dead players are included (ghosts are in world). Bots are
-    /// included: they have no session, but they do have a live entity.
     fn in_world_players(&self) -> Result<Vec<presence::RealmPresence>>;
 
-    /// `game_area.name` for `zone_id` — `/who`'s search-string match against a zone name. Empty
-    /// when the catalogue holds no row for it (unimported, or an id the client sends that the
-    /// imported DBC lacks).
     fn zone_name(&self, zone_id: u32) -> String;
 
-    /// `self_guid`'s friend guids and ignore guids for `CMSG_FRIEND_LIST`. `self_guid` is always
-    /// the CALLING World Session's own guid, never a peer's, so a Store may answer this from
-    /// whatever cheap per-connection state it keeps for its own connected sessions (the Coordinator
-    /// reads its Gateway-side `Viewer`). A caller that needs a friend's PRESENCE composes it
-    /// separately with `world::social::friend_views`, over `presence::of`; a caller that needs to
-    /// know whether an ARBITRARY (possibly unconnected) Character ignores another uses
-    /// [`SocialStore::ignored_guids`] instead, never this method.
     fn contact_lists(&self, self_guid: u64) -> Result<(Vec<u64>, Vec<u64>)>;
 
-    /// `owner_guid`'s ignore guids, read directly off this Shard's durable contact rows — realm-wide
-    /// safe for ANY owner, including one with no live World Session on this Gateway process at all
-    /// (a whisper sender or a guild-invite target usually is not). `whisper::ignored_anywhere` fans
-    /// this out across every connected Shard. Unlike `contact_lists`, this never reads a `Viewer`.
     fn ignored_guids(&self, owner_guid: u64) -> Result<Vec<u64>>;
 
-    /// Resolve a typed contact name to a character guid on THIS Shard (case-insensitive, like the
-    /// Module's `character_by_name`): `presence::resolve_by_name`'s per-Shard primitive. `None`
-    /// if this Shard has no character with that name.
     fn character_guid_by_name(&self, name: &str) -> Result<Option<u64>>;
 
-    // Contact ops answer a [`ContactOutcome`]: a typed Refusal is a gameplay answer the
-    // client renders, and only a failure with an unknown durable result stays `Err`.
-
-    /// `CMSG_ADD_FRIEND` (the name is already resolved to `target_guid` by the gateway).
-    /// `target_race` is the target's own Speaker Fact, read realm-wide by the gateway: the Module's
-    /// Enemy Gate needs it and holds no Characters of its own to read it from.
     fn add_friend(&self, actor: Actor, target_guid: u64, target_race: u8)
         -> Result<ContactOutcome>;
 
-    /// `CMSG_DEL_FRIEND`.
     fn del_friend(&self, actor: Actor, target_guid: u64) -> Result<ContactOutcome>;
 
-    /// `CMSG_ADD_IGNORE` (the name is already resolved to `target_guid` by the gateway).
     fn add_ignore(&self, actor: Actor, target_guid: u64) -> Result<ContactOutcome>;
 
-    /// `CMSG_DEL_IGNORE`.
     fn del_ignore(&self, actor: Actor, target_guid: u64) -> Result<ContactOutcome>;
 }
 
-/// What one contact-list op answered. A [`ContactRefusal`] is a gameplay answer `SMSG_FRIEND_STATUS`
-/// renders; a Transport Loss or an untagged Refusal stays `Err` and ends the session, because the
-/// durable outcome is then unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContactOutcome {
     Done,
@@ -121,7 +68,7 @@ impl<
             + ?Sized,
     > ProtocolFamily<St> for Social
 {
-    #[allow(clippy::too_many_lines)] // One match arm per social or party opcode.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         store: &St,
         session: &mut ProtocolSession,
@@ -130,10 +77,6 @@ impl<
         let msg = request.message()?;
         let mut outbound = Vec::new();
         match msg {
-            // /who panel: filtered realm-wide (`who::respond`), same team only, every filter the
-            // client sent applied. Silently dropped outside the world (no requester Character to read
-            // a team from), for an unresolvable requester (never guess a team), and while this
-            // session's `WHO_THROTTLE` cooldown is running (vm:MiscHandler.cpp:230).
             ClientOpcodeMessage::CMSG_WHO(request) => {
                 if let Some(me) = session.self_guid() {
                     if session.admit_who() {
@@ -147,9 +90,6 @@ impl<
                     }
                 }
             }
-            // Friends / ignore list: opening the social pane's friends tab requests BOTH
-            // lists off the one opcode — vanilla answers with SMSG_FRIEND_LIST + SMSG_IGNORE_LIST.
-            // Silently dropped outside the world (no character to scope the lists to).
             ClientOpcodeMessage::CMSG_FRIEND_LIST => {
                 if let WorldState::InWorld(iw) = &session.state {
                     let (friend_guids, ignored) = store.contact_lists(iw.self_guid)?;
@@ -167,10 +107,6 @@ impl<
                     )));
                 }
             }
-            // Add a friend/ignore by typed name: resolved realm-wide the same way `/whisper`'s target
-            // is, then the module re-validates self/duplicate/cap/team server-side. Either way the
-            // client gets an SMSG_FRIEND_STATUS its system message reads the result code off. The
-            // contact ops are silently dropped outside the world: there is no Character to act as.
             ClientOpcodeMessage::CMSG_ADD_FRIEND(c) => {
                 if let Some(actor) = session.actor() {
                     let (result, guid, online) = resolve_add_contact(store, actor, &c.name, false)?;
@@ -185,7 +121,6 @@ impl<
                     outbound.push(Outbound::Raw { opcode, body });
                 }
             }
-            // Remove a friend/ignore by guid (the client already has it from the list row).
             ClientOpcodeMessage::CMSG_DEL_FRIEND(c) => {
                 if let Some(actor) = session.actor() {
                     let (result, guid) = resolve_del_contact(store, actor, c.guid.guid(), false)?;
@@ -200,15 +135,6 @@ impl<
                     outbound.push(Outbound::Raw { opcode, body });
                 }
             }
-            // Party/group. The invite/uninvite names resolve gateway-side (the add_friend
-            // convention); outcomes echo as SMSG_PARTY_COMMAND_RESULT. The cross-player packets
-            // (SMSG_GROUP_INVITE/LIST/DECLINE/DESTROYED) ride the game_group_event relay.
-            //
-            // The op itself goes through `world::party`, which decides WHICH DATABASE
-            // runs it — realm-core when the gateway is multi-database, the player's own shard otherwise.
-            // Every arm below is otherwise unchanged, including which failures the client is told about.
-            // Silently dropped outside the world: with no in-world character there is no `self_guid` to
-            // act as, and none of these opcodes is reachable at character select.
             ClientOpcodeMessage::CMSG_GROUP_INVITE(c) => {
                 let result = match (session.actor(), presence::resolve_by_name(store, &c.name)?) {
                     (Some(me), Some(guid)) => {
@@ -250,11 +176,6 @@ impl<
                     ));
                 }
             }
-            // `CMSG_LOOT_METHOD`: the leader sets the party's loot method/
-            // threshold/master. No ack packet — vanilla itself sends none for this opcode (cmangos's
-            // `HandleLootMethodOpcode` only calls `group->SendUpdate()`); the module's own reducer
-            // echoes via the EXISTING `SMSG_GROUP_LIST` roster relay. A rejection (not the leader, bad
-            // method/threshold/master) is per-action — log + ignore, matching group_accept/decline.
             ClientOpcodeMessage::CMSG_LOOT_METHOD(c) => {
                 let op = party::Op::LootMethod {
                     setting: c.loot_setting.as_int(),
@@ -277,8 +198,6 @@ impl<
                     promote: c.set_assistant,
                 },
             )?,
-            // The raid frame's "Remove from group" names the member by guid, so no name lookup runs
-            // (cm:GroupHandler.cpp:250-296). Naming yourself gets no answer (lines 255-260).
             ClientOpcodeMessage::CMSG_GROUP_UNINVITE_GUID(c)
                 if session.self_guid() != Some(c.guid.guid()) =>
             {
@@ -289,17 +208,12 @@ impl<
                 )?)
             }
             ClientOpcodeMessage::CMSG_GROUP_UNINVITE_GUID(_) => {}
-            // `CMSG_GROUP_CHANGE_SUB_GROUP` / `CMSG_GROUP_SWAP_SUB_GROUP`: the leader or an Assistant
-            // drags a raid member to another Subgroup, or swaps two. No ack packet: the
-            // `SMSG_GROUP_LIST` roster relay is the client-visible result, and cmangos is silent for
-            // every refusal here (cm:GroupHandler.cpp:492-525, cm:GroupHandler.cpp:901-944).
             ClientOpcodeMessage::CMSG_GROUP_CHANGE_SUB_GROUP(c) => {
                 change_subgroup(store, session, &c.name, c.group_number)?
             }
             ClientOpcodeMessage::CMSG_GROUP_SWAP_SUB_GROUP(c) => {
                 swap_subgroup(store, session, &c.name, &c.swap_with_name)?
             }
-            // Group Broadcasts. Every member's packet rides the group event relay, the actor's too.
             ClientOpcodeMessage::MSG_RAID_READY_CHECK(c) => {
                 let op = match c.answer {
                     None => party::Op::ReadyCheckStart,
@@ -323,8 +237,6 @@ impl<
     }
 }
 
-/// Run a leave or a kick by guid. Only a Refusal answers, as `SMSG_PARTY_COMMAND_RESULT(Leave, "",
-/// result)`; an op that ran is heard through the relay.
 fn run_answering_refusal<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -349,7 +261,6 @@ fn run_answering_refusal<
     }
 }
 
-/// Raid conversion answers success with a party command result. A Refusal is silent.
 fn raid_convert<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -379,9 +290,6 @@ fn raid_convert<
     }
 }
 
-/// Run a party op whose outcome the client hears only through the relay. A Refusal is logged at
-/// debug and sends nothing. cmangos sends nothing for set leader and set Assistant, whatever the
-/// outcome (cm:GroupHandler.cpp:344-362, 527-545).
 fn run_unanswered<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -401,10 +309,6 @@ fn run_unanswered<
     Ok(())
 }
 
-/// `CMSG_GROUP_CHANGE_SUB_GROUP`: the leader or an Assistant moves `name` to `subgroup`. The name
-/// resolves against the actor's OWN roster rather than realm-wide, so a namesake standing outside
-/// the Raid cannot be reached — the same avoided-homonym rule cmangos applies to Swap Subgroup
-/// alone (cm:GroupHandler.cpp:919-936), extended here to both opcodes.
 fn change_subgroup<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -433,10 +337,6 @@ fn change_subgroup<
     }
 }
 
-/// `CMSG_GROUP_SWAP_SUB_GROUP`: the leader or an Assistant swaps `name` and `swap_with_name`. Same
-/// roster-only name resolution as [`change_subgroup`] (cm:GroupHandler.cpp:901-944,
-/// cm:GroupHandler.cpp:919-936), with both names resolved against the SAME roster read so the
-/// pair cannot straddle two different snapshots of it.
 fn swap_subgroup<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -465,10 +365,6 @@ fn swap_subgroup<
     }
 }
 
-/// Run one Group Broadcast for the session's Character. cmangos answers every refusal of these
-/// opcodes with silence, so a Refusal only logs. A transport failure only logs too: a broadcast
-/// changes no roster and nothing waits on it, so a lost ping or roll must not end the session.
-/// A throttled op sent again inside its cooldown is dropped the same way.
 pub(super) fn run_group_broadcast<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -499,8 +395,6 @@ pub(super) fn run_group_broadcast<
     }
 }
 
-/// `MSG_RAID_TARGET_UPDATE` as a Target Icon op. `RequestIcons` is the list request, and
-/// `Unknown0` to `Unknown8` are indexes 0 to 8. The Module refuses index 8.
 fn target_icon_op(update: &MSG_RAID_TARGET_UPDATE_Client) -> party::Op {
     use MSG_RAID_TARGET_UPDATE_Client as Update;
     let (icon, target) = match *update {
@@ -521,7 +415,6 @@ fn target_icon_op(update: &MSG_RAID_TARGET_UPDATE_Client) -> party::Op {
     }
 }
 
-/// The `PartyResult` code one party outcome renders as.
 fn party_result(outcome: PartyOutcome) -> PartyResult {
     match outcome {
         PartyOutcome::Ran => PartyResult::Success,
@@ -529,12 +422,6 @@ fn party_result(outcome: PartyOutcome) -> PartyResult {
     }
 }
 
-/// Map each [`GroupRefusal`] onto the vanilla `PartyResult` the client renders ("X is already in a
-/// group" etc.). Vanilla has no code for an offline or self-named target, a stale invite, a raid
-/// op in a Party, a temporarily unavailable actor, or either Subgroup move Refusal, since cmangos
-/// answers a refused Change or Swap Subgroup with silence rather than a code, so all of those read
-/// as BadPlayerName, a visible line that does not crash the client. The intent claim never reaches
-/// a client; it is listed so a new Refusal cannot be forgotten here.
 fn party_result_for(refusal: GroupRefusal) -> PartyResult {
     match refusal {
         GroupRefusal::AlreadyInGroup => PartyResult::AlreadyInGroup,
@@ -561,8 +448,6 @@ fn party_result_for(refusal: GroupRefusal) -> PartyResult {
     }
 }
 
-/// The `FriendResult` code one contact Refusal renders as. The friends and ignore lists have
-/// separate code families for the same three conditions, so the list decides the answer.
 fn friend_result_for(refusal: ContactRefusal, is_ignore: bool) -> FriendResult {
     match (refusal, is_ignore) {
         (ContactRefusal::AddSelf, false) => FriendResult::SelfX,
@@ -572,21 +457,13 @@ fn friend_result_for(refusal: ContactRefusal, is_ignore: bool) -> FriendResult {
         (ContactRefusal::ListFull, false) => FriendResult::ListFull,
         (ContactRefusal::ListFull, true) => FriendResult::IgnoreFull,
         (ContactRefusal::NotOnList, true) => FriendResult::IgnoreNotFound,
-        // The friend-list remove of a row that is not there, and an actor the module could not
-        // reach, both read as the one "no such entry" line vanilla has.
         (ContactRefusal::NotOnList, false) | (ContactRefusal::ActorUnavailable, _) => {
             FriendResult::NotFound
         }
-        // Ignore has no faction rule (only `resolve_add_contact`'s friend arm can produce this),
-        // but the wire still has one code for it.
         (ContactRefusal::Enemy, _) => FriendResult::Enemy,
     }
 }
 
-/// The `SMSG_FRIEND_STATUS` trailing fields for a Realm Presence that is online — the ONLINE/
-/// ADDED_ONLINE case. Away Status reads `None` off any Whereabouts but `InWorld` (a Character
-/// between places carries no live `PLAYER_FLAGS` to read one from). `pub(crate)` because the
-/// Account Claim Relay (`stdb::world_view`) shares it for the login/logout notice.
 pub(crate) fn friend_online_fields(presence: &presence::RealmPresence) -> codec::FriendOnline {
     let away = match &presence.whereabouts {
         presence::Whereabouts::InWorld { away, .. } => *away,
@@ -602,12 +479,6 @@ pub(crate) fn friend_online_fields(presence: &presence::RealmPresence) -> codec:
     }
 }
 
-/// Hydrate friend guids into `FriendView`s for `CMSG_FRIEND_LIST`: online means `session_online`
-/// and the same team as `own_team`, carrying level/class/zone/Away Status from Realm Presence
-/// (cm:SocialMgr.cpp:108-139). A friend whose Realm Presence read fails — an unreachable Shard —
-/// degrades that one row to offline rather than failing the whole list or ending the World
-/// Session. Lives over the `WorldStore` seam, not behind any one Store's own `contact_lists`, so a
-/// Store Fake exercises the exact composition a Coordinator serves.
 pub(crate) fn friend_views<St: ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     own_team: u32,
@@ -644,11 +515,6 @@ pub(crate) fn friend_views<St: ShardRoutingStore + SocialStore + ?Sized>(
         .collect()
 }
 
-/// Resolve a typed contact name realm-wide, call the module's add reducer (`add_friend`/
-/// `add_ignore`), and translate the outcome into what `SMSG_FRIEND_STATUS` needs: the result code,
-/// the OTHER party's guid, and — ONLINE/ADDED_ONLINE only — the trailing presence fields. An
-/// unknown name never reaches the module (guid 0, `NotFound`/`IgnoreNotFound`); everything else
-/// (self/duplicate/cap/team) is the module's own typed Refusal.
 fn resolve_add_contact<St: CharacterStore + ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     actor: Actor,
@@ -672,12 +538,6 @@ fn resolve_add_contact<St: CharacterStore + ShardRoutingStore + SocialStore + ?S
         return Ok((result, target_guid, None));
     }
 
-    // Friends only: the module's Enemy Gate needs the target's race, and a successful add's
-    // answer (ADDED_ONLINE vs ADDED_OFFLINE) needs its presence. An unreachable Shard must not
-    // end the World Session over a friend add, so a Realm Presence read failure degrades to the
-    // best-effort identity read instead — a local cache lookup that cannot itself fail this way.
-    // NEVER guess a race: a wrong default (0 reads as Alliance) can refuse a real same-team
-    // friend as an enemy, or wave a real enemy through.
     let target = presence::of(store, target_guid).unwrap_or_else(|error| {
         log::debug!("resolve_add_contact: Realm Presence read failed for {target_guid}: {error:#}");
         None
@@ -689,8 +549,6 @@ fn resolve_add_contact<St: CharacterStore + ShardRoutingStore + SocialStore + ?S
             .map(|identity| identity.race),
     };
     let Some(target_race) = target_race else {
-        // No connected Shard currently knows this Character at all, though the name resolved a
-        // moment ago — treat it the same as an unresolved name rather than guess.
         return Ok((FriendResult::NotFound, 0, None));
     };
     let outcome = store.add_friend(actor, target_guid, target_race)?;
@@ -715,9 +573,6 @@ fn resolve_add_contact<St: CharacterStore + ShardRoutingStore + SocialStore + ?S
     Ok((result, target_guid, online))
 }
 
-/// Call the module's remove reducer (`del_friend`/`del_ignore`) for `target_guid` and translate the
-/// outcome into the `(FriendResult, guid)` pair `SMSG_FRIEND_STATUS` needs. A remove carries no
-/// trailing presence fields, whatever the outcome.
 fn resolve_del_contact<St: SocialStore + ?Sized>(
     store: &St,
     actor: Actor,
@@ -741,8 +596,6 @@ fn resolve_del_contact<St: SocialStore + ?Sized>(
 mod tests {
     use super::*;
 
-    /// The six conditions vanilla has a code for keep their own code; the rest share the one
-    /// visible fallback line rather than being swallowed.
     #[test]
     fn each_group_refusal_renders_its_own_party_result() {
         for refusal in GroupRefusal::ALL {
@@ -760,8 +613,6 @@ mod tests {
         assert_eq!(party_result(PartyOutcome::Ran), PartyResult::Success);
     }
 
-    /// The friends and ignore lists carry separate code families for the same conditions, so the
-    /// same Refusal must not answer both lists with one code.
     #[test]
     fn each_contact_refusal_renders_the_code_of_the_list_it_names() {
         for refusal in ContactRefusal::ALL {

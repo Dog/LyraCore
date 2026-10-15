@@ -8,11 +8,7 @@ pub(crate) struct TrainerState {
     pub(crate) reputation_at_war: std::sync::Mutex<std::collections::BTreeMap<u32, bool>>,
     pub(crate) talent_reset_quote: Option<u32>,
     pub(crate) reset_talents_refusal: Option<String>,
-    /// Spelled as a refusal so derive-Default (false) keeps every fixture trainer serving; the
-    /// trait method reads the negation.
     pub(crate) trainer_refuses_class: bool,
-    /// Recorded `reset_talents` dispatches: (actor guid, trainer_guid) — the unlearn-talents
-    /// gossip select.
     pub(crate) reset_talents_calls: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
@@ -45,7 +41,7 @@ impl TrainerStore for WorldFake {
     }
 
     fn trainer_serves(&self, _player_guid: u64, _trainer_guid: u64) -> Result<bool> {
-        Ok(!self.trainer.trainer_refuses_class) // default true — every existing fixture trainer serves
+        Ok(!self.trainer.trainer_refuses_class)
     }
 
     fn trainer_list(
@@ -98,7 +94,7 @@ impl TrainerStore for WorldFake {
     }
 
     fn talent_points_spent(&self, _character_guid: u64) -> u32 {
-        0 // login stays byte-identical in every existing harness test
+        0
     }
 
     fn learn_talent(&self, _actor: Actor, _talent_id: u32) -> Result<()> {
@@ -118,11 +114,11 @@ impl TrainerStore for WorldFake {
     }
 
     fn resolve_learn_target(&self, spell_id: u32) -> u32 {
-        spell_id // self-contained ranks (no wrapper table in the Fake)
+        spell_id
     }
 
     fn trainer_offer_skill_line(&self, _trainer_guid: u64, _spell_id: u32) -> u32 {
-        0 // every offering reads as an ordinary spell purchase
+        0
     }
 
     fn superseded_old_rank(&self, _new_spell: u32, _player_guid: u64) -> Option<u32> {
@@ -130,19 +126,13 @@ impl TrainerStore for WorldFake {
     }
 
     fn character_presence(&self, guid: u64) -> Result<Option<(bool, u8, u8, u32)>> {
-        Ok(self
-            .characters
-            .iter()
-            .find(|c| c.guid == guid)
-            // `offline_guids` drives the invite gate's "player not online" arm. Empty by
-            // default, so a seeded character is online exactly as it always was.
-            .map(|c| {
-                (
-                    !self.social.offline_guids.contains(&guid),
-                    c.level,
-                    c.class,
-                    c.zone_id,
-                )
-            }))
+        Ok(self.characters.iter().find(|c| c.guid == guid).map(|c| {
+            (
+                !self.social.offline_guids.contains(&guid),
+                c.level,
+                c.class,
+                c.zone_id,
+            )
+        }))
     }
 }

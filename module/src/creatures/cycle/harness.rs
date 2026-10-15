@@ -1,7 +1,3 @@
-//! In-memory creature world for the behavior cycle: no database, no `ReducerContext`. A test
-//! describes creatures and their legs, runs one cycle, and reads back the authoritative state plus
-//! the ordered movement effects a client would have received.
-
 use super::*;
 use crate::combat::MOVE_FLAG_FORWARD;
 use crate::creatures::ai::ROUT_DURATION_MS;
@@ -58,27 +54,20 @@ pub(crate) use eventai_legacy::{
     TARGET_SELF, TARGET_SPAWNER, TARGET_TOP_THREAT, TARGET_TOP_THREAT_PLAYER,
 };
 
-/// A creature's authoritative state, as the cycle writes it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct XCreature {
-    /// The static creature template entry.
     entry: u32,
     at: Point,
     grid: (i32, i32),
     cell: i64,
     last_move_ms: u32,
-    /// Where it looks. Only the facing turn writes it.
     orientation: f32,
-    /// The ETA gate an idle leg arms, and the route cursor patrol walks by.
     leg_ends_ms: u32,
     wp_target: u64,
-    /// What a heal-when-low rotation line reads. Full health unless a scenario hurts it.
     health: u32,
     max_health: u32,
-    /// The power bar regeneration ticks. `max_power` 0 — every creature — has no bar at all.
     power: u32,
     max_power: u32,
-    // --- what the engagement phases read; every one has a quiet default a builder overrides.
     level: u32,
     faction_template: u32,
     map_id: u32,
@@ -89,8 +78,6 @@ struct XCreature {
     cannot_act: bool,
 }
 
-/// One movement leg the cycle emitted — everything the relay carries to a client. A zero `dur_ms`
-/// with `dest == start` is a stop.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct MoveEffect {
     guid: u64,
@@ -107,15 +94,12 @@ struct MoveEffect {
     facing_angle: f32,
 }
 
-/// What the pet phase did to one pet, in the order it did it. The follow leg is NOT here — it goes
-/// through the shared leg writer and shows up in `effects()` like every other movement.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PetEffect {
     Took(u64, u64),
     StoodDown(u64),
     Dismissed(u64),
     Restaged(u64, Point, u32, u64),
-    /// The owner's stale ATTACK order was cleared.
     OrderCleared(u64),
 }
 
@@ -161,111 +145,58 @@ struct Scenario {
     creatures: RefCell<HashMap<u64, XCreature>>,
     legs: RefCell<Vec<LegInFlight>>,
     obstructed_paths: RefCell<HashSet<u64>>,
-    /// FROZEN by crowd control — a stun, root or polymorph. Fear is the other axis, below.
     frozen: RefCell<HashSet<u64>>,
-    /// Live fear auras, `(feared unit, caster)`, in the order the world reads them: one row each, so
-    /// a creature feared twice really is listed twice.
     fears: RefCell<Vec<(u64, u64)>>,
     engaged: RefCell<HashSet<u64>>,
     routes: RefCell<HashMap<u64, Vec<Waypoint>>>,
     homes: RefCell<HashMap<u64, Home>>,
-    /// Determinism input: the firing clock every cycle reads through `TickContext`.
     now_micros: Cell<u64>,
-    /// Determinism input: the world's random stream, oldest roll first.
     rolls: RefCell<VecDeque<u32>>,
-    /// Determinism input: the imported ground under every landing point. `None` is an unimported
-    /// slice, where a leg keeps the height its decider fell back to.
     ground: Cell<Option<f32>>,
-    /// Determinism input: navigation aims at this corner instead of the goal, i.e. the goal is
-    /// blocked and the walk has to go around.
     detours: RefCell<HashMap<u64, (f32, f32)>>,
-    /// Ordered movement effects, oldest first.
     effects: RefCell<Vec<MoveEffect>>,
-    /// The last carrier row each creature wrote, and the firing clock it was written at. A creature
-    /// has ONE spline row and a subscriber sees only a transaction's net change, so a second write
-    /// in one firing would reach no client at all — [`Scenario::record`] refuses it.
     last_carrier: RefCell<HashMap<u64, (u64, MoveEffect)>>,
-    /// The players in the world, in the order the world reads them.
     players: RefCell<Vec<AggroTarget>>,
     eventai_player_health: RefCell<HashMap<u64, (u32, u32)>>,
-    /// Live melee engagements — what aggro arms, and what combat entry and chase read.
     fights: RefCell<Vec<Engagement>>,
-    /// Each engagement's rout clock, `creature -> the ms its window closes at`. Absent is the
-    /// never-routed sentinel; the rout phase is the only thing that writes it.
     rout_clock: RefCell<HashMap<u64, u32>>,
-    /// The longest offensive spell range a creature fights from; absent means melee-only.
     hold_ranges: RefCell<HashMap<u64, f32>>,
-    /// Determinism input: when each PLAYER last moved. A creature's own move clock is on its row.
     player_moved_ms: RefCell<HashMap<u64, u32>>,
-    /// Determinism input: each PLAYER's live movement flags, as its heartbeats stamp them. A creature
-    /// stamps none — the leg the module moves it along is what says it travels.
     player_move_flags: RefCell<HashMap<u64, u32>>,
-    /// Faction pairs at war, directed. Anything absent is not hostile, as missing data is.
     at_war: RefCell<HashSet<(u32, u32)>>,
-    /// `(looker, unseen)` pairs with something solid in between.
     blind: RefCell<HashSet<(u64, u64)>>,
-    /// Ordered engagements the cycle armed, oldest first.
     pulls: RefCell<Vec<(u64, u64, Pull)>>,
-    /// Ordered units the cycle flagged in combat, oldest first.
     flagged: RefCell<Vec<u64>>,
-    /// The in-combat flag as state: `unit -> the ms its flag stops being earned`. Combat entry
-    /// stamps it, combat exit clears it, the way the world's own flag works.
     combat_flags: RefCell<HashMap<u64, u64>>,
-    /// Ordered units the cycle dropped out of combat, oldest first.
     unflagged: RefCell<Vec<u64>>,
-    /// Units carrying a combat-regen aura — the only ones that heal while they fight.
     combat_regen: RefCell<HashSet<u64>>,
-    /// Authored spell rotations, per creature (the world keys them by template).
     rotations: RefCell<HashMap<u64, Vec<SpellOption>>>,
-    /// Independent Creature Spell Lists, separate from template compatibility schedules.
     creature_spell_lists: RefCell<HashMap<u64, Vec<SpellOption>>>,
-    /// The single spell a creature with no rotation falls back to.
     lone_spells: RefCell<HashMap<u64, u32>>,
-    /// `(unit, spell)` auras already on a unit — what a missing-aura condition reads.
     auras: RefCell<HashSet<(u64, u32)>>,
-    /// Creatures with a cast bar already running.
     casting: RefCell<HashSet<u64>>,
-    /// Units holding the non-melee spell slot through an active channel.
     channeling: RefCell<HashSet<u64>>,
     slowed: RefCell<HashSet<u64>>,
-    /// Fault injection: spells the spell module refuses — on cooldown, unaffordable or out of range.
     not_ready: RefCell<HashSet<u32>>,
-    /// Static spell ranges used by EventAI selection. Unlisted spells have no practical limit.
     eventai_spell_ranges: RefCell<HashMap<u32, u32>>,
-    /// Ordered casts the cycle began, oldest first.
     casts: RefCell<Vec<CastEffect>>,
-    /// Typed EventAI spell starts, retained separately from the compatibility cast log.
     eventai_spell_starts:
         RefCell<Vec<(SpellStartMode, SpellCastTarget, bool, SpellCasterAdmission)>>,
-    /// The threat table, `(creature, source) -> threat`.
     threat: RefCell<HashMap<(u64, u64), i64>>,
-    /// Live taunt locks: the creature is pinned on this unit whatever the threat table says.
     taunts: RefCell<HashMap<u64, u64>>,
-    /// Live pets, `pet -> owner`. A pet is an ordinary creature row plus this link.
     pet_owners: RefCell<HashMap<u64, u64>>,
-    /// The pet bar per OWNER; an absent entry is the vanilla default (Follow + Defensive).
     pet_bars: RefCell<HashMap<u64, (PetCommand, PetReact)>>,
-    /// Creatures killed but not yet removed. Only the pet phase reads this: a pet has no spawn row,
-    /// so corpse decay never reaps it.
     corpses: RefCell<HashSet<u64>>,
-    /// Ordered pet effects, oldest first.
     pet_effects: RefCell<Vec<PetEffect>>,
-    /// Scenario input for the active-cell sweep.
     awake: RefCell<TickSweep>,
-    /// Positions read BEFORE any pass ran, i.e. by the sweep — still the leg starts, because the
-    /// sweep runs ahead of spline advance.
     seen_by_sweep: RefCell<Vec<(u64, Point)>>,
     maintenance_runs: Cell<u32>,
     package_runs: Cell<u32>,
-    /// Authored EventAI action rows, mirroring the Module-only static table.
     eventai_rows: RefCell<Vec<CreatureAiEvent>>,
-    /// Native definitions used by revision and instruction-boundary scenarios.
     eventai_definitions: RefCell<Vec<EventAiDefinition>>,
-    /// Imported broadcast text, keyed by its stable catalogue id.
     eventai_text: RefCell<HashMap<u32, (String, u8, u32, u32)>>,
     eventai_creature_state: RefCell<HashMap<u64, CreatureState>>,
     eventai_rule_state: RefCell<HashMap<u64, HashMap<u64, RuleState>>>,
-    /// Typed EventAI projection calls, retained so behavior tests can inspect the world seam.
     eventai_presentation: RefCell<
         Vec<(
             u64,
@@ -294,7 +225,6 @@ struct Scenario {
     eventai_encounter_notifications: RefCell<Vec<(u64, NotifyEncounterInstruction)>>,
     eventai_relay_starts: RefCell<Vec<(u32, u64, u64, u64)>>,
     eventai_next_summon: Cell<u64>,
-    /// Ordered text effects emitted by authored rules.
     eventai_speech: RefCell<Vec<(u64, u8, String)>>,
     eventai_speech_targets: RefCell<Vec<(u64, u64)>>,
     eventai_emotes: RefCell<Vec<(u64, u32, u32, u64)>>,
@@ -310,8 +240,6 @@ impl Scenario {
         s
     }
 
-    /// Place a creature at `at`, with its grid address derived the way the world derives it. It is
-    /// level 10, of the creature faction, on the level-scaled aggro radius, and fit to fight.
     fn creature(self, guid: u64, at: Point) -> Self {
         let (gx, gy) = spatial::grid_cell(at.x, at.y);
         self.creatures.borrow_mut().insert(
@@ -342,7 +270,6 @@ impl Scenario {
         self
     }
 
-    /// Edit one creature's sensing state.
     fn tweak(self, guid: u64, edit: impl FnOnce(&mut XCreature)) -> Self {
         edit(self.creatures.borrow_mut().get_mut(&guid).unwrap());
         self
@@ -597,7 +524,6 @@ impl Scenario {
             .collect()
     }
 
-    /// Compatibility ownership for this creature's current EventAI lifecycle.
     fn authored_combat(&self, creature_guid: u64) -> eventai::AuthoredCombat {
         if self.pet_owners.borrow().contains_key(&creature_guid) {
             return eventai::AuthoredCombat::default();
@@ -623,22 +549,18 @@ impl Scenario {
         authored
     }
 
-    /// The creature's template carries a hand-tuned aggro range instead of the level-scaled one.
     fn tuned_aggro_range(self, guid: u64, yards: u32) -> Self {
         self.tweak(guid, |c| c.aggro_range = Some(yards))
     }
 
-    /// Mind Soothe: a signed yard change to this creature's own detection radius.
     fn soothed(self, guid: u64, yards: f32) -> Self {
         self.tweak(guid, |c| c.detect_range_mod = yards)
     }
 
-    /// Near death and of a kind that runs — it must not be pulled into a fight it would flee.
     fn near_death(self, guid: u64) -> Self {
         self.tweak(guid, |c| c.would_rout = true)
     }
 
-    /// Stunned, polymorphed or feared: it cannot act.
     fn crowd_controlled(self, guid: u64) -> Self {
         self.tweak(guid, |c| c.cannot_act = true)
     }
@@ -651,7 +573,6 @@ impl Scenario {
         self.tweak(guid, |c| c.instance_id = instance_id)
     }
 
-    /// Put a living, visible, level-10 ALLIANCE player at `at`.
     fn player(self, guid: u64, at: Point) -> Self {
         self.players.borrow_mut().push(AggroTarget {
             guid,
@@ -667,7 +588,6 @@ impl Scenario {
         self
     }
 
-    /// Edit one player.
     fn tweak_player(self, guid: u64, edit: impl FnOnce(&mut AggroTarget)) -> Self {
         edit(
             self.players
@@ -690,7 +610,6 @@ impl Scenario {
         self
     }
 
-    /// A GM who cannot be killed.
     fn godmoded(self, guid: u64) -> Self {
         self.tweak_player(guid, |p| p.godmode = true)
     }
@@ -703,19 +622,16 @@ impl Scenario {
         self.tweak_player(guid, |p| p.stealthed = true)
     }
 
-    /// These two factions are enemies, both ways round.
     fn at_war(self, a: u32, b: u32) -> Self {
         self.at_war.borrow_mut().extend([(a, b), (b, a)]);
         self
     }
 
-    /// Something solid stands between `looker` and `unseen`.
     fn wall_between(self, looker: u64, unseen: u64) -> Self {
         self.blind.borrow_mut().insert((looker, unseen));
         self
     }
 
-    /// `attacker` is already swinging at `victim`.
     fn attacking(self, attacker: u64, victim: u64) -> Self {
         self.fights.borrow_mut().push(Engagement {
             attacker,
@@ -726,31 +642,26 @@ impl Scenario {
         self
     }
 
-    /// The creature is already routing: wounded, of a kind that runs, and inside an open window.
     fn routing(self, guid: u64) -> Self {
         let ends_ms = (self.now_micros.get() / 1000) as u32 + ROUT_DURATION_MS;
         self.rout_clock.borrow_mut().insert(guid, ends_ms);
         self.wounded_runner(guid)
     }
 
-    /// Hurt past the rout threshold and of a kind that runs — `rout_eligible` in the world.
     fn wounded_runner(self, guid: u64) -> Self {
         self.hurt(guid, 10).near_death(guid)
     }
 
-    /// `caster` has fear up on `guid`. Called twice, the creature carries two live fear auras.
     fn feared_by(self, guid: u64, caster: u64) -> Self {
         self.fears.borrow_mut().push((guid, caster));
         self
     }
 
-    /// The creature is an offensive caster: it fights from `yards` away instead of closing.
     fn caster(self, guid: u64, yards: f32) -> Self {
         self.hold_ranges.borrow_mut().insert(guid, yards);
         self
     }
 
-    /// Author one line of the creature's spell rotation.
     fn rotation_line(self, guid: u64, spell_id: u32, when: CastWhen, priority: u8) -> Self {
         let mut rotations = self.rotations.borrow_mut();
         let lines = rotations.entry(guid).or_default();
@@ -783,19 +694,16 @@ impl Scenario {
         self
     }
 
-    /// The creature has no rotation, only the one authored spell.
     fn lone_spell(self, guid: u64, spell_id: u32) -> Self {
         self.lone_spells.borrow_mut().insert(guid, spell_id);
         self
     }
 
-    /// The unit already carries this spell's aura.
     fn carrying(self, guid: u64, spell_id: u32) -> Self {
         self.auras.borrow_mut().insert((guid, spell_id));
         self
     }
 
-    /// The creature's cast bar is already running.
     fn mid_cast(self, guid: u64) -> Self {
         self.casting.borrow_mut().insert(guid);
         self
@@ -806,7 +714,6 @@ impl Scenario {
         self
     }
 
-    /// Fault injection: the spell module refuses this spell — on cooldown, unaffordable, out of range.
     fn not_ready(self, spell_id: u32) -> Self {
         self.not_ready.borrow_mut().insert(spell_id);
         self
@@ -823,7 +730,6 @@ impl Scenario {
         self.tweak(guid, |c| c.health = health)
     }
 
-    /// `source` has done enough to `creature` to hold this much of its threat table.
     fn threat(self, creature: u64, source: u64, threat: i64) -> Self {
         self.threat.borrow_mut().insert((creature, source), threat);
         self
@@ -833,7 +739,6 @@ impl Scenario {
         self.threat.borrow().get(&(creature, source)).copied()
     }
 
-    /// A live taunt: the creature is pinned on `taunter` for the window's duration.
     fn taunted(self, creature: u64, taunter: u64) -> Self {
         self.taunts.borrow_mut().insert(creature, taunter);
         self
@@ -843,7 +748,6 @@ impl Scenario {
         self.casts.borrow().clone()
     }
 
-    /// Who each creature is fighting now, guid-ordered — what retargeting rewrites.
     fn victims(&self) -> Vec<(u64, u64)> {
         let mut pairs: Vec<(u64, u64)> = self
             .fights
@@ -855,8 +759,6 @@ impl Scenario {
         pairs
     }
 
-    /// The player RUNS to `at`: it stands there, its move clock reads now and it is holding the
-    /// forward key, so a chaser treats it as a kiter rather than a planted target.
     fn kiting(self, guid: u64, at: Point) -> Self {
         let now_ms = (self.now_micros.get() / 1000) as u32;
         self.player_moved_ms.borrow_mut().insert(guid, now_ms);
@@ -866,15 +768,11 @@ impl Scenario {
         self.tweak_player(guid, |p| p.at = at)
     }
 
-    /// The player RELEASED the movement key where it stands: its translation flags go to zero while
-    /// its move clock keeps reading whenever it last ran.
     fn stopped(self, guid: u64) -> Self {
         self.player_move_flags.borrow_mut().insert(guid, 0);
         self
     }
 
-    /// The player is TURNING IN PLACE — spinning the camera, going nowhere. Vanilla does not count
-    /// this as movement, so neither may a chaser.
     fn turning(self, guid: u64) -> Self {
         let now_ms = (self.now_micros.get() / 1000) as u32;
         self.player_moved_ms.borrow_mut().insert(guid, now_ms);
@@ -884,7 +782,6 @@ impl Scenario {
         self
     }
 
-    /// How long ago this player's last movement heartbeat landed.
     fn since_last_move_ms(&self, guid: u64) -> u32 {
         let now_ms = (self.now_micros.get() / 1000) as u32;
         now_ms.wrapping_sub(
@@ -896,12 +793,10 @@ impl Scenario {
         )
     }
 
-    /// The creature looks this way — what the facing turn measures its correction against.
     fn facing(self, guid: u64, orientation: f32) -> Self {
         self.tweak(guid, |c| c.orientation = orientation)
     }
 
-    /// A player's auto-attack toggle armed at something it has never reached.
     fn aiming_at(self, player: u64, victim: u64) -> Self {
         self.fights.borrow_mut().push(Engagement {
             attacker: player,
@@ -920,15 +815,12 @@ impl Scenario {
         self.flagged.borrow().clone()
     }
 
-    /// The unit carries the in-combat flag until `until_ms`, and the sweep harvested it into this
-    /// firing's candidates — the two always travel together, because the sweep IS the flag scan.
     fn in_combat_until(self, guid: u64, until_ms: u64) -> Self {
         self.combat_flags.borrow_mut().insert(guid, until_ms);
         self.awake.borrow_mut().in_combat.push(guid);
         self
     }
 
-    /// Is this unit still flagged in combat?
     fn in_combat(&self, guid: u64) -> bool {
         self.combat_flags.borrow().contains_key(&guid)
     }
@@ -937,7 +829,6 @@ impl Scenario {
         self.unflagged.borrow().clone()
     }
 
-    /// Give the unit a power bar, the way only a player has one.
     fn power(self, guid: u64, power: u32, max_power: u32) -> Self {
         self.tweak(guid, |c| {
             c.power = power;
@@ -945,14 +836,11 @@ impl Scenario {
         })
     }
 
-    /// A combat-regen aura (the Troll Regeneration racial): this unit heals even while it fights.
     fn combat_regen(self, guid: u64) -> Self {
         self.combat_regen.borrow_mut().insert(guid);
         self
     }
 
-    /// Summon `guid` as `owner`'s pet at `at`: a creature row plus the owner link, harvested into
-    /// this firing's pet candidates by the sweep.
     fn pet(self, guid: u64, owner: u64, at: Point) -> Self {
         let s = self.creature(guid, at);
         s.awake.borrow_mut().pets.push(guid);
@@ -960,14 +848,11 @@ impl Scenario {
         s
     }
 
-    /// The owner's pet bar, as the player left it. An absent entry is the vanilla default
-    /// (Follow + Defensive), which is exactly what a pet did before the bar existed.
     fn pet_bar(self, owner: u64, command: PetCommand, react: PetReact) -> Self {
         self.pet_bars.borrow_mut().insert(owner, (command, react));
         self
     }
 
-    /// The creature was killed and its row is still there.
     fn slain(self, guid: u64) -> Self {
         self.corpses.borrow_mut().insert(guid);
         self
@@ -977,13 +862,11 @@ impl Scenario {
         self.pet_effects.borrow().clone()
     }
 
-    /// Wake these creatures: the active-cell sweep found them near a covered player this firing.
     fn awake(self, guids: impl IntoIterator<Item = u64>) -> Self {
         self.awake.borrow_mut().active = guids.into_iter().collect();
         self
     }
 
-    /// Give the creature a patrol route, `(waypoint id, point)` in route order.
     fn route(self, guid: u64, waypoints: &[(u64, Point)]) -> Self {
         self.routes.borrow_mut().insert(
             guid,
@@ -995,7 +878,6 @@ impl Scenario {
         self
     }
 
-    /// Point the route cursor at the waypoint the creature is walking TO.
     fn walking_to(self, guid: u64, waypoint_id: u64) -> Self {
         self.creatures
             .borrow_mut()
@@ -1005,8 +887,6 @@ impl Scenario {
         self
     }
 
-    /// Give the creature a spawn post; `wanders` is cmangos RANDOM movement (an IDLE creature holds
-    /// its post instead).
     fn home(self, guid: u64, at: Point, wanders: bool) -> Self {
         self.homes.borrow_mut().insert(guid, Home { at, wanders });
         self
@@ -1017,7 +897,6 @@ impl Scenario {
         self
     }
 
-    /// The creature's current idle leg animates until `leg_ends_ms`.
     fn mid_leg(self, guid: u64, leg_ends_ms: u32) -> Self {
         self.creatures
             .borrow_mut()
@@ -1032,13 +911,11 @@ impl Scenario {
         self
     }
 
-    /// Imported terrain: every landing point sits on this ground height.
     fn ground(self, z: f32) -> Self {
         self.ground.set(Some(z));
         self
     }
 
-    /// The straight line to this creature's goal is blocked; navigation heads for `corner` instead.
     fn detour(self, guid: u64, corner: (f32, f32)) -> Self {
         self.detours.borrow_mut().insert(guid, corner);
         self
@@ -1048,7 +925,6 @@ impl Scenario {
         self.now_micros.set(self.now_micros.get() + micros);
     }
 
-    /// Put `guid` mid-flight from `start` to `dest`, launched at `started_micros`.
     fn flying(
         self,
         guid: u64,
@@ -1081,7 +957,6 @@ impl Scenario {
         self
     }
 
-    /// This engagement's rout clock, as the phase left it.
     fn rout_ends_ms(&self, guid: u64) -> u32 {
         self.rout_clock.borrow().get(&guid).copied().unwrap_or(0)
     }
@@ -1110,8 +985,6 @@ impl Scenario {
         }
     }
 
-    /// One firing of a schedule row ticking every `interval_micros`, with the cadence resolved from
-    /// that interval exactly as `tick_creatures` resolves it, and the scenario clock moved to it.
     fn firing(&self, now_micros: u64, interval_micros: i64, scope: TickScope) -> TickContext {
         self.now_micros.set(now_micros);
         TickContext {
@@ -1170,18 +1043,12 @@ impl MotionSink for Scenario {
 }
 
 impl Scenario {
-    /// The crowd-control lattice, composed the way the world composes it — `spell::cc_blocks` over
-    /// this scenario's frozen set and its fear rows: `(action blocked, movement blocked, self
-    /// movement suppressed)`.
     fn cc(&self, guid: u64) -> (bool, bool, bool) {
         let frozen = self.frozen.borrow().contains(&guid);
         let feared = self.fears.borrow().iter().any(|(unit, _)| *unit == guid);
         crate::spell::cc_blocks(frozen, false, feared, false)
     }
 
-    /// Is this creature ACTIVELY routing — the world's `creature_is_routing`: wounded and of a kind
-    /// that runs, inside an open window, and free to move. Chase, the rout leg and the swing pass all
-    /// read this one verdict, so the harness answers it in one place too.
     fn is_routing(&self, guid: u64) -> bool {
         let entitled = self
             .creatures
@@ -1193,8 +1060,6 @@ impl Scenario {
         entitled && rout_window_open(now_ms, self.rout_ends_ms(guid)) && !self.cc(guid).2
     }
 
-    /// The state mirror behind every position write, matching `CtxWorld::place`: the row moves, and
-    /// the move clock and the facing move with it only when the caller says so.
     fn place(
         &self,
         guid: u64,
@@ -1217,9 +1082,6 @@ impl Scenario {
         Some(*c)
     }
 
-    /// The one place a `MoveEffect` is recorded, and the rule production gets from the schema: a
-    /// creature has ONE `game_creature_spline` row, so two writes for it in one firing reach a
-    /// client as the second alone. The Fake refuses rather than recording a relay that cannot happen.
     fn record(&self, effect: MoveEffect) {
         let now = self.now_micros.get();
         if let Some((wrote_at, first)) = self.last_carrier.borrow().get(&effect.guid) {
@@ -1237,9 +1099,6 @@ impl Scenario {
         self.effects.borrow_mut().push(effect);
     }
 
-    /// The zero-duration row a stop leaves behind. It REPLACES the leg it interrupts (the writer
-    /// upserts one row per mover), so the next cycle reads it as landed and reaps it instead of
-    /// resuming the old destination.
     fn park_leg(&self, guid: u64, at: Point, map_id: u32, instance_id: u64) {
         let mut legs = self.legs.borrow_mut();
         legs.retain(|l| l.guid != guid);
@@ -1256,10 +1115,6 @@ impl Scenario {
         });
     }
 
-    /// A fight's victim wherever it stands — a creature row or a player — as its position and live
-    /// translation flags. Chase reads both: a kiter is run down, a planted one is stood next to and
-    /// faced. A creature carries no flags of its own, so the leg the cycle is moving it along is what
-    /// says it travels, exactly as the production adapter derives it.
     fn unit(&self, guid: u64) -> Option<(Point, u32)> {
         if let Some(c) = self.creatures.borrow().get(&guid) {
             let carried = self
@@ -1277,8 +1132,6 @@ impl Scenario {
             .map(|p| (p.at, flags.unwrap_or(0)))
     }
 
-    /// A pet's owner as the pet reads it. `None` for an owner that logged out or died — the two are
-    /// the same despawn to a pet.
     fn pet_owner(&self, guid: u64) -> Option<PetOwner> {
         let (at, map_id, instance_id) = self
             .players
@@ -1293,9 +1146,6 @@ impl Scenario {
                     .filter(|_| !self.corpses.borrow().contains(&guid))
                     .map(|c| (c.at, c.map_id, c.instance_id))
             })?;
-        // A live melee row IS the owner's fight. The in-combat-selection fallback the world also
-        // reads (`pet::owner_combat_target`) needs no scenario shape of its own — either way this
-        // is "the enemy the owner is fighting".
         let combat_target = self
             .fights
             .borrow()
@@ -1602,8 +1452,6 @@ impl EventAiWorld for Scenario {
             .map(|expiry| expiry.summoner_guid)
     }
 
-    /// The world prunes by grid cell before its exact distance check; this Fake hands back the
-    /// whole partition, guid-ordered, and lets the shared logic apply the radius.
     fn eventai_units_near(&self, center: &EventAiUnit, _radius_yd: f32) -> Vec<EventAiUnit> {
         let mut guids: Vec<u64> = self.creatures.borrow().keys().copied().collect();
         guids.extend(self.players.borrow().iter().map(|p| p.guid));
@@ -1665,8 +1513,6 @@ impl EventAiWorld for Scenario {
         self.casting.borrow().contains(&guid) || self.channeling.borrow().contains(&guid)
     }
 
-    /// The scenario world has no faction table, so kinship is template equality, exactly the
-    /// fallback the world uses when the table is empty.
     fn eventai_factions_friendly(&self, first: u32, second: u32) -> bool {
         first == second
     }
@@ -1894,8 +1740,6 @@ impl EventAiWorld for Scenario {
             .expect("the scenario ran out of EventAI random rolls")
     }
 
-    /// The say/yell chokepoint the world speaks through: a corpse says nothing and the line is
-    /// trimmed and length-capped, as `apply_send_chat` does it.
     fn eventai_deliver_line(
         &mut self,
         speaker_guid: u64,
@@ -2388,8 +2232,6 @@ impl EventAiWorld for Scenario {
     }
 }
 
-// The in-memory idle world. A scenario holds only LIVE creature rows, so the "no players, no
-// corpses" half of `CtxWorld::idle_creatures` has nothing to reject here.
 impl IdleSink for Scenario {
     fn idle_creatures(&self, active: &HashSet<u64>) -> Vec<IdleCreature> {
         let creatures = self.creatures.borrow();
@@ -2523,8 +2365,6 @@ impl IdleSink for Scenario {
             })
             .unwrap_or(WANDER_RADIUS)
     }
-    /// Either side of a live fight is engaged, the way a melee row makes it so in the world — plus
-    /// whatever a scenario marked engaged without arming a fight.
     fn engaged(&self, guid: u64) -> bool {
         self.engaged.borrow().contains(&guid)
             || self
@@ -2568,8 +2408,6 @@ impl IdleSink for Scenario {
             )),
         );
     }
-    /// The one leg writer: ground-snap, relay, and start the spline the NEXT cycle advances along —
-    /// the production writer's three jobs in one place, exactly as `emit_creature_leg` does them.
     fn commit_leg(&mut self, guid: u64, leg: Leg, now_ms: u32) {
         let Some(from) = self.creatures.borrow().get(&guid).copied() else {
             return;
@@ -2580,9 +2418,9 @@ impl IdleSink for Scenario {
             z: self.ground.get().unwrap_or(leg.z_fallback),
         };
         if !finite_point(dest.x, dest.y, dest.z) {
-            return; // the writer refuses a corrupt leg rather than writing it onto the creature
+            return;
         }
-        let dur_ms = leg.dur_ms.max(1); // a zero-duration lerp would divide by zero
+        let dur_ms = leg.dur_ms.max(1);
         self.record(MoveEffect {
             guid,
             start: from.at,
@@ -2619,8 +2457,6 @@ impl IdleSink for Scenario {
     }
 }
 
-// The in-memory engagement world. A scenario holds only live, non-pet creature rows, so the
-// "no players, no corpses, no pets" half of `CtxWorld::sensing_creatures` has nothing to reject.
 impl EngageSink for Scenario {
     fn players(&self) -> Vec<AggroTarget> {
         self.players.borrow().clone()
@@ -2655,9 +2491,6 @@ impl EngageSink for Scenario {
     fn hostile(&self, faction_template: u32, other: u32) -> bool {
         self.at_war.borrow().contains(&(faction_template, other))
     }
-    /// The scenario blocks sight between two UNITS, so the sighted point is resolved back to the
-    /// unit standing on it — unambiguous in a scenario, and it keeps the assist scan's habit of
-    /// sighting a caller at the neighbor's own height out of the test's way.
     fn line_of_sight(&self, looker: u64, at: Point) -> bool {
         let seen = self
             .creatures
@@ -2693,8 +2526,6 @@ impl EngageSink for Scenario {
         });
         eventai::evaluate(self, request);
     }
-    /// The instance is the ATTACKER's, read live — the world reads it off the attacker's own entity
-    /// row, so a scenario that puts a creature in an instance puts its fight there too.
     fn engagements(&self) -> Vec<Engagement> {
         let creatures = self.creatures.borrow();
         let mut engagements: Vec<Engagement> = self
@@ -2805,14 +2636,9 @@ impl EngageSink for Scenario {
     }
 }
 
-/// What a full out-of-combat tick recovers here. The RATES are `combat::tables`' in production;
-/// this stands in for them, because what the cycle decides is WHO recovers and WHEN, never how much.
 const REGEN_TICK: u32 = 5;
-/// What a combat-regen aura leaves of that tick — a fraction, as the in-combat rate is.
 const COMBAT_REGEN_TICK: u32 = 1;
 
-// The in-memory regeneration world. A scenario holds only creature rows, so a unit with a power bar
-// stands in for the player half the production pass also covers.
 impl RegenSink for Scenario {
     fn recovering(&self, flagged: &[u64]) -> Vec<Recovering> {
         let fights = self.fights.borrow();
@@ -2830,8 +2656,6 @@ impl RegenSink for Scenario {
                 max_health: c.max_health,
                 power: c.power,
                 max_power: c.max_power,
-                // Both halves the world reads: either side of a live fight, plus the flag the sweep
-                // harvested for a unit with no melee row of its own.
                 in_combat: flagged.contains(guid)
                     || fights
                         .iter()
@@ -2863,8 +2687,6 @@ impl RegenSink for Scenario {
     }
 }
 
-// The in-memory casting world. The spell module is a fake: `begin_cast` records the action and
-// reports "not ready" for the spells a scenario put on cooldown, which is all the cycle reads back.
 impl CastSink for Scenario {
     fn casters(&self, scope: &TickScope) -> Vec<Caster> {
         let creatures = self.creatures.borrow();
@@ -2924,8 +2746,6 @@ impl CastSink for Scenario {
     }
 }
 
-// The in-memory threat world. The compare and the taunt window are the real `crate::threat`'s in
-// production; here a scenario states the table and the lock outright.
 impl ThreatSink for Scenario {
     fn fighters(&self, scope: &TickScope) -> Vec<Fighter> {
         let creatures = self.creatures.borrow();
@@ -2949,7 +2769,6 @@ impl ThreatSink for Scenario {
             .borrow()
             .iter()
             .filter(|((creature, _), _)| *creature == guid)
-            // Highest threat wins; the lowest guid breaks a tie, as the threat table does.
             .max_by(|a, b| a.1.cmp(b.1).then(b.0 .1.cmp(&a.0 .1)))
             .map(|((_, source), _)| *source)
     }
@@ -2969,8 +2788,6 @@ impl ThreatSink for Scenario {
     }
 }
 
-// The in-memory chase world. A fight whose attacker is not a creature row is a PLAYER's own attack
-// row, which the production adapter drops for the same reason: chase moves creatures.
 impl PursuitSink for Scenario {
     fn pursuits(&self, scope: &TickScope) -> Vec<Pursuit> {
         let creatures = self.creatures.borrow();
@@ -3042,9 +2859,6 @@ impl PursuitSink for Scenario {
         }
         self.hold_ranges.borrow().get(&guid).copied().unwrap_or(0.0)
     }
-    /// The stop AND the turn, as one carrier row: the creature is planted at `at` looking at
-    /// `orientation`, and the zero-duration facing row replaces the leg it was riding, exactly as
-    /// the production writer's upsert does.
     fn face(&mut self, guid: u64, at: Point, orientation: f32, spline_id: u32) {
         let Some(c) = self.place(guid, at, None, Some(orientation)) else {
             return;
@@ -3067,8 +2881,6 @@ impl PursuitSink for Scenario {
     }
 }
 
-// The in-memory rout world. A fight whose attacker is not a creature row is a PLAYER's own attack
-// row, which the production adapter drops for the same reason: only creatures rout.
 impl RoutSink for Scenario {
     fn routers(&self, scope: &TickScope) -> Vec<Router> {
         let creatures = self.creatures.borrow();
@@ -3098,7 +2910,6 @@ impl RoutSink for Scenario {
     }
 }
 
-// The in-memory fear world: one candidate per live fear aura, as the world's aura scan yields them.
 impl FearSink for Scenario {
     fn panicked(&self, scope: &TickScope) -> Vec<Panicked> {
         let creatures = self.creatures.borrow();
@@ -3107,11 +2918,7 @@ impl FearSink for Scenario {
             .iter()
             .filter_map(|(guid, _)| {
                 let c = creatures.get(guid)?;
-                // Which caster wins is the FIRST fear row on the unit, not this row's — the same
-                // tie-break `spell::fear_source` makes.
                 let (_, caster) = fears.iter().find(|(unit, _)| unit == guid)?;
-                // The caster if it is still in the world; failing that, whatever the creature was
-                // fighting — it still flees SOMETHING.
                 let source = self.unit(*caster).map(|(at, _)| at).or_else(|| {
                     let victim = self
                         .fights
@@ -3132,8 +2939,6 @@ impl FearSink for Scenario {
     }
 }
 
-// The in-memory pet world. An owner is a player in production; the harness resolves a creature row
-// too, and a gone-or-dead owner reads as `None` either way — which is what despawns the pet.
 impl PetSink for Scenario {
     fn pets(&self, scope: &TickScope, candidates: &[u64]) -> Vec<Pet> {
         let creatures = self.creatures.borrow();
@@ -3170,15 +2975,10 @@ impl PetSink for Scenario {
         if target == 0 || target == pet.guid || target == owner.guid {
             return false;
         }
-        // Only a live CREATURE row is a valid foe: a player, a corpse and another pet are all out.
-        // The FACTION half of the guard is the world's (`pet::may_attack`) — a scenario states who
-        // exists, not who is friendly to whom.
         self.creatures.borrow().contains_key(&target)
             && !self.corpses.borrow().contains(&target)
             && !self.pet_owners.borrow().contains_key(&target)
     }
-    /// The seek RADIUS is the world's (`pet::nearest_hostile_near`); what the cycle decides is WHEN
-    /// to ask, so the scenario answers with the nearest foe it holds at all.
     fn nearest_hostile_to(&self, pet: &Pet) -> Option<u64> {
         let creatures = self.creatures.borrow();
         creatures
@@ -3250,14 +3050,11 @@ impl PetSink for Scenario {
 }
 
 const WOLF: u64 = 0x0000_0000_0000_0BEE;
-/// A second and third wolf of the same pack, guid-ordered after `WOLF`.
 const PACK_MATE: u64 = WOLF + 1;
 const FAR_MATE: u64 = WOLF + 2;
 const HUNTER: u64 = 0x0000_0000_0000_0A11;
 const RANGER: u64 = HUNTER + 1;
-/// A warlock's summoned Imp, and the guid its owner carries.
 const IMP: u64 = 0x0000_0000_0000_1117;
-/// An authored offensive spell, a heal, a debuff and a self-buff.
 const NUKE: u32 = 100;
 const HEAL: u32 = 101;
 const DEBUFF: u32 = 102;
@@ -3266,10 +3063,8 @@ const BEASTS: u32 = 14;
 const ALLIANCE: u32 = 1;
 const MAP: u32 = 0;
 const INSTANCE: u64 = 0;
-/// A one-second leg launched at t=0, sampled half way through.
 const LEG_MS: u32 = 1000;
 const HALF_WAY: u64 = 500_000;
-/// The 1.12 turn-left bit — a movement flag that is deliberately NOT translation.
 const MOVE_FLAG_TURN_LEFT: u32 = 0x10;
 
 fn p(x: f32, y: f32, z: f32) -> Point {
@@ -3280,15 +3075,12 @@ fn catch_all() -> TickScope {
     TickScope::from_rows(crate::creatures::GLOBAL_TICK_INSTANCE, [])
 }
 
-/// A wolf half way through a 10-yard leg.
 fn wolf_mid_flight(now_micros: u64) -> Scenario {
     Scenario::new(now_micros)
         .creature(WOLF, p(0.0, 0.0, 10.0))
         .flying(WOLF, p(0.0, 0.0, 10.0), p(10.0, 0.0, 10.0), 0, LEG_MS)
 }
 
-/// A route-less wolf awake near a player, with its spawn post at the origin: the shape both
-/// walking home and loitering decide on.
 fn idle_wolf(at: Point, wanders: bool) -> Scenario {
     Scenario::new(HALF_WAY)
         .creature(WOLF, at)
@@ -3331,8 +3123,6 @@ fn a_creature_mid_flight_moves_to_the_point_its_client_renders() {
 
 #[test]
 fn a_later_pass_reads_the_advanced_position_not_the_leg_start() {
-    // The wolf renders at (5, 0) half way through its leg. The waypoint BEHIND it is the nearer one
-    // from the leg start, the waypoint AHEAD is the nearer one from where it actually is.
     let mut w = wolf_mid_flight(HALF_WAY)
         .awake([WOLF])
         .route(WOLF, &[(1, p(-4.0, 0.0, 10.0)), (2, p(11.0, 0.0, 10.0))]);
@@ -3371,7 +3161,7 @@ fn a_patrolling_creature_walks_the_next_segment_of_its_route() {
             guid: WOLF,
             start: p(0.0, 0.0, 10.0),
             dest: p(10.0, 0.0, 10.0),
-            dur_ms: 4000, // 10 yd at WALK
+            dur_ms: 4000,
             spline_id: now_ms,
             run: false,
             map_id: MAP,
@@ -3394,7 +3184,6 @@ fn a_patrolling_creature_walks_the_next_segment_of_its_route() {
 
 #[test]
 fn a_badly_displaced_patroller_steps_toward_its_waypoint_one_firing_at_a_time() {
-    // Combat dragged the wolf 300 yd off its route while it was already walking to waypoint 2.
     let route = [(1, p(5.0, 5.0, 10.0)), (2, p(0.0, 0.0, 10.0))];
     let mut w = Scenario::new(HALF_WAY)
         .creature(WOLF, p(0.0, 300.0, 10.0))
@@ -3421,8 +3210,6 @@ fn a_badly_displaced_patroller_steps_toward_its_waypoint_one_firing_at_a_time() 
 
 #[test]
 fn a_displaced_patroller_converges_then_resumes_ordinary_patrolling() {
-    // Just past the displaced threshold: one stepped firing closes enough of the gap that the next
-    // one falls back to an ordinary, held-to-completion leg straight to the waypoint.
     let route = [(1, p(5.0, 5.0, 10.0)), (2, p(0.0, 0.0, 10.0))];
     let mut w = Scenario::new(HALF_WAY)
         .creature(WOLF, p(0.0, 41.0, 10.0))
@@ -3431,7 +3218,7 @@ fn a_displaced_patroller_converges_then_resumes_ordinary_patrolling() {
         .walking_to(WOLF, 2);
     let tick = w.tick(true, catch_all());
     run_cycle(&mut w, tick);
-    w.advance_clock(500_000); // the stepped leg's own duration — it has landed
+    w.advance_clock(500_000);
 
     let tick = w.tick(true, catch_all());
     run_cycle(&mut w, tick);
@@ -3499,11 +3286,10 @@ fn a_creature_that_runs_home_does_not_also_wander_in_the_same_firing() {
 
 #[test]
 fn a_creature_that_reaches_home_loiters_again() {
-    // Just outside the leash: one run leg lands it back inside, so the NEXT cycle loiters instead.
     let mut w = idle_wolf(p(0.0, 16.0, 10.0), true).rolls([0, 0, 0]);
     let tick = w.tick(true, catch_all());
     run_cycle(&mut w, tick);
-    w.advance_clock(500_000); // the run leg's own duration — it has landed
+    w.advance_clock(500_000);
 
     let tick = w.tick(true, catch_all());
     run_cycle(&mut w, tick);
@@ -3522,7 +3308,6 @@ fn a_creature_that_reaches_home_loiters_again() {
 
 #[test]
 fn an_idle_creature_loiters_near_its_post_on_about_a_third_of_firings() {
-    // roll 0: below WANDER_CHANCE_PCT, so it hops. Angle 0 and a full radius roll aim due east.
     for (chance_roll, hops) in [(0u32, true), (99, false)] {
         let mut w = idle_wolf(p(0.0, 0.0, 10.0), true).rolls([chance_roll, 0, u32::MAX]);
         let tick = w.tick(true, catch_all());
@@ -3618,7 +3403,6 @@ fn an_engaged_or_suppressed_creature_is_moved_by_no_idle_behavior() {
     let holds: [fn(Scenario, u64) -> Scenario; 2] = [Scenario::fighting, Scenario::rooted];
     for held in holds {
         for patrols in [true, false] {
-            // Displaced past its leash and RANDOM-movement, so all three idle movers would want it.
             let mut w = Scenario::new(HALF_WAY)
                 .creature(WOLF, p(0.0, 20.0, 10.0))
                 .awake([WOLF])
@@ -3733,8 +3517,6 @@ fn a_new_obstruction_stops_a_retained_path_before_committing_the_next_position()
     assert_eq!(w.effects()[0].dur_ms, 0);
 }
 
-/// A wolf the last firing stored at `stored`, 1.5 s along a Route Path from (0, 0) through
-/// (10, 0) to (10, 10): 20 yd in 4 s, so its first segment ends 2 s after the start.
 fn wolf_on_a_route_path(stored: Point) -> Scenario {
     let w = Scenario::new(1_500_000).creature(WOLF, stored).flying(
         WOLF,
@@ -3756,7 +3538,6 @@ fn assert_near(at: Point, want: Point) {
 
 #[test]
 fn a_stop_after_a_segment_end_holds_the_rendered_point_facing_the_next_segment() {
-    // The first segment ended at 2 s and the stop comes at 2.3 s, before the next firing.
     let w = wolf_on_a_route_path(p(7.5, 0.0, 10.0));
     let leg = w.legs.borrow()[0].clone();
     let stop = stop_on_leg(&w, &leg, 2_300_000).expect("a finite stop");
@@ -3915,8 +3696,6 @@ fn world_maintenance_and_package_passes_run_on_every_catch_all_firing() {
     }
 }
 
-/// An awake wolf at the origin and a hostile player it may notice. Both are level 10, so the
-/// level-scaled aggro radius is the flat 20 yards.
 fn wolf_and_player(player_at: Point) -> Scenario {
     Scenario::new(HALF_WAY)
         .creature(WOLF, p(0.0, 0.0, 10.0))
@@ -3925,13 +3704,10 @@ fn wolf_and_player(player_at: Point) -> Scenario {
         .player(HUNTER, player_at)
 }
 
-/// A scenario twist a table-driven test applies before it runs the cycle.
 type Twist = fn(Scenario) -> Scenario;
 
-/// One cast the cycle began: who cast, which spell, and at whom.
 type CastEffect = (u64, u32, u64);
 
-/// A passive pack mate: it answers a call but never notices a player by itself.
 fn pack_mate(w: Scenario, guid: u64, at: Point) -> Scenario {
     w.creature(guid, at).tuned_aggro_range(guid, 1)
 }
@@ -3985,7 +3761,6 @@ fn a_creature_outside_every_active_cell_notices_nobody() {
 
 #[test]
 fn a_stealthed_player_is_noticed_only_from_inside_the_detection_range() {
-    // Level 10 against level 10: a 20-yard aggro radius, but only 5 yards of seeing through stealth.
     for (dist, noticed) in [(4.0f32, true), (9.0, false)] {
         let mut w = wolf_and_player(p(dist, 0.0, 10.0)).stealthed(HUNTER);
         let tick = w.tick(true, catch_all());
@@ -4230,12 +4005,8 @@ fn a_creature_that_pulls_is_in_combat_before_the_same_cycle_ends() {
     );
 }
 
-/// A clock late enough that a unit which has never moved reads as STANDING STILL: chase plants a
-/// creature only next to a victim whose move clock has gone quiet for `CHASE_TARGET_MOVING_MS`.
 const SETTLED: u64 = 4_000_000;
 
-/// A wolf at the origin and a hostile player, on the settled clock — the shape every fight scenario
-/// starts from. The wolf is NOT awake: chase is driven by the engagements, not by the sweep.
 fn wolf_fighting(player_at: Point) -> Scenario {
     Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 0.0, 10.0))
@@ -4302,7 +4073,6 @@ fn a_chaser_rides_one_committed_leg_until_its_victim_veers() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    // The kiter keeps running straight: the chaser is already pointed at it.
     w.advance_clock(500_000);
     w = w.kiting(HUNTER, p(23.0, 0.0, 10.0));
     let tick = w.tick(false, catch_all());
@@ -4315,7 +4085,6 @@ fn a_chaser_rides_one_committed_leg_until_its_victim_veers() {
          the committed leg exists to remove"
     );
 
-    // The kiter cuts away: the held heading no longer points at it.
     w.advance_clock(500_000);
     w = w.kiting(HUNTER, p(23.0, 20.0, 10.0));
     let tick = w.tick(false, catch_all());
@@ -4336,7 +4105,6 @@ fn a_chaser_rides_one_committed_leg_until_its_victim_veers() {
 
 #[test]
 fn a_creature_that_reaches_a_standing_victim_stops_and_faces_it() {
-    // Half way through a leg thrown at the player, who has since stopped two yards ahead of it.
     let launched = SETTLED - 500_000;
     let mut w = wolf_fighting(p(7.0, 0.0, 10.0))
         .facing(WOLF, std::f32::consts::PI)
@@ -4386,7 +4154,6 @@ fn a_creature_that_reaches_a_standing_victim_stops_and_faces_it() {
 
 #[test]
 fn a_creature_whose_victim_kites_out_of_reach_keeps_chasing() {
-    // Inside melee reach, but running: vanilla mobs run a kiter down and swing on the move.
     let mut w = wolf_fighting(p(4.0, 0.0, 10.0))
         .kiting(HUNTER, p(4.0, 0.0, 10.0))
         .attacking(WOLF, HUNTER);
@@ -4405,12 +4172,8 @@ fn a_creature_whose_victim_kites_out_of_reach_keeps_chasing() {
     );
 }
 
-/// The window the DISPLACED rule read the victim's move clock over. A stop packet lands well inside
-/// it, which is why a clock cannot answer "is this player still running".
 const STALE_MOVE_WINDOW_MS: u32 = 700;
 
-/// The bearings a player walks up to a creature from. Nothing about the answer may depend on which
-/// side they stand on.
 const APPROACHES: [f32; 8] = [
     0.0,
     std::f32::consts::FRAC_PI_4,
@@ -4495,8 +4258,6 @@ fn a_kiter_inside_reach_is_chased_without_a_stop_between_firings() {
     let mut w = wolf_fighting(p(4.0, 0.0, 10.0))
         .kiting(HUNTER, p(4.0, 0.0, 10.0))
         .attacking(WOLF, HUNTER);
-    // Three firings of a straight-line kite: the victim keeps its heading, so the committed leg
-    // keeps its own.
     for step in 0..3 {
         let tick = w.tick(false, catch_all());
         run_cycle(&mut w, tick);
@@ -4525,8 +4286,6 @@ fn a_lead_leg_is_stopped_where_it_renders_once_the_victim_stops() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    // The player releases the key half a firing into the lead leg, inside melee reach of where the
-    // creature now renders.
     w.advance_clock(500_000);
     w = w.stopped(HUNTER);
     let tick = w.tick(false, catch_all());
@@ -4630,8 +4389,6 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    // The player releases the key at 23 yd, still well outside melee reach, half a firing into
-    // the lead leg the first cycle threw at the old heading.
     w.advance_clock(500_000);
     w = w.kiting(HUNTER, p(23.0, 0.0, 10.0)).stopped(HUNTER);
     let tick = w.tick(false, catch_all());
@@ -4668,8 +4425,6 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
          lead leg through the player"
     );
 
-    // Ride the replacement out: the creature must never pass the victim it stopped short of, and
-    // the approach must end on the one facing spline the stop writes at the stop point.
     for _ in 0..8 {
         w.advance_clock(500_000);
         let tick = w.tick(false, catch_all());
@@ -4699,10 +4454,6 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
 
 #[test]
 fn a_creature_victim_with_a_leg_in_flight_is_chased_like_a_kiting_player() {
-    // A creature or pet victim carries no move flags of its own — the leg the cycle is already
-    // moving it along is what says it travels. Same shape as a kiting player: run it down with a
-    // lead rather than planting into attack stance, which is the run/stand/run flicker chase exists
-    // to remove.
     let mut w = Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 0.0, 10.0))
         .creature(PACK_MATE, p(4.0, 0.0, 10.0))
@@ -4781,8 +4532,6 @@ fn an_offensive_caster_holds_at_its_spell_range() {
 
 #[test]
 fn a_caster_whose_victim_stops_inside_reach_turns_and_halts_its_lead() {
-    // Half way through a leg thrown at the player, who has since stopped two yards ahead of it,
-    // well inside the 30 yd the caster would otherwise hold at.
     let launched = SETTLED - 500_000;
     let mut w = wolf_fighting(p(7.0, 0.0, 10.0))
         .caster(WOLF, 30.0)
@@ -4843,8 +4592,6 @@ fn a_blocked_chase_goes_around_instead_of_through() {
     );
 }
 
-/// A wolf fighting the hunter with ONE authored spell and 30 yards of spell range — the caster shape
-/// the cast phase decides on. The cast phase is a sensing phase, so its scenarios fire `sense`.
 fn wolf_casting(player_at: Point) -> Scenario {
     wolf_fighting(player_at)
         .attacking(WOLF, HUNTER)
@@ -4905,7 +4652,6 @@ fn a_caster_that_cannot_act_or_is_already_casting_begins_nothing() {
 
 #[test]
 fn the_rotation_fires_its_highest_priority_ready_action() {
-    // A heal it only wants below half health, over a nuke it can always throw.
     let rotation = |w: Scenario| {
         w.rotation_line(WOLF, HEAL, CastWhen::Hurt(50), 10)
             .rotation_line(WOLF, NUKE, CastWhen::Always, 1)
@@ -5095,13 +4841,10 @@ fn a_taunt_pins_the_target_whatever_the_threat_table_says() {
     }
 }
 
-/// A wolf swinging at a hunter standing INSIDE melee reach and already faced: chase decides to stand
-/// still, so every movement effect in these scenarios is the rout's or fear's own.
 fn wolf_cornered() -> Scenario {
     wolf_fighting(p(3.0, 0.0, 10.0)).attacking(WOLF, HUNTER)
 }
 
-/// What a healthy creature's run leg over the committed rout distance would take.
 fn healthy_rout_ms() -> u32 {
     (FLEE_LEG_YD / lyracore_shared::constants::speeds::RUN * 1000.0) as u32
 }
@@ -5140,7 +4883,6 @@ fn a_wounded_runner_breaks_off_and_sprints_away_from_its_victim() {
 
 #[test]
 fn a_creature_that_fights_to_the_death_never_enters_the_rout_path() {
-    // Identically wounded, but a beast/undead/elemental or a pet: it stands and swings.
     let mut w = wolf_cornered().hurt(WOLF, 10);
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
@@ -5174,7 +4916,6 @@ fn a_router_rides_its_committed_leg_and_re_rolls_only_once_it_ends() {
         "a router must stay ENGAGED while it runs, or it can be neither chased down nor killed"
     );
 
-    // The dash lands, and the window is still open: the next one is rolled from where it stopped.
     w.advance_clock(dur_ms as u64 * 1000);
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
@@ -5193,7 +4934,6 @@ fn a_spent_rout_returns_the_creature_to_chasing_and_never_opens_a_second() {
     run_cycle(&mut w, tick);
     let opened_at = w.rout_ends_ms(WOLF);
 
-    // Past the window: the dash has landed and the creature is an ordinary attacker again.
     w.advance_clock(ROUT_DURATION_MS as u64 * 1000 + 1_000_000);
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
@@ -5309,7 +5049,7 @@ fn a_crowd_controlled_router_keeps_its_state_and_resumes_when_the_control_ends()
          window here is a creature that stands still for good once the control lifts"
     );
 
-    w.frozen.borrow_mut().remove(&WOLF); // the root expires
+    w.frozen.borrow_mut().remove(&WOLF);
     w.advance_clock(500_000);
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
@@ -5321,8 +5061,6 @@ fn a_crowd_controlled_router_keeps_its_state_and_resumes_when_the_control_ends()
     );
 }
 
-/// A warlock at the origin with its Imp beside it, on the settled clock. The pet phase is a SENSING
-/// phase, so every scenario below fires `sense`.
 fn warlock_and_imp(imp_at: Point) -> Scenario {
     Scenario::new(SETTLED)
         .player(HUNTER, p(0.0, 0.0, 10.0))
@@ -5612,13 +5350,10 @@ fn a_pet_whose_owner_changed_instance_is_snapped_across_rather_than_walked() {
     );
 }
 
-/// The `SETTLED` clock in ms — what a combat-drop deadline is measured against.
 const SETTLED_MS: u64 = SETTLED / 1000;
 
 #[test]
 fn a_creature_that_engaged_and_chased_this_cycle_is_not_healed_by_the_same_cycle() {
-    // The fight is armed by the aggro phase of THIS cycle, so regeneration's gate can only see it
-    // by running after that phase.
     let mut w = wolf_fighting(p(15.0, 0.0, 10.0))
         .awake([WOLF])
         .hurt(WOLF, 10);
@@ -5670,8 +5405,6 @@ fn a_unit_in_combat_heals_only_through_a_combat_regen_aura() {
         ("carrying Troll Regeneration", |w| w.combat_regen(WOLF), 11),
     ];
     for (case, twist, health) in cases {
-        // Flagged in combat with no melee row of its own: a pure caster, which is the half of the
-        // in-combat verdict the engagement rows do not answer.
         let mut w = twist(
             Scenario::new(SETTLED)
                 .creature(WOLF, p(0.0, 0.0, 10.0))
@@ -5732,8 +5465,6 @@ fn combat_entry_outlasts_combat_exit_in_the_same_cycle() {
 
 #[test]
 fn a_creature_the_leash_dropped_walks_home_and_leaves_combat_in_one_cycle() {
-    // The leash pass in `tick_melee` already evaded this creature: its engagement is gone and its
-    // combat deadline has run out. What is left is what the cycle owns.
     let mut evaded = Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 20.0, 10.0))
         .awake([WOLF])
@@ -5758,7 +5489,6 @@ fn a_creature_the_leash_dropped_walks_home_and_leaves_combat_in_one_cycle() {
          healed by the same firing that released it recovers a tick early for free"
     );
 
-    // The same creature with the pursuit still live: the fight owns it, so nothing walks it home.
     let mut pursuing = Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 20.0, 10.0))
         .awake([WOLF])
@@ -5818,17 +5548,9 @@ fn regeneration_and_combat_exit_run_only_on_the_catch_all_sense_firing() {
     }
 }
 
-// ================================================================================================
-//  COVERAGE, CADENCE AND COST — what one firing is allowed to touch, and how often
-// ================================================================================================
-
-/// The instance that has a schedule row of its own in the partition scenarios.
 const DEDICATED: u64 = 7;
-/// A third player, so each instance's fight has its own victim.
 const WARDEN: u64 = RANGER + 1;
 
-/// One fight per instance — the open world, the dedicated-row instance, and a third instance with
-/// no row of its own. Every creature stands 15 yards from its victim, so chase moves all three.
 fn one_fight_per_instance() -> Scenario {
     Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 0.0, 10.0))
@@ -5862,7 +5584,6 @@ fn the_catch_all_firing_covers_every_instance_exactly_once() {
 #[test]
 fn a_dedicated_row_and_the_catch_all_stay_a_strict_partition() {
     let mut w = one_fight_per_instance();
-    // The catch-all skips the instance holding a row of its own; that row then fires for it.
     let tick = w.tick(
         false,
         TickScope::from_rows(
@@ -5901,12 +5622,9 @@ fn a_dedicated_row_and_the_catch_all_stay_a_strict_partition() {
 
 #[test]
 fn movement_runs_every_firing_while_sensing_holds_the_four_second_cadence() {
-    // A 100ms dedicated row and the seeded 500ms world row, over the SAME closed four seconds
-    // (t = 0 through 4s), so both are compared at the same instant.
     let mut settled_at = Vec::new();
     for (interval_micros, firings) in [(100_000i64, 41u64), (crate::creatures::MOVE_TICK_MICROS, 9)]
     {
-        // A minute-long leg, so there is movement work left on every firing of the window.
         let mut w = Scenario::new(0).creature(WOLF, p(0.0, 0.0, 10.0)).flying(
             WOLF,
             p(0.0, 0.0, 10.0),
@@ -5943,9 +5661,6 @@ fn movement_runs_every_firing_while_sensing_holds_the_four_second_cadence() {
 
 #[test]
 fn discovery_stays_on_the_narrow_candidate_universes() {
-    // A crowded world: twelve creatures, of which two are awake near the player and exactly one is
-    // fighting. The counts below are what an operator greps for; a phase that regressed to a
-    // full-world scan reports twelve here and keeps every behavior test green.
     let mut w = Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 0.0, 10.0))
         .creature(PACK_MATE, p(60.0, 0.0, 10.0))

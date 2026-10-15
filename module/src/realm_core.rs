@@ -1,58 +1,15 @@
-//! Realm-core: the realm-wide **character→shard index** (spec).
-//!
-//! # What "realm-core" is
-//!
-//! Realm-core is not a new service and not a new crate — it is **this same module published under a
-//! different database name** (`spacetime publish … realm-core`). Every table in the module exists on
-//! every database; which tables are *authoritative* where is a deployment fact the GATEWAY knows, not
-//! a schema fact. On realm-core the authoritative tables are `game_account`, `game_session`, and the
-//! [`CharacterShard`] index below; on a world shard those first two are a write-through cache
-//! and this index is a *forwarding receipt* (see below). Everything else in
-//! the module is simply inert on realm-core, because nothing ever writes it there.
-//!
-//! That is the laziest structure that works: no second wasm crate, no shared-schema crate, no
-//! conditional compilation — one artifact, N deployments, and the routing lives in the gateway where
-//! every other routing decision already lives (`gateway/src/config.rs`'s `ShardMap`).
-//!
-//! # The index orders routing state
-//!
-//! `game_character_shard` answers "which (map, instance) — and therefore, through the shard map,
-//! which database — owns this character". It stores the LOCATION rather than a database name on
-//! purpose: a database name would be invalidated by every shard-map edit (an operator rebalancing a
-//! pool would silently strand every indexed character), whereas a location is re-resolvable against
-//! whatever map is loaded today.
-//!
-//! The gateway treats an entry as a hint it must confirm: it accepts the hint only when the shard it
-//! names actually holds the character row, and otherwise falls back to probing the connected shards
-//! and writes the corrected entry back (`gateway/src/realm_core.rs::locate_home_shard`, and the
-//! tests there). So a stale — or entirely absent, or maliciously wrong — index entry costs one extra
-//! cache lookup at login and then heals a settled row. Party partition projection uses only its
-//! ordered Realm revision and pending phase; a Transfer compare-and-set prevents an old worker from
-//! moving that state backward.
-
 use spacetimedb::{reducer, table, Identity, ReducerContext, Table};
 
-/// Character→shard index entry: "character `character_guid` lives at (`map_id`, `instance_id`)".
-///
-/// PRIVATE (no `public`): this is realm operations data, not game state — a public table would hand
-/// every connected client a directory of every character's whereabouts. The gateway's coordinator
-/// connection authenticates with the owner token, which bypasses RLS, so it subscribes to it exactly
-/// the way it already subscribes to the private `game_account` / `game_session`. [session]
 #[table(accessor = game_character_shard)]
 pub struct CharacterShard {
     #[primary_key]
     pub character_guid: u64,
     pub map_id: u32,
     pub instance_id: u64,
-    /// When this entry was written — diagnostics only (nothing reads it to decide anything; the
-    /// gateway confirms an entry by probing, never by trusting its age).
     pub updated_micros: i64,
-    /// Realm-core-owned order for settled partition changes. World Shard copies have their own
-    /// independent value and never certify a party member's remote partition.
+    // World Shard revisions are independent and cannot certify a remote party partition.
     #[default(1u64)]
     pub revision: u64,
-    /// Exact bot crossing that last advanced this Realm locator. Generic player/login repairs clear
-    /// these fields; a bot publication uses them for idempotence without trusting a destination.
     #[default(Identity::ZERO)]
     pub bot_source_identity: Identity,
     #[default(0u64)]
@@ -67,30 +24,13 @@ pub struct CharacterShard {
     pub pending_destination_instance: u64,
 }
 
-// A deleted character must not leave a directory entry behind: guids are reused (`create_character`
-// allocates max-referenced + 1), so a stale entry could name a shard for a guid that now belongs to
-// someone else. Harmless in itself — the gateway confirms every hint by probing — but one fewer wrong
-// answer to reason about, for one line.
 crate::character_owned!(delete, fn sweep_delete_game_character_shard(ctx, character_guid) {
     ctx.db.game_character_shard().character_guid().delete(character_guid);
 });
 
-// CROSS-DATABASE transport: the directory entry deliberately does NOT ride the
-// export blob. It is not character data — it is a routing HINT about WHERE the character is, and the
-// blob's whole purpose is to change that. The source's row is snapshotted by `begin_transfer` while
-// it still names the SOURCE, so importing it would give the destination a forwarding receipt
-// pointing back at the shard the character just left: a login there would be bounced to a database
-// that no longer holds it, until the gateway's probe healed it. The two writes that DO keep the
-// directory honest are `transfer::do_finish` (the source's own row, rewritten to name the
-// destination, in the escrow's transaction) and the gateway's `set_character_shard` against
-// realm-core, which is the authoritative copy — driven as a required step of
-// `world::transfer::run_transfer` immediately after `finish_transfer` commits, and
-// re-driven by the login self-heal probe whenever the two disagree.
+// Routing hints do not travel; the source snapshot still names the partition being left.
 crate::character_owned!(not_transported, fn sweep_transfer_game_character_shard());
 
-/// Upsert the index entry for `character_guid`. Shared by [`set_character_shard`] (the gateway's
-/// write, on realm-core) and by `transfer::do_finish` (the module's write, in the SAME transaction
-/// that releases the escrow).
 pub(crate) fn record_shard(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -135,12 +75,8 @@ pub(crate) fn record_shard(
     }
 }
 
-/// Mark one crossing before the source is frozen. Party partition certification treats this Realm
-/// phase as pending without trusting a World Shard cache that can change after it is sampled.
-/// A human crossing with source revision zero requires an absent locator and inserts pending
-/// revision one. Replays must name that same pending crossing; they cannot replace a settled row.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // Exact predecessor, destination, crossing, and Actor are the wire Gate.
+#[allow(clippy::too_many_arguments)]
 pub fn begin_character_shard_transfer(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -224,10 +160,8 @@ pub fn begin_character_shard_transfer(
     Ok(())
 }
 
-/// Settle only the crossing that owns Realm-core's pending phase. Repeating the same settlement is
-/// idempotent; any later crossing has a different predecessor revision and is left untouched.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // Exact predecessor, destination, crossing, and Actor are the wire Gate.
+#[allow(clippy::too_many_arguments)]
 pub fn finish_character_shard_transfer(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -306,11 +240,8 @@ pub fn finish_character_shard_transfer(
     Ok(())
 }
 
-/// Resume the one Realm pending phase from an observed destination Character. This closes the
-/// process-crash window after source finish, when the source plan is gone but the destination copy
-/// and Realm phase still identify the same landing partition.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // Exact observed Realm phase, arrival crossing, and Actor are one CAS Gate.
+#[allow(clippy::too_many_arguments)]
 pub fn finish_pending_character_shard_transfer(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -381,14 +312,6 @@ fn next_shard_revision(current: Option<&CharacterShard>, map_id: u32, instance_i
     }
 }
 
-/// Publish a character's location into the realm-core index. Operator-gated like every other
-/// gateway-coordination reducer (`provision_account` / `establish_session`): the index is a routing
-/// input, so a client that could write it could redirect another player's login.
-///
-/// The Gateway's one caller is the login self-heal in `realm_core::locate_home_shard`, which
-/// `settle_home_shard` runs at every world entry: it reads this index first, confirms the hint on
-/// the Shard it names, and rewrites the entry when the Shard that holds the Character disagrees.
-/// A Transfer settles its destination through `finish_character_shard_transfer` instead.
 #[reducer]
 pub fn set_character_shard(
     ctx: &ReducerContext,
@@ -412,34 +335,13 @@ pub fn set_character_shard(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
-// Guid-range registry — realm-core answers "which shard mints from where"
-// ---------------------------------------------------------------------------------------------
-
-/// How many guids a slot owns. Slot *n* is `[n · GUID_RANGE_SIZE, (n+1) · GUID_RANGE_SIZE)`, which
-/// makes the hand-applied floors (core 0, world-1 1e9, instances 2e9, realm-core 3e9) slots
-/// 0/1/2/3 exactly — so the live databases migrate into this registry by being *recorded*, with no
-/// guid changing. Decimal and small on purpose (`GuidRange`'s doc, `auth.rs`): readable in logs and SQL,
-/// a billion issued identities per Shard shared by Characters and items. Current assignments are
-/// far below `2^53`, above which `spacetime call` mangles a u64
-/// argument (danger-zones).
 pub const GUID_RANGE_SIZE: u64 = 1_000_000_000;
 
-/// Which slot a database that has already minted up to `mark` is *actually* using. Pure.
 pub(crate) fn slot_of(mark: u64) -> u32 {
     (mark / GUID_RANGE_SIZE) as u32
 }
 
-/// Which slot to assign, given the slots already taken and the one the shard is already minting
-/// from. Pure — the whole allocation decision, so the ordering property below is testable without a
-/// database.
-///
-/// **Order independence is the load-bearing property.** Handing out `max + 1` unconditionally would
-/// make the outcome depend on the order the gateway happens to claim in: claim `world-1` (already
-/// minting at 1e9, slot 1) first and it would take slot 0, then `lyracore` — which holds
-/// guids 1..213, i.e. slot 0 — would be handed slot 1 and mint straight into world-1's live
-/// characters. Preferring the shard's own slot when it is free makes every live shard land on the
-/// range it is already using, in any order.
+// Prefer the Shard's existing slot so claim order cannot change already issued GUID ranges.
 pub(crate) fn assign_slot(taken: impl Iterator<Item = u32>, desired: u32) -> u32 {
     let taken: Vec<u32> = taken.collect();
     if !taken.contains(&desired) {
@@ -448,17 +350,11 @@ pub(crate) fn assign_slot(taken: impl Iterator<Item = u32>, desired: u32) -> u32
     taken.iter().max().map_or(0, |m| m + 1)
 }
 
-/// Which shard owns which guid range. **Realm-core's table**, in the same sense as
-/// [`CharacterShard`] above: it exists on every database and is authoritative on exactly one.
-///
-/// PRIVATE for the same reason as the index — realm operations data, not game state.
 #[table(accessor = game_guid_range_registry)]
 pub struct GuidRangeAssignment {
     #[primary_key]
     pub shard_name: String,
-    /// `#[unique]` is the conflict-safety, not a convention: two gateways claiming at once cannot
-    /// both land on one slot, because the second insert violates this constraint and its whole
-    /// transaction aborts.
+    // The unique slot aborts a concurrent claim rather than assigning the same range twice.
     #[unique]
     pub slot: u32,
     pub base: u64,
@@ -466,16 +362,6 @@ pub struct GuidRangeAssignment {
     pub assigned_micros: i64,
 }
 
-/// Assign `shard_name` a guid range, once in that shard's lifetime. Idempotent: a shard that
-/// already holds one keeps it — re-running this is how the gateway checks, so it must be free.
-///
-/// `current_mark` is the shard's own `game_guid_allocator` high-water, which is what makes the
-/// four live databases migrate onto their existing floors instead of being shuffled (see
-/// [`assign_slot`]). The caller then installs the assigned base on the shard itself with
-/// `auth::install_guid_range`; nothing here reaches across databases, because nothing can.
-///
-/// Operator-gated like every other gateway-coordination reducer: a client that could write this
-/// could hand a shard someone else's range.
 #[reducer]
 pub fn claim_guid_range(
     ctx: &ReducerContext,
@@ -535,8 +421,6 @@ mod guid_range_registry_tests {
 
     #[test]
     fn a_shard_keeps_the_slot_it_is_already_minting_from_whatever_the_claim_order() {
-        // The four live databases, by their floors — claimed in the WORST order (highest
-        // first), which is exactly what a `max + 1` allocator would mangle.
         let live = [
             ("world-1", 1_000_000_101u64),
             ("instances", 2_000_000_000),
@@ -553,7 +437,6 @@ mod guid_range_registry_tests {
             );
             taken.push(slot);
         }
-        // …and a brand-new shard, which has minted nothing, cannot be handed core's slot 0.
         let fresh = assign_slot(taken.iter().copied(), slot_of(0));
         assert!(
             !taken.contains(&fresh),

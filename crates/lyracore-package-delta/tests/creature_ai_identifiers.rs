@@ -1,9 +1,3 @@
-//! The creature-ai family's identifier policy and its global keys.
-//!
-//! One band covers three tables that share nothing else: a broadcast text, a summon placement and
-//! a quest event requirement are three independent identifier spaces. None of the three names a
-//! map, so every claim in this family is global and reaches every Shard.
-
 mod common;
 
 use common::{
@@ -33,8 +27,6 @@ fn every_creature_ai_key_is_its_own_row_identifier() {
     assert_eq!(requirement.table(), Table::QuestEventRequirement);
 }
 
-/// The `creature-ai` base import writes these three tables with global SQL, so a claim on one
-/// reaches every Shard. Nothing in the family carries a map to route by.
 #[test]
 fn no_creature_ai_claim_states_a_map() {
     for key in [
@@ -84,8 +76,6 @@ fn an_insert_outside_the_package_range_is_refused() {
     }
 }
 
-/// Every insertable creature-ai table shares one band, so one out-of-range identifier is refused
-/// the same way whichever of them names it.
 #[test]
 fn one_band_covers_every_insertable_creature_ai_table() {
     let out_of_band = PACKAGE_CREATURE_AI_ID_FLOOR - 1;
@@ -143,8 +133,6 @@ fn the_package_creature_ai_band_is_its_own() {
     assert!(!is_fixture_reserved_creature_ai_id(id));
 }
 
-/// Row 0 is not a row. Every creature-ai table keys on a surrogate identifier, so the refusal is
-/// the same on all three.
 #[test]
 fn row_zero_is_not_a_creature_ai_row() {
     for claim in [
@@ -160,8 +148,6 @@ fn row_zero_is_not_a_creature_ai_row() {
     }
 }
 
-/// The claim carries the row identifier in its key, so naming it again in `fields` would let a
-/// Package state it twice and disagree with itself.
 #[test]
 fn a_creature_ai_claim_may_not_restate_its_key() {
     assert_eq!(

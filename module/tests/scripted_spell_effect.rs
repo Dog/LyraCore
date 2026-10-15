@@ -1,10 +1,3 @@
-//! `E_SCRIPTED`: a spell effect whose `script_id` names a Runtime Script instead of a Rust handler.
-//!
-//! Everything here needs a live `ReducerContext` (the cast core, the `game_script` lookup, and the
-//! Runtime Script Host all meet only inside a real reducer call), which a native test has no way to
-//! build — see `module/src/spell/cast/resolve.rs`'s "no ctx harness by design" convention. This
-//! drives the rung those cannot reach: the precast Gate and the effect dispatch, end to end.
-
 mod support;
 
 use lyracore_shared::spell::taxonomy::{E_ENERGIZE, E_SCRIPTED, T_SELF, T_TARGET_ANY};
@@ -31,7 +24,6 @@ const FAILING_SCRIPT: u32 = 100_903;
 const HEAL_SCRIPT_COST: u32 = 30;
 const GATE_SPELL_COST: u32 = 40;
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_enabled_scripted_effect_heals_the_resolved_target_and_credits_xp_to_the_caster() {
@@ -97,8 +89,6 @@ fn an_enabled_scripted_effect_heals_the_resolved_target_and_credits_xp_to_the_ca
     );
 }
 
-/// `script_id == 0` is the vanilla no-op every seed/imported spell carries — this must stay exactly
-/// that after E_SCRIPTED gained real dispatch: no `game_script` lookup, no gate, no effect.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_scripted_effect_with_script_id_zero_stays_the_vanilla_no_op() {
@@ -146,9 +136,6 @@ fn a_scripted_effect_with_script_id_zero_stays_the_vanilla_no_op() {
     assert_eq!(xp(&standalone, PLAYER) - xp_before, 0);
 }
 
-/// A missing or disabled script named by a nonzero `script_id` refuses the WHOLE cast before any
-/// cost is spent — the same shape whether the row never existed or an Operator switched it off.
-/// Enabling the row then lets the identical cast through.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
@@ -175,7 +162,6 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
     );
     let wolf = spawn_wolf(&standalone);
 
-    // --- No game_script row at all: missing.
     let refused = standalone.call(
         "debug_force_cast_at",
         &[
@@ -195,7 +181,6 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
     );
     assert!(cast_events_for(&standalone, E_GATE_SPELL).is_empty());
 
-    // --- The row exists but is disabled.
     insert_script(
         &standalone,
         GATE_SCRIPT,
@@ -222,7 +207,6 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
     );
     assert!(cast_events_for(&standalone, E_GATE_SPELL).is_empty());
 
-    // --- Enabling the SAME row lets the SAME cast through.
     standalone.assert_sql(&format!(
         "UPDATE game_script SET enabled = true WHERE script_id = {GATE_SCRIPT}"
     ));
@@ -238,8 +222,6 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
     assert_eq!(cast_events_for(&standalone, E_GATE_SPELL).len(), 1);
 }
 
-/// A spell with a healthy effect ALONGSIDE a scripted effect whose script fails: the failure
-/// discards only that scripted effect's own staged operations, and the healthy effect still lands.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
@@ -253,7 +235,6 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
         "Fixture Scripted Partial Failure",
         0,
     );
-    // Effect 0: an ordinary ENERGIZE on the caster — unrelated to the script, deterministic.
     insert_effect(
         &standalone,
         E_PARTIAL_FAILURE_SPELL,
@@ -263,7 +244,6 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
         u32::from(T_SELF),
         0,
     );
-    // Effect 1: a script that stages a heal and then fails — the staged heal must never commit.
     insert_effect(
         &standalone,
         E_PARTIAL_FAILURE_SPELL,
@@ -281,9 +261,6 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
         "heal(event.target, 999)\nerror(\"boom\")",
     );
 
-    // Two calls, not one: the first buys headroom (`debug_set_power` raises `max_power` to meet
-    // whatever it is told), the second sets the floor comfortably under that ceiling so the
-    // effect's +50 below can never clamp against it.
     prevent_scheduled_regeneration(&standalone, PLAYER);
     standalone.assert_call("debug_set_power", &[&PLAYER.to_string(), "1000"]);
     standalone.assert_call("debug_set_power", &[&PLAYER.to_string(), "800"]);
@@ -354,7 +331,6 @@ fn insert_script(standalone: &Standalone, script_id: u32, name: &str, enabled: b
     ));
 }
 
-/// A Test Wolf within melee reach, tough enough to survive whatever this test does to it.
 fn spawn_wolf(standalone: &Standalone) -> u64 {
     standalone.assert_call(
         "debug_spawn_at_feet",
@@ -391,8 +367,6 @@ fn power(standalone: &Standalone, guid: u64) -> u32 {
         .expect("power is a number")
 }
 
-/// Keep an entity in combat beyond the fixture deadline so scheduled regeneration cannot change an
-/// exact health or power observation.
 fn prevent_scheduled_regeneration(standalone: &Standalone, guid: u64) {
     let flags = entity(standalone, guid)["unit_flags"]
         .parse::<u32>()

@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::entity::subscriptions::instance_relay_gate;
 use crate::codec::{self};
 use crate::stdb::bindings::*;
@@ -32,11 +30,7 @@ pub(crate) fn relay_gameobject_create(
         return Vec::new();
     };
     let view = go_view(row.clone(), &tmpl);
-    // The CREATE_OBJECT's typed descriptor builder can only carry rot0 of the 4-float spawn
-    // quaternion (gtker's slot-0-only wall), so the other 3 slots — and the yaw-derive fallback for
-    // an all-zero stored quaternion — ride a second raw VALUES frame right behind CREATE. The client
-    // has already materialized the object by the time this second frame arrives (same ordering the
-    // aura/quest-log raw-VALUES relays rely on elsewhere in this file).
+    // CREATE carries only rot0; send all four quaternion slots in the following VALUES frame.
     let (rot_opcode, rot_body) = codec::build_gameobject_rotation_values(&view);
     vec![
         Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(
@@ -96,8 +90,7 @@ pub(crate) fn gameobject_vanished(view: &WorldView, shard: ShardId, guid: u64) {
         return;
     };
     for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        // DESTROY stays ungated (the `on_melee_delete` precedent): SMSG_DESTROY_OBJECT for a guid
-        // the client never created is a client no-op, and gating it risks a stale object.
+        // DESTROY for an unknown guid is a client no-op; gating it can leave stale objects.
         enqueue(viewer.clone(), move |viewer| {
             crate::codec::gameobject::subscriptions::relay_gameobject_destroy(&viewer, guid)
         });

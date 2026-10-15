@@ -1,5 +1,3 @@
-//! World Session entry keeps queue, viewer registration, and Transfer operations in order.
-
 use super::handlers::build_buyback_view_replay;
 use super::*;
 
@@ -18,7 +16,6 @@ pub(super) fn login(
     if let Some(bound) = store.bind_session(token)? {
         conn.store.pin(bound);
     }
-    // Route before login and viewer registration so both use the Character's Home Shard.
     conn.route_home(character_guid)?;
     let home = conn.store.current();
     enter_world(tx, &*home, conn, character, codec::WorldEntry::FreshLogin)
@@ -37,8 +34,7 @@ pub(super) fn world_port_ack(
         log::debug!("world: spurious WORLDPORT_ACK ignored (guid {character_guid} still in world)");
         return Ok(());
     }
-    // Transfer cleanup must not publish source-shard changes to this viewer. Retain InWorld
-    // until entry succeeds so a failed Transfer still follows the existing logout policy.
+    // Unregister before source cleanup; retain InWorld until entry succeeds for failure logout.
     if let WorldState::InWorld(iw) = &mut conn.state {
         iw.subs.unregister_viewer();
     }
@@ -54,7 +50,6 @@ pub(super) fn world_port_ack(
     Ok(())
 }
 
-/// Queue the Transfer abort when possible, preserving the original failure.
 fn abort_pending_transfer<St: TransferStore + ?Sized>(
     tx: &SessionTx,
     store: &St,
@@ -90,7 +85,7 @@ fn abort_pending_transfer<St: TransferStore + ?Sized>(
     }
 }
 
-/// Queue self creation before registering the viewer; initial AOI Relays must follow it.
+// Queue self CREATE before registration so initial AOI Relays follow it.
 fn enter_world(
     tx: &SessionTx,
     store: &dyn WorldStore,
@@ -137,7 +132,6 @@ fn enter_world(
         entity.zone_id,
         WeatherChangeType::Instant,
     ));
-    // The login sequence and self creation stay contiguous on the writer.
     send(tx, Outbound::Batch(batch))?;
     for (opcode, body) in items.iter().filter_map(codec::build_random_property_values) {
         send(tx, Outbound::Raw { opcode, body })?;
@@ -151,7 +145,6 @@ fn enter_world(
             }
         }
     }
-    // Registration may queue initial AOI objects immediately.
     let subs =
         store.subscribe_player_events(conn.account_id, character_guid, &entity, tx.clone())?;
     if quests_enabled {
@@ -188,7 +181,6 @@ fn enter_world(
             ))),
         )?;
     }
-    // Record successful sign-on so cleanup owes a sign-off even if later entry work fails.
     if entry == codec::WorldEntry::FreshLogin && handlers::guild_sign_on(store, character_guid) {
         conn.guild_signed_on = Some(character_guid);
     }
@@ -207,7 +199,6 @@ fn enter_world(
         .collect();
     handlers::destroy_inert_charters(store, character_guid, &charters);
     crate::world::mail::redrive(store, character_guid);
-    // Forget snapshots after the party frame so the next tick supplies every field.
     if let Some(record) = subs.member_stats_record().cloned() {
         let forget = move || {
             record.forget_all();

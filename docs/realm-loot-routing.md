@@ -11,6 +11,15 @@ another database. That local roll is a staging copy. `relay_tick` promotes it to
 clears the staging copy so only one database votes and resolves it. The initial `ROLL_START`
 message reaches the nearby participants through their existing local relay.
 
+Realm-core keeps a Loot Roll Promotion Receipt for each source Module identity, corpse and slot.
+Its source roll ID is a high-water mark. Replays at or below that mark succeed without recreating
+the roll, even after resolution. A newer promotion waits until the current roll in that slot has
+resolved. Receipts have no expiry because delayed requests from a retired source can still arrive.
+
+The source `game_loot_roll` auto-increment sequence orders those generations. Content imports must
+preserve that sequence and must not insert explicit roll IDs. Restoring an older copy under the
+same Module identity can reuse IDs, so recovery must account for the receipts already on Realm-core.
+
 `run_vote` flushes pending promotions before issuing the vote on Realm-core. `party::run` also
 flushes them before leave and uninvite requests. Those requests can disband a Group, whose removal
 transaction must see every existing roll to resolve it immediately. A periodic poll alone leaves

@@ -24,9 +24,6 @@ fn party_line(recipients: &[u64], ignorable: bool) -> RealmChatEvent {
     }
 }
 
-/// Every queued packet for one viewer, jobs run in order.
-/// The body of every packet queued for one viewer, jobs run in order. Each packet must be one
-/// framed `SMSG_MESSAGECHAT`: size u16 big-endian, then opcode 0x0096 little-endian.
 fn received(rx: &Receiver<Outbound>) -> Vec<Vec<u8>> {
     let mut bodies = Vec::new();
     while let Ok(outbound) = rx.try_recv() {
@@ -48,17 +45,14 @@ fn received(rx: &Receiver<Outbound>) -> Vec<Vec<u8>> {
     bodies
 }
 
-/// A PARTY line in Common from `SPEAKER` saying "form up", written out from cm:Chat.cpp:3637-3641
-/// rather than built with the codec the Relay calls: type, language, the sender guid twice, the
-/// sized message with its terminator, then the chat tag.
 fn expected_line() -> Vec<u8> {
-    let mut body = vec![0x01]; // CHAT_MSG_PARTY
-    body.extend(7u32.to_le_bytes()); // LANG_COMMON
+    let mut body = vec![0x01];
+    body.extend(7u32.to_le_bytes());
     body.extend(SPEAKER.to_le_bytes());
     body.extend(SPEAKER.to_le_bytes());
-    body.extend(8u32.to_le_bytes()); // "form up" and its terminator
+    body.extend(8u32.to_le_bytes());
     body.extend(b"form up\0");
-    body.push(0); // CHAT_TAG_NONE
+    body.push(0);
     body
 }
 
@@ -120,8 +114,6 @@ fn the_ignore_set_follows_its_owners_ignore_rows_on_the_owners_shard() {
     assert!(!viewer.ignores(SPEAKER));
 }
 
-/// The friend set follows the same rule as the ignore set, off the SAME contact rows and
-/// callbacks, filtered by `is_ignore` the other way.
 #[test]
 fn the_friend_set_follows_its_owners_friend_rows_on_the_owners_shard() {
     let view = WorldView::new(true);

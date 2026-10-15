@@ -1,16 +1,7 @@
-//! Quest traffic over the world session. Which screen a quest opens, and which durable request it
-//! makes, is decided and proved at the `Quest::handle` seam (`handlers/quest.rs`). What is
-//! left here is only what the seam cannot see: that a quest opcode reaches the seam through the
-//! full handshake + login + cipher, and that the bodies it answers with survive the encrypted
-//! frame.
-
 use super::*;
 
 #[test]
 fn quest_choose_reward_relays_inventory_before_completion_over_the_cipher() {
-    // The socket-level contract: the subscribed reducer callback has already queued the complete
-    // item insertion when turn_in_quest returns, so the session's completion presentation must sit
-    // behind CREATE, its inventory pointer and gain feedback on the one writer queue.
     let mut s = quest_store();
     let detail = detail_view(1234, "A Threat Within");
     s.quest.quest_details = vec![detail.clone()];
@@ -254,7 +245,6 @@ fn assert_quest_entry(worldport: bool, cross_shard: bool) {
         .unwrap();
     let mut frames = drain_world_entry(&mut client, &mut c_dec);
     if worldport {
-        // Drain all login traffic before the map acknowledgement.
         wow_world_messages::vanilla::CMSG_PING {
             sequence_id: 647,
             round_time_in_ms: 0,
@@ -300,7 +290,6 @@ fn assert_create_quest_progress(frames: &[ServerOpcodeMessage]) {
             })
         })
         .expect("world entry must create the Character");
-    // Reframe the received CREATE descriptor as VALUES for the independent field decoder.
     let values = wow_world_messages::vanilla::SMSG_UPDATE_OBJECT {
         has_transport: 0,
         objects: vec![Object::Values {
@@ -333,9 +322,6 @@ fn assert_create_quest_progress(frames: &[ServerOpcodeMessage]) {
 
 #[test]
 fn quest_hello_reaches_the_quest_module_and_its_raw_details_body_survives_the_cipher() {
-    // The socket-level contract: dispatch routes HELLO to the quest module, and the raw-encoded
-    // DETAILS screen it returns crosses the encrypted frame intact. Which screen a giver opens is
-    // decided at the `Quest::handle` seam and proved there.
     const OP_QUEST_DETAILS: u16 = 0x0188;
     let mut s = quest_store();
     s.quest.quest_evals = vec![eval(1234, codec::ROLE_START, false, false)];
@@ -360,8 +346,6 @@ fn quest_hello_reaches_the_quest_module_and_its_raw_details_body_survives_the_ci
 
 #[test]
 fn quest_query_answers_the_raw_definition_body_through_the_cipher() {
-    // The socket-level contract for the client's cold-cache definition query: the hand-rolled 5875
-    // body crosses the encrypted frame intact. Which quests answer at all is proved at the seam.
     const OP_QUEST_QUERY_RESPONSE: u16 = 0x005D;
     let mut s = quest_store();
     s.quest.quest_details = vec![detail_view(1234, "A Threat Within")];

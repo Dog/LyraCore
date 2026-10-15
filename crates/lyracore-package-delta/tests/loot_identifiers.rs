@@ -1,8 +1,3 @@
-//! The loot identifier policy: which rows a Package may claim. Mirrors `item_identifiers.rs`. A
-//! loot row's key is flat, the same shape as an item's `entry`, because (unlike the quest family)
-//! no loot table's owning entity (creature, gameobject/chest, or zone) is ever Package-invented.
-//! The band therefore applies to a loot row's OWN `id`, not to an owning identifier.
-
 mod common;
 
 use common::{artifact, pickpocket_loot_claim, WHOLE_PICKPOCKET_LOOT_ROW};
@@ -127,8 +122,6 @@ fn an_incomplete_loot_insert_is_refused() {
     }
 }
 
-/// The four loot tables are independent SpacetimeDB tables, so sharing one numeric band across
-/// them cannot collide: the same `id` is a valid key on each.
 #[test]
 fn the_same_id_is_independently_claimable_on_every_loot_table() {
     for table in [

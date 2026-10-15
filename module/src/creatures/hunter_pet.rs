@@ -1,5 +1,3 @@
-//! Durable Hunter-pet identity and the wild-creature-to-live-pet transition.
-
 use lyracore_shared::pet::pet_guid_for;
 use spacetimedb::{table, ReducerContext, Table, TimeDuration, Timestamp};
 
@@ -11,8 +9,6 @@ use crate::{
 const CLASS_HUNTER: u8 = 3;
 const INITIAL_HAPPINESS: u32 = 166_500;
 
-/// The one durable Hunter-pet identity currently owned by a character. The table is module-private;
-/// callers read a pet through its owner lookup below.
 #[derive(Clone)]
 #[table(
     accessor = game_hunter_pet,
@@ -36,8 +32,6 @@ pub struct HunterPet {
     pub loyalty_updated_at: Timestamp,
 }
 
-/// Client-facing Hunter-pet state. This intentionally omits care timestamps, loyalty progress and
-/// rename eligibility; the gateway needs only these fields to render the owner's live pet.
 #[table(
     accessor = game_hunter_pet_protocol,
     public,
@@ -79,13 +73,10 @@ crate::character_owned!(transfer, fn sweep_transfer_game_hunter_pet_protocol(ctx
     keep_key,
 });
 
-/// Explicit kind for a live owned creature. A missing row is the safe legacy default: any old
-/// `owner_guid != 0` entity remains a summoned pet.
 #[table(accessor = game_live_pet_kind)]
 pub struct LivePetKind {
     #[primary_key]
     pub pet_guid: u64,
-    /// Zero means summoned; a non-zero value names the durable Hunter identity.
     pub hunter_pet_id: u64,
 }
 
@@ -110,8 +101,6 @@ pub(crate) fn hunter_pet_for_owner(ctx: &ReducerContext, owner_guid: u64) -> Opt
         .next()
 }
 
-/// Publish the bounded protocol projection after a durable identity write. Care/progression modules
-/// call this at their identity-update seam so the gateway sees one owner-addressed delta.
 pub(crate) fn publish_hunter_pet_protocol(
     ctx: &ReducerContext,
     pet: &HunterPet,
@@ -251,7 +240,6 @@ fn eligibility(
     }
 }
 
-/// Read-only tame gate used by spell completion before cost or any other write.
 pub(crate) fn validate_tame(
     ctx: &ReducerContext,
     caster: &WorldEntity,
@@ -263,10 +251,6 @@ pub(crate) fn validate_tame(
         .map_err(str::to_string)
 }
 
-/// Convert the existing wild row into the Hunter's live pet and create its durable identity. A
-/// durable row left by a despawned pet (logout, owner death, Dismiss, pet death) is replaced —
-/// retaming is the slice's only recovery path. All validation is repeated immediately before the
-/// first write, so a delayed completion cannot use stale target or owner state.
 pub(crate) fn tame_creature(
     ctx: &ReducerContext,
     caster_guid: u64,
@@ -292,8 +276,6 @@ pub(crate) fn tame_creature(
     let family_id = template.creature_family as u32;
     let pet_id = caster.guid;
 
-    // The preserved row retains entry/family-derived template, display, level and exact
-    // current/max health ratio.
     target.owner_guid = caster.guid;
     target.faction_template = caster.faction_template;
     target.target_guid = 0;
@@ -303,10 +285,7 @@ pub(crate) fn tame_creature(
     target.combat_until_ms = 0;
     target.unit_flags &= !lyracore_shared::constants::unit_flags::IN_COMBAT;
 
-    // Replace the wild guid with the existing owner-derived pet guid. Keep the authored spawn and
-    // arm its next appearance in the future: taming retires this individual creature, not the world
-    // spawn point that produced it. The live pet reaches the normal creature-create relay, including
-    // summon fields and pet bar.
+    // Taming retires this wild life; preserve its authored spawn and arm its future appearance.
     let wild_guid = target.guid;
     let pet_guid = pet_guid_for(caster.guid);
     let creature_entry = target.entry;
@@ -345,7 +324,6 @@ pub(crate) fn tame_creature(
         care_updated_at: now,
         loyalty_updated_at: now,
     };
-    // Implicit abandon on retame: drop the orphaned identity so the keyed insert cannot collide.
     ctx.db.game_hunter_pet().pet_id().delete(pet_id);
     let hunter_pet = ctx.db.game_hunter_pet().insert(hunter_pet);
     ctx.db.game_live_pet_kind().insert(LivePetKind {
@@ -383,7 +361,6 @@ mod tests {
         assert_eq!(eligible().validate(), Ok(()));
     }
 
-    /// One gate broken in an otherwise valid tame.
     type BreakGate = Box<dyn Fn(&mut TameEligibility)>;
 
     #[test]

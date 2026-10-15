@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`RealmDb`] adapter.
-
 use anyhow::{anyhow, Result};
 use spacetimedb_sdk::Table;
 
@@ -9,8 +7,6 @@ use crate::stdb::connection::call_reducer;
 use crate::stdb::{AccountRow, Coordinator, RealmRow};
 use crate::world::Actor;
 
-/// `realm_core.rs`'s Fake replaces this whole block. Reads that other code paths also use stay
-/// inherent on `Coordinator`; a Realm-only read or reducer call lives here.
 impl RealmDb for Coordinator {
     fn shard_name(&self) -> &str {
         self.shard_name()
@@ -51,8 +47,6 @@ impl RealmDb for Coordinator {
         self.establish_session(account_id, session_key, bound_identity)
     }
 
-    /// The Module combines the conveyed Account authority with its own Character GM level and
-    /// remains the final Gate. Its Refusal reason is the text the GM sees.
     fn request_gm_command(&self, actor: Actor, alpha_test_tools: bool, text: String) -> Result<()> {
         call_reducer!(
             self.0.call_pipe().conn.reducers,
@@ -65,8 +59,6 @@ impl RealmDb for Coordinator {
         self.character_location(guid)
     }
 
-    /// Call it on the Realm-core handle: on a World Shard `finish_transfer` maintains the index
-    /// in the same transaction.
     fn set_character_shard(&self, guid: u64, map_id: u32, instance_id: u64) -> Result<()> {
         let actor = character_actor(self, guid)?;
         call_reducer!(
@@ -83,7 +75,6 @@ impl RealmDb for Coordinator {
         self.realm_character_partition(guid)
     }
 
-    // The arguments mirror the Realm reducer's exact Transfer Gate.
     fn begin_character_shard_transfer(
         &self,
         source_map: u32,
@@ -201,8 +192,6 @@ impl RealmDb for Coordinator {
         self.escrow_row(guid).is_some()
     }
 
-    /// Player entities (`account_id != 0`) in this shard's cache. Shard truth, so every Gateway
-    /// reports the same number.
     fn session_count(&self) -> usize {
         self.0
             .coord()
@@ -214,7 +203,6 @@ impl RealmDb for Coordinator {
             .count()
     }
 
-    /// Callers hold the Realm-core handle: only Realm-core reads `game_shard_load`.
     fn record_shard_load(
         &self,
         shard: &str,
@@ -235,7 +223,6 @@ impl RealmDb for Coordinator {
     }
 }
 
-/// The Realm index reducers act for the Character they move.
 fn character_actor(coordinator: &Coordinator, character_guid: u64) -> Result<SessionActor> {
     let actor = Actor::new(character_guid)
         .ok_or_else(|| anyhow!("Character guid 0 cannot act in the Realm index"))?;

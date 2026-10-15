@@ -1,9 +1,9 @@
-//! Package Delta format. See `docs/package-delta-format.md` for the contract and rationale.
+//! Before changing artifact parsing or claims, read docs/package-delta-format.md.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs, clippy::pedantic)]
-// The parser narrows every integer with an explicit bound check immediately before the cast, so the
-// `as` conversions in `delta.rs` are the checked ones, not the lossy ones this lint looks for.
+#![warn(clippy::pedantic)]
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+// Integer casts follow explicit bounds checks in the parser.
 #![allow(clippy::cast_possible_truncation)]
 
 mod canonical;
@@ -54,13 +54,6 @@ pub use script::{
 };
 pub use trace::{trace, ClaimConflict, ClaimTrace, ClaimedField, TracedRow};
 
-/// Reads an artifact and writes it back in canonical form.
-///
-/// Equivalent input produces identical bytes, whatever member order, whitespace or number spelling
-/// it arrived with.
-///
-/// # Errors
-/// Any [`DeltaError`] the parse would raise.
 pub fn canonicalize(json: &str) -> Result<String, DeltaError> {
     Ok(PackageDelta::parse(json)?.to_canonical_json())
 }

@@ -1,6 +1,3 @@
-//! Self-Resurrection Option: chosen at death from a Soulstone aura, used through
-//! `debug_self_resurrect` (the `gw_self_resurrect` core), and spent by every other way back.
-
 mod support;
 
 use lyracore_shared::spell::taxonomy::{
@@ -16,7 +13,6 @@ type SqlRow = BTreeMap<String, String>;
 
 const PLAYER: u64 = 1;
 
-/// Minor Soulstone, from ClassicDB 1.12.1 `spell_template`: the aura rank and the spell it grants.
 const SOULSTONE_AURA: u32 = 20707;
 const SOULSTONE_SELF_RES: u32 = 3026;
 const SOULSTONE_HEALTH: u32 = 400;
@@ -157,8 +153,6 @@ fn rage_comes_back_empty_and_energy_comes_back_full() {
     assert_eq!(number(&entity(&standalone), "power"), 100);
 }
 
-/// Publish, materialize the Character with room above the flat Soulstone health, and stage the
-/// Minor Soulstone spells. The aura has no cast time so the debug cast lands at once.
 fn start(name: &str) -> Standalone {
     let mut standalone = Standalone::start(name);
     standalone.publish_module();
@@ -206,7 +200,6 @@ fn soulstone(standalone: &Standalone) {
     assert!(has_aura(standalone, SOULSTONE_AURA));
 }
 
-/// Rewrite the class and power-type bytes of `unit_bytes_0` and the power pool.
 fn set_class(standalone: &Standalone, class: u32, power_type: u32, max_power: u32) {
     let bytes = number(&entity(standalone), "unit_bytes_0");
     let bytes = (bytes & 0x00FF_00FF) | (class << 8) | (power_type << 24);
@@ -216,8 +209,6 @@ fn set_class(standalone: &Standalone, class: u32, power_type: u32, max_power: u3
     ));
 }
 
-/// Keep scheduled regeneration and rage decay from moving an exact vitals observation: in combat
-/// until the end of time, and inside the mana regen pause.
 fn hold_vitals(standalone: &Standalone) {
     let flags = number(&entity(standalone), "unit_flags");
     standalone.assert_sql(&format!(
@@ -246,8 +237,6 @@ fn insert_spell(standalone: &Standalone, spell_id: u32, name: &str, duration_ms:
     ));
 }
 
-/// One effect row at index 0. The self-resurrect row keeps vanilla's one-sided die, which the rule
-/// must ignore.
 fn insert_effect(
     standalone: &Standalone,
     spell_id: u32,

@@ -1,11 +1,5 @@
-//! Character-select wire mapping: `CharacterView` + the char-enum / char-create / name-query
-//! builders and the logout ack. Pure code-motion out of `mod.rs` (behind the `pub use` facade).
-
 use super::*;
 
-/// A character row as the gateway reads it from the coordinator cache (`game_character`),
-/// flattened to the plain ints/strings the codec needs to build `SMSG_CHAR_ENUM`. Decoupled
-/// from the module's table type; the typed enum conversions happen in [`build_char_enum`].
 #[derive(Clone, Debug, Default)]
 pub struct CharacterView {
     pub guid: u64,
@@ -25,23 +19,14 @@ pub struct CharacterView {
     pub y: f32,
     pub z: f32,
     pub first_login: bool,
-    /// Equipment display models for the character-select screen.  Indexed by equipment slot
-    /// (0..=18, matching `game_item_instance.slot`).  Default is all-zero (naked/grey).
-    /// Populated by `Coordinator::characters` from `game_item_instance` + `game_item_template`.
     pub equipment: [CharacterGear; 19],
-    /// Accrued played-time total in whole seconds, NOT counting the current live session (`/played`).
-    /// Folded with `session_start_micros` at the `CMSG_PLAYED_TIME` reply site so an
-    /// online player's total keeps ticking without a periodic write.
+    /// Whole seconds excluding the current World Session.
     pub played_total_secs: u32,
-    /// Unix-epoch micros the current live session began (0 = offline / no live session).
+    /// Unix-epoch microseconds; zero means offline.
     pub session_start_micros: u64,
-    /// The Character's Guild, read from Realm-core membership. 0 = no Guild.
     pub guild_id: u32,
 }
 
-/// The five appearance bytes a player picks at character creation, bundled so `create_character`
-/// (dispatch → trait → coordinator) passes one value instead of five positional `u8`s that are
-/// trivial to transpose. (race/class/gender are validated separately via typed `try_from`.)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Appearance {
     pub skin: u8,
@@ -51,18 +36,14 @@ pub struct Appearance {
     pub facial_hair: u8,
 }
 
-/// Outcome of a `CMSG_CHAR_CREATE` from the server's perspective (mapped to a `WorldResult`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CharCreateOutcome {
     Success,
     NameInUse,
-    /// Account already holds the per-realm character cap (10) — the 11th is refused.
     ServerLimit,
     Failed,
 }
 
-/// Build the `SMSG_CHAR_CREATE` reply. `CharCreateSuccess` makes the client re-send
-/// `CMSG_CHAR_ENUM` (so the new character appears); the others raise a popup.
 pub fn build_char_create_response(outcome: CharCreateOutcome) -> SMSG_CHAR_CREATE {
     SMSG_CHAR_CREATE {
         result: match outcome {
@@ -74,15 +55,12 @@ pub fn build_char_create_response(outcome: CharCreateOutcome) -> SMSG_CHAR_CREAT
     }
 }
 
-/// Outcome of a `CMSG_CHAR_DELETE` from the server's perspective (mapped to a `WorldResult`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CharDeleteOutcome {
     Success,
     Failed,
 }
 
-/// Build the `SMSG_CHAR_DELETE` reply. Per the wire doc this updates the character-select screen
-/// directly — the client does NOT need to re-send `CMSG_CHAR_ENUM` (unlike char-create).
 pub fn build_char_delete_response(outcome: CharDeleteOutcome) -> SMSG_CHAR_DELETE {
     SMSG_CHAR_DELETE {
         result: match outcome {
@@ -92,15 +70,6 @@ pub fn build_char_delete_response(outcome: CharDeleteOutcome) -> SMSG_CHAR_DELET
     }
 }
 
-/// Build the `SMSG_CHAR_ENUM` reply for the character-select screen (gateway
-/// translation §4). Each [`CharacterView`] becomes a `wow_world_messages` `Character` block;
-/// the count and the `first_bag_*` trailers are written by the codec, not set here.
-///
-/// The list is ordered by ascending guid, as CMaNGOS enumerates Characters: the Store's
-/// subscription-cache and cross-Shard probe order is not stable between logins. Equipment comes
-/// from the view. `race`/`class`/`gender`/`map` are load-bearing for what the client renders, so
-/// an out-of-range raw value is a hard error; `area`/`zone` is cosmetic on this screen, so an
-/// unknown zone degrades to `Area::None` rather than failing the whole enumeration.
 pub fn build_char_enum(chars: &[CharacterView]) -> Result<SMSG_CHAR_ENUM> {
     let mut ordered: Vec<&CharacterView> = chars.iter().collect();
     ordered.sort_unstable_by_key(|c| c.guid);
@@ -138,10 +107,6 @@ pub fn build_char_enum(chars: &[CharacterView]) -> Result<SMSG_CHAR_ENUM> {
     Ok(SMSG_CHAR_ENUM { characters })
 }
 
-/// Build the `SMSG_NAME_QUERY_RESPONSE` the client needs to render a (peer or self) character's
-/// name + race/class/gender, so it shows the real name instead of "Unknown". `realm_name` is empty
-/// (same-realm). race/class/gender are load-bearing for the name plate, so an out-of-range raw
-/// value is a hard error.
 pub fn build_name_query_response(c: &CharacterView) -> Result<SMSG_NAME_QUERY_RESPONSE> {
     Ok(SMSG_NAME_QUERY_RESPONSE {
         guid: Guid::new(c.guid),
@@ -153,20 +118,13 @@ pub fn build_name_query_response(c: &CharacterView) -> Result<SMSG_NAME_QUERY_RE
     })
 }
 
-/// Build the `SMSG_INSPECT` reply to `CMSG_INSPECT`: just an echo of the validated target guid — the
-/// client opens the paperdoll and renders it from the target's OWN visible-item fields (already synced
-/// via the entity's `PLAYER_VISIBLE_ITEM_*` update-mask fields), no extra payload needed. The gateway
-/// only sends this after the `inspect` reducer's range+friendly gate passes.
+/// The client renders inspection from the target's existing visible-item fields.
 pub fn build_inspect_response(target_guid: u64) -> SMSG_INSPECT {
     SMSG_INSPECT {
         guid: Guid::new(target_guid),
     }
 }
 
-/// The reply to `CMSG_LOGOUT_REQUEST` (the client's Logout/Exit button): acknowledge an
-/// **instant** successful logout, then immediately complete it. Without this the client hangs on
-/// the logout/exit screen waiting for `SMSG_LOGOUT_COMPLETE`. Only called when the player is NOT
-/// in combat.
 pub fn logout_sequence() -> Vec<ServerOpcodeMessage> {
     vec![
         ServerOpcodeMessage::SMSG_LOGOUT_RESPONSE(SMSG_LOGOUT_RESPONSE {
@@ -177,9 +135,6 @@ pub fn logout_sequence() -> Vec<ServerOpcodeMessage> {
     ]
 }
 
-/// Denial reply to `CMSG_LOGOUT_REQUEST` when the player is in combat. Vanilla uses
-/// `FAILURE_IN_COMBAT` (result=1); the client shows an error message and does NOT begin a
-/// logout countdown. `speed` is irrelevant for non-Success results but must be set.
 pub fn logout_denied_in_combat() -> SMSG_LOGOUT_RESPONSE {
     SMSG_LOGOUT_RESPONSE {
         result: LogoutResult::FailureInCombat,
@@ -262,21 +217,17 @@ mod tests {
 
     #[test]
     fn played_time_folds_the_live_session_span_into_the_durable_total() {
-        // Offline (no live session): total is exactly the durable value, no fold.
         let offline = build_played_time(3600, 0, 999_999);
         assert_eq!(offline.total_played_time, 3600);
         assert_eq!(offline.level_played_time, 3600);
-        // Online: total = durable + elapsed seconds since session_start_micros.
-        let now = 10_000_000_000u64; // an arbitrary "current" wall-clock reading, in micros
-        let session_start = now - 5_000_000; // session began 5 real seconds ago
+        let now = 10_000_000_000u64;
+        let session_start = now - 5_000_000;
         let online = build_played_time(3600, session_start, now);
         assert_eq!(online.total_played_time, 3605);
     }
 
     #[test]
     fn played_time_never_underflows_a_clock_that_moved_backward() {
-        // A `now_micros` at or before `session_start_micros` (a clock adjustment / bad caller) must
-        // saturate the elapsed span at 0 rather than wrap a u64 subtraction into a huge total.
         let msg = build_played_time(100, 5_000_000, 1_000_000);
         assert_eq!(
             msg.total_played_time, 100,

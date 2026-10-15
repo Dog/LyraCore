@@ -186,7 +186,6 @@ fn a_first_kalimdor_transfer_arrives_and_recovers_after_import_or_source_finish(
             );
         }
 
-        // A fresh Coordinator reads the committed state as a replacement Gateway would.
         let replacement = runtime.block_on(Coordinator::connect(&config)).unwrap();
         login_on_kalimdor(replacement, &runtime, guid);
         let character_query = format!("SELECT guid FROM game_character WHERE guid = {guid}");

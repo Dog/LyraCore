@@ -1,5 +1,3 @@
-//! Quest-credit EventAI scenarios.
-
 use super::*;
 use crate::creatures::eventai::*;
 use crate::quest::{

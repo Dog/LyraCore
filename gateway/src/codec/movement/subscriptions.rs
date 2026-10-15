@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::subscriptions::{MOTION_CALLS, MOTION_SENT};
@@ -15,17 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::Vector3d;
 
-/// Build the wire relay for one `game_teleport_event` row. Pure: takes the
-/// already-derived `still_here` boolean (whether the live entity survived the transaction — the
-/// module/gateway-mirrored same-map/cross-map signal, see the `on_teleport` callback's doc comment)
-/// instead of a live `ReducerContext`/connection, so it's testable without a DB (module crate
-/// convention: extract pure functions and test those).
-///
-/// `still_here` → same-map: `MSG_MOVE_TELEPORT_ACK` (byte-identical to the previous behavior — the ONLY
-/// caller-visible difference from before is that this is now reached via a branch rather than
-/// unconditionally). NOT `still_here` → cross-map: `SMSG_TRANSFER_PENDING`+`SMSG_NEW_WORLD` as one batch
-/// (`codec::build_cross_map_teleport`). `Err` only for a `map_id` the client's `Map` enum doesn't know
-/// (propagated so the caller can log it — never silently drops the relay).
 pub(crate) fn build_teleport_relay(
     still_here: bool,
     mover_guid: u64,
@@ -46,7 +33,6 @@ pub(crate) fn build_teleport_relay(
     }
 }
 
-/// Build the complete teleport result on the addressed session's writer queue.
 pub(crate) fn teleport_event_outbound(row: &TeleportEvent) -> Vec<Outbound> {
     match build_teleport_relay(
         !row.cross_map,
@@ -103,9 +89,6 @@ pub(crate) fn creature_leg_outbound(
         y: row.sy,
         z: row.sz,
     };
-    // a facing-only leg (the mover doesn't move, `emit_facing_spline`'s carrier) gets the
-    // `FacingAngle` variant — the only 1.12 `SMSG_MONSTER_MOVE` shape that turns a STATIONARY
-    // creature without a spline the client would otherwise have nothing to interpolate from.
     if row.facing {
         return vec![Outbound::One(ServerOpcodeMessage::SMSG_MONSTER_MOVE(
             Box::new(codec::build_monster_move_facing(
@@ -231,17 +214,11 @@ pub(crate) fn motion(
     delivery.received();
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
     let row = Arc::new(row.clone());
-    // The MOVER is deliberately not a recipient (`world_entity_recipients`' self leg is skipped
-    // here): a
-    // player must never receive their own movement echoed back, or they fight the server for
-    // authority over their position. `relay_entity_motion` re-checks it anyway.
+    // Never echo a Character's movement to its own client; it fights position authority.
     for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
         if viewer.self_guid == row.guid {
             continue;
         }
-        // SUPERSEDE, don't append — the viewer needs only this mover's latest position, so
-        // the upsert replaces any not-yet-flushed heartbeat from the same mover and the queue
-        // carries at most one flush job regardless of crowd size.
         viewer
             .motion_pending
             .entity
@@ -256,7 +233,6 @@ pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSplin
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
     let row = Arc::new(row.clone());
     for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        // Same supersession as player motion — latest leg per creature wins.
         viewer
             .motion_pending
             .creature
@@ -267,14 +243,10 @@ pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSplin
     }
 }
 
-/// Queue this viewer's ONE motion-flush job, unless one is already queued. The egress shed
-/// decision keeps its pump-side, one-atomic-load shape (task B2's contract): a shed drops the
-/// FLUSH — the pending map keeps superseding meanwhile, the flag resets so a later heartbeat
-/// retries, and nothing is stranded.
 pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) {
     use std::sync::atomic::Ordering as AtOrd;
     if viewer.motion_pending.flush_queued.swap(true, AtOrd::AcqRel) {
-        return; // a queued flush will carry the upsert that just landed
+        return;
     }
     if crate::stdb::subscriptions::shed_motion_at_depth(viewer.tx.depth()) {
         crate::stdb::subscriptions::MOTION_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -286,8 +258,7 @@ pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) 
     }
     let viewer = viewer.clone();
     enqueue(viewer.clone(), move |viewer| {
-        // Clear BEFORE draining: an upsert racing the drain re-queues a follow-up flush (possibly
-        // empty — harmless) instead of being stranded behind a still-set flag.
+        // Clear before draining so a racing upsert can queue another flush.
         viewer
             .motion_pending
             .flush_queued
@@ -317,8 +288,6 @@ pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) 
     });
 }
 
-/// A teleport row names one character owner on this shard. Packet construction stays on that
-/// viewer's writer.
 pub(crate) fn teleport_appeared(view: &WorldView, shard: ShardId, row: &TeleportEvent) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.mover_guid)) else {
         return;

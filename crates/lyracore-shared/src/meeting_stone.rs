@@ -1,17 +1,9 @@
-//! The Meeting Stone Queue wire contract: the `realm_meeting_stone_op` op bytes, the queue status
-//! and join failure bytes the client renders, the typed [`MeetingStoneRefusal`], and the event kinds
-//! and payload the Module writes to `game_group_event`. Both the Module and the Gateway import it.
-
-/// The `op` byte of `realm_meeting_stone_op`. Its own byte space, separate from
-/// [`crate::group::realm_op`], because the queue has its own reducer.
 pub mod realm_op {
-    /// `CMSG_MEETINGSTONE_JOIN`: queue the actor, or the Party it leads, for `area_id`.
     pub const JOIN: u8 = 0;
-    /// `CMSG_MEETINGSTONE_LEAVE`: leave the queue.
     pub const LEAVE: u8 = 1;
 }
 
-/// `SMSG_MEETINGSTONE_SETQUEUE`'s status byte (cm:LFG/LFGDefines.h:50-58).
+// SMSG_MEETINGSTONE_SETQUEUE status byte, cm:LFG/LFGDefines.h:50-58.
 pub mod queue_status {
     pub const LEAVE_QUEUE: u8 = 0;
     pub const JOINED_QUEUE: u8 = 1;
@@ -21,48 +13,30 @@ pub mod queue_status {
     pub const NONE: u8 = 5;
 }
 
-/// `SMSG_MEETINGSTONE_JOINFAILED`'s reason byte (cm:LFG/LFGDefines.h:61-67).
+// SMSG_MEETINGSTONE_JOINFAILED reason byte, cm:LFG/LFGDefines.h:61-67.
 pub mod join_failure {
     pub const PARTY_LEADER: u8 = 1;
     pub const FULL_GROUP: u8 = 2;
     pub const RAID_GROUP: u8 = 3;
 }
 
-/// The `game_group_event` kinds the Meeting Stone Queue writes. They share the byte space that
-/// [`crate::group::event_kind`] documents.
 pub mod event_kind {
-    /// `SMSG_MEETINGSTONE_SETQUEUE`. Payload: [`super::encode_queue`].
     pub const QUEUE: u8 = 27;
-    /// `SMSG_MEETINGSTONE_MEMBER_ADDED`. `other_guid` is the added Character.
     pub const MEMBER_ADDED: u8 = 28;
-    /// `SMSG_MEETINGSTONE_IN_PROGRESS`. No payload.
     pub const IN_PROGRESS: u8 = 29;
-    /// `SMSG_MEETINGSTONE_COMPLETE`. No payload.
     pub const COMPLETE: u8 = 30;
 }
 
-/// Why the Module refused a Meeting Stone Durable Request. The tag is the whole reducer error text.
-/// Only the three party Refusals have a client answer ([`join_failure_for`]); both cores drop the
-/// rest silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeetingStoneRefusal {
-    /// The actor is in a Party it does not lead.
     NotLeader,
-    /// The actor leads a Raid.
     RaidGroup,
-    /// The actor's Party already has five members.
     PartyFull,
-    /// The actor has no World Session, no live entity, or is on a taxi flight.
     ActorUnavailable,
-    /// The GameObject is gone, is not type 23, or has no imported stone row.
     NotAMeetingStone,
-    /// The stone is out of reach.
     OutOfRange,
-    /// The stone is on another map or in another instance.
     OtherPartition,
-    /// The actor's level is outside the stone's range.
     LevelOutOfRange,
-    /// The stone names no dungeon area.
     UnknownArea,
 }
 
@@ -100,8 +74,6 @@ impl MeetingStoneRefusal {
     }
 }
 
-/// The `SMSG_MEETINGSTONE_JOINFAILED` reason for a Refusal, or `None` when the client gets nothing
-/// (cm:LFG/LFGHandler.cpp:58-77).
 pub fn join_failure_for(refusal: MeetingStoneRefusal) -> Option<u8> {
     match refusal {
         MeetingStoneRefusal::NotLeader => Some(join_failure::PARTY_LEADER),
@@ -111,12 +83,10 @@ pub fn join_failure_for(refusal: MeetingStoneRefusal) -> Option<u8> {
     }
 }
 
-/// `area,status` in decimal, the [`event_kind::QUEUE`] payload.
 pub fn encode_queue(area_id: u32, status: u8) -> String {
     format!("{area_id},{status}")
 }
 
-/// `None` for a malformed payload or a status the client does not know.
 pub fn decode_queue(payload: &str) -> Option<(u32, u8)> {
     let (area, status) = payload.split_once(',')?;
     let status: u8 = status.parse().ok()?;
@@ -143,7 +113,6 @@ mod tests {
         assert_eq!(MeetingStoneRefusal::parse_tag("group:not_leader"), None);
     }
 
-    /// The three party Refusals answer with cmangos's failure byte; every other one is silent.
     #[test]
     fn only_the_party_refusals_answer_the_client() {
         use MeetingStoneRefusal::*;
@@ -154,7 +123,6 @@ mod tests {
         assert_eq!(answered, [(NotLeader, 1), (RaidGroup, 3), (PartyFull, 2)]);
     }
 
-    /// cm:LFG/LFGDefines.h:50-67.
     #[test]
     fn the_status_and_failure_bytes_are_the_vanilla_values() {
         use queue_status::*;

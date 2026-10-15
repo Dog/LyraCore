@@ -5,7 +5,6 @@ use crate::{
     game_creature_template, game_gameobject, game_gameobject_template, GameObject, WorldEntity,
 };
 
-/// Resolve the required focus in the caster's partition before a cast spends anything.
 pub(crate) fn check_hostile_summon(
     ctx: &ReducerContext,
     caster: &WorldEntity,

@@ -2,58 +2,20 @@ use super::*;
 
 #[derive(Default)]
 pub(crate) struct TopologyState {
-    /// Multi-shard routing: the database this handle stands for. `""` (derive-Default) is the
-    /// single-shard world every other test runs in, where nothing routes.
     pub(crate) shard: String,
-    /// The handle `home_shard()` hands back — the character's home shard. `None` (default) = "you
-    /// are already on the right shard", i.e. the single-entry shard map / pre-sharding behavior.
     pub(crate) home: Option<std::sync::Arc<WorldFake>>,
-    /// Home-shard reassignment: when set, every `home_shard()` resolution AFTER the first
-    /// answers THIS shard instead of `home` — the mock's stand-in for a routing change landing
-    /// between two logins (a shard-map edit, or the realm-core index re-homing a character). `None`
-    /// (default): every resolution answers `home`, byte-identical to before this field existed.
     pub(crate) home_after_flip: Option<std::sync::Arc<WorldFake>>,
-    /// The one location this handle routes elsewhere, and where to: `(map_id, instance_id, shard)`.
-    /// `None` (derive-Default) = "this handle serves every location", the single-database answer
-    /// `shard_for_location` gives. Keyed by location on purpose — a caller that asks about the
-    /// wrong place gets `None` and the crossing silently becomes a no-op, which is what the tests
-    /// must be able to tell apart from a crossing that ran.
     pub(crate) location_shard: Option<(u32, u64, std::sync::Arc<WorldFake>)>,
-    /// How many times `home_shard()` has been asked — drives `home_after_flip`, and is itself the
-    /// assertion that routing is resolved ONCE PER WORLD ENTRY and never mid-session. SHARED
-    /// between a store and the handles it routes to (like `calls`), so a re-resolution asked of the
-    /// *pinned* handle — which is what a mid-session re-route would actually look like, since
-    /// `route_home` asks whichever handle the session currently holds — is counted too.
     pub(crate) home_shard_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// SHARED between a store and its `home` handle: `(shard, call)` for every instrumented
-    /// player-scoped call, in order. The routing test asserts nothing lands on the wrong database.
     pub(crate) calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    /// Realm-core authority when configured. `None` models a single-Shard Realm; `realm_error`
-    /// models an outage without changing which Store owns the realm-wide state.
     pub(crate) realm: Option<std::sync::Arc<WorldFake>>,
-    /// The connected WORLD shards `world_stores()` fans the roster mirror out to (and the
-    /// cross-shard name/presence lookups walk). Empty = single database. Behind a `Mutex` only so
-    /// the topology can be wired up AFTER every handle exists — production reads the shared
-    /// `ShardSet`, which has the same shape and the same "includes this handle" membership.
     pub(crate) peers: std::sync::Mutex<Vec<std::sync::Arc<WorldFake>>>,
-    /// When set, the configured World Shard set is incomplete or unhealthy.
     pub(crate) world_shard_set_error: Option<String>,
-    /// A configured Realm-core outage, mutable so a recovery test can restore the same authority.
     pub(crate) realm_error: std::sync::Mutex<Option<String>>,
-    /// When set, `settle_home_shard` fails with this message (a transfer that could not be
-    /// driven — an unreachable destination shard, a refused import).
     pub(crate) settle_error: Option<String>,
-    /// How many `settle_home_shard` calls SUCCEED before `settle_error` starts firing. 0
-    /// (derive-Default) = the very first one fails, i.e. the login-time failure the transfer
-    /// test drives.
-    /// 1 = the login routes fine and the WORLD-PORT's settle is the one that cannot be driven —
-    /// the case that hung a real client on its loading screen forever.
     pub(crate) settle_ok_calls: usize,
-    /// How many times `settle_home_shard` has been asked (drives `settle_ok_calls`).
     pub(crate) settle_calls: std::sync::atomic::AtomicUsize,
-    /// Accounts `bind_shard_session` was called for, per shard.
     pub(crate) bound_sessions: std::sync::Mutex<Vec<u64>>,
-    /// Whether this character still had an addressable viewer at each transfer-resolution call.
     pub(crate) viewer_present_at_settle: std::sync::Mutex<Vec<bool>>,
 }
 
@@ -61,8 +23,6 @@ impl ShardRoutingStore for WorldFake {
     fn shard_name(&self) -> &str {
         &self.topology.shard
     }
-
-    // The Fake enforces the Module's escrow guards so transfer ordering affects outcomes.
 
     fn settle_home_shard(
         &self,
@@ -135,7 +95,6 @@ impl ShardRoutingStore for WorldFake {
 }
 
 impl WorldFake {
-    /// Record one player-scoped call against THIS handle's shard.
     pub(crate) fn rec(&self, what: &str) {
         self.topology
             .calls

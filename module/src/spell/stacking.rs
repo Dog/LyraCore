@@ -1,20 +1,9 @@
 use spacetimedb::{log, table, ReducerContext, Table};
 
 use crate::game_world_entity;
-// Aura/SpellEffect row types, the `game_aura`/`game_spell_chain` accessors, and the A_CONTROL/P_MECHANIC/
-// The parent module names the shared M_* taxonomy constants.
+
 use super::*;
 
-// ===========================================================================================
-//  Tables (module-only: NO `public`, no Timestamp, no gateway binding — same shape/rationale as
-//  `game_spell_chain`/`game_spell_learn`). `game_aura` itself is UNCHANGED (verified below in the report):
-//  strength/category are computed at apply time, so this whole feature lands with zero subscribed-schema
-//  change.
-// ===========================================================================================
-
-/// One `(group_id, spell_id)` membership row — a group has 1+ member spells. `id` is the PK (not
-/// `(group_id, spell_id)`) because SpacetimeDB tables need a single-column PK and this one is purely a
-/// membership list (no natural single-column key). [static]
 #[table(accessor = game_spell_group, index(accessor = by_group, btree(columns = [group_id])), index(accessor = by_spell, btree(columns = [spell_id])))]
 pub struct SpellGroup {
     #[primary_key]
@@ -24,20 +13,12 @@ pub struct SpellGroup {
     pub spell_id: u32,
 }
 
-/// The stacking rule for `group_id` (PK — one rule row per group). `rule`: 0 STACKS (a no-op group — every
-/// member stacks normally, present for completeness/future data), 1 EXCLUSIVE (one aura from the group per
-/// target, any caster — latest application evicts every other member), 2 EXCLUSIVE_PER_CASTER (one per
-/// CASTER per target — Blessings: a paladin's own Blessing replaces their prior one, another paladin's
-/// stands), 3 EXCLUSIVE_STRONGER (refuse the incoming application if a STRONGER member is present, else
-/// replace every member). [static]
 #[table(accessor = game_spell_group_rule)]
 pub struct SpellGroupRule {
     #[primary_key]
     pub group_id: u32,
     pub rule: u8,
-    /// Whether spell-chain ranks are comparable within this group. Cross-family groups such as
-    /// armor debuffs deliberately compare their effective magnitude only: a rank number from
-    /// Sunder Armor does not describe the strength of Expose Armor or Faerie Fire.
+    // Rank numbers from different spell chains do not measure comparable strength.
     #[default(true)]
     pub rank_is_comparable: bool,
 }
@@ -48,16 +29,7 @@ pub(crate) const RULE_EXCLUSIVE: u8 = 1;
 pub(crate) const RULE_EXCLUSIVE_PER_CASTER: u8 = 2;
 pub(crate) const RULE_EXCLUSIVE_STRONGER: u8 = 3;
 
-/// Per-`(target_guid, category)` CC diminishing-returns state — RLS-free (server-internal bookkeeping,
-/// nothing the client needs directly: DR manifests only as a shorter aura duration), small, reaped by
-/// `sweep_dr_state` (wired into the shared event-GC pass — see that fn's doc comment for exactly where).
-/// `level` is "how many CC hits have already landed in the current 15s-after-removal window" (1..=3 while
-/// a window is live; a target with no live window simply has no row, treated as level 0 — see
-/// `dr_pre_level`). `window_expires_micros` is stamped at APPLY time as a PROVISIONAL value (this aura's
-/// own scaled expiry + 15s, so a recast of the SAME spell while it's still active reads a sane in-window
-/// state) and OVERWRITTEN with the AUTHORITATIVE value at REMOVAL (natural expiry in
-/// `scheduler::tick_auras`, or dispel in `effects::dispel_target`) — see `bump_dr_level` / `dr_window_on_removal`.
-/// [entity]
+// Apply-time expiry keeps recasts in the window; aura removal resets it from the removal time.
 #[table(accessor = game_dr_state, index(accessor = by_target, btree(columns = [target_guid])))]
 pub struct DrState {
     #[primary_key]
@@ -65,33 +37,19 @@ pub struct DrState {
     pub id: u64,
     pub target_guid: u64,
     pub category: u8,
-    pub level: u8, // 1..=3
+    pub level: u8,
     pub window_expires_micros: i64,
 }
 
-/// CC diminishing-returns category constants. These are OUR internal ids (nothing on the wire or in a
-/// DBC keys on them; the numbering happens to agree with the one the reference cores use, which keeps
-/// cross-checking a category assignment against public documentation cheap) — NOT the same numbering
-/// as this crate's own `M_STUN`/`M_ROOT`/`M_FEAR`/`M_POLY` mechanic consts in `taxonomy.rs`, hence the
-/// separate mapping fn below rather than reusing the mechanic value directly). Only stun/fear/root/poly are
-/// reachable today — they are the only mechanics we have.
-// 3, 5 and 7 are left unnamed: charm/sleep/disorient have no mechanic in `taxonomy.rs` yet, so
-// naming them now would be a constant with no reader.
+// DR category numbers follow cmangos, not the M_* mechanic constants.
 pub(crate) const DR_CAT_STUN: u8 = 1;
 pub(crate) const DR_CAT_FEAR: u8 = 2;
 pub(crate) const DR_CAT_ROOT: u8 = 4;
 pub(crate) const DR_CAT_POLY: u8 = 6;
 
-/// 15 seconds, in micros — the DR window length, measured from the CC aura's REMOVAL (not its apply).
+// The 15-second window starts when crowd control ends.
 pub(crate) const DR_WINDOW_MICROS: i64 = 15_000_000;
 
-// ===========================================================================================
-//  Pure types + the two chokepoint fns (resolve_group_conflict / resolve_dr).
-// ===========================================================================================
-
-/// A minimal snapshot of an EXISTING aura relevant to a stacking-group decision — just enough to compare
-/// against the incoming application without touching the live row inside the pure fn. The caller
-/// (`apply_group_conflict`) builds these from `game_aura` + the strength formula below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuraSummary {
     pub aura_id: u64,
@@ -99,7 +57,6 @@ pub(crate) struct AuraSummary {
     pub strength: i32,
 }
 
-/// Which stacking rule governs the incoming spell's group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GroupRule {
     Stacks,
@@ -108,8 +65,6 @@ pub(crate) enum GroupRule {
     ExclusiveStronger,
 }
 
-/// Decode `game_spell_group_rule.rule` — an unrecognized byte (shouldn't happen; defensive) falls back to
-/// `Stacks` (the safest no-op: never silently refuses/evicts on a data bug).
 pub(crate) fn group_rule_from_u8(rule: u8) -> GroupRule {
     match rule {
         RULE_EXCLUSIVE => GroupRule::Exclusive,
@@ -119,16 +74,12 @@ pub(crate) fn group_rule_from_u8(rule: u8) -> GroupRule {
     }
 }
 
-/// The DR window state read for `(target, category)` BEFORE this application, or `None` if no row exists
-/// yet (a target that has never taken this category of CC).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DrWindow {
-    pub level: u8, // 1..=3, as stored
+    pub level: u8,
     pub window_expires_micros: i64,
 }
 
-/// The verdict shared by both chokepoints below. `evict` is always empty for a DR decision (DR only
-/// scales/refuses, it never evicts another aura — the two concerns don't overlap).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyDecision {
     Apply {
@@ -140,10 +91,6 @@ pub(crate) enum ApplyDecision {
     },
 }
 
-/// THE stacking-group chokepoint. Called by `apply_group_conflict` for a fresh
-/// stacking-group member application (a same-spell refresh never reaches this — see that fn's doc). Pure:
-/// no DB access, no logging, no side effects — the caller does all the I/O and acts on the returned
-/// `ApplyDecision`.
 pub(crate) fn resolve_group_conflict(
     caster_guid: u64,
     strength: i32,
@@ -181,8 +128,6 @@ pub(crate) fn resolve_group_conflict(
     }
 }
 
-/// Whether an existing member already has at least the incoming strength. Maintenance selection
-/// treats equality as satisfied because refreshing an equal family member would be redundant.
 pub(crate) fn group_strength_satisfied(strength: i32, existing: &[AuraSummary]) -> bool {
     existing.iter().any(|aura| aura.strength >= strength)
 }
@@ -195,8 +140,6 @@ pub(crate) enum BuffGroupStatus {
     Unavailable,
 }
 
-/// Compare a requested buff with active members of its stacking family. The limits belong beside
-/// the stacking reads so casting and maintenance cannot grow different family rules.
 pub(crate) fn buff_group_status(
     ctx: &ReducerContext,
     spell_id: u32,
@@ -292,11 +235,6 @@ pub(crate) fn buff_group_status(
     }
 }
 
-/// THE CC-diminishing-returns chokepoint. Called by `resolve_dr_for_target` for every
-/// `A_CONTROL(mechanic)` effect on a player target. `prior` is the DR window state read for this
-/// `(target, category)` BEFORE this application (`None` if the target has never taken this category of
-/// CC, or its prior window has lapsed by `now_micros`). Pure: no DB access, no logging, no side effects —
-/// the caller does all the I/O and acts on the returned `ApplyDecision`.
 pub(crate) fn resolve_dr(prior: Option<DrWindow>, now_micros: i64) -> ApplyDecision {
     match dr_scale_bp(dr_pre_level(prior, now_micros)) {
         Some(bp) => ApplyDecision::Apply {
@@ -307,10 +245,6 @@ pub(crate) fn resolve_dr(prior: Option<DrWindow>, now_micros: i64) -> ApplyDecis
     }
 }
 
-/// The DR level EFFECTIVE for an application at `now_micros`: the stored level IF a window is still live
-/// (`now_micros <= window_expires_micros`), else 0 (no row, or the window lapsed — a fresh chain). Shared
-/// by `resolve_dr` and `bump_dr_level` (so the "what level are we bumping FROM" logic
-/// has exactly one definition).
 pub(crate) fn dr_pre_level(prior: Option<DrWindow>, now_micros: i64) -> u8 {
     match prior {
         Some(w) if now_micros <= w.window_expires_micros => w.level,
@@ -318,10 +252,6 @@ pub(crate) fn dr_pre_level(prior: Option<DrWindow>, now_micros: i64) -> u8 {
     }
 }
 
-/// The row `bump_dr_level` writes after a successful application: the level advanced off the SAME
-/// `dr_pre_level` the decision was made from (capped at the immune step) and the PROVISIONAL window ending
-/// 15s after this application's own already-scaled expiry. Pure so the whole ladder is driven from
-/// production math in a test — the ctx-bound `bump_dr_level` is only the read/write around it.
 pub(crate) fn dr_bump(
     prior: Option<DrWindow>,
     now_micros: i64,
@@ -333,8 +263,6 @@ pub(crate) fn dr_bump(
     }
 }
 
-/// Duration scale (basis points) for a CC application at `pre_level` (the level BEFORE this hit): 0 → 100%
-/// (fresh/reset), 1 → 50%, 2 → 25%, 3+ → `None` (immune — the 4th same-window hit is refused outright).
 pub(crate) fn dr_scale_bp(pre_level: u8) -> Option<u32> {
     match pre_level {
         0 => Some(10_000),
@@ -344,23 +272,14 @@ pub(crate) fn dr_scale_bp(pre_level: u8) -> Option<u32> {
     }
 }
 
-/// "Strength" for a stacking-group comparison: rank first (dominant), then the effect's own magnitude as
-/// the tiebreaker. `magnitude` must already be non-negative (callers pass `abs()`'d, stack-multiplied
-/// values — see `apply_group_conflict`). Reaching for this directly compares rank numbers that may
-/// belong to different spell chains; only `compute_group_strength` knows whether that is meaningful.
 pub(crate) fn compute_strength(rank: u8, magnitude: i32) -> i32 {
     (rank as i32) * 100_000 + magnitude.clamp(0, 99_999)
 }
 
-/// Strength with the group's comparison contract applied. A group that mixes rank chains — armor
-/// debuffs, or any buff paired with its group-cast form — drops rank and compares magnitude alone,
-/// because one chain's rank number says nothing about another's.
 pub(crate) fn compute_group_strength(rank_is_comparable: bool, rank: u8, magnitude: i32) -> i32 {
     compute_strength(if rank_is_comparable { rank } else { 0 }, magnitude)
 }
 
-/// `game_spell_chain.rank` for `spell_id`, or 0 if the spell has no chain row (every id outside a
-/// hand-tracked rank family — the common case).
 pub(crate) fn rank_of(ctx: &ReducerContext, spell_id: u32) -> u8 {
     ctx.db
         .game_spell_chain()
@@ -393,8 +312,6 @@ pub(crate) fn dr_category_for_effect(
     dr_category_for_mechanic(eff_p0)
 }
 
-/// Map this crate's `M_*` mechanic const (`taxonomy.rs`) onto the cmangos-numbered DR category. `None` for
-/// a mechanic with no DR category yet (there are none today — every mechanic we have maps).
 const fn dr_category_for_mechanic(mechanic: i32) -> Option<u8> {
     match mechanic {
         M_STUN => Some(DR_CAT_STUN),
@@ -405,16 +322,6 @@ const fn dr_category_for_mechanic(mechanic: i32) -> Option<u8> {
     }
 }
 
-// ===========================================================================================
-//  ctx-bound orchestration — the DB I/O around the two pure fns above. Called from `cast::aura_apply` (the
-//  chokepoint) and the two removal paths.
-// ===========================================================================================
-
-/// Resolve + ACT on the stacking-group conflict for `spell_id` (if any) landing on `target_guid` — called
-/// from `aura_apply`'s FRESH-insert branch only (a same-effect refresh never reaches this — matches "same-
-/// spell-same-caster refresh runs BEFORE group logic"). `strength` is the incoming aura's own
-/// `compute_strength(...)`. Returns `true` to let the fresh insert proceed (deleting every evicted aura row
-/// as a side effect), `false` to have the caller bail out (refused — nothing placed, nothing touched).
 pub(crate) fn apply_group_conflict(
     ctx: &ReducerContext,
     spell_id: u32,
@@ -430,7 +337,7 @@ pub(crate) fn apply_group_conflict(
         .map(|g| g.group_id)
         .next()
     else {
-        return true; // not in any group — the overwhelming common case
+        return true;
     };
     let rule_row = ctx
         .db
@@ -452,9 +359,7 @@ pub(crate) fn apply_group_conflict(
     let members: Vec<AuraSummary> = auras
         .by_target()
         .filter(&target_guid)
-        // Exclude the incoming spell's OWN spell_id: a multi-effect spell calls `aura_apply` once per
-        // effect, and an earlier effect's just-inserted row must never count as a conflicting "other"
-        // group member against a later effect of the SAME cast.
+        // Earlier effects of the same cast must not conflict with its later effects.
         .filter(|a| a.spell_id != spell_id && member_ids.contains(&a.spell_id))
         .map(|a| AuraSummary {
             aura_id: a.id,
@@ -487,8 +392,6 @@ pub(crate) fn apply_group_conflict(
     }
 }
 
-/// Resolve the CC-DR decision for a `dr_category_for_effect`-tagged application landing on `target_guid`
-/// at `now_micros`. Read-only (no write) — the caller applies `bump_dr_level` on `Apply`.
 pub(crate) fn resolve_dr_for_target(
     ctx: &ReducerContext,
     target_guid: u64,
@@ -508,11 +411,6 @@ pub(crate) fn resolve_dr_for_target(
     resolve_dr(prior, now_micros)
 }
 
-/// Persist the DR level bump after a successful `Apply` from `resolve_dr_for_target` — increments the
-/// level (via the SAME `dr_pre_level` the decision was made from, so the bump can never disagree with the
-/// decision), stamping a PROVISIONAL `window_expires_micros` = this (already-scaled) aura's own
-/// `expires_at_micros` + 15s. See the `DrState` doc comment for why this is provisional (a still-active
-/// recast needs SOME in-window value to read; the removal hooks below overwrite it with the real one).
 pub(crate) fn bump_dr_level(
     ctx: &ReducerContext,
     target_guid: u64,
@@ -567,13 +465,6 @@ pub(crate) fn dr_window_on_removal(
     }
 }
 
-/// Reap `game_dr_state` rows whose window has long lapsed — pure bookkeeping (a lapsed window already
-/// reads as level-0/fresh via `dr_pre_level`, so this is a size-bound, not a correctness fix). WIRED into
-/// `gc::reap_movement_events` (module/src/gc.rs) via one bespoke call — `game_dr_state` doesn't fit the
-/// file's `reap!` macro (that macro assumes an `id: u64` + `created_at: Timestamp` shape; this table's
-/// time column is a plain `i64`, and its liveness test is `window_expires_micros`, not the row's own age),
-/// so a bespoke call is the right shape, mirroring the teleport-event / corpse-decay bespoke blocks
-/// already in that file.
 pub(crate) fn sweep_dr_state(ctx: &ReducerContext) {
     let now_micros = ctx.timestamp.to_micros_since_unix_epoch();
     let table = ctx.db.game_dr_state();
@@ -611,7 +502,6 @@ mod tests {
             }
         );
 
-        // Reverse: rank1(A) attempted while target carries rank2(B) → weaker → Refuse.
         let rank2_b = AuraSummary {
             aura_id: 43,
             caster_guid: 200,
@@ -628,9 +518,6 @@ mod tests {
         );
     }
 
-    /// Blessings (EXCLUSIVE_PER_CASTER, verbatim vector): Blessing of Might(A) + Blessing of Wisdom(A) on
-    /// the same target — the second REPLACES the first (same caster). Might(A) + Wisdom(B) — both stand
-    /// (different casters never conflict under this rule).
     #[test]
     fn blessings_are_exclusive_per_caster_not_across_casters() {
         let might_a = AuraSummary {
@@ -638,7 +525,6 @@ mod tests {
             caster_guid: 500,
             strength: 0,
         };
-        // Wisdom cast by the SAME caster (500) — replaces Might.
         assert_eq!(
             resolve_group_conflict(500, 0, GroupRule::ExclusivePerCaster, &[might_a]),
             ApplyDecision::Apply {
@@ -646,7 +532,6 @@ mod tests {
                 evict: vec![1]
             }
         );
-        // Wisdom cast by a DIFFERENT caster (600) — both stand, nothing evicted.
         assert_eq!(
             resolve_group_conflict(600, 0, GroupRule::ExclusivePerCaster, &[might_a]),
             ApplyDecision::Apply {
@@ -656,16 +541,10 @@ mod tests {
         );
     }
 
-    /// The armor-debuff family is heterogeneous, so `rank_is_comparable` is false for it and the
-    /// comparison is magnitude only. Sunder Armor's magnitude is per-application: its ACTIVE STACK
-    /// COUNT decides whether Expose Armor displaces it, which is the whole point of the two vectors
-    /// below. Magnitudes are the real 1.12.1 values — Sunder rank 5 is 450 armor per stack and Expose
-    /// Armor rank 5 at five combo points is 2050.
     #[test]
     fn armor_debuff_strength_folds_sunders_active_stack_count() {
         const SUNDER_PER_STACK: i32 = 450;
         const EXPOSE_5_COMBO: i32 = 2050;
-        // The fold `apply_group_conflict` performs when it summarises an existing aura row.
         fn armor_strength(rank: u8, amount: i32, stacks: u16) -> i32 {
             compute_group_strength(
                 false,
@@ -674,7 +553,6 @@ mod tests {
             )
         }
 
-        // ONE STACK: Sunder is worth 450, so Expose Armor's 2050 displaces it.
         let sunder_1_stack = AuraSummary {
             aura_id: 8,
             caster_guid: 2,
@@ -694,7 +572,6 @@ mod tests {
             }
         );
 
-        // FIVE STACKS: the same Sunder is worth 2250, so the same Expose Armor is refused.
         let sunder_5_stack = AuraSummary {
             aura_id: 8,
             caster_guid: 2,
@@ -711,7 +588,6 @@ mod tests {
             ApplyDecision::Refuse { reason: "weaker" }
         );
 
-        // A fresh single Sunder never displaces an established Expose Armor either.
         let expose_existing = AuraSummary {
             aura_id: 7,
             caster_guid: 1,
@@ -728,9 +604,6 @@ mod tests {
         );
     }
 
-    /// Fortitude mixes two rank chains, so it compares magnitude. A higher rank still replaces a lower
-    /// one (its magnitude is larger) and a lower rank is still refused. Magnitudes are the real 1.12.1
-    /// stamina values.
     #[test]
     fn fortitude_family_replaces_and_refuses_by_magnitude() {
         const PW_FORT_R5: i32 = 43;
@@ -768,8 +641,6 @@ mod tests {
             ApplyDecision::Refuse { reason: "weaker" }
         );
 
-        // Prayer of Fortitude rank 2 grants the same stamina as Power Word: Fortitude rank 6. Comparing
-        // the two chains' rank numbers instead would refuse it as "rank 2 versus rank 6".
         assert_eq!(
             resolve_group_conflict(
                 100,
@@ -784,11 +655,6 @@ mod tests {
         );
     }
 
-    /// A plain STACKS-rule group is a complete no-op: full duration, nothing evicted, regardless of what
-    /// else is on the target. (The OTHER "no-op" case — a spell not in any group at all — no longer has a
-    /// pure-fn equivalent to pin: `apply_group_conflict` now returns `true` directly without ever calling
-    /// `resolve_group_conflict`, so there is nothing here to unit-test beyond that caller-side short
-    /// circuit.)
     #[test]
     fn stacks_rule_is_a_full_duration_noop() {
         let other = AuraSummary {
@@ -805,21 +671,11 @@ mod tests {
         );
     }
 
-    // --- CC diminishing returns ------------------------------------------------------------------
-
-    /// The verbatim poly DR timeline (t in seconds -> micros): t=0 full (fresh); t=12 (aura expired at
-    /// t=10, its removal set the window to expire at t=25) -> 50%, level->2; t=16 (aura, still active,
-    /// hasn't been removed yet — its own apply-time level bump already put the row at level 2) -> 25%,
-    /// level->3; t=20 (aura removed at t=18.5, its removal reset the window to expire at t=33.5, still
-    /// live) -> Refuse{immune}; t=40.1 (> t=33.5, window lapsed) -> full duration, level reset.
     #[test]
-    // Every timestamp in this vector is written `<n> * SECOND` so the timeline reads off the page in
-    // the same units as the doc comment above; `0 * SECOND` is that convention at t=0, not a bug.
     #[allow(clippy::erasing_op)]
     fn poly_dr_timeline_matches_the_verbatim_vector() {
         const SECOND: i64 = 1_000_000;
 
-        // t=0: no prior row -> full duration.
         let t0 = 0 * SECOND;
         let decision0 = resolve_dr(None, t0);
         assert_eq!(
@@ -829,16 +685,13 @@ mod tests {
                 evict: vec![]
             }
         );
-        // bump_dr_level's own math (mirrored here, no ctx): pre_level 0 -> new_level 1.
         assert_eq!(dr_pre_level(None, t0), 0);
 
-        // Aura (full 10s) removed at t=10 (natural expiry) -> window row: level 1, expires t=10+15=25.
         let row_after_removal_1 = DrWindow {
             level: 1,
             window_expires_micros: 25 * SECOND,
         };
 
-        // t=12: within window (12 <= 25) at level 1 -> 50%, i.e. 5s of a 10s base.
         let t12 = 12 * SECOND;
         let decision12 = resolve_dr(Some(row_after_removal_1), t12);
         assert_eq!(
@@ -849,15 +702,11 @@ mod tests {
             }
         );
         assert_eq!(dr_pre_level(Some(row_after_removal_1), t12), 1);
-        // 10s base * 50% = 5s -> expires at t=17. Not removed yet by t=16 (still active): the apply-time
-        // bump already advanced the row to level 2 (this models what `bump_dr_level` writes).
         let row_after_apply_2 = DrWindow {
             level: 2,
             window_expires_micros: 17 * SECOND + DR_WINDOW_MICROS,
         };
 
-        // t=16: aura still active (expires t=17), a recast reads the row AS-IS (no removal happened),
-        // level 2 -> 25%, i.e. 2.5s of a 10s base.
         let t16 = 16 * SECOND;
         let decision16 = resolve_dr(Some(row_after_apply_2), t16);
         assert_eq!(
@@ -868,23 +717,17 @@ mod tests {
             }
         );
         assert_eq!(dr_pre_level(Some(row_after_apply_2), t16), 2);
-        // 10s * 25% = 2.5s -> expires at t=18.5. THIS TIME it naturally expires (removed) at t=18.5,
-        // stamping the AUTHORITATIVE window: level 3 (unchanged at removal), expires t=18.5+15=33.5.
         let row_after_removal_3 = DrWindow {
             level: 3,
             window_expires_micros: (18 * SECOND + SECOND / 2) + DR_WINDOW_MICROS,
         };
-        assert_eq!(row_after_removal_3.window_expires_micros, 335 * SECOND / 10); // t=33.5s
+        assert_eq!(row_after_removal_3.window_expires_micros, 335 * SECOND / 10);
 
-        // t=20: within window (20 <= 33.5) at level 3 -> immune -> Refuse.
         let t20 = 20 * SECOND;
         let decision20 = resolve_dr(Some(row_after_removal_3), t20);
         assert_eq!(decision20, ApplyDecision::Refuse { reason: "immune" });
-        // Refused: the row is untouched (no bump on a Refuse) — level stays 3, window stays 33.5s.
         assert_eq!(dr_pre_level(Some(row_after_removal_3), t20), 3);
 
-        // t=40.1: past the window (40.1 > 33.5) -> lapsed -> full duration, level effectively reset to 0
-        // (the next `bump_dr_level` would store level 1, a fresh chain).
         let t40_1 = 40 * SECOND + SECOND / 10;
         let decision40 = resolve_dr(Some(row_after_removal_3), t40_1);
         assert_eq!(
@@ -897,21 +740,16 @@ mod tests {
         assert_eq!(dr_pre_level(Some(row_after_removal_3), t40_1), 0);
     }
 
-    /// One player target's `(category)` DR state driven through the PRODUCTION policy fns — the
-    /// in-process twin of the live probe in `docs/verification/cc-diminishing-returns-probe.md`, so the ladder, the window
-    /// stamping and the level agreement are asserted without a `ReducerContext`.
     struct DrProbe {
         row: Option<DrWindow>,
     }
 
     impl DrProbe {
-        /// A CC application of `base_ms` base duration at `now`. Returns the aura expiry the caster would
-        /// observe, or `None` when the application is refused at the immune step.
         fn apply(&mut self, now: i64, base_ms: i64) -> Option<i64> {
             match resolve_dr(self.row, now) {
                 ApplyDecision::Refuse { reason } => {
                     assert_eq!(reason, "immune");
-                    None // refused: `aura_apply` returns before `bump_dr_level`, so `self.row` is untouched
+                    None
                 }
                 ApplyDecision::Apply {
                     duration_scale_bp,
@@ -925,8 +763,6 @@ mod tests {
             }
         }
 
-        /// Removal by ANY path — natural expiry, dispel, or break-on-damage. Mirrors the one line
-        /// `dr_window_on_removal` writes around its row read.
         fn remove(&mut self, at: i64) {
             let row = self
                 .row
@@ -936,37 +772,26 @@ mod tests {
         }
     }
 
-    /// The end-to-end player-target timeline the live probe reproduces, on Polymorph's 20s base: full,
-    /// half and quarter duration, a refused immune application, an early (break-on-damage) removal
-    /// stamping the window before the scheduled expiry would have, a natural expiry stamping it at the
-    /// reaper's observation instant, and a fresh chain once the window lapses.
     #[test]
     fn player_target_dr_timeline_end_to_end_on_a_twenty_second_control() {
         const S: i64 = 1_000_000;
         const POLY_MS: i64 = 20_000;
         let mut probe = DrProbe { row: None };
 
-        // t=0 — first application: full duration, stored level 1.
         let expiry_1 = probe
             .apply(0, POLY_MS)
             .expect("a fresh target is never immune");
         assert_eq!(expiry_1, 20 * S);
         let row_1 = probe.row.expect("a successful application persists a row");
         assert_eq!(row_1.level, 1);
-        // The persisted window agrees with the observed expiry: provisional = this aura's expiry + 15s.
         assert_eq!(row_1.window_expires_micros, expiry_1 + DR_WINDOW_MICROS);
 
-        // t=3 — RECAST while the first aura is still active (it expires at t=20). The still-live level is
-        // read as-is, so a refresh cannot bypass progression: 50%, stored level 2.
         let expiry_2 = probe.apply(3 * S, POLY_MS).expect("level 1 still applies");
-        assert_eq!(expiry_2, 13 * S); // 3s + 50% of 20s
+        assert_eq!(expiry_2, 13 * S);
         let row_2 = probe.row.expect("row persists");
         assert_eq!(row_2.level, 2);
         assert_eq!(row_2.window_expires_micros, expiry_2 + DR_WINDOW_MICROS);
 
-        // t=5 — EARLY removal (break-on-damage or dispel) seven seconds before the scheduled expiry. The
-        // window is re-stamped from the ACTUAL removal, which is strictly earlier than the provisional
-        // scheduled-expiry value; the level is untouched by a removal.
         let provisional = row_2.window_expires_micros;
         probe.remove(5 * S);
         let row_3 = probe.row.expect("row persists");
@@ -974,19 +799,14 @@ mod tests {
         assert!(row_3.window_expires_micros < provisional);
         assert_eq!(row_3.level, 2);
 
-        // t=8 — third application inside the window: 25%, stored level 3.
         let expiry_3 = probe.apply(8 * S, POLY_MS).expect("level 2 still applies");
-        assert_eq!(expiry_3, 13 * S); // 8s + 25% of 20s
+        assert_eq!(expiry_3, 13 * S);
         assert_eq!(probe.row.expect("row persists").level, 3);
 
-        // t=10 — fourth application while the third aura is still active: refused as immune, and the
-        // persisted level AND window are left exactly as they were.
         let before_immune = probe.row;
         assert_eq!(probe.apply(10 * S, POLY_MS), None);
         assert_eq!(probe.row, before_immune);
 
-        // t=13.2 — NATURAL expiry, observed by the aura reaper 200ms after the scheduled t=13. The window
-        // starts at that removal instant, not at the scheduled expiry.
         let removed_at = 13 * S + S / 5;
         assert!(removed_at >= expiry_3);
         probe.remove(removed_at);
@@ -994,10 +814,8 @@ mod tests {
         assert_eq!(row_4.window_expires_micros, removed_at + DR_WINDOW_MICROS);
         assert_eq!(row_4.level, 3);
 
-        // Still immune at the exact window boundary (t=28.2).
         assert_eq!(probe.apply(row_4.window_expires_micros, POLY_MS), None);
 
-        // One microsecond later the window has lapsed: full duration again, and a FRESH chain (level 1).
         let restart = row_4.window_expires_micros + 1;
         let expiry_4 = probe
             .apply(restart, POLY_MS)
@@ -1006,14 +824,8 @@ mod tests {
         assert_eq!(probe.row.expect("row persists").level, 1);
     }
 
-    /// Same double-poly scenario against a CREATURE target: `dr_category_for_effect` returns `None` for a
-    /// non-player target (checked at the call site, before `resolve_dr_for_target` is ever invoked), so
-    /// `aura_apply` never calls `resolve_dr` at all for a creature — modeled here as a `None` prior with no
-    /// window ever recorded, which always resolves to full duration regardless of `now`.
     #[test]
     fn creature_target_skips_dr_entirely_full_duration_both_casts() {
-        // "Both casts" — calling twice (as if back-to-back on the creature) yields full duration each time,
-        // since there is no DR bookkeeping in play for a creature target at all.
         assert_eq!(
             resolve_dr(None, 0),
             ApplyDecision::Apply {
@@ -1030,30 +842,23 @@ mod tests {
         );
     }
 
-    /// `dr_scale_bp` / `dr_pre_level` in isolation: the 100/50/25/immune ladder + the window-lapse reset,
-    /// pinned as a small pure table (the building blocks the timeline test above composes).
     #[test]
     fn dr_scale_ladder_and_window_lapse_reset() {
         assert_eq!(dr_scale_bp(0), Some(10_000));
         assert_eq!(dr_scale_bp(1), Some(5_000));
         assert_eq!(dr_scale_bp(2), Some(2_500));
         assert_eq!(dr_scale_bp(3), None);
-        assert_eq!(dr_scale_bp(4), None); // defensive: anything >=3 is immune
-                                          // No row -> pre_level 0 regardless of `now`.
+        assert_eq!(dr_scale_bp(4), None);
         assert_eq!(dr_pre_level(None, 0), 0);
         assert_eq!(dr_pre_level(None, 1_000_000_000), 0);
-        // A live window (now == the boundary tick) still counts as in-window (`<=`).
         let w = DrWindow {
             level: 2,
             window_expires_micros: 100,
         };
         assert_eq!(dr_pre_level(Some(w), 100), 2);
-        // One micro past the boundary -> lapsed -> 0.
         assert_eq!(dr_pre_level(Some(w), 101), 0);
     }
 
-    /// `dr_category_for_mechanic` maps every mechanic this crate has today; an unmapped mechanic (or the
-    /// inert 0 sentinel) is `None`.
     #[test]
     fn dr_category_mapping_covers_every_current_mechanic() {
         assert_eq!(dr_category_for_mechanic(M_STUN), Some(DR_CAT_STUN));
@@ -1064,28 +869,20 @@ mod tests {
         assert_eq!(dr_category_for_mechanic(999), None);
     }
 
-    /// `compute_strength`: rank dominates when ranks differ; magnitude (clamped to [0, 99_999]) is the
-    /// tiebreaker within equal rank. A negative-magnitude input (never passed by a caller today — callers
-    /// abs() first — but exercised here for the clamp floor) never goes negative.
     #[test]
     fn compute_strength_ranks_first_then_magnitude() {
-        assert!(compute_strength(2, 1) > compute_strength(1, 99_999)); // rank 2 beats rank 1's max magnitude
+        assert!(compute_strength(2, 1) > compute_strength(1, 99_999));
         assert_eq!(compute_strength(0, 100), compute_strength(0, 100));
-        assert!(compute_strength(0, 200) > compute_strength(0, 100)); // equal rank -> magnitude decides
-        assert_eq!(compute_strength(0, -50), 0); // clamp floor
+        assert!(compute_strength(0, 200) > compute_strength(0, 100));
+        assert_eq!(compute_strength(0, -50), 0);
     }
 
     #[test]
     fn heterogeneous_groups_ignore_unrelated_spell_chain_ranks() {
-        // A rank-five Sunder is not intrinsically stronger than rank-one Expose Armor. In this
-        // group their effective armor reduction alone decides the outcome.
         assert!(compute_group_strength(false, 1, 2_050) > compute_group_strength(false, 5, 450));
-        // Homogeneous rank families preserve rank-first comparison.
         assert!(compute_group_strength(true, 2, 1) > compute_group_strength(true, 1, 99_999));
     }
 
-    /// `group_rule_from_u8` decodes the four documented rule bytes; an unrecognized byte is the safe
-    /// `Stacks` no-op fallback (never silently refuses/evicts on a data bug).
     #[test]
     fn group_rule_decode_and_safe_fallback() {
         assert_eq!(group_rule_from_u8(RULE_STACKS), GroupRule::Stacks);

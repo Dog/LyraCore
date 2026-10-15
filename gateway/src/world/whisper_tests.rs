@@ -1,11 +1,3 @@
-//! Whisper target facts over the multi-shard Fake, and the whisper arm end to end.
-//!
-//! What executes here is production `world::whisper::target_facts` against the in-memory
-//! multi-database topology the group tests use (`party_tests::party_topology`: Ginger in the open
-//! world on `world`, Vim inside the dungeon on `instances`, plus an offline Character and a
-//! playerbot). The Module's whisper rules are pinned in `module/src/realm_chat.rs`; the dispatch
-//! arm's Refusal answers are pinned in `handlers/chat.rs`.
-
 use super::party_tests::{character, party_topology, BOT, DORMANT, GINGER, TRIN, VIM};
 use super::*;
 
@@ -20,8 +12,6 @@ fn facts(guid: u64, name: &str) -> WhisperTargetFacts {
     }
 }
 
-/// The live failure this path exists for: `/w Vim` from the open world, with Vim's row on the
-/// instances database. The name resolves realm-wide, case-insensitively.
 #[test]
 fn a_whisper_target_on_another_shard_resolves_realm_wide() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -50,7 +40,6 @@ fn an_unknown_name_reaches_nobody() {
     );
 }
 
-/// No offline whispering in vanilla: the gate is `game_character.online`, the session flag.
 #[test]
 fn an_offline_character_reaches_nobody() {
     let (_realm, world, _instances, _calls) = party_topology();
@@ -60,8 +49,6 @@ fn an_offline_character_reaches_nobody() {
     );
 }
 
-/// A playerbot has a live entity and never logs in, so its session flag stays false. Whisper
-/// reads the session flag, so a bot stays unwhisperable, as it was before Realm Presence.
 #[test]
 fn a_playerbot_reaches_nobody_because_the_gate_reads_the_session_flag() {
     let (_realm, world, _instances, _calls) = party_topology();
@@ -75,8 +62,6 @@ fn a_playerbot_reaches_nobody_because_the_gate_reads_the_session_flag() {
     );
 }
 
-/// The ignore verdict is read from the Shard that holds the target's contact rows, which is not
-/// the Shard the whisper was typed on.
 #[test]
 fn the_ignore_verdict_is_read_from_whichever_shard_holds_the_target() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -114,8 +99,6 @@ fn an_ignore_of_somebody_else_is_not_the_speakers() {
     );
 }
 
-/// A peer Shard that cannot answer contributes no ignore. Reading its `Err` as "ignored" would
-/// drop every whisper on the Realm and tell every sender they are ignored while it is down.
 #[test]
 fn an_unreachable_shard_does_not_make_a_whisper_look_ignored() {
     let (_realm, world, _instances, _calls) = party_topology();
@@ -137,8 +120,6 @@ fn an_unreachable_shard_does_not_make_a_whisper_look_ignored() {
     );
 }
 
-/// An AFK target on another Shard: the Away Status comes from its live entity's PLAYER_FLAGS
-/// (0x02) and the Auto-Reply from that same Shard.
 #[test]
 fn an_afk_target_conveys_its_auto_reply_from_its_own_shard() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -171,8 +152,6 @@ fn an_afk_target_conveys_its_auto_reply_from_its_own_shard() {
     );
 }
 
-/// DND (0x04) with no stored text conveys an empty Auto-Reply; the Module answers with the
-/// default "Do not Disturb".
 #[test]
 fn a_dnd_target_without_stored_text_conveys_an_empty_reply() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -192,7 +171,6 @@ fn a_dnd_target_without_stored_text_conveys_an_empty_reply() {
     );
 }
 
-/// A stored row without the flag is not an Away Status: PLAYER_FLAGS is the state observers see.
 #[test]
 fn a_reply_row_without_the_away_flag_is_ignored() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -215,8 +193,6 @@ fn a_reply_row_without_the_away_flag_is_ignored() {
     );
 }
 
-/// Names are unique per Shard, not per Realm. A logged-out homonym on the sender's own Shard must
-/// not shadow the Vim who is online inside the dungeon.
 #[test]
 fn a_homonym_on_the_senders_own_shard_does_not_shadow_the_online_target() {
     const HOMONYM: u64 = 9;
@@ -275,8 +251,6 @@ fn a_homonym_on_the_senders_own_shard_does_not_shadow_the_online_target() {
     );
 }
 
-/// A candidate whose Realm Presence cannot be read is not reported missing: the read error is the
-/// answer, and the arm logs it and answers `SMSG_CHAT_PLAYER_NOT_FOUND`.
 #[test]
 fn an_unreadable_candidate_is_an_error_not_a_missing_character() {
     let (_realm, world, _instances, _calls) = party_topology();
@@ -298,8 +272,6 @@ fn an_unreadable_candidate_is_an_error_not_a_missing_character() {
     assert!(error.to_string().contains("unreachable"), "got {error}");
 }
 
-/// Say, yell and emotes stay on the player's own Shard: they are spatial, which is the rule that
-/// moved the whisper, which is not, onto Realm-core.
 #[test]
 fn say_yell_and_emotes_stay_on_the_players_own_shard_when_sharded() {
     let (realm, world, _instances, calls) = party_topology();
@@ -329,8 +301,6 @@ fn say_yell_and_emotes_stay_on_the_players_own_shard_when_sharded() {
     assert!(realm.chat.realm_whispers.lock().unwrap().is_empty());
 }
 
-/// A whisper line names its sender by guid and the client resolves the name over
-/// `CMSG_NAME_QUERY`. Answered from the asking Shard alone, a cross-shard sender renders nameless.
 #[test]
 fn a_name_query_resolves_a_character_on_another_shard() {
     let (_realm, world, instances, _calls) = party_topology();
@@ -355,10 +325,6 @@ fn a_name_query_resolves_a_character_on_another_shard() {
         .is_none());
 }
 
-/// End to end over a real socket, through `run_world_session`'s own dispatch. The speaker guid
-/// the Module acts on is an argument, so it must be the guid this socket entered the world with:
-/// anything else is impersonation. An unresolvable name answers `SMSG_CHAT_PLAYER_NOT_FOUND` with
-/// the typed name.
 #[test]
 fn a_real_session_whispers_across_shards_as_its_own_character() {
     let (realm, _world, instances, _calls) = party_topology();
@@ -423,8 +389,6 @@ fn a_real_session_whispers_across_shards_as_its_own_character() {
     }
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
-    // The successful whisper answers nothing (its lines return on the Relay), so the next reply is
-    // the second whisper's.
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_CHAT_PLAYER_NOT_FOUND(m) => assert_eq!(m.name, "Nobodyatall"),
         other => panic!("expected SMSG_CHAT_PLAYER_NOT_FOUND, got {other}"),

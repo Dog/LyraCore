@@ -1,12 +1,3 @@
-//! The Meeting Stone Queue. [`gw_admit_meeting_stone`] admits a Character at the stone on its Home
-//! Shard and writes nothing. [`realm_meeting_stone_op`] queues it on Realm-core, where party
-//! membership is authoritative, so Seekers on every World Shard share one queue. Realm-core holds
-//! no Character rows, so the Gateway conveys race and class as [`SeekerFacts`].
-//!
-//! Matching runs in the transaction that changes a bucket ([`match_bucket`]): the cores' queue
-//! thread reduces to longest wait per Open Role, so a tick would only add latency. A solo Seeker
-//! lasts as long as its Account Claim ([`claim_ended`]); a party Seeker as long as its membership.
-
 use std::collections::BTreeSet;
 
 use spacetimedb::{
@@ -27,24 +18,19 @@ use matching::{formation, next_stone_add, open_roles};
 use crate::group::{Departure, JoinPlan, JoinTarget};
 use crate::{game_account_claim, game_group};
 
-/// A queued Party hears IN_PROGRESS this often (cm:LFG/LFGMgr.cpp:55).
 const REMINDER_INTERVAL_MICROS: i64 = 5 * 60 * 1_000_000;
 
 const REMINDER_TICK_MICROS: i64 = 5_000_000;
 
-/// One Meeting Stone template's level range and dungeon area, imported from `data0` to `data2`.
-/// Packages do not author it. [static]
 #[table(accessor = game_meeting_stone)]
 pub struct MeetingStone {
     #[primary_key]
     pub entry: u32,
     pub min_level: u32,
-    /// 0 means no upper bound.
     pub max_level: u32,
     pub area_id: u32,
 }
 
-/// One Seeker. The Gateway reads it to answer `CMSG_MEETINGSTONE_INFO`. [entity]
 #[table(
     accessor = game_meeting_stone_seeker,
     index(accessor = by_bucket, btree(columns = [area_id, team])),
@@ -55,15 +41,11 @@ pub struct MeetingStoneSeeker {
     pub character_guid: u64,
     pub area_id: u32,
     pub team: u32,
-    /// 0 when the Gateway could not read it.
     pub class: u8,
-    /// 0 for a solo Seeker.
     pub group_id: u64,
     pub queued_at: Timestamp,
 }
 
-/// One queued Party. It exists exactly while the Party is queued, and its Seeker rows are its
-/// current members. [entity]
 #[table(accessor = game_meeting_stone_party)]
 pub struct MeetingStoneParty {
     #[primary_key]
@@ -82,7 +64,6 @@ pub struct MeetingStoneReminderSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// The Seekers that can meet: one dungeon area and one team.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bucket {
     pub(crate) area_id: u32,
@@ -102,8 +83,6 @@ fn refused(refusal: MeetingStoneRefusal, detail: &str) -> String {
     tag.to_string()
 }
 
-/// May `actor_guid` use the Meeting Stone `go_guid`? Writes nothing. The level check has no 1.12
-/// failure code, so the Gateway drops that Refusal silently, as the client checks it first.
 #[reducer]
 pub fn gw_admit_meeting_stone(
     ctx: &ReducerContext,
@@ -126,7 +105,6 @@ fn admit(
     actor_guid: u64,
     go_guid: u64,
 ) -> Result<(), MeetingStoneRefusal> {
-    // Humans only: no World Session, no queue.
     if request_actor.ownership.is_none() || crate::taxi::is_in_flight(ctx, actor_guid) {
         return Err(MeetingStoneRefusal::ActorUnavailable);
     }
@@ -160,7 +138,6 @@ fn gate_refusal(kind: crate::actor::ActionRefusalKind) -> MeetingStoneRefusal {
     }
 }
 
-/// A `max_level` of 0 has no upper bound.
 fn level_in_range(level: u32, min_level: u32, max_level: u32) -> bool {
     level >= min_level && (max_level == 0 || level <= max_level)
 }
@@ -172,8 +149,6 @@ struct Membership {
     members: usize,
 }
 
-/// A grouped actor queues only as the leader of a Party with room. The order of the checks picks
-/// the failure code (cm:LFG/LFGHandler.cpp:58-77).
 fn party_join_gate(membership: Membership) -> Result<(), MeetingStoneRefusal> {
     if !membership.leads {
         return Err(MeetingStoneRefusal::NotLeader);
@@ -189,7 +164,6 @@ fn party_join_gate(membership: Membership) -> Result<(), MeetingStoneRefusal> {
 
 enum StoneOpError {
     Refused(MeetingStoneRefusal),
-    /// Untagged, so the Gateway treats the outcome as unknown.
     Invalid(String),
 }
 
@@ -205,9 +179,6 @@ impl From<crate::group::GroupOpError> for StoneOpError {
     }
 }
 
-/// One Meeting Stone Queue op on the party authority. Operator-gated because the actor is an
-/// argument. JOIN reads `area_id` and the `seekers` of the actor or its whole Party; LEAVE reads
-/// neither. Too many facts, facts without the actor, or an unknown op is an untagged error.
 #[reducer]
 pub fn realm_meeting_stone_op(
     ctx: &ReducerContext,
@@ -295,8 +266,6 @@ fn first_reminder_at(ctx: &ReducerContext) -> Result<Timestamp, String> {
         .ok_or_else(|| "reminder time overflow".to_string())
 }
 
-/// Queue `group_id` with `members`, `(guid, class)` each, and tell each JOINED. Re-queueing resets
-/// the area and wait time and drops Seeker rows of former members.
 fn queue_party(
     ctx: &ReducerContext,
     group_id: u64,
@@ -383,8 +352,6 @@ fn member_guids(ctx: &ReducerContext, group_id: u64) -> Vec<u64> {
         .collect()
 }
 
-/// A solo Seeker leaves with LEAVE_QUEUE, and a queued Party's leader takes the whole Party out.
-/// Any other member only hears NONE.
 fn leave(ctx: &ReducerContext, actor_guid: u64) -> Result<(), StoneOpError> {
     let Some((group, _)) = crate::group::group_with_members(ctx, actor_guid)? else {
         let seekers = ctx.db.game_meeting_stone_seeker();
@@ -408,7 +375,6 @@ fn leave(ctx: &ReducerContext, actor_guid: u64) -> Result<(), StoneOpError> {
     Ok(())
 }
 
-/// Take a queued Party out of the queue. Every member hears `SETQUEUE(0, status)`.
 pub(crate) fn dequeue_party(ctx: &ReducerContext, group_id: u64, status: u8) {
     if ctx
         .db
@@ -441,7 +407,6 @@ fn dequeue_party_rows(ctx: &ReducerContext, group_id: u64) {
     }
 }
 
-/// Every member hears COMPLETE, then `SETQUEUE(0, NONE)`, and the Party leaves the queue.
 fn complete_party(ctx: &ReducerContext, group_id: u64) {
     let members = member_guids(ctx, group_id);
     push_to_each(ctx, &members, event_kind::COMPLETE, 0);
@@ -451,12 +416,6 @@ fn complete_party(ctx: &ReducerContext, group_id: u64) {
     dequeue_party_rows(ctx, group_id);
 }
 
-// =================================================================================================
-//  The bucket pass
-// =================================================================================================
-
-/// Match `bucket` until nothing changes: queued Parties fill oldest first, then five solo Seekers
-/// form a Party and the Parties fill again. An `Err` is a broken durable relationship.
 pub(crate) fn match_bucket(ctx: &ReducerContext, bucket: Bucket) -> Result<(), String> {
     loop {
         let (mut solos, parties) = read_bucket(ctx, bucket);
@@ -470,9 +429,6 @@ pub(crate) fn match_bucket(ctx: &ReducerContext, bucket: Bucket) -> Result<(), S
     }
 }
 
-/// The bucket's solo Seekers, and its queued Parties oldest first. Drops what could make a Stone
-/// Add fail: a solo Seeker without a live claim (the lease reaper may take 15 s) or in a Group, and
-/// a party row whose Group is gone or is a Raid. `remove_member` cannot roll a pass back.
 fn read_bucket(
     ctx: &ReducerContext,
     bucket: Bucket,
@@ -529,8 +485,6 @@ fn has_live_claim(ctx: &ReducerContext, character_guid: u64) -> bool {
         .any(|claim| !claim.closed && claim.expires_micros > now)
 }
 
-/// Give `party` Stone Adds while a Seeker fits an Open Role. The current members hear MEMBER_ADDED
-/// before each add. A full Party is completed, never joined.
 fn fill_party(
     ctx: &ReducerContext,
     party: &MeetingStoneParty,
@@ -581,8 +535,6 @@ fn party_class(ctx: &ReducerContext, guid: u64, group_id: u64) -> u8 {
         .map_or(0, |seeker| seeker.class)
 }
 
-/// Form a Party of `leader` and `member` and queue it. The leader hears MEMBER_ADDED before the
-/// Party exists, then both hear JOINED.
 fn form_party(
     ctx: &ReducerContext,
     bucket: Bucket,
@@ -635,7 +587,6 @@ fn plan_stone_add(
     })
 }
 
-/// Add `joiner` through `plan` and advance the Group's Roster Revision. Returns the Group id.
 fn stone_add(ctx: &ReducerContext, joiner: &MeetingStoneSeeker, plan: JoinPlan) -> u64 {
     ctx.db
         .game_meeting_stone_seeker()
@@ -646,13 +597,6 @@ fn stone_add(ctx: &ReducerContext, joiner: &MeetingStoneSeeker, plan: JoinPlan) 
     joined.group_id
 }
 
-// =================================================================================================
-//  Group core hooks
-// =================================================================================================
-
-/// `character_guid` joined `group_id` through an accepted invite. A solo Seeker leaves the queue,
-/// with LEAVE_QUEUE unless the Party is queued for the same area. A queued Party gains a Seeker,
-/// completes at five, and otherwise rematches, because the new member moves the Open Roles.
 pub(crate) fn party_joined(
     ctx: &ReducerContext,
     group_id: u64,
@@ -694,14 +638,6 @@ pub(crate) struct PartyDeparture {
     pub(crate) leader_changed: bool,
 }
 
-/// A member left a queued Party that survives it, after the member row is gone and before the
-/// roster list (cm:Groups/Group.cpp:413-476). Returns the bucket to rematch, if any.
-///
-/// - Left, same leader: the leaver hears NONE, the rest PARTY_MEMBER_LEFT_LFG, the Party stays.
-/// - Left, new leader: the leaver hears NONE and the Party leaves with LEAVE_QUEUE.
-/// - Kicked: the rest hear PARTY_MEMBER_REMOVED_PARTY_REMOVED and the Party leaves with
-///   LEAVE_QUEUE. The kicked Character, if it has a World Session, hears
-///   LOOKING_FOR_NEW_PARTY_IN_QUEUE and waits alone.
 pub(crate) fn party_left(ctx: &ReducerContext, departed: PartyDeparture) -> Option<Bucket> {
     let party = ctx
         .db
@@ -725,7 +661,6 @@ pub(crate) fn party_left(ctx: &ReducerContext, departed: PartyDeparture) -> Opti
                 );
             }
             dequeue_party(ctx, departed.group_id, queue_status::LEAVE_QUEUE);
-            // A kicked bot or offline member only leaves, as in cmangos (`if (player)`).
             if !has_live_claim(ctx, guid) {
                 return None;
             }
@@ -762,7 +697,6 @@ pub(crate) fn party_left(ctx: &ReducerContext, departed: PartyDeparture) -> Opti
     }
 }
 
-/// A queued Party disbanded: every former member hears NONE, and nobody waits on alone.
 pub(crate) fn party_disbanded(ctx: &ReducerContext, group_id: u64, former_members: &[u64]) {
     if ctx
         .db
@@ -779,12 +713,6 @@ pub(crate) fn party_disbanded(ctx: &ReducerContext, group_id: u64, former_member
     dequeue_party_rows(ctx, group_id);
 }
 
-// =================================================================================================
-//  Reminders
-// =================================================================================================
-
-/// Every member of a queued Party whose reminder is due hears IN_PROGRESS. Scheduler-only. The
-/// party table holds only queued Parties, so this reads it whole.
 #[reducer]
 pub fn remind_queued_parties(ctx: &ReducerContext, _schedule: MeetingStoneReminderSchedule) {
     if ctx.sender() != ctx.database_identity() {
@@ -812,8 +740,6 @@ pub fn remind_queued_parties(ctx: &ReducerContext, _schedule: MeetingStoneRemind
     }
 }
 
-/// Arm the reminder tick with exactly one schedule row. `init` and `debug_repair_after_publish`
-/// both call this.
 pub(crate) fn rearm_reminder_schedule(ctx: &ReducerContext) {
     let schedule = ctx.db.game_meeting_stone_reminder_schedule();
     let stale: Vec<u64> = schedule.iter().map(|row| row.scheduled_id).collect();
@@ -826,8 +752,6 @@ pub(crate) fn rearm_reminder_schedule(ctx: &ReducerContext) {
     });
 }
 
-/// `character_guid`'s Account Claim ended: drop its solo Seeker row without a packet, since no
-/// session is left to hear one. A party Seeker row ends with the membership instead.
 pub(crate) fn claim_ended(ctx: &ReducerContext, character_guid: u64) {
     let seekers = ctx.db.game_meeting_stone_seeker();
     if seekers
@@ -871,7 +795,6 @@ mod tests {
         }
     }
 
-    /// A member of a full raid hears only that it does not lead.
     #[test]
     fn the_join_gate_checks_leader_then_raid_then_size() {
         use MeetingStoneRefusal::*;

@@ -1,7 +1,3 @@
-//! The Meeting Stone Queue on a private Standalone: the Home Shard admission, JOIN and LEAVE for a
-//! lone Seeker and for a Party, and a solo Seeker ending with its Account Claim. One database plays
-//! both the Home Shard and Realm-core, as on a single-database realm.
-
 mod support;
 
 use std::collections::BTreeMap;
@@ -10,12 +6,9 @@ use std::time::Duration;
 use serde_json::json;
 use support::Standalone;
 
-// Fixture ids sit in 509_6000-509_6099.
 const DEADMINES_STONE: (u32, u64) = (509_6000, 509_6001);
 const STOCKADE_STONE: (u32, u64) = (509_6002, 509_6003);
-/// The Deadmines (AreaTable 1581), levels 15 to 20.
 const DEADMINES: u32 = 1581;
-/// The Stockade (AreaTable 717), levels 22 to 30.
 const STOCKADE: u32 = 717;
 const STONE_AT: (f32, f32, f32) = (-8949.95, -132.493, 83.5312);
 
@@ -27,7 +20,6 @@ const MAGE: u8 = 8;
 const JOIN: &str = "0";
 const LEAVE: &str = "1";
 
-// SMSG_MEETINGSTONE_SETQUEUE status bytes, cm:LFG/LFGDefines.h:50-58.
 const LEAVE_QUEUE: u8 = 0;
 const JOINED_QUEUE: u8 = 1;
 const NONE: u8 = 5;
@@ -37,8 +29,6 @@ fn start(name: &str) -> Standalone {
     realm.publish_module();
     realm.assert_call("claim_operator", &[]);
     realm.assert_call("install_guid_range", &["0"]);
-    // Group events are reaped by the shared GC. Disarming it keeps every QUEUE row for the whole
-    // test, so each assertion reads the rows an action added by id.
     realm.assert_sql("DELETE FROM game_event_reaper_schedule");
     stage_stone(&realm, DEADMINES_STONE, 15, 20, DEADMINES);
     stage_stone(&realm, STOCKADE_STONE, 22, 30, STOCKADE);
@@ -63,7 +53,6 @@ fn stage_stone(realm: &Standalone, (entry, go): (u32, u64), min: u32, max: u32, 
     );
 }
 
-/// A Character `offset` yards east of the stones on `map`, with a live claim of its own Account.
 fn stage_character(realm: &Standalone, guid: u64, class: u8, level: u8, map: u32, offset: f32) {
     stage_character_on(realm, guid, guid, class, level, map, offset);
 }
@@ -109,7 +98,6 @@ fn token(account_id: u64, guid: u64) -> serde_json::Value {
     json!({ "account_id": account_id, "generation": 1, "request_nonce": guid })
 }
 
-/// The World Session actor the fixture claim admits.
 fn session(guid: u64) -> String {
     session_on(guid, guid)
 }
@@ -150,7 +138,6 @@ fn refused(realm: &Standalone, reducer: &str, args: &[&str], tag: &str) {
     );
 }
 
-/// Every QUEUE event so far, as `(id, recipient, payload)` in insert order.
 fn queue_events(realm: &Standalone) -> Vec<(u64, u64, String)> {
     let mut rows: Vec<_> = realm
         .query_rows("SELECT id, recipient_guid, payload FROM game_group_event WHERE kind = 27")
@@ -167,7 +154,6 @@ fn queue_events(realm: &Standalone) -> Vec<(u64, u64, String)> {
     rows
 }
 
-/// The QUEUE events `action` adds, as `(recipient, payload)` in insert order.
 fn queue_events_of(realm: &Standalone, action: impl FnOnce()) -> Vec<(u64, String)> {
     let seen = queue_events(realm).last().map_or(0, |event| event.0);
     action();
@@ -182,7 +168,6 @@ fn queue(area: u32, status: u8) -> String {
     format!("{area},{status}")
 }
 
-/// Every Seeker row by guid: `(area_id, team, class, group_id)`.
 fn seekers(realm: &Standalone) -> BTreeMap<u64, (String, String, String, String)> {
     realm
         .query_rows("SELECT * FROM game_meeting_stone_seeker")
@@ -221,7 +206,6 @@ fn solo(area: u32, class: u8) -> (String, String, String, String) {
     )
 }
 
-/// Criterion 3: one SETQUEUE(area, JOINED) and one Seeker row; a second stone replaces the row.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_lone_seeker_queues_once_and_a_second_stone_replaces_its_row() {
@@ -239,7 +223,6 @@ fn a_lone_seeker_queues_once_and_a_second_stone_replaces_its_row() {
         BTreeMap::from([(ALDO, solo(DEADMINES, WARRIOR))])
     );
 
-    // Level 22 is inside the Stockade range and above the Deadmines one.
     stage_character(&realm, ALDO, WARRIOR, 22, 0, 0.0);
     admit(&realm, &session(ALDO), STOCKADE_STONE);
     let joined = queue_events_of(&realm, || {
@@ -253,7 +236,6 @@ fn a_lone_seeker_queues_once_and_a_second_stone_replaces_its_row() {
     assert!(parties(&realm).is_empty());
 }
 
-/// Criterion 4: every admission Refusal leaves no row and no event.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_stone_admission_refuses_without_writing_anything() {
@@ -298,8 +280,6 @@ fn the_stone_admission_refuses_without_writing_anything() {
         "DELETE FROM game_active_taxi_flight WHERE character_guid = {BRAM}"
     ));
 
-    // Without a World Session the actor carries no token. Its claim is gone, so the shared
-    // ownership Gate lets it through and the stone refuses it.
     realm.assert_sql(&format!(
         "DELETE FROM game_account_claim WHERE account_id = {BRAM}"
     ));
@@ -350,7 +330,6 @@ fn the_stone_admission_refuses_without_writing_anything() {
     assert_eq!(queue_events(&realm), before);
 }
 
-/// Criterion 5: the three party Refusals in cmangos's order, none of which writes anything.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_party_join_refusal_changes_nothing() {
@@ -395,8 +374,6 @@ fn a_party_join_refusal_changes_nothing() {
     assert_eq!(queue_events(&realm), before);
 }
 
-/// Criterion 6: one party row, one Seeker row per member with the class the Gateway supplied, and
-/// SETQUEUE(area, JOINED) to every member.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_party_leaders_join_queues_every_member() {
@@ -405,7 +382,6 @@ fn a_party_leaders_join_queues_every_member() {
     const DUNN: u64 = 509_6051;
     const ELLA: u64 = 509_6052;
     stage_character(&realm, CARA, WARRIOR, 18, 0, 0.0);
-    // The members stand elsewhere: a party queues from its leader's stone alone.
     stage_character(&realm, DUNN, PRIEST, 30, 1, 0.0);
     stage_character(&realm, ELLA, MAGE, 10, 0, 500.0);
     stage_group(&realm, CARA, &[DUNN, ELLA], false);
@@ -436,7 +412,6 @@ fn a_party_leaders_join_queues_every_member() {
             group_id.clone(),
         )
     };
-    // ELLA's facts were missing, so she holds a seat and no class.
     assert_eq!(
         seekers(&realm),
         BTreeMap::from([
@@ -452,7 +427,6 @@ fn a_party_leaders_join_queues_every_member() {
     assert_eq!(party[0]["team"], "469");
 }
 
-/// Criterion 7: LEAVE per cm:LFG/LFGHandler.cpp:86-110.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn leave_answers_the_seeker_the_party_and_the_member() {
@@ -465,7 +439,6 @@ fn leave_answers_the_seeker_the_party_and_the_member() {
         stage_character(&realm, guid, class, 18, 0, 0.0);
     }
 
-    // Nobody queued, no party: nothing happens.
     let nothing = queue_events_of(&realm, || stone_op(&realm, LEAVE, &session(FINN), 0, &[]));
     assert!(nothing.is_empty());
 
@@ -497,13 +470,10 @@ fn leave_answers_the_seeker_the_party_and_the_member() {
     assert!(seekers(&realm).is_empty());
     assert!(parties(&realm).is_empty());
 
-    // The leader of a party that is not queued gets NONE, like any member.
     let unqueued = queue_events_of(&realm, || stone_op(&realm, LEAVE, &session(GALE), 0, &[]));
     assert_eq!(unqueued, [(GALE, queue(0, NONE))]);
 }
 
-/// Criterion 9: release, reap and replacement each drop a solo Seeker without a packet. A party
-/// Seeker survives all three.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_solo_seeker_ends_with_its_account_claim() {
@@ -514,8 +484,6 @@ fn a_solo_seeker_ends_with_its_account_claim() {
     const LEADER: u64 = 509_6080;
     const MEMBER: u64 = 509_6081;
     const SEATED: u64 = 509_6082;
-    // `claim_account` needs a real Account row, and the seeded Account 1 is one. Its claim admits
-    // SEATED first and REPLACED after.
     const SEEDED_ACCOUNT: u64 = 1;
     let replace_seeded_claim = |nonce: &str| {
         realm.assert_sql(&format!(
@@ -540,7 +508,6 @@ fn a_solo_seeker_ends_with_its_account_claim() {
     }
     let before = queue_events(&realm);
 
-    // Replaced, for a party Seeker: the row stays.
     replace_seeded_claim("9001");
     stage_character_on(&realm, REPLACED, SEEDED_ACCOUNT, MAGE, 18, 0, 0.0);
     stone_op(
@@ -552,17 +519,14 @@ fn a_solo_seeker_ends_with_its_account_claim() {
     );
     let joined = queue_events(&realm);
 
-    // Released.
     for guid in [RELEASED, LEADER] {
         realm.assert_call("release_account_claim", &[&token(guid, guid).to_string()]);
     }
     assert!(!seekers(&realm).contains_key(&RELEASED));
 
-    // Replaced, for a solo Seeker.
     replace_seeded_claim("9002");
     assert!(!seekers(&realm).contains_key(&REPLACED));
 
-    // Reaped by the Gateway lease schedule.
     realm.assert_sql(&format!(
         "UPDATE game_account_claim SET expires_micros = 0 WHERE account_id = {REAPED} \
          OR account_id = {MEMBER}"

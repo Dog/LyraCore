@@ -1,5 +1,3 @@
-//! Preserve source positions and the choices that govern their first population.
-
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{bail, Context, Result};
@@ -122,8 +120,6 @@ fn chance_bp(row: &[String], column: usize, table: &str) -> Result<u32> {
     Ok((chance * 100.0).round() as u32)
 }
 
-/// Equal-sized, equal-chance single-selection children have the same initial distribution
-/// as one flat pool. Other nesting needs a hierarchical selector and fails before import.
 fn flatten_pool(
     id: u64,
     pools: &BTreeMap<u64, Pool>,

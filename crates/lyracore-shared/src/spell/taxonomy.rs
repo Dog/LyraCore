@@ -1,8 +1,5 @@
-//! Durable spell effect codes and the parameter vocabulary shared by import and gameplay.
-
 macro_rules! effect_kinds {
     ($($code:ident => $variant:ident = $value:literal),+ $(,)?) => {
-        /// A known effect code. Table columns retain their byte encoding.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(u8)]
         pub enum EffectKind {
@@ -28,7 +25,7 @@ macro_rules! effect_kinds {
             }
         }
 
-        // Byte names are retained for authored rows and the Package API.
+        // Keep byte names for authored rows and Package API compatibility.
         $(pub const $code: u8 = EffectKind::$variant as u8;)+
     };
 }
@@ -203,7 +200,6 @@ mod tests {
         assert_eq!(A_ABSORB, 0xA2);
         assert_eq!(A_MOD_COMBAT, 0xA3);
         assert_eq!(A_FLAG, 0xBE);
-        // every aura kind has the high bit; every instant kind does not.
         for k in [
             E_DAMAGE, E_HEAL, E_ENERGIZE, E_DISPEL, E_TRIGGER, E_SCRIPTED,
         ] {
@@ -279,7 +275,6 @@ mod tests {
         assert_eq!(M_ROOT, 2);
         assert_eq!(M_FEAR, 3);
         assert_eq!(M_POLY, 4);
-        // All distinct + non-zero (0 stays the inert "no mechanic" value).
         let ms = [M_STUN, M_ROOT, M_FEAR, M_POLY];
         for (i, a) in ms.iter().enumerate() {
             assert_ne!(*a, 0, "mechanic must be non-zero (0 = inert sentinel)");
@@ -287,7 +282,6 @@ mod tests {
                 assert_ne!(a, b, "mechanics must be distinct");
             }
         }
-        // A_CONTROL is an aura kind (the gates read it off a frozen game_aura row).
         assert_eq!(A_CONTROL & KIND_AURA_BIT, KIND_AURA_BIT);
     }
 }

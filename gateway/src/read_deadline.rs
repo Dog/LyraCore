@@ -1,24 +1,12 @@
-//! The total pre-auth I/O budget shared by both listeners.
-//!
-//! Each connection pins one blocking-pool thread, so a peer that connects and sends nothing would
-//! hold a thread until the pool (512 by default) has no seat left for a real login. The listener
-//! starts one budget when it accepts the socket. Each pre-auth read or write receives only the time
-//! that remains. An async watchdog shuts down the socket at the same deadline even if its blocking
-//! task has not started. The session clears both socket timeouts and cancels the watchdog once the
-//! peer has proven itself.
-
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-/// Total time a logon connection gets to complete authentication after accept.
 pub const LOGON_AUTH_DEADLINE: Duration = Duration::from_secs(10);
-/// Total time a world connection gets to complete client proof after accept.
 pub const WORLD_AUTH_DEADLINE: Duration = Duration::from_secs(15);
 
-/// A socket whose blocking reads and writes can share one pre-auth deadline.
 pub trait IoDeadline {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
@@ -37,7 +25,6 @@ impl DeadlineClock for SystemClock {
     }
 }
 
-/// One total budget shared by every read and write before authentication succeeds.
 pub(crate) struct PreAuthDeadline<C = SystemClock> {
     expires_at: Instant,
     clock: C,
@@ -54,7 +41,6 @@ impl PreAuthDeadline<SystemClock> {
         }
     }
 
-    /// Shut the socket down at this deadline even if its blocking task has not started yet.
     pub(crate) fn arm(&mut self, stream: &std::net::TcpStream) -> std::io::Result<()> {
         let stream = stream.try_clone()?;
         let socket = Arc::new(Mutex::new(Some(stream)));
@@ -103,7 +89,6 @@ impl<C: DeadlineClock> PreAuthDeadline<C> {
         }
     }
 
-    /// End the pre-auth policy without leaving either socket timeout on the long-lived session.
     pub(crate) fn finish<S: IoDeadline>(&mut self, stream: &S) -> std::io::Result<()> {
         if let Some(watchdog) = self.watchdog.as_mut() {
             watchdog.disarm_before(self.expires_at, &self.clock)?;
@@ -176,8 +161,7 @@ struct PreAuthWatchdog {
 }
 
 impl PreAuthWatchdog {
-    /// Claim the socket before the deadline or leave it for the expiry task. The mutex makes proof
-    /// completion and the timer choose exactly one owner at the boundary.
+    // The mutex lets proof completion and expiry choose exactly one socket owner.
     fn disarm_before<C: DeadlineClock>(
         &mut self,
         expires_at: Instant,
@@ -241,8 +225,6 @@ impl IoDeadline for std::os::unix::net::UnixStream {
     }
 }
 
-/// Linux reports `WouldBlock` when a socket read or write timeout expires; other platforms may
-/// report `TimedOut`.
 pub fn is_io_deadline(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),

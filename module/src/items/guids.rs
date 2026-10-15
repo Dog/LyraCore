@@ -1,10 +1,3 @@
-//! Item identities issued from the Shard's durable GUID Range.
-//!
-//! Characters and items share the range's high-water mark. An item GUID keeps `HIGHGUID_ITEM` in
-//! bits 48–63, sets bit 47 to mark this format, and holds the issued value in bits 0–46. It does not
-//! pack its owner's GUID. An item keeps its GUID across slot moves and Character Transfer; Trading,
-//! Mail, Auctions and Buyback create new items for the recipient.
-
 use spacetimedb::ReducerContext;
 
 use super::tables::game_item_instance;
@@ -13,8 +6,7 @@ const ITEM_PREFIX: u64 = lyracore_shared::constants::starter_item::HIGHGUID_ITEM
 const FORMAT_BIT: u64 = 1 << 47;
 const MAX_LOW_ID: u64 = FORMAT_BIT - 1;
 
-/// Reserve the complete batch before changing inventory. The shared high-water mark never
-/// rewinds, so crafting and Trading cannot reuse identities deleted in the same transaction.
+// The shared GUID Range never rewinds, even after items are deleted.
 pub(crate) fn allocate_item_guids(ctx: &ReducerContext, count: usize) -> Result<Vec<u64>, String> {
     if count == 0 {
         return Ok(Vec::new());

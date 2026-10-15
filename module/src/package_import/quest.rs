@@ -1,21 +1,3 @@
-//! The quest Import Family's half of a Package Delta apply: the setters for the six quest tables a
-//! Package may claim, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of quests.
-//!
-//! One Package identifier band covers the whole family (`is_package_quest_id`, checked against
-//! `quest_entry`), the same way the Package spell range covers both `game_spell` and
-//! `game_spell_effect`. `game_quest_text` is 1:1 with its header by `quest_entry`; the other four
-//! tables carry a derived packed key (`quest_entry` plus a natural per-row index), the same shape
-//! `packed_spell_effect_id` documents. `game_creature_quest`/`game_gameobject_quest` (which
-//! creature/gameobject starts or ends a quest) are out of this family's claimable catalogue. See
-//! `lyracore_package_delta::Table::columns`'s doc for why.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -32,7 +14,6 @@ use crate::{game_creature_template, game_gameobject_template, game_item_template
 
 use super::{as_bool, as_i32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a quest claim whose final row would point at data this Shard does not hold.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         let quest_entry = row.key().quest_entry();
@@ -172,7 +153,6 @@ fn missing_reference(row: &TracedRow, field: &str, value: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -226,19 +206,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package quest range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs: the Package that owns the quest is not enabled, and the one tuning it is claiming a
-/// row that does not exist. A base quest is different because the base import puts it there. Every quest
-/// table checks the same `quest_entry`, because a child row is only ever as Package-owned as the
-/// quest it belongs to.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_quest_id(row.key().quest_entry())
 }
 
-/// Removes every row a Package invented, across all six tables. Once per import, right after the
-/// base import rewrote them anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let templates = ctx.db.game_quest_template();
     let stale_templates: Vec<u32> = templates
@@ -447,10 +418,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn blank_quest(entry: u32) -> QuestTemplate {
     QuestTemplate {
@@ -742,10 +709,6 @@ fn built_quest_reward_choice(row: &TracedRow) -> Result<QuestRewardChoice, Strin
     Ok(reward_choice)
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -754,8 +717,6 @@ mod tests {
     };
     use super::*;
 
-    /// The Package quest range is cleared on every apply, so tuning a Package quest nobody enables
-    /// is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_quest_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -801,8 +762,6 @@ mod tests {
         assert_eq!(quest.reward_money, 100);
     }
 
-    /// The packed key is derived from the quest and the slot, never authored, so the built row
-    /// must carry the same value the key packs.
     #[test]
     fn an_inserted_objective_derives_its_packed_key_from_the_quest_and_the_slot() {
         let plan = plan(&[artifact(
@@ -846,8 +805,6 @@ mod tests {
         assert_eq!(reward_item.count, 1);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_quest_column_has_a_setter() {
         let mut quest = blank_quest(PACKAGE_QUEST);

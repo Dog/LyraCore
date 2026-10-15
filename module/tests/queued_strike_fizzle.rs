@@ -1,8 +1,3 @@
-//! The on-next-swing strike at the main-hand swing: what happens when the caster can no longer pay
-//! the deferred cost, and what still happens when it can. Drives the real reducers against a
-//! published module and reads the durable outcome back, because the queue, the power pool, the swing
-//! roll and the cast-event output only meet inside the swing tick.
-
 mod support;
 
 use lyracore_shared::spell::taxonomy::{E_NEXT_SWING, T_TARGET_ENEMY};
@@ -19,15 +14,11 @@ const TEST_WOLF_ENTRY: u32 = 51000;
 const HEROIC_STRIKE: u32 = 78;
 const CLEAVE: u32 = 845;
 const BATTLE_SHOUT: u32 = 6673;
-/// Costs are internal rage units (rage is stored ×10): Heroic Strike 15 rage, Cleave 20, Battle
-/// Shout 10 — the vanilla rank-1 costs.
 const HEROIC_STRIKE_COST: u32 = 150;
 const CLEAVE_COST: u32 = 200;
 const BATTLE_SHOUT_COST: u32 = 100;
-/// The module's `CAST_FAIL_NO_POWER`, which the gateway reports as `SPELL_FAILED_NO_POWER`.
 const NO_POWER: &str = "1";
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
@@ -40,24 +31,17 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         HEROIC_STRIKE_COST,
     );
     stage_on_next_swing_spell(&standalone, CLEAVE, "Cleave", CLEAVE_COST);
-    // The sandbox seeds Battle Shout free; give it its vanilla rage cost. Its global cooldown is
-    // zeroed with it — the scenario stages several casts back to back and the global cooldown is
-    // not what it is about.
     standalone.assert_sql(&format!(
         "UPDATE game_spell SET cost = {BATTLE_SHOUT_COST}, gcd_ms = 0 WHERE spell_id = {BATTLE_SHOUT}"
     ));
 
     standalone.assert_call("debug_spawn_player_entity", &["1"]);
-    // The Warrior is staged untouchable for the whole scenario: the wolf's own swings would
-    // otherwise kill a level-1 player mid-scenario, and rage taken from a hit would blur every
-    // power reading. What the Warrior DEALS is untouched, so the white swing below is a real one.
     standalone.assert_sql(&format!(
         "UPDATE game_world_entity SET godmode = true WHERE guid = {PLAYER}"
     ));
     let wolf = spawn_target(&standalone);
     engage(&standalone, wolf);
 
-    // --- The reported rotation: queue Heroic Strike with the rage for it, then shout it away.
     stage_power(&standalone, HEROIC_STRIKE_COST);
     cast(&standalone, HEROIC_STRIKE, wolf);
     cast(&standalone, BATTLE_SHOUT, PLAYER);
@@ -91,22 +75,16 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         !casts.iter().any(|row| fired(row, HEROIC_STRIKE)),
         "a fizzled strike must not report a cast, got {casts:?}"
     );
-    // The attack itself survives the fizzle as an ordinary white swing — it rolls the normal attack
-    // table, so it may land or be avoided, but it is never presented as the queued ability.
     assert_eq!(
         own_swing(&standalone)["spell_swing"],
         "false",
         "the attack must resolve as an ordinary white swing"
     );
 
-    // --- The same contract for a second on-next-swing ability, at the cost boundary. Both sides
-    // are staged untouchable here so no rage flows from the swing itself and the pool arithmetic is
-    // exact on either side of the boundary.
     standalone.assert_sql(&format!(
         "UPDATE game_world_entity SET godmode = true WHERE guid = {wolf}"
     ));
 
-    // Rage exactly equal to the cost fires the strike and spends the pool to zero.
     stage_power(&standalone, CLEAVE_COST);
     cast(&standalone, CLEAVE, wolf);
     swing(&standalone);
@@ -133,7 +111,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "a fired strike replaces the white swing"
     );
 
-    // One point below the cost fizzles, exactly like Heroic Strike did.
     stage_power(&standalone, CLEAVE_COST);
     cast(&standalone, CLEAVE, wolf);
     stage_power(&standalone, CLEAVE_COST - 1);
@@ -158,9 +135,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
     assert_eq!(own_swing(&standalone)["spell_swing"], "false");
 }
 
-/// An on-next-swing ability the sandbox has no import for: a rage-costed melee header plus one
-/// `E_NEXT_SWING` effect on the target, which is the shape the importer gives Heroic Strike and
-/// Cleave. No global cooldown, so the staging casts below never wait on one.
 fn stage_on_next_swing_spell(standalone: &Standalone, spell_id: u32, name: &str, cost: u32) {
     const RAGE: u32 = 1;
     standalone.assert_sql(&format!(
@@ -181,7 +155,6 @@ fn stage_on_next_swing_spell(standalone: &Standalone, spell_id: u32, name: &str,
     ));
 }
 
-/// A Test Wolf within melee reach, tough enough to outlive the scenario's swings.
 fn spawn_target(standalone: &Standalone) -> u64 {
     standalone.assert_call(
         "debug_spawn_at_feet",
@@ -201,8 +174,6 @@ fn spawn_target(standalone: &Standalone) -> u64 {
     guid
 }
 
-/// Arm the melee engagement and wait until it is swinging, which is also what stops the Warrior's
-/// rage from decaying out of combat while the scenario stages each case.
 fn engage(standalone: &Standalone, target: u64) {
     standalone.assert_call("debug_engage", &["1", &target.to_string()]);
     assert!(
@@ -211,13 +182,11 @@ fn engage(standalone: &Standalone, target: u64) {
     );
 }
 
-/// Set the Warrior's rage, holding the swing off so the staging call cannot be overtaken.
 fn stage_power(standalone: &Standalone, rage: u32) {
     hold_the_swing(standalone);
     standalone.assert_call("debug_set_power", &["1", &rage.to_string()]);
 }
 
-/// Cast `spell_id` at `target`, holding the swing off for the same reason.
 fn cast(standalone: &Standalone, spell_id: u32, target: u64) {
     hold_the_swing(standalone);
     standalone.assert_call(
@@ -226,10 +195,6 @@ fn cast(standalone: &Standalone, spell_id: u32, target: u64) {
     );
 }
 
-/// Let exactly one main-hand swing through and wait for it to land. The swing clock is the
-/// engagement's own `last_swing_ms` against the module's millisecond wall clock: stamping it now
-/// buys a full swing interval of quiet, stamping it at 1 makes the next tick due immediately. The
-/// event tables are emptied first so the assertions read this swing alone.
 fn swing(standalone: &Standalone) {
     hold_the_swing(standalone);
     standalone.assert_sql("DELETE FROM game_spell_cast_event");
@@ -276,15 +241,12 @@ fn cast_events(standalone: &Standalone) -> Vec<SqlRow> {
     ))
 }
 
-/// The caster-private failure a queued strike reports when it cannot pay at the swing: the cast-bar
-/// teardown carrying the Not Enough Power reason.
 fn is_power_failure(row: &SqlRow, spell_id: u32) -> bool {
     row["spell_id"] == spell_id.to_string()
         && row["is_interrupted"] == "true"
         && row["failure_reason"] == NO_POWER
 }
 
-/// The cast a queued strike reports when it does fire.
 fn fired(row: &SqlRow, spell_id: u32) -> bool {
     row["spell_id"] == spell_id.to_string() && row["is_completion"] == "true"
 }

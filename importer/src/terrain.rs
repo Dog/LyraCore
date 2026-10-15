@@ -1,16 +1,3 @@
-//! `--terrain <client Data/ dir>`, ADT heightmap slice → `game_terrain_chunk`.
-//!
-//! Reads the operator's OWN client terrain MPQs (same licensing firewall as `--dbc`: extracted
-//! data never enters the repo), parses the ADT tiles covering the content slice with `wow-adt`,
-//! and loads one row per MCNK cell through the `import_terrain_chunks` reducer(s) — `Vec<f32>`
-//! has no spacetime-SQL literal, so terrain takes the packed-string reducer path like spawns.
-//! Heights are rebased to ABSOLUTE world Z here (MCVT is relative to the chunk header Z), so
-//! the module's `ground_z` is pure arithmetic. Dry-run prints the plan + a self-check; `--apply`
-//! calls the reducers. Honors `--map/--center/--radius`, or `--box X0,X1,Y0,Y1` in place of
-//! `--radius` for an exact rectangle (a wide zone like Westfall+Elwynn together
-//! needs a rectangle, not a center-radius circle's bounding square). `--center` still drives the
-//! interpolate self-check below, so put it INSIDE the box.
-
 use anyhow::{bail, Context, Result};
 use lyracore_shared::terrain::{cell_index as shared_cell_index, cell_key, interpolate};
 use std::collections::BTreeMap;
@@ -18,19 +5,11 @@ use std::io::Cursor;
 use std::path::Path;
 use wow_mpq::PatchChain;
 
-/// Vanilla map id → client map directory name. Both CONTINENTS are supported: map 0 is the Elwynn
-/// corridor, and map 1 is the Kalimdor continent, `--terrain`/`--nav --map 1`
-/// read `World\Maps\Kalimdor\*.adt` through this same code path, self-checks included. Instance
-/// terrain remains refused because this height row represents only one floor per cell.
-// Deliberate simplification: two-arm match, not Map.dbc — add arms (or read the DBC) when a third
-// CONTINENT matters.
 pub(crate) fn map_dir(map_id: u32) -> Result<&'static str> {
     match map_id {
         0 => Ok("Azeroth"),
         1 => Ok("Kalimdor"),
-        // Deadmines has ADT tiles, but `game_terrain_chunk` cannot represent its stacked floors.
-        // Keep terrain absent until archive and route evidence support a multi-floor representation.
-        // Runtime movement therefore keeps its imported or current Z through the existing fallback.
+        // A scalar heightmap cannot represent the stacked floors in Deadmines.
         36 => bail!(
             "map 36 (Deadmines) has stacked instance floors that game_terrain_chunk cannot \
              represent; terrain import remains unavailable"
@@ -39,13 +18,8 @@ pub(crate) fn map_dir(map_id: u32) -> Result<&'static str> {
     }
 }
 
-/// Largest gap, in yards, between a slice sample's Z and the heightmap interpolated at its X/Y
-/// before the slice is refused. A wrong sample (a WMO floor, a wrong map) is tens of yards off; a
-/// right one is within a fraction of a yard, so this is a coarse gate, not a precision claim.
 const SELF_CHECK_TOLERANCE: f32 = 2.0;
 
-/// Open the terrain patch chain in client load order: `terrain.MPQ` < `patch.MPQ` < `patch-2.MPQ`
-/// (ADTs live in terrain.MPQ in the 1.12 client; patches may override tiles).
 fn open_terrain_chain(data_dir: &Path) -> Result<PatchChain> {
     let mut chain = PatchChain::new();
     let mut found_base = false;
@@ -113,11 +87,10 @@ pub(crate) struct CellRow {
     pub(crate) has_liquid: bool,
     pub(crate) holes: u32,
     pub(crate) area_id: u32,
-    pub(crate) heights: Vec<f32>, // 145, absolute
+    pub(crate) heights: Vec<f32>,
 }
 
 impl CellRow {
-    /// `map,cx,cy,liquid,has_liquid,holes,area,h0:h1:...:h144`
     fn packed(&self) -> String {
         let hs: Vec<String> = self.heights.iter().map(|h| format!("{h}")).collect();
         format!(
@@ -134,18 +107,10 @@ impl CellRow {
     }
 }
 
-/// World coord → global cell index (0..1023) as i32 for range math. Wraps the shared
-/// `lyracore_shared::terrain::cell_index`; out-of-square is -1 (the caller range-checks hard).
 fn cell_index(coord: f32) -> i32 {
     shared_cell_index(coord).map(|c| c as i32).unwrap_or(-1)
 }
 
-/// Cell-index range `(x_min, x_max, y_min, y_max)` covering the content slice: a `--box`
-/// rectangle when given (a wide zone like Westfall needs an exact rectangle, not a
-/// center±radius bounding square that either misses corners or overshoots into neighbours), else
-/// the original center±radius square. Cell indices count DOWN as world coordinates grow (see
-/// `cell_index`), so a box's HIGH world coordinate (x1/y1) maps to the LOW cell index and vice
-/// versa. Pure so the corner math is unit-tested without a client Data/ dir.
 pub(crate) fn slice_cell_range(
     bbox: Option<(f64, f64, f64, f64)>,
     center: (f64, f64, f64),
@@ -212,9 +177,6 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
     Ok(())
 }
 
-/// Every cell row the scope's Bounded Map Slices cover, deduplicated where slices overlap, plus
-/// the tile count read. Each slice's terrain self-check runs here, so a dry run and `--apply`
-/// prove the same thing: no slice reaches a reducer with a sample the heightmap contradicts.
 fn collect_scope(
     chain: &mut PatchChain,
     scope: &crate::world_import_scope::WorldImportScope,
@@ -261,7 +223,7 @@ fn collect_slice(
     let tiles = map_tiles(chain, map_name)?;
     for tx in tx_min..=tx_max {
         for ty in ty_min..=ty_max {
-            // WDT filename axes are the reverse of the world-coordinate cell axes.
+            // WDT filename axes reverse the world-coordinate cell axes.
             if let Some(tiles) = &tiles {
                 let present = tiles
                     .get((tx * 64 + ty) as usize)
@@ -280,7 +242,7 @@ fn collect_slice(
                 let Ok(bytes) = chain.read_file(name) else {
                     continue;
                 };
-                // Patch archives remove terrain tiles with empty ADT entries.
+                // Empty ADT patch entries remove terrain tiles.
                 if bytes.is_empty() {
                     continue;
                 }
@@ -349,9 +311,6 @@ fn dedup_rows(slice_rows: Vec<Vec<CellRow>>) -> Vec<CellRow> {
     rows.into_values().collect()
 }
 
-/// Content check for the filename arbitration: does this parsed tile's terrain actually live in
-/// grid tile (tx, ty)? True when every height-bearing MCNK's position-derived cell falls in the
-/// tile's 16-cell range on both axes (sampling all chunks; a tile is 256 of them).
 pub(crate) fn tile_matches(mcnks: &[wow_adt::McnkChunk], tx: i32, ty: i32) -> bool {
     let mut saw_any = false;
     for mcnk in mcnks {
@@ -370,9 +329,6 @@ pub(crate) fn tile_matches(mcnks: &[wow_adt::McnkChunk], tx: i32, ty: i32) -> bo
     saw_any
 }
 
-/// Pull every MCNK inside the cell bbox out of one parsed ADT. Cell indices come from the
-/// chunk's own header POSITION (world coords of its high-corner), not from tile/ix/iy
-/// bookkeeping — immune to filename-order and row/column folklore.
 pub(crate) fn collect_cells(
     mcnks: &[wow_adt::McnkChunk],
     map_id: u32,
@@ -381,7 +337,7 @@ pub(crate) fn collect_cells(
 ) -> Result<()> {
     for mcnk in mcnks {
         let Some(mcvt) = &mcnk.heights else {
-            continue; // no MCVT (WMO-only chunk) — nothing to stand on, skip
+            continue;
         };
         if mcvt.heights.len() != 145 {
             continue;
@@ -391,14 +347,13 @@ pub(crate) fn collect_cells(
             mcnk.header.position[1],
             mcnk.header.position[2],
         );
-        let (cx, cy) = (cell_index(px - 0.01), cell_index(py - 0.01)); // corner sits ON the boundary; nudge inside
+        // Nudge boundary corners inside their cell.
+        let (cx, cy) = (cell_index(px - 0.01), cell_index(py - 0.01));
         if cx < x_min || cx > x_max || cy < y_min || cy > y_max {
             continue;
         }
         let heights: Vec<f32> = mcvt.heights.iter().map(|h| h + pz).collect();
-        // MCLQ max_height is the vanilla water surface for the near-flat classic liquids.
-        // Deliberate simplification: per-cell scalar, not the per-vertex surface — store the grid
-        // when swimming physics needs per-vertex accuracy.
+        // MCLQ max_height supplies the scalar liquid surface for near-flat classic liquids.
         let (has_liquid, liquid_level) = match &mcnk.liquid {
             Some(l) => (true, l.max_height),
             None => (false, 0.0),
@@ -494,8 +449,6 @@ mod tests {
         assert!(format!("{error:#}").contains("parsing World"), "{error:#}");
     }
 
-    /// The operator's own 1.12.1 client `Data/` dir. Client archives never enter the repo, so the
-    /// tests that read it are ignored by default.
     fn client_data_dir() -> Option<std::path::PathBuf> {
         let dir = std::env::var_os("LYRACORE_CLIENT_DATA")?;
         Some(std::path::PathBuf::from(dir))
@@ -504,9 +457,6 @@ mod tests {
     #[test]
     #[ignore = "requires the Operator's LYRACORE_CLIENT_DATA"]
     fn alliance_eastern_terrain_dry_run_passes_every_slice_self_check() {
-        // Verification against the owned client: the same `collect_scope` a `--terrain
-        // --world-profile alliance-eastern` dry run takes, so a green result proves the profile's
-        // Human, Dun Morogh and Loch Modan samples stand on the heightmap the Module will read.
         let data_dir = client_data_dir()
             .expect("LYRACORE_CLIENT_DATA must name the owned client Data directory");
         let scope = WorldImportScope::canonical(WorldImportProfile::AllianceEastern)
@@ -556,14 +506,11 @@ mod tests {
 
     #[test]
     fn slice_cell_range_from_box_uses_corners_not_center_radius() {
-        // The widened Westfall box. High world X/Y (x1/y1) map to the LOW cell index
-        // (cell index counts DOWN as world coords grow) — the min/max pairing is corner-derived, not
-        // center±radius, and radius is ignored entirely once a box is given.
         let (x0, x1, y0, y1) = (-11400.0f64, -8000.0, -1600.0, 2000.0);
         let (cx_min, cx_max, cy_min, cy_max) =
             slice_cell_range(Some((x0, x1, y0, y1)), (-8949.95, -132.493, 83.5312), 180.0);
-        assert_eq!(cx_min, cell_index(x1 as f32)); // high world X → low cell index
-        assert_eq!(cx_max, cell_index(x0 as f32)); // low world X → high cell index
+        assert_eq!(cx_min, cell_index(x1 as f32));
+        assert_eq!(cx_max, cell_index(x0 as f32));
         assert_eq!(cy_min, cell_index(y1 as f32));
         assert_eq!(cy_max, cell_index(y0 as f32));
         assert!(cx_min < cx_max);
@@ -579,13 +526,11 @@ mod tests {
             err36.contains("stacked instance floors"),
             "the map-36 refusal names the floor representation limit: {err36}"
         );
-        // Any other unknown map still fails loud.
         assert!(super::map_dir(429).is_err());
     }
 
     #[test]
     fn slice_cell_range_without_box_falls_back_to_center_radius_square() {
-        // No --box: reproduces the original center±radius bounding square exactly.
         let center = (-8949.95f64, -132.493, 83.5312);
         let radius = 180.0f64;
         let got = slice_cell_range(None, center, radius);

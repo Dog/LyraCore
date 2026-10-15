@@ -1,10 +1,3 @@
-//! Reward Letters: the letter a quest giver sends when a Character turns a quest in.
-//!
-//! The turn-in runs on the Home Shard and the mail plane is Realm-core, so no transaction spans
-//! both. The turn-in files the letter as Mail Escrow in its own transaction, and the Gateway drives
-//! that escrow to the mail plane as it drives a stalled send. The letter then commits with the
-//! turn-in or not at all, and the escrow id makes the commit happen once.
-
 use lyracore_shared::mail::{QuestGiver, RewardHeader};
 use spacetimedb::{log, ReducerContext};
 
@@ -13,23 +6,15 @@ use crate::items::ItemSnapshot;
 use crate::mail_catalogue::{game_mail_loot, game_mail_template, game_quest_reward_mail};
 use crate::mail_catalogue::{MailLoot, QuestRewardMail};
 
-/// A Reward Letter as the catalogue describes it, ready to file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct RewardLetter {
     pub header: RewardHeader,
-    /// The Mail Template's text.
     pub body: String,
     pub money: u32,
     pub item: ItemSnapshot,
-    /// How long after the commit the letter arrives (`quest_template.RewMailDelaySecs`).
     pub delay_secs: u32,
 }
 
-/// The Reward Letter `reward` describes. The sender is the alternative creature a
-/// `SCRIPT_COMMAND_SEND_MAIL` row names, else the quest ender (cmangos `ScriptMgr.cpp:2850-2866`,
-/// `Mail.cpp:48-75`). `body` is the Mail Template's text. `loot` is the template's one item and
-/// `max_durability` that item's template value; the letter carries it unworn. `Err` names the
-/// catalogue row that is missing.
 pub(crate) fn plan_reward_letter(
     reward: &QuestRewardMail,
     quest_ender: Option<QuestGiver>,
@@ -64,12 +49,6 @@ pub(crate) fn plan_reward_letter(
     })
 }
 
-/// File the Reward Letter `quest_entry` sends, if it sends one, for `character_guid`, who just
-/// turned the quest in at `giver_guid`. Call it in the turn-in's transaction. A quest with no
-/// reward mail files nothing. A letter whose catalogue rows are missing logs an error and files
-/// nothing, and the turn-in still succeeds: the importer refuses that data, so the Character is
-/// not at fault.
-/// `Err` when the Shard can mint no escrow id; the turn-in then fails too, so no letter is lost.
 pub(crate) fn file_reward_letter(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -114,8 +93,6 @@ pub(crate) fn file_reward_letter(
             return Ok(());
         }
     };
-    // The Shard's GUID Range is its own slot in the Realm-core registry, and a Gateway mints its
-    // escrow ids from a slot of its own there, so no other writer can issue this id.
     let escrow_id = *crate::auth::reserve_guids(ctx, 1, u64::MAX)?.start();
     crate::mail_escrow::file_reward(ctx, escrow_id, character_guid, &letter)
 }
@@ -133,25 +110,16 @@ mod fixture {
     };
 
     const CHARACTER: u64 = 1;
-    /// The seed chicken. The fixture clones it into a giver next to the Character.
     const GIVER_SOURCE: u64 = (0xF130_u64 << 48) | ((620_u64) << 24) | 1;
     const GIVER: u64 = (0xF130_u64 << 48) | ((620_u64) << 24) | 0x00FF_FF01;
     const GIVER_ENTRY: u32 = 620;
-    /// Shaped like 3645, Membership Card Renewal: one item after 86,400 s (`cdb:` quest_template,
-    /// mail_loot_template). The item is the seed's Tempered Blade.
     const CARD_QUEST: u32 = 509_091;
     const CARD_TEMPLATE: u32 = 509_091;
     const CARD_ITEM: u32 = crate::seed::FIXTURE_BLADE;
-    /// Shaped like 8728: creature 11811 sends 1,000,000 copper after 129,600 s
-    /// (`cdb:` dbscripts_on_quest_end).
     const ELDER_QUEST: u32 = 509_092;
     const ELDER_TEMPLATE: u32 = 509_092;
-    /// A quest with no reward mail.
     const PLAIN_QUEST: u32 = 509_093;
 
-    /// Stage three completed quests for the seeded Character 1 at a giver creature next to it: a
-    /// card-renewal-shaped letter with an item, an 8728-shaped letter with copper from another
-    /// creature, and a quest that sends nothing.
     #[spacetimedb::reducer]
     pub fn debug_stage_reward_letter_fixture(ctx: &ReducerContext) -> Result<(), String> {
         crate::helpers::require_operator(ctx)?;
@@ -301,8 +269,6 @@ mod tests {
 
     const CARD_ENDER: Option<QuestGiver> = Some(QuestGiver::Creature(7_802));
 
-    /// Quest 3645, Membership Card Renewal: template 99 attaches item 11423, count 1, and the quest
-    /// ender sends it after 86,400 s (`cdb:` quest_template, mail_loot_template).
     #[test]
     fn the_quest_ender_sends_the_template_text_and_its_one_item() {
         let letter = plan_reward_letter(
@@ -332,8 +298,6 @@ mod tests {
         );
     }
 
-    /// Quest 8728: `dbscripts_on_quest_end` names creature 11811 and 1,000,000 copper, and the
-    /// template carries no item (`cdb:`).
     #[test]
     fn a_script_sender_replaces_the_quest_ender_and_brings_its_copper() {
         let letter = plan_reward_letter(
@@ -396,9 +360,6 @@ mod tests {
         .is_err());
     }
 
-    /// A Shard in slot n mints from `[n * 1e9, (n + 1) * 1e9)`, so a Shard in slot 9,999 or lower
-    /// mints no id above 9,999,999,999,999. A Gateway's escrow range starts at slot 10,000 or
-    /// higher. A Shard in a higher slot relies on the registry giving each slot one owner.
     #[test]
     fn a_shard_below_slot_10000_mints_no_id_in_a_gateway_escrow_range() {
         assert_eq!(crate::realm_core::GUID_RANGE_SIZE, 1_000_000_000);

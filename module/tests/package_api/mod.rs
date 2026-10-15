@@ -1,6 +1,3 @@
-//! The Package API lint: every crate-root path an installed Package names is on Package API
-//! version 4, as `docs/package-api.md` documents it.
-
 mod contract;
 mod paths;
 #[path = "../../build_support/source.rs"]
@@ -16,13 +13,11 @@ pub use contract::ROOTS;
 pub use paths::UnsupportedSyntax;
 use source::{collect_rs_files, file_gate, strip_source};
 
-/// A line comment can exempt an ordinary path outside the Package API when it names a reason.
 const PACKAGE_API_EXEMPT: &str = "// package-api: exempt";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub package: String,
-    /// The file as `packages/<package>/src/<path>`.
     pub file: PathBuf,
     pub line: usize,
     pub finding: Finding,
@@ -109,8 +104,6 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// Check every Rust file of every Package under `packages_dir`, a directory per Package, the
-/// same Packages the build compiles: those with a `src/` directory.
 pub fn check_inventory(contract: &Contract, packages_dir: &Path) -> Result<(), Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
     if !packages_dir.is_dir() {
@@ -146,8 +139,6 @@ pub fn check_inventory(contract: &Contract, packages_dir: &Path) -> Result<(), V
     }
 }
 
-/// Every Package API finding in one Package file, in line order. `relative_path` is the file's
-/// path beneath its Package's `src/`.
 pub fn check_source(
     contract: &Contract,
     package: &str,
@@ -165,7 +156,6 @@ pub fn check_source(
         })
         .map(|(line, _)| *line)
         .collect();
-    // `mod.rs` is its directory's module; any other file adds its stem as one module segment.
     let components = relative_path.components().count();
     let depth = if relative_path
         .file_name()

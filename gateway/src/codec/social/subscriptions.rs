@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::{CellKey, EntityLayer, ShardId};
@@ -11,10 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// SAY proximity range (vanilla ~25yd). See [`chat_in_range`].
 pub(crate) const SAY_RANGE_YD: f32 = 25.0;
 
-/// YELL proximity range (vanilla ~300yd). Same rationale as `SAY_RANGE_YD`.
 pub(crate) const YELL_RANGE_YD: f32 = 300.0;
 
 #[cfg(test)]
@@ -23,7 +19,6 @@ pub(crate) const SAY_RANGE_SQ: f32 = SAY_RANGE_YD * SAY_RANGE_YD;
 #[cfg(test)]
 pub(crate) const YELL_RANGE_SQ: f32 = YELL_RANGE_YD * YELL_RANGE_YD;
 
-/// The distance used for local speech. Zone speech and creature whispers use their own audience.
 pub(crate) fn chat_range_yd(chat_type: u8) -> f32 {
     if matches!(
         chat_type,
@@ -36,12 +31,7 @@ pub(crate) fn chat_range_yd(chat_type: u8) -> f32 {
     }
 }
 
-/// Group / loot-roll / quest-share: the ONE kind-decode body both legs
-/// run. PRIVATE data — the audience (the row's recipient, and nobody else) is resolved by the
-/// caller (RLS on the per-player leg; the owner-session lookup + `private_recipient_audience` on
-/// the shared leg). `store` is the connection the row came from: Realm-core on a sharded Realm.
-/// The LIST render reads every World Shard through it, and QUEST_SHARE reads the quest detail.
-#[allow(clippy::too_many_lines)] // One arm per group event kind.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn group_event_outbound<
     St: CharacterStore + QuestActionStore + SessionStore + ShardRoutingStore + ?Sized,
 >(
@@ -54,18 +44,11 @@ pub(crate) fn group_event_outbound<
     use lyracore_shared::meeting_stone::event_kind as stone_kind;
     use lyracore_shared::quest::share_event_kind as quest_share_kind;
     let msg = match row.kind {
-        // Sent even when no shard can name the inviter (falls back to an empty name, like
-        // `render_list` does for an unresolved roster member): the popup is the target's only way
-        // to learn of the invite, and the pending `game_group_invite` row already committed.
-        // Skipping the packet would strand it for the whole 2-minute invite GC.
         group_kind::INVITE => Some(ServerOpcodeMessage::SMSG_GROUP_INVITE(Box::new(
             codec::build_group_invite(
                 other_character_name(store, row, "INVITE").unwrap_or_default(),
             ),
         ))),
-        // The same renderer world entry uses: presence and blank names come from the shard caches,
-        // because a roster written on realm-core can know neither. A Party's Target Icons follow
-        // in the same job, because the Party client clears its marks on the list.
         group_kind::LIST => match lyracore_shared::group::RosterPayload::decode(&row.payload) {
             Some(roster) => {
                 let mut packets = vec![crate::world::party::render_list(store, self_guid, &roster)];
@@ -84,8 +67,6 @@ pub(crate) fn group_event_outbound<
                 None
             }
         },
-        // Same fallback as INVITE, for the same reason: consistent behavior for the two kinds
-        // that answer an invite dialog.
         group_kind::DECLINE => Some(ServerOpcodeMessage::SMSG_GROUP_DECLINE(Box::new(
             codec::build_group_decline(
                 other_character_name(store, row, "DECLINE").unwrap_or_default(),
@@ -189,11 +170,6 @@ pub(crate) fn group_event_outbound<
                 }
             }
         }
-        // Quest sharing: an eligible party member receives the shared quest —
-        // `row.other_guid` is the SHARER (resolved/pushed by `group::push_event`), `row.payload`
-        // is the quest entry. Opens the DETAILS screen with the SHARER as "giver" (the
-        // recipient's own `CMSG_QUESTGIVER_ACCEPT_QUEST` then re-validates fresh via the
-        // module's `GiverKind::Party` — this relay never authorizes anything by itself).
         quest_share_kind::QUEST_SHARE => match row.payload.parse::<u32>() {
             Ok(quest_id) => match store.quest_detail_view(quest_id) {
                 Ok(Some(detail)) => {
@@ -224,9 +200,6 @@ pub(crate) fn group_event_outbound<
                 None
             }
         },
-        // Quest sharing: the SENDER's per-member feedback line, one row per member,
-        // always (whether or not the share actually landed) — `row.other_guid` is that member,
-        // `row.payload` is the `share_result` wire byte (mirrors gtker's `QuestPartyMessage` 1:1).
         quest_share_kind::QUEST_PUSH_RESULT => match row.payload.parse::<u8>() {
             Ok(code) => Some(ServerOpcodeMessage::MSG_QUEST_PUSH_RESULT(Box::new(
                 codec::build_quest_push_result(row.other_guid, code),
@@ -321,17 +294,6 @@ pub(crate) fn group_event_outbound<
     }
 }
 
-/// The Character an INVITE, DECLINE or SET_LEADER row names by `other_guid`: the inviter, the
-/// decliner, or the new leader. The Gateway always looks it up from the World Shard caches,
-/// because Realm-core holds no `game_character` rows to resolve one from. `None` means no
-/// connected shard can name it, or the lookup itself failed.
-///
-/// INVITE and DECLINE fall back to an empty name and send the packet anyway, the way
-/// [`crate::world::party::render_list`] fills an unresolved roster member's name with
-/// `.unwrap_or_default()`: the popup is the target's only way to learn of an invite that already
-/// committed durably, so dropping the packet would strand it for the whole GC window. SET_LEADER
-/// skips the packet instead: the roster mirror the Gateway already pushed carries the new leader,
-/// so the line is redundant rather than load-bearing.
 pub(crate) fn other_character_name<St: CharacterStore + ShardRoutingStore + ?Sized>(
     store: &St,
     row: &GroupEvent,
@@ -358,8 +320,6 @@ pub(crate) fn other_character_name<St: CharacterStore + ShardRoutingStore + ?Siz
     }
 }
 
-/// One Group Broadcast packet from its decoded payload. A payload that does not decode logs and
-/// sends nothing, so a corrupt row never reaches the client.
 pub(crate) fn broadcast_packet<T>(
     row: &GroupEvent,
     decoded: Option<T>,
@@ -381,13 +341,9 @@ pub(crate) fn log_unparseable_broadcast(row: &GroupEvent) {
 }
 
 pub(crate) fn private_recipient_audience(row_recipient_guid: u64, viewer_guid: u64) -> bool {
-    // 0 is "unaddressed"/"uninitialized", never a real character — an equality alone would let an
-    // unaddressed row match a half-initialized viewer (0 == 0), so zero denies on either side.
     row_recipient_guid != 0 && row_recipient_guid == viewer_guid
 }
 
-/// A Realm Chat Line: one `SMSG_MESSAGECHAT` for one recipient. The Relay already chose the
-/// audience; an unknown Chat Kind sends nothing.
 pub(crate) fn realm_chat_outbound(row: &RealmChatEvent) -> Vec<Outbound> {
     codec::build_realm_chat_line(
         row.kind,
@@ -402,7 +358,6 @@ pub(crate) fn realm_chat_outbound(row: &RealmChatEvent) -> Vec<Outbound> {
     .collect()
 }
 
-/// Build a Package System Message after the caller validates the recipient.
 pub(crate) fn system_message_event_outbound(row: &SystemMessageEvent) -> Vec<Outbound> {
     let message = codec::build_gm_system_message(row.message.clone());
     vec![Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(
@@ -410,14 +365,6 @@ pub(crate) fn system_message_event_outbound(row: &SystemMessageEvent) -> Vec<Out
     ))]
 }
 
-/// Nearby chat: the one body both legs run. A player speaker always hears
-/// their own line; everyone else is `chat_in_range`-gated (say/`/e`/text emote ~25yd, yell ~300yd,
-/// map + instance fenced), with both endpoints read from the COORDINATOR's global cache — the
-/// AOI-scoped per-player cache could not see a 100–300yd YELL speaker. Missing endpoint → drop
-/// (safer than flooding). `/e` (EMOTE) also gates on [`lyracore_shared::faction::same_team`] — the
-/// one Chat Kind here vanilla keeps same-team-only by default; say and yell still reach both teams.
-/// A player's line carries the chat tag of its live entity's Away Status, read when the line is
-/// relayed (cm:Player.cpp:16571-16599). A creature's line carries none.
 pub(crate) fn chat_event_outbound(
     coord: &Coordinator,
     self_guid: u64,
@@ -571,8 +518,6 @@ mod creature_chat_tests {
     }
 }
 
-/// The chat tag a nearby line carries: a player speaker's Away Status, and none for a creature or
-/// a speaker whose entity is already gone.
 pub(crate) fn nearby_chat_tag(speaker: Option<&WorldEntity>) -> u8 {
     match speaker {
         Some(entity)
@@ -601,12 +546,6 @@ pub(crate) fn chat_event_message(
     Outbound::One(ServerOpcodeMessage::SMSG_MESSAGECHAT(Box::new(message)))
 }
 
-/// Text emotes (`/wave`, `/dance`, …): SMSG_TEXT_EMOTE + SMSG_EMOTE, `chat_in_range`-gated at
-/// [`lyracore_shared::chat::broadcast_chat::TEXT_EMOTE_RANGE_YD`] like say (cm:ChatHandler.cpp:789-
-/// 794 sends to both teams, so there is no team gate here — contrast `chat_event_outbound`'s EMOTE
-/// arm). The performer always sees their own emote. The target name resolves through the
-/// coordinator cache (player, else creature template); unknown ids degrade gracefully so the rest
-/// still relays.
 pub(crate) fn emote_event_outbound(
     coord: &Coordinator,
     self_guid: u64,
@@ -643,7 +582,6 @@ pub(crate) fn emote_event_outbound(
             return Vec::new();
         }
     }
-    // target_guid == 0 → untargeted emote (the client sends 0 when nothing is selected).
     let target_name = if row.target_guid != 0 {
         let guard = coord.0.coord();
         let db = &guard.conn.db;
@@ -679,12 +617,6 @@ pub(crate) fn emote_event_outbound(
     out
 }
 
-/// The SAY/YELL proximity gate: does a speaker at `(speaker_map, speaker_instance,
-/// speaker_x, speaker_y)` reach a listener at `(listener_map, listener_instance, listener_x,
-/// listener_y)` within `range_sq` (already squared — pass `SAY_RANGE_SQ`/`YELL_RANGE_SQ`)? Different
-/// maps or different instances never hear each other (also guards the distance arithmetic against
-/// comparing positions on unrelated maps). Pure — no I/O — so it is the ONE tested source of truth
-/// for `on_chat`'s range gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chat_in_range(
     speaker_map: u32,
@@ -705,7 +637,6 @@ pub(crate) fn chat_in_range(
     dx * dx + dy * dy <= range_sq
 }
 
-/// Show an Instance Removal countdown to its owner on the callback's Shard.
 pub(crate) fn instance_removal_started(
     view: &Arc<WorldView>,
     shard: ShardId,
@@ -724,8 +655,6 @@ pub(crate) fn instance_removal_started(
     });
 }
 
-/// Hide an ended Instance Removal countdown, canceled or expired, from its owner on the callback's
-/// Shard.
 pub(crate) fn instance_removal_ended(view: &Arc<WorldView>, shard: ShardId, row: &InstanceRemoval) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.character_guid)) else {
         return;
@@ -736,8 +665,6 @@ pub(crate) fn instance_removal_ended(view: &Arc<WorldView>, shard: ShardId, row:
     });
 }
 
-/// `SMSG_RAID_GROUP_ONLY` with `timer_ms` left, 0 to hide the countdown, noting what the client
-/// now shows.
 pub(crate) fn show_countdown(view: &WorldView, character_guid: u64, timer_ms: u32) -> Outbound {
     view.note_countdown(character_guid, timer_ms > 0);
     Outbound::One(ServerOpcodeMessage::SMSG_RAID_GROUP_ONLY(
@@ -745,10 +672,6 @@ pub(crate) fn show_countdown(view: &WorldView, character_guid: u64, timer_ms: u3
     ))
 }
 
-/// The timer a world entry sends: the time left of the countdown `due` on the Home Shard, or 0 to
-/// hide a countdown the client was last shown when the Home Shard holds none. A Character that
-/// left the Instance Pool through the portal reaches its new Home Shard this way (vmangos hides
-/// with the same zero timer, vm:Player.cpp:18561-18569). `None` sends nothing. Pure.
 pub(crate) fn resident_countdown_ms(
     due: Option<&spacetimedb_sdk::ScheduleAt>,
     shown: bool,
@@ -760,8 +683,6 @@ pub(crate) fn resident_countdown_ms(
     }
 }
 
-/// Milliseconds left before `due` at `now_micros`, rounded up and never more than the full
-/// countdown, so a Gateway clock behind the Module's never shows extra time. `None` once due. Pure.
 pub(crate) fn instance_removal_time_left_ms(
     due: &spacetimedb_sdk::ScheduleAt,
     now_micros: u64,
@@ -781,9 +702,6 @@ pub(crate) fn instance_removal_time_left_ms(
     )
 }
 
-/// The world-entry Instance Removal packet for `character_guid`, read from its Home Shard `coord`:
-/// a reconnect inside the countdown shows the time left, and an arrival without one hides a
-/// countdown still on screen. See [`resident_countdown_ms`].
 pub(crate) fn resident_instance_removal_outbound(
     view: &WorldView,
     coord: &Coordinator,
@@ -805,9 +723,6 @@ pub(crate) fn resident_instance_removal_outbound(
         .collect()
 }
 
-/// A Realm Chat Line landed → one `SMSG_MESSAGECHAT` per recipient with a World Session on this
-/// Gateway, whatever Shard it plays on. The Module chose the audience. The only per-listener
-/// filter here is the listener's own ignore list, and only for lines the Module marked ignorable.
 pub(crate) fn realm_chat_appeared(view: &WorldView, row: &RealmChatEvent) {
     let row = Arc::new(row.clone());
     for &recipient in &row.recipients {
@@ -833,8 +748,6 @@ pub(crate) fn realm_chat_appeared(view: &WorldView, row: &RealmChatEvent) {
     }
 }
 
-/// A contact row changed on `shard` → the owner's ignore set or friend set, whichever list the row
-/// names, if the owner plays on that Shard.
 pub(crate) fn contact_changed(view: &WorldView, shard: ShardId, row: &ContactEntry, present: bool) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.owner_guid)) else {
         return;
@@ -846,10 +759,7 @@ pub(crate) fn contact_changed(view: &WorldView, shard: ShardId, row: &ContactEnt
     }
 }
 
-/// Rebuild the ignore set AND the friend set of every viewer on `shard` from that Shard's contact
-/// rows. A resubscribe replays inserts but never the deletes it missed, so the live callbacks alone
-/// could keep a removed contact in force until relog. Runs on the Shard's pump, like its contact
-/// callbacks.
+// Resubscribe replays inserts but not missed deletes; rebuild both contact sets.
 pub(crate) fn replace_contact_sets(view: &WorldView, shard: ShardId, contacts: &[ContactEntry]) {
     let mut ignored: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut friends: HashMap<u64, HashSet<u64>> = HashMap::new();
@@ -872,10 +782,6 @@ pub(crate) fn replace_contact_sets(view: &WorldView, shard: ShardId, contacts: &
     }
 }
 
-/// The World Sessions that could possibly hear a friend online/offline notice about
-/// `subject_guid`, on any Shard: every viewer that lists it as a friend, minus its own viewer.
-/// Team is checked separately by each caller — one already knows it for free (the just-committed
-/// `game_character` row), the other only after a read.
 pub(crate) fn friend_notice_candidates(view: &WorldView, subject_guid: u64) -> Vec<Arc<Viewer>> {
     view.all_viewers()
         .into_iter()
@@ -924,27 +830,6 @@ pub(crate) fn character_home_changed(
     });
 }
 
-/// A Character logged in on this Shard → `FRIEND_ONLINE` to every same-team viewer, on any Shard,
-/// who lists it as a friend (cm:CharacterHandler.cpp:856, cm:WorldSession.cpp:754,
-/// cm:SocialMgr.cpp:263-292).
-///
-/// Hooked to `game_character` (shard-local, inside `player_login`'s own transaction), never the
-/// realm-wide Account Claim: `CMSG_PLAYER_LOGIN`'s handler calls `claim_session` BEFORE
-/// `enter_world`/`player_login`, so a Claim-driven edge could fire for a Character that has not
-/// entered the world yet, or never will if `enter_world` then refuses — carrying its stale
-/// pre-login level and zone either way. This row IS the just-committed login state, so no further
-/// read is needed: race/class/level/zone come straight off it, and Away Status is always `None`
-/// (login clears it — nobody crosses a loading screen AFK).
-///
-/// The edge is landing on a fresh, nonzero `session_start_micros`, not `online` flipping false →
-/// true. `player_login` is the only writer that ever stamps `session_start_micros` to a real value;
-/// every `persist_entity` call — a real logout AND a same-database transfer's `freeze_live_entity`
-/// alike — zeroes it back out, but `freeze_live_entity` passes `set_offline: false` and so never
-/// touches `online`. An abandoned, rolled-back transfer therefore leaves a Character `online: true`
-/// with no live entity; a plain `old.online` check would never fire for that Character's real next
-/// login, because `online` reads true on both sides of it. Marks the Character in this Gateway's
-/// own `online_characters` set, the dedup [`account_claim_changed`] reads before it answers
-/// FRIEND_OFFLINE for the same Character's later claim close.
 pub(crate) fn character_online_changed(view: &WorldView, old: &Character, new: &Character) {
     if new.session_start_micros == 0 || old.session_start_micros == new.session_start_micros {
         return;
@@ -978,9 +863,6 @@ pub(crate) fn character_online_changed(view: &WorldView, old: &Character, new: &
     }
 }
 
-/// Does an Account Claim row's old and new state close the OLD row's Character? `old` is `None`
-/// for the account's first-ever claim, never a close. Reopening after a close, and a fresh open,
-/// both answer `None` — that edge is [`character_online_changed`]'s, not this file's.
 pub(crate) fn claim_closed(old: Option<&AccountClaim>, new: &AccountClaim) -> Option<u64> {
     let old = old?;
     let replaced = old.generation != new.generation || old.character_guid != new.character_guid;
@@ -988,14 +870,6 @@ pub(crate) fn claim_closed(old: Option<&AccountClaim>, new: &AccountClaim) -> Op
     (was_live && (replaced || new.closed)).then_some(old.character_guid)
 }
 
-/// The departing Character's team for one Account Claim close — read with the local-cache-only
-/// [`presence::character_identity_anywhere`], not the health-checked [`presence::of`]: the
-/// Character has just stopped being reachable, so a Whereabouts read has nothing left to prove.
-/// Computed ONCE per transition, by whichever candidate's job runs first (cached in the caller's
-/// `OnceLock` for every other candidate), on that job's own writer thread, NEVER the shared pump:
-/// this read can cross the network to another Shard, and the pump is the one thread every World
-/// Session on this Shard depends on. `None` when no connected Shard currently knows the Character
-/// at all: never guess a team, which could notify the wrong side.
 pub(crate) fn claim_close_team(coord: &Coordinator, subject_guid: u64) -> Option<u32> {
     let identity = crate::world::presence::character_identity_anywhere(coord, subject_guid)
         .ok()
@@ -1003,15 +877,6 @@ pub(crate) fn claim_close_team(coord: &Coordinator, subject_guid: u64) -> Option
     Some(lyracore_shared::faction::team_for_race(identity.race))
 }
 
-/// An Account Claim closed on Realm-core → `FRIEND_OFFLINE` to every same-team viewer, on any
-/// Shard, who lists the Character as a friend (cm:CharacterHandler.cpp:856,
-/// cm:WorldSession.cpp:754, cm:SocialMgr.cpp:263-292) — but ONLY for a Character this Gateway
-/// itself watched come online ([`WorldView::take_character_online`]). A claim can close without
-/// `player_login` ever having run for it: `CMSG_PLAYER_LOGIN`'s handler calls `claim_session`
-/// BEFORE `enter_world`, so a login that fails after the claim opens releases it on session
-/// teardown with no Character having ever entered the world, and this must answer nothing for it.
-/// `coord` is the world handle [`claim_close_team`] reads through — never the Realm-core handle,
-/// which holds no Characters.
 pub(crate) fn account_claim_changed(
     view: &WorldView,
     coord: &Coordinator,
@@ -1050,7 +915,6 @@ pub(crate) fn account_claim_changed(
     }
 }
 
-/// Queue a Package System Message for its addressed World Session.
 pub(crate) fn system_message_appeared(view: &WorldView, row: &SystemMessageEvent) {
     let Some(session) = view.session_of_owner(row.recipient_guid) else {
         return;
@@ -1070,9 +934,6 @@ pub(crate) fn system_message_appeared(view: &WorldView, row: &SystemMessageEvent
     });
 }
 
-/// A group/loot-roll/quest-share event landed → the kind-decoded packets to the row's RECIPIENT
-/// and nobody else (`coord` feeds the QUEST_SHARE detail JOIN inside the job). The recipient gets
-/// its rows of one transaction in the order the Module inserted them ([`GroupEventCursor::take`]).
 pub(crate) fn group_event_appeared(
     view: &WorldView,
     coord: &Coordinator,
@@ -1105,7 +966,6 @@ pub(crate) fn group_event_appeared(
             packets.extend(crate::codec::social::subscriptions::group_event_outbound(
                 &coord, self_guid, row,
             ));
-            // A party frame sets every member's online flag, so Member Stats start over behind it.
             if row.kind == lyracore_shared::group::event_kind::LIST {
                 viewer.member_stats.forget_all();
             }
@@ -1114,8 +974,6 @@ pub(crate) fn group_event_appeared(
     });
 }
 
-/// A shard mirror delta is the point at which viewer-relative Loot Tag flags can be projected from
-/// current membership without racing the realm event that requested the mirror write.
 pub(crate) fn group_member_mirror_changed(
     view: &WorldView,
     coord: &Coordinator,
@@ -1131,9 +989,6 @@ pub(crate) fn group_member_mirror_changed(
     });
 }
 
-/// A text emote names no cell of its own; the row carries the actor's cell (stamped at insert
-/// time), widened to the 25 yd text-emote range rather than the AOI box — the job's `chat_in_range`
-/// gate is the exact filter, this only bounds the candidate set.
 pub(crate) fn emote_audience(
     view: &WorldView,
     shard: ShardId,
@@ -1148,9 +1003,6 @@ pub(crate) fn emote_audience(
     )
 }
 
-/// A text emote landed → SMSG_TEXT_EMOTE + SMSG_EMOTE per viewer within 25 yd of the sender
-/// (`emote_event_outbound`'s `chat_in_range` gate). Name resolve runs in the job against `coord`'s
-/// cache.
 pub(crate) fn emote_appeared(
     view: &WorldView,
     coord: &Coordinator,
@@ -1167,8 +1019,6 @@ pub(crate) fn emote_appeared(
     }
 }
 
-/// Creature whispers select their recipient; zone speech reaches the shard's viewers before the
-/// zone gate. Local speech uses the speaker's cell and the chat kind's distance.
 pub(crate) fn chat_audience(view: &WorldView, shard: ShardId, row: &ChatEvent) -> Vec<Arc<Viewer>> {
     if row.chat_type == lyracore_shared::chat::broadcast_chat::CREATURE_WHISPER {
         return view
@@ -1189,9 +1039,6 @@ pub(crate) fn chat_audience(view: &WorldView, shard: ShardId, row: &ChatEvent) -
     view.cell_audience(shard, key, span, &[row.sender_guid, row.target_guid])
 }
 
-/// A say/yell line landed → SMSG_MESSAGECHAT per viewer, `chat_in_range`-gated inside the job
-/// (`chat_event_outbound`: speaker echo, SAY/YELL radii, map+instance fence, coordinator-cache
-/// endpoint lookups).
 pub(crate) fn chat_appeared(
     view: &WorldView,
     coord: &Coordinator,

@@ -9,8 +9,9 @@ We build complex things as simply as possible, and we look for ways to remove co
 - Boy scout rule: fix defects in code you already change. Exceptions: a fix that spreads to other
   files, or that changes behaviour the user must weigh. Name those in one line and carry on. Fix
   everything else, even when it feels too big. That feeling reads high.
-- Legacy code carries essay comments and issue references. Match its naming and idiom, not its
-  comment density.
+- Apply [the comment policy](CODING_STANDARDS.md#comments-and-documentation) when writing or reviewing
+  source, tests, scripts and configuration. Complete its
+  [comment review](CODING_STANDARDS.md#comment-review) before handoff.
 
 ## Words
 
@@ -32,6 +33,8 @@ We build complex things as simply as possible, and we look for ways to remove co
   ownership up front. Choose each subagent's model and effort for its subtask: a cheaper model for
   scoped work, the top tier for hard design, concurrency or adversarial review. The spawning agent
   owns that choice.
+- Require implementation and review subagents to read `AGENTS.md` in their checkout and return the
+  comment-review result. Review the combined diff after integrating parallel work.
 - Touch production or a live database only when the user tells you to or confirms it. Before you
   touch anything adjacent to one, name it.
 

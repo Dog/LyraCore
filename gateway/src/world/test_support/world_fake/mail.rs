@@ -1,12 +1,9 @@
 use super::super::*;
 
-/// The Module refusing a mail reducer with `reason`, as the Fake's reducer edge reports it.
 fn refused(reason: impl std::fmt::Display) -> anyhow::Error {
     crate::stdb::ReducerCallError::refused("mail", &reason.to_string()).into()
 }
 
-/// The Module's Delivery Delay rule (`module/src/mail.rs::delivery_delay_secs`): an item sent to
-/// another Realm Account waits one hour, and everything else arrives at once.
 pub(crate) fn delivery_delay_secs(has_item: bool, same_account: bool) -> u32 {
     if has_item && !same_account {
         3_600
@@ -15,7 +12,6 @@ pub(crate) fn delivery_delay_secs(has_item: bool, same_account: bool) -> u32 {
     }
 }
 
-/// A mail's `deliver_secs` when it arrives `delay_secs` from now. 0 means from creation.
 pub(crate) fn delivered_after(delay_secs: u32) -> i64 {
     if delay_secs == 0 {
         0
@@ -26,62 +22,23 @@ pub(crate) fn delivered_after(delay_secs: u32) -> i64 {
 
 #[derive(Default)]
 pub(crate) struct MailState {
-    /// The mail rows on THIS database, as `(recipient_guid, row)`. The realm handle owns them on a
-    /// sharded gateway and a world shard's staying empty is how a test tells "the mailbox read went
-    /// to the authority" from "it quietly went back to being shard-local"; on a single-database
-    /// gateway the one handle owns them instead. Same fixture either way — that is the point.
     pub(crate) mails: std::sync::Mutex<Vec<(u64, codec::MailView)>>,
-    /// Gameobject guids that ARE a mailbox within reach on this shard. Empty (derive-Default)
-    /// refuses every mailbox, which is the wrong-map / out-of-range / not-a-mailbox arm.
     pub(crate) mailboxes: Vec<u64>,
-    /// `game_world_entity.money` per guid, on THIS database — the purse the postage comes out of.
-    /// A guid with no row here cannot pay, which is also the module's answer for a character with no
-    /// live entity on the shard being asked.
     pub(crate) purses: std::sync::Mutex<Vec<(u64, u32)>>,
-    /// Letters written on THIS database: `(sender, recipient, subject, body, attached money)`.
-    /// Recorded separately from `mails` because WHICH call wrote the row is what tells the two
-    /// planes apart — `mail_send` on one database, `mail_commit` on the mail plane of a sharded one.
     #[allow(clippy::type_complexity)]
     pub(crate) sent_mail: std::sync::Mutex<Vec<(u64, u64, String, String, u32)>>,
-    /// The escrow ledger on THIS database, as `(the guid the fence is filed under, the row)`. A
-    /// letter's fence is filed under its SENDER and lives on their shard; a take's is filed under
-    /// the PAYEE and lives on the plane holding the mail row.
     #[allow(clippy::type_complexity)]
     pub(crate) mail_escrows: std::sync::Mutex<Vec<(u64, crate::world::mail::HeldEscrow)>>,
-    /// How many `mail_escrows_of` reads answer empty before a just-filed fence shows up. The same
-    /// cross-connection lag `escrow_reads_before_visible` dials in for `escrowed_transfer`, made
-    /// dialable for the mail escrow read `held_fence` polls.
     pub(crate) mail_escrow_reads_before_visible: std::sync::atomic::AtomicUsize,
-    /// The Realm Account name THIS Shard holds per Character guid. A Character missing here is
-    /// one this Shard cannot name: absent, or on a shadow Account.
     pub(crate) realm_accounts: std::sync::Mutex<Vec<(u64, String)>>,
-    /// The `same_account` each mail send, fence and return carried, in call order.
     pub(crate) same_account_seen: std::sync::Mutex<Vec<(&'static str, bool)>>,
-    /// `game_mail_escrow.delivered` per escrow id: the attestation that licenses the settle. Kept
-    /// beside the fence rather than in it so the fake cannot settle one it never attested.
     pub(crate) attested: std::sync::Mutex<Vec<(u64, bool)>>,
-    /// Delivery/payout receipts on THIS database, `(escrow_id, recipient or payee)` — the
-    /// idempotency key that makes a replayed commit or payout a no-op.
     pub(crate) mail_receipts: std::sync::Mutex<Vec<(u64, u64)>>,
-    /// `game_item_text` on THIS database: `(item_text_id, text)`. Filed by `mail_copy_text`, read
-    /// back by `item_text` — the mail plane's half of a Letter Copy.
     pub(crate) item_texts: std::sync::Mutex<Vec<(u32, String)>>,
-    /// Plain Letters `mail_grant_letter` granted on THIS database: `(payee_guid, item_text_id)`.
-    /// Not `mail_items` — a Letter Copy mints a fresh item, it never moves one out of a mail row.
     pub(crate) granted_letters: std::sync::Mutex<Vec<(u64, u32)>>,
-    /// `game_mail.item_text_id` per mail id: the attached Plain Letter's text id. Kept beside
-    /// `mails` because `MailView` does not carry it.
     pub(crate) mail_item_text_ids: std::sync::Mutex<Vec<(u64, u32)>>,
-    /// The mail-escrow step to fail on THIS database — a gateway killed before that step's
-    /// transaction committed. `transfer`'s `kill_at` for the mail drive, and a `Mutex` because a
-    /// re-drive test has to bring the database back up before driving again.
     pub(crate) mail_kill_at: std::sync::Mutex<Option<String>>,
-    /// `game_item_instance` on THIS database: `item_guid -> (owner_guid, snapshot)`. The mail
-    /// attachment path deletes from here at send and inserts at take, which is the whole "a fenced
-    /// item is in nobody's bags" property.
     pub(crate) mail_items: std::sync::Mutex<Vec<(u64, u64, crate::world::mail::AttachedItem)>>,
-    /// This shard's bags have no room — the fixture behind the full-bag refusal on a take.
-    /// Atomic so a test can flip it AFTER the fixture is wrapped in an `Arc`, like `purses`.
     pub(crate) bags_full: std::sync::atomic::AtomicBool,
 }
 
@@ -126,9 +83,6 @@ impl MailStore for WorldFake {
         Ok(self.mail.mailboxes.contains(&mailbox_guid))
     }
 
-    /// Models the module's `apply_mark_read`: the row lookup scoped to `recipient_guid` IS the
-    /// authorization, so a mail that exists but belongs to someone else, or has not arrived yet,
-    /// fails the same way a nonexistent id does.
     fn mail_mark_read(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_mark_read");
@@ -146,8 +100,6 @@ impl MailStore for WorldFake {
         }
     }
 
-    /// Models the module's `apply_delete`: same merged not-found/not-yours/not-arrived refusal as
-    /// mark-read, and a priced mail is refused.
     fn mail_delete(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_delete");
@@ -166,11 +118,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models the module's `apply_return`: the SAME row, re-addressed to whoever sent it, with
-    /// whatever it still carries (or nothing) travelling unchanged — except the cash-on-delivery
-    /// price, which is dropped, because the row is going back to whoever set it. Only a delivered
-    /// Character mail with a sender goes back, and only once. An item going back to another
-    /// Account waits its Delivery Delay.
     fn mail_return(&self, recipient: Actor, mail_id: u64, same_account: bool) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_return");
@@ -198,9 +145,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models the module's `apply_send`: the postage plus the attached coin leave the purse and the
-    /// row is written, in ONE call — the single-database plane's one transaction. The id is
-    /// per-database, as the module's `auto_inc` is.
     #[allow(clippy::too_many_arguments)]
     fn mail_send(
         &self,
@@ -239,9 +183,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models the module's `apply_take_item`: the COD debit, the grant, the clear and the seller's
-    /// payout row are ONE transaction, so a full bag or a price the taker cannot pay leaves the
-    /// letter exactly as it was, and a second take finds an empty one.
     fn mail_take_item(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         let (item, settlement) = {
@@ -280,8 +221,7 @@ impl MailStore for WorldFake {
                 .map_err(|_| refused(lyracore_shared::mail::COD_NOT_AFFORDABLE))?;
         }
         if let Err(e) = self.store_snapshot(recipient_guid, &item) {
-            // The fake cannot roll back, so it undoes the one write it made — the real module gets
-            // this from the transaction, and asserting on it is the point of the full-bag test.
+            // The Fake lacks rollback, so undo this write to match the Module's transaction.
             if let Some(s) = &settlement {
                 self.credit(s.payer_guid, s.copper);
             }
@@ -329,11 +269,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_text::apply_copy_text`: sets COPIED and files the body as item text, on the
-    /// database that owns the mail row. Refused for a mail that is not the caller's, is not
-    /// delivered, has no body, or is already GRANTED — the same Gates the plan function pins. A
-    /// replay before GRANTED is set is `Ok`, and the text insert is skipped when the id already has
-    /// a row (a returned mail keeps its id, so a second recipient's copy can reuse it).
     fn mail_copy_text(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_copy_text");
@@ -362,11 +297,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `items::grant_letter_item`: one Plain Letter, refused by the same full-bag fixture
-    /// every other grant uses. A no-op when the payee already holds an item carrying `item_text_id`
-    /// — the crash-window guard for a retry between this call landing and `mail_mark_letter_granted`
-    /// recording that it did, not the durable "already got one" record (that is GRANTED, on the mail
-    /// row).
     fn mail_grant_letter(&self, payee: Actor, item_text_id: u32) -> Result<()> {
         let payee_guid = payee.guid();
         self.rec("mail_grant_letter");
@@ -395,8 +325,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_text::apply_mark_letter_granted`: sets GRANTED on the mail row. Once this lands,
-    /// `mail_copy_text` refuses for good, whether or not the granted item still exists.
     fn mail_mark_letter_granted(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_mark_letter_granted");
@@ -411,7 +339,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models the Coordinator's `item_text`: a PK read of `game_item_text` on THIS database.
     fn item_text(&self, item_text_id: u32) -> Result<Option<String>> {
         self.rec("item_text");
         Ok(self
@@ -424,9 +351,6 @@ impl MailStore for WorldFake {
             .map(|(_, text)| text.clone()))
     }
 
-    /// Models the Coordinator's `owns_item_with_text`: does `owner_guid` hold a granted letter
-    /// carrying `item_text_id`? The fake has no item-guid fixture to answer `hint_item_guid`'s fast
-    /// path distinctly, so both routes resolve through the same `granted_letters` lookup.
     fn owns_item_with_text(
         &self,
         owner_guid: u64,
@@ -444,8 +368,6 @@ impl MailStore for WorldFake {
                 .any(|&(guid, id)| guid == owner_guid && id == item_text_id))
     }
 
-    /// Models the module's `apply_take_money`: the credit and the clear are one transaction, so a
-    /// second take finds an empty row.
     fn mail_take_money(&self, recipient: Actor, mail_id: u64) -> Result<()> {
         let recipient_guid = recipient.guid();
         self.rec("mail_take_money");
@@ -467,7 +389,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_fence`: the whole cost leaves the purse into a fence row here.
     fn mail_fence(
         &self,
         escrow_id: u64,
@@ -488,11 +409,9 @@ impl MailStore for WorldFake {
         self.mail_kill("mail_fence")?;
         let escrows = self.mail.mail_escrows.lock().unwrap();
         if escrows.iter().any(|(_, e)| e.escrow_id == escrow_id) {
-            return Ok(()); // replay — the purse must not be debited twice for one letter
+            return Ok(());
         }
         drop(escrows);
-        // The attachment before the debit: it is the refusal that can still fire, and nothing has
-        // been written when it does.
         let item = self.detach(sender_guid, item_guid)?;
         self.debit(sender_guid, money.saturating_add(postage))?;
         let delivery_delay_secs = delivery_delay_secs(!item.is_empty(), same_account);
@@ -517,7 +436,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_commit`: the row plus a receipt, idempotent on the escrow id.
     fn mail_commit(
         &self,
         escrow_id: u64,
@@ -539,7 +457,6 @@ impl MailStore for WorldFake {
         if receipts.iter().any(|(id, _)| *id == escrow_id) {
             return Ok(());
         }
-        // A COD payment pays only a price its payer still owes on a delivered mail.
         if cod_source_mail_id != 0 {
             let now = crate::world::mail::now_secs();
             let owed = self.mail.mails.lock().unwrap().iter().any(|(to, m)| {
@@ -569,7 +486,6 @@ impl MailStore for WorldFake {
             cod,
             &item,
             cod_source_mail_id != 0,
-            // A payment arrives at once whatever the commit carries.
             if cod_source_mail_id != 0 {
                 0
             } else {
@@ -577,7 +493,6 @@ impl MailStore for WorldFake {
             },
         );
         if let Some(header) = reward {
-            // Models `crate::world::mail::Letter::reward`: from the quest giver, naming its Mail Template.
             let (sender_kind, sender_guid, sender_entry) = header.giver.sender().columns();
             let mut mails = self.mail.mails.lock().unwrap();
             if let Some((_, m)) = mails.iter_mut().max_by_key(|(_, m)| m.id) {
@@ -588,9 +503,6 @@ impl MailStore for WorldFake {
                 m.check_flags = lyracore_shared::mail::CHECK_MASK_HAS_BODY;
             }
         }
-        // The price stops being owed in the SAME call that delivers the payment for it — the
-        // module clears it inside the commit's transaction, which is what makes a COD take charge
-        // once however the drive is interrupted.
         if cod_source_mail_id != 0 {
             if let Some((_, m)) = self
                 .mail
@@ -606,7 +518,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_take_fence`: the copper leaves the ROW into a fence here.
     fn mail_take_money_fence(
         &self,
         escrow_id: u64,
@@ -667,7 +578,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_take_item_fence`: the ATTACHMENT leaves the row into a fence.
     fn mail_take_item_fence(
         &self,
         escrow_id: u64,
@@ -742,8 +652,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_item_payout`: the grant plus a receipt, idempotent on the escrow
-    /// id, and refused by a full bag — which leaves the fence holding the item.
     fn mail_item_payout(
         &self,
         escrow_id: u64,
@@ -768,7 +676,6 @@ impl MailStore for WorldFake {
         Ok(())
     }
 
-    /// Models `mail_escrow::apply_payout`: the credit plus a receipt, idempotent on the escrow id.
     fn mail_payout(&self, escrow_id: u64, payee: Actor, _mail_id: u64, amount: u32) -> Result<()> {
         let payee_guid = payee.guid();
         self.rec("mail_payout");
@@ -808,7 +715,6 @@ impl MailStore for WorldFake {
         }
     }
 
-    /// Models `mail_escrow::apply_settle`, delete-last included: it REFUSES while unattested.
     fn mail_settle(&self, escrow_id: u64) -> Result<()> {
         self.rec("mail_settle");
         self.mail_kill("mail_settle")?;
@@ -821,7 +727,7 @@ impl MailStore for WorldFake {
             .find(|(id, _)| *id == escrow_id)
             .map(|(_, done)| *done);
         match attested {
-            None => Ok(()), // already settled, or this call reached the wrong database
+            None => Ok(()),
             Some(false) => Err(refused(format!(
                 "mail escrow {escrow_id}: delivery not attested — refusing to destroy the fence"
             ))),
@@ -853,7 +759,7 @@ impl MailStore for WorldFake {
             )
             .is_ok()
         {
-            return Ok(Vec::new()); // the coordinator cache has not caught up yet
+            return Ok(Vec::new());
         }
         Ok(self
             .mail
@@ -868,8 +774,6 @@ impl MailStore for WorldFake {
 }
 
 impl WorldFake {
-    /// One mail-escrow step boundary. `Err` is the gateway dying before this step committed: the
-    /// call never lands, and nothing after it in the drive runs either.
     pub(crate) fn mail_kill(&self, step: &str) -> Result<()> {
         if self.mail.mail_kill_at.lock().unwrap().as_deref() == Some(step) {
             log::info!(
@@ -881,8 +785,6 @@ impl WorldFake {
         Ok(())
     }
 
-    /// Take `copper` out of a purse on THIS database, or refuse and take nothing — the module's
-    /// `charge_postage`, including its "no live entity here" arm for a guid with no purse row.
     pub(crate) fn debit(&self, guid: u64, copper: u32) -> Result<()> {
         let mut purses = self.mail.purses.lock().unwrap();
         match purses.iter_mut().find(|(g, _)| *g == guid) {
@@ -901,8 +803,6 @@ impl WorldFake {
         }
     }
 
-    /// The module's `detach_item`: the mailable verdict, then the DELETE. `item_guid` 0 is a letter
-    /// with no attachment.
     pub(crate) fn detach(
         &self,
         sender_guid: u64,
@@ -924,8 +824,6 @@ impl WorldFake {
         }
     }
 
-    /// The module's `store_instance_state`: one new row carrying the recorded state, or the item
-    /// module's own full-bag refusal.
     pub(crate) fn store_snapshot(
         &self,
         owner_guid: u64,
@@ -944,8 +842,6 @@ impl WorldFake {
         Ok(())
     }
 
-    /// Every item `owner` holds on this database — the assertion surface for "it left the bags",
-    /// "it arrived unchanged" and "it never arrived twice".
     pub(crate) fn bags_of(&self, owner: u64) -> Vec<crate::world::mail::AttachedItem> {
         self.mail
             .mail_items
@@ -957,10 +853,6 @@ impl WorldFake {
             .collect()
     }
 
-    /// The module's `insert_letter` for a Character's letter: the row both write paths reach, so a
-    /// letter written by the single-database send and one written by the escrow's commit cannot
-    /// differ. It has HAS_BODY with a body and COPIED without one, like `Letter::from_character`,
-    /// and only COD_PAYMENT when it pays a price. It arrives `delay_secs` from now.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_mail(
         &self,
@@ -1014,7 +906,6 @@ impl WorldFake {
         }
     }
 
-    /// The text id of the letter attached to mail `mail_id`, 0 for any other attachment.
     pub(crate) fn attached_text_id(&self, mail_id: u64) -> u32 {
         self.mail
             .mail_item_text_ids
@@ -1025,7 +916,6 @@ impl WorldFake {
             .map_or(0, |(_, text_id)| *text_id)
     }
 
-    /// Take the attached letter's text id off mail `mail_id`, as the take clears the attachment.
     pub(crate) fn take_attached_text_id(&self, mail_id: u64) -> u32 {
         let mut ids = self.mail.mail_item_text_ids.lock().unwrap();
         let Some(at) = ids.iter().position(|(id, _)| *id == mail_id) else {

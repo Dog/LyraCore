@@ -1,29 +1,4 @@
-//! The Fee Hold: how a guild operation that costs copper pays across two databases.
-//!
-//! The purse lives on the payer's Home Shard. Whether the operation is allowed is known only on
-//! Realm-core. No transaction spans both, so one fee takes three Durable Requests, each idempotent
-//! on the Gateway's operation id:
-//!
-//! 1. [`gw_guild_fee_hold`] on the Home Shard runs the NPC and purse Gates and moves the fee from
-//!    the purse into the payer's Fee Hold. A Guild Charter is created in the same step.
-//! 2. [`realm_guild_fee_decide`] on Realm-core runs the guild Gates and commits one decision row
-//!    for the operation id, with the accepted effect in the same transaction. A refusal is data in
-//!    that row, so a retry gets the same answer.
-//! 3. [`gw_guild_fee_finish`] on the Home Shard spends the Hold on acceptance or puts the copper
-//!    back on refusal, and deletes the Hold last. A refused Guild Charter is destroyed and refunded
-//!    only while the payer still holds it, so a Charter the payer destroyed is never paid back. A
-//!    refund that does not fit in the purse follows the auction rule: the purse takes what fits and
-//!    the rest goes out as Mail Escrow in the same transaction.
-//!
-//! What the fee pays for can vanish between the phases: the Guild disbands, leadership moves. The
-//! decision then refuses and the finish refunds, so copper never strands. A Hold that a crash left
-//! behind travels with its Character on Transfer, and the Gateway finishes it at the next world
-//! entry. Character deletion is refused while one exists.
-//!
-//! The Gateway mints a fresh operation id inside each hold call and never replays that call, so a
-//! Hold is taken at most once per operation id; a replay of an id that Realm-core already decided
-//! would take the fee a second time. It always holds before it decides. A finish or decide that
-//! arrives without its Hold spends nothing.
+//! Hold before deciding; reusing a decided operation id can debit the fee twice.
 
 use lyracore_shared::constants::npc_flags;
 use lyracore_shared::guild::{
@@ -36,27 +11,20 @@ use super::{game_guild, member, petition, push_event};
 use crate::game_world_entity;
 use crate::items::{game_item_instance, game_item_template};
 
-/// Copper a Character paid for a guild operation that is not finished yet. Keyed by the payer, so
-/// a Character has at most one Fee Hold and the Gateway finds it by guid. The row carries every
-/// input the decision needs, so a re-drive decides from the Hold alone.
 #[table(accessor = game_guild_fee_hold)]
 pub struct GuildFeeHold {
     #[primary_key]
     pub payer_guid: u64,
     pub operation_id: u64,
-    /// `lyracore_shared::guild::fee_kind`.
     pub kind: u8,
     pub copper: u32,
-    /// The Tabard Designer or Petitioner the payer stood at.
     pub npc_guid: u64,
     pub emblem_style: u32,
     pub emblem_color: u32,
     pub border_style: u32,
     pub border_color: u32,
     pub background_color: u32,
-    /// The Guild Charter the Hold created. 0 for an emblem.
     pub charter_item_guid: u64,
-    /// The guild name on the Guild Charter. Empty for an emblem.
     pub charter_name: String,
     pub created_micros: i64,
 }
@@ -68,11 +36,8 @@ crate::character_owned!(transfer, fn sweep_transfer_game_guild_fee_hold(ctx, cha
     primary_key = payer_guid,
 });
 
-/// The text of the letter that carries the part of a guild fee refund the purse could not hold.
 const REFUND_LETTER_BODY: &str = "Your purse could not hold all of this guild fee refund.";
 
-/// Realm-core's one decision for one operation id. Kept after the Hold is finished: a guild pays
-/// a few fees in its lifetime, and the row is what makes a late retry harmless.
 #[table(accessor = game_guild_fee_decision)]
 pub struct GuildFeeDecision {
     #[primary_key]
@@ -80,14 +45,11 @@ pub struct GuildFeeDecision {
     pub payer_guid: u64,
     pub kind: u8,
     pub accepted: bool,
-    /// The `GuildRefusal` tag when refused, empty when accepted.
     pub refusal: String,
-    /// The petition a Guild Charter opened. 0 for an emblem.
     pub petition_id: u32,
     pub decided_micros: i64,
 }
 
-/// The five tabard design values of a Guild, in the order the client sends them.
 #[derive(SpacetimeType, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuildEmblem {
     pub emblem_style: u32,
@@ -97,30 +59,24 @@ pub struct GuildEmblem {
     pub background_color: u32,
 }
 
-/// A Guild Emblem bought at the Tabard Designer `npc_guid`.
 #[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuildEmblemPurchase {
     pub npc_guid: u64,
     pub emblem: GuildEmblem,
 }
 
-/// A Guild Charter bought at the Petitioner `npc_guid`, proposing a Guild named `name`.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildCharterPurchase {
     pub npc_guid: u64,
     pub name: String,
 }
 
-/// What the payer asks its Home Shard to hold copper for. Later fee kinds append variants.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub enum GuildFeeRequest {
     Emblem(GuildEmblemPurchase),
     Charter(GuildCharterPurchase),
 }
 
-/// A Guild Charter purchase as Realm-core decides it: the Charter the Hold created and its name,
-/// read back from the Hold, plus the owner's name and team, which the Gateway conveys because
-/// Realm-core holds no Character rows.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildCharterTerms {
     pub charter_item_guid: u64,
@@ -129,7 +85,6 @@ pub struct GuildCharterTerms {
     pub payer_team: u32,
 }
 
-/// What Realm-core decides on: the operation a Fee Hold pays for, read back from the Hold.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub enum GuildFeeTerms {
     Emblem(GuildEmblem),
@@ -145,11 +100,9 @@ impl GuildFeeTerms {
     }
 }
 
-/// What a Fee Hold pays for, as the Home Shard stores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HeldTerms {
     Emblem(GuildEmblem),
-    /// `charter_item_guid` is 0 until the hold creates the Charter.
     Charter {
         name: String,
         charter_item_guid: u64,
@@ -172,7 +125,6 @@ impl HeldTerms {
     }
 }
 
-/// One Fee Hold as the protocol sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeldFee {
     operation_id: u64,
@@ -205,8 +157,6 @@ impl HeldFee {
         }
     }
 
-    /// Is this Hold what `request` asked for? The hold mints the Charter guid, so a replay of the
-    /// same request matches whatever guid the first hold minted.
     fn answers(&self, request: &HeldFee) -> bool {
         let mut minted = request.clone();
         if let (
@@ -275,8 +225,6 @@ impl HeldFee {
     }
 }
 
-/// Why a fee Durable Request did nothing. A Refusal answers the player; a conflict is a Gateway or
-/// transport fault and leaves the Hold for the next re-drive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeeError {
     Refused(GuildRefusal),
@@ -292,39 +240,23 @@ impl FeeError {
     }
 }
 
-/// The Home Shard half: the payer's purse, its Guild Charters and its Fee Hold.
 trait FeePurse {
     fn held(&self, payer_guid: u64) -> Option<HeldFee>;
-    /// The payer's purse, `None` when the payer is not in the world on this Shard.
     fn purse(&self, payer_guid: u64) -> Option<u32>;
-    /// Does `npc_guid` serve fee `kind` to the payer here: flag, alive, in reach, not refusing?
     fn npc_serves(&self, payer_guid: u64, npc_guid: u64, kind: u8) -> bool;
-    /// Does this Shard know the Guild Charter item?
     fn charter_known(&self) -> bool;
-    /// Can the payer carry one more Guild Charter? The item's unique count comes before a free
-    /// bag slot, as `Player::CanStoreNewItem` checks them (`cm:PetitionsHandler.cpp:128-134`).
     fn charter_room(&self, payer_guid: u64) -> Result<(), GuildRefusal>;
-    /// Take `hold.copper` from the purse and insert the Hold. A Charter Hold also creates the
-    /// Charter and records its guid.
     fn take(&mut self, hold: HeldFee) -> Result<(), FeeError>;
-    /// Destroy the Guild Charter `charter_item_guid` if the payer still holds it. Answers whether
-    /// it did.
     fn take_back_charter(&mut self, payer_guid: u64, charter_item_guid: u64) -> bool;
-    /// Put `credit` back in the purse, send `mailed` by mail, and delete the Hold. `credit` fits
-    /// in the purse.
     fn release(&mut self, hold: &HeldFee, credit: u32, mailed: u32) -> Result<(), FeeError>;
 }
 
-/// The Realm-core half: guild facts, Petitions and the decision ledger.
 trait FeeLedger {
-    /// The payer and kind a decision for `operation_id` was made for.
     fn decided_for(&self, operation_id: u64) -> Option<(u64, u8)>;
-    /// The payer's Guild and its Guild Leader, when the payer is a member.
     fn guild_of(&self, payer_guid: u64) -> Option<(u32, u64)>;
     fn owns_petition(&self, payer_guid: u64) -> bool;
     fn guild_name_taken(&self, name: &str) -> bool;
     fn apply_emblem(&mut self, guild_id: u32, emblem: &GuildEmblem);
-    /// Open the Petition of an accepted Charter. Answers its id.
     fn open_petition(&mut self, payer_guid: u64, terms: &GuildCharterTerms) -> u32;
     fn record(
         &mut self,
@@ -336,8 +268,6 @@ trait FeeLedger {
     );
 }
 
-/// Gates in mangos order: the NPC, the Charter template, the purse, then a bag slot for
-/// the Charter (`cm:GuildHandler.cpp:726-755`, `cm:PetitionsHandler.cpp:76-134`).
 fn hold_fee<P: FeePurse>(purse: &mut P, hold: HeldFee) -> Result<(), FeeError> {
     if hold.operation_id == 0 {
         return Err(FeeError::Conflict("operation id 0"));
@@ -370,12 +300,10 @@ fn hold_fee<P: FeePurse>(purse: &mut P, hold: HeldFee) -> Result<(), FeeError> {
     purse.take(hold)
 }
 
-/// Does one more Guild Charter fit under the item's unique count? `max_count` 0 means no limit.
 fn charter_fits(max_count: u32, held: usize) -> bool {
     max_count == 0 || held < max_count as usize
 }
 
-/// Exactly one decision per operation id; a retry changes nothing.
 fn decide_fee<L: FeeLedger>(
     ledger: &mut L,
     operation_id: u64,
@@ -413,7 +341,6 @@ fn decide_fee<L: FeeLedger>(
     Ok(())
 }
 
-/// Only the Guild Leader saves an emblem (`cm:GuildHandler.cpp:735-748`). Answers the Guild.
 fn emblem_gate<L: FeeLedger>(ledger: &L, payer_guid: u64) -> Result<u32, GuildRefusal> {
     let (guild_id, leader_guid) = ledger
         .guild_of(payer_guid)
@@ -424,9 +351,6 @@ fn emblem_gate<L: FeeLedger>(ledger: &L, payer_guid: u64) -> Result<u32, GuildRe
     Ok(guild_id)
 }
 
-/// A Guild Charter opens a Petition for a Character outside every Guild that owns none, under a
-/// valid name no Guild holds (`cm:PetitionsHandler.cpp:88-112`,
-/// `vm:src/game/Handlers/PetitionsHandler.cpp:69-71`).
 fn charter_gate<L: FeeLedger>(
     ledger: &L,
     payer_guid: u64,
@@ -445,9 +369,7 @@ fn charter_gate<L: FeeLedger>(
     Ok(())
 }
 
-/// A Hold with another operation id, or none, means this finish already ran. Both
-/// outcomes need the payer in the world here, so a Character in transit keeps its Hold for the
-/// destination.
+// An absent Character keeps its Fee Hold for the Transfer destination.
 fn finish_fee<P: FeePurse>(
     purse: &mut P,
     operation_id: u64,
@@ -499,9 +421,6 @@ impl FeePurse for CtxPurse<'_> {
     }
 
     fn npc_serves(&self, payer_guid: u64, npc_guid: u64, kind: u8) -> bool {
-        // A Guild Charter needs a Petitioner that is also a Tabard Designer
-        // (`cm:PetitionsHandler.cpp:76-84`). The interaction Gate accepts any one of the flags, so
-        // every one of them is checked after it.
         let required_flags = match kind {
             fee_kind::EMBLEM => npc_flags::TABARDDESIGNER,
             fee_kind::CHARTER => npc_flags::PETITIONER | npc_flags::TABARDDESIGNER,
@@ -616,9 +535,6 @@ impl FeePurse for CtxPurse<'_> {
 }
 
 impl CtxPurse<'_> {
-    /// File the part of a refund the purse cannot hold as Mail Escrow from the NPC that took the
-    /// fee. The Gateway delivers it at the payer's next world entry or mailbox visit, like a Reward
-    /// Letter. An NPC no longer in the world here signs the letter with entry 0.
     fn mail_refund(&self, hold: &HeldFee, mailed: u32) -> Result<(), FeeError> {
         let npc_entry = self
             .ctx
@@ -644,7 +560,6 @@ impl CtxPurse<'_> {
             .map_err(|_| FeeError::Conflict("refund letter not filed"))
     }
 
-    /// Mint one Guild Charter into the payer's bags. Answers its guid.
     fn create_charter(
         &self,
         payer_guid: u64,
@@ -765,10 +680,6 @@ impl FeeLedger for CtxLedger<'_> {
     }
 }
 
-/// Fee on the payer's Home Shard: move the fee from the purse into a Fee Hold. While that
-/// Hold exists, the same operation id with the same request is a replay and succeeds without a
-/// second debit. After the finish deletes the Hold, a replay would take the fee again, so the
-/// Gateway never replays a hold.
 #[reducer]
 pub fn gw_guild_fee_hold(
     ctx: &ReducerContext,
@@ -785,8 +696,6 @@ pub fn gw_guild_fee_hold(
     .map_err(FeeError::into_text)
 }
 
-/// Fee on Realm-core: commit the one decision for `operation_id`. Always Ok once a
-/// decision exists for this payer and kind, accepted or refused.
 #[reducer]
 pub fn realm_guild_fee_decide(
     ctx: &ReducerContext,
@@ -800,8 +709,6 @@ pub fn realm_guild_fee_decide(
         .map_err(FeeError::into_text)
 }
 
-/// Fee on the payer's Home Shard: spend the Hold, or refund it when Realm-core refused,
-/// then delete it. Without a Hold for `operation_id` it is a replay and changes nothing.
 #[reducer]
 pub fn gw_guild_fee_finish(
     ctx: &ReducerContext,
@@ -815,7 +722,7 @@ pub fn gw_guild_fee_finish(
         .map_err(FeeError::into_text)
 }
 
-/// Character deletion must not destroy copper held for a guild operation.
+// Character deletion must not destroy copper held for a guild operation.
 pub(crate) fn character_has_fee_hold(ctx: &ReducerContext, character_guid: u64) -> bool {
     ctx.db
         .game_guild_fee_hold()
@@ -849,19 +756,14 @@ mod tests {
         })
     }
 
-    /// One Home Shard: purses of Characters in the world, the NPCs that serve them, the Guild
-    /// Charters each Character holds, and the Holds.
     #[derive(Default)]
     struct Shard {
         purses: BTreeMap<u64, u32>,
-        /// Refund copper sent by mail because the purse could not hold it, per payer.
         mailed: BTreeMap<u64, u32>,
         serving_npcs: Vec<u64>,
         holds: BTreeMap<u64, HeldFee>,
-        /// Guild Charter guid to its holder.
         charters: BTreeMap<u64, u64>,
         charter_unknown: bool,
-        /// What the payer's bags answer one more Guild Charter.
         charter_room: Option<GuildRefusal>,
     }
 
@@ -927,14 +829,12 @@ mod tests {
         }
     }
 
-    /// Realm-core: membership, leaders, emblems, Petitions, decisions and TABARD_CHANGED events.
     #[derive(Default)]
     struct Realm {
         members: BTreeMap<u64, u32>,
         leaders: BTreeMap<u32, u64>,
         guild_names: Vec<String>,
         emblems: BTreeMap<u32, GuildEmblem>,
-        /// Owner to its Petition id and the terms that opened it.
         petitions: BTreeMap<u64, (u32, GuildCharterTerms)>,
         decisions: BTreeMap<u64, (u64, u8, Option<GuildRefusal>)>,
         decided_petitions: BTreeMap<u64, u32>,
@@ -1025,7 +925,6 @@ mod tests {
         matches!(realm.decisions.get(&operation_id), Some((_, _, None)))
     }
 
-    /// Hold, decide, finish with the decision the ledger recorded, as the Gateway drives it.
     fn pay(shard: &mut Shard, realm: &mut Realm, operation_id: u64, payer_guid: u64) {
         hold(shard, operation_id, payer_guid).unwrap();
         decide(realm, operation_id, payer_guid).unwrap();
@@ -1060,7 +959,6 @@ mod tests {
     fn a_refund_the_purse_cannot_hold_sends_the_rest_by_mail() {
         let (mut shard, mut realm) = (shard(150_000), realm());
         hold(&mut shard, 1, MEMBER).unwrap();
-        // Loot fills the purse to 30,000 copper under the u32 cap while the Hold waits.
         shard.purses.insert(MEMBER, 4_294_937_295);
         decide(&mut realm, 1, MEMBER).unwrap();
         finish_fee(&mut shard, 1, MEMBER, accepted(&realm, 1)).unwrap();
@@ -1229,8 +1127,6 @@ mod tests {
         )
     }
 
-    /// Decide the Charter the shard holds for `payer_guid`, as the Gateway conveys it from the
-    /// Hold plus the payer's name and team.
     fn decide_charter(
         shard: &Shard,
         realm: &mut Realm,
@@ -1336,8 +1232,6 @@ mod tests {
         }
     }
 
-    /// Item 5863 is unique (`max_count` 1): a Character who kept its first Charter through a
-    /// Guild it has since left holds one and cannot carry a second.
     #[test]
     fn a_unique_charter_fits_only_under_its_max_count() {
         assert!(charter_fits(1, 0));

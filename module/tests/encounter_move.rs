@@ -1,7 +1,3 @@
-//! A scripted move keeps the mover's stored row on its leg, and the relay arrival that follows a
-//! `move-dynamic` still fires when the leg lands. Both need real creature firings between the
-//! move and the read.
-
 mod support;
 
 use std::time::Duration;
@@ -71,7 +67,6 @@ fn a_scripted_move_leaves_the_stored_row_on_the_leg() {
         "the stored row right after the call",
     );
 
-    // The walk covers 2.5 yd/s, so the wolf is about 3 yd along, however the call round trips go.
     std::thread::sleep(Duration::from_millis(900));
     let walking = position(&stored(&shard, &guid));
     assert!(
@@ -117,8 +112,6 @@ fn a_move_dynamic_arrival_is_dropped_when_a_newer_leg_replaced_the_leg() {
     let start = position(&pair[0]);
 
     shard.assert_call("debug_start_relay_move", &[&mover, &target]);
-    // A walk of 20 yd outlasts the run to the target, so the newer leg is still in flight when the
-    // first one lands.
     move_to(&shard, &mover, (start.0, start.1 + LEG_YD, start.2));
     assert!(arrival_pending(&shard, &mover));
 

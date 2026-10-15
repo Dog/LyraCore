@@ -1,18 +1,12 @@
-//! Module registry generation and Package discovery. See `docs/module-build.md`.
-//!
-//! The `package_api_lint` test target checks Package API paths.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Each consumer reads the lexical operations it needs.
 #[allow(dead_code)]
 #[path = "build_support/source.rs"]
 mod source;
 
 use source::{collect_rs_files, file_gate, strip_source, DEBUG_REDUCERS_FILE_CFG};
 
-/// One core hook and the Runtime Script payload it supplies.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HookEvent {
@@ -43,13 +37,12 @@ enum HookFieldType {
     Text,
 }
 
-/// Author declarations and dispatch use one catalogue. Rust checks every payload expression.
 static HOOK_EVENTS: std::sync::LazyLock<Vec<HookEvent>> = std::sync::LazyLock::new(|| {
     serde_json::from_str(include_str!("../datascripts/runtime-scripts/events.json"))
         .expect("the checked-in Runtime Script event catalogue must have valid rows")
 });
 
-#[allow(clippy::too_many_lines)] // One scan-and-emit step per generated registry.
+#[allow(clippy::too_many_lines)]
 fn main() {
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
@@ -63,11 +56,8 @@ fn main() {
         .join("packages");
     println!("cargo:rerun-if-changed={}", packages_dir.display());
 
-    // Scan roots: (crate-path prefix, dir). Core src/ derives per-file prefixes; each package
-    // collapses to its generated root module.
     let mut registries = Registries::default();
 
-    // ---- core src/ ----
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     files.sort();
@@ -76,8 +66,7 @@ fn main() {
         scan_file(file, &src_dir, false, &prefix, &mut registries);
     }
 
-    // ---- packages/*/src/ ----
-    let mut pkg_mods: Vec<(String, PathBuf)> = Vec::new(); // (ident, abs path to src/mod.rs)
+    let mut pkg_mods: Vec<(String, PathBuf)> = Vec::new();
     if packages_dir.is_dir() {
         let mut pkg_dirs: Vec<PathBuf> = fs::read_dir(&packages_dir)
             .unwrap_or_else(|e| panic!("build.rs: cannot read {}: {e}", packages_dir.display()))
@@ -116,13 +105,11 @@ fn main() {
         }
     }
 
-    // Package-only actor verbs need no caller in a Core checkout with no installed Rust Package.
     println!("cargo::rustc-check-cfg=cfg(has_packages)");
     if !pkg_mods.is_empty() {
         println!("cargo::rustc-cfg=has_packages");
     }
 
-    // Durable tests need a registered name for ownership and teardown, without installing content.
     if std::env::var_os("CARGO_FEATURE_PACKAGE_TEST_FIXTURE").is_some() {
         pkg_mods.push((
             "test_fixture".to_string(),
@@ -132,7 +119,6 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
 
-    // ---- character_sweeps.rs (also fed by package markers) ----
     registries.delete.sort();
     registries.restamp.sort();
     let mut out = String::new();
@@ -153,8 +139,6 @@ fn main() {
         out.push_str(&format!("    {path},\n"));
     }
     out.push_str("];\n");
-    // The SAME enumeration as table-accessor names — the escrowed-transfer manifest (src/transfer.rs).
-    // Derived from the delete-sweep fn names so there is no parallel list to hand-maintain.
     out.push_str("pub const CHARACTER_OWNED_TABLES: &[&str] = &[\n");
     for path in &registries.delete {
         let fn_name = path
@@ -172,15 +156,7 @@ fn main() {
         out.push_str(&format!("    \"{table}\",\n"));
     }
     out.push_str("];\n");
-    // The CROSS-DATABASE row transport, keyed by table accessor so
-    // `transfer::export_rows`/`import_rows` can pair a manifest entry with its mover. Derived from
-    // the `sweep_transfer_<table_accessor>` fn names by the same prefix-strip rule as the delete
-    // sweeps — so a transport arm can never name a table that isn't in the manifest.
     registries.transfer.sort();
-    // ONE table, ONE arm. A second arm for a table that already has one exports its rows twice,
-    // and — when the second one declines — is how a drop-in could stop a CORE table from crossing.
-    // `the_not_transported_allowlist_matches_the_arms_that_decline` used to catch that from the
-    // package side; it no longer sees a package-registered decline, so the shape check moves here.
     let mut claimed: Vec<(&str, &String)> = Vec::new();
     for path in &registries.transfer {
         let table = transfer_table_name(path);
@@ -194,11 +170,7 @@ fn main() {
         claimed.push((table, path));
     }
     out.push_str(
-        // The `(name, fn)` pair trips `clippy::type_complexity` in the GENERATED file, where nobody
-        // can annotate it — emit the allow with it. The pair is the registry's row shape, not an
-        // accidental type: each entry is one table's name plus its transfer sweep.
-        "// The `(&str, fn(..))` pair is this registry's row shape: one table name + its sweep.\n\
-         #[allow(clippy::type_complexity)]\n\
+        "#[allow(clippy::type_complexity)]\n\
          pub const CHARACTER_OWNED_TRANSFERS: &[(&str, fn(&spacetimedb::ReducerContext, u64, &mut crate::transfer::RowIo<'_>))] = &[\n",
     );
     for path in &registries.transfer {
@@ -208,21 +180,12 @@ fn main() {
         ));
     }
     out.push_str("];\n");
-    // The SAME names again, as plain strings. `CHARACTER_OWNED_TRANSFERS` above cannot be
-    // named from a NATIVE test binary — referencing it materializes every registered fn's POINTER,
-    // which drags the SpacetimeDB host imports (`datastore_insert_bsatn`, …) in and they cannot
-    // link outside wasm. The transfer ratchet used to work around that by string-parsing this very
-    // generated file at test time; it reads this array instead.
-    out.push_str("// The transported-table names, in `CHARACTER_OWNED_TRANSFERS` order.\n");
+    // Names remain native-linkable; function pointers would pull in wasm-only SpacetimeDB imports.
     out.push_str("pub const CHARACTER_OWNED_TRANSFER_NAMES: &[&str] = &[\n");
     for path in &registries.transfer {
         out.push_str(&format!("    \"{}\",\n", transfer_table_name(path)));
     }
     out.push_str("];\n");
-    // The DECLINING subset — the arms written with the `not_transported` marker kind. This is the
-    // mechanical half of the decision; the reasoned half is `transfer::NOT_TRANSPORTED`, and
-    // `the_not_transported_allowlist_matches_the_arms_that_decline` fails if they disagree in
-    // either direction. Sorted by TABLE name so the assertion compares two stable lists.
     registries.not_transported.sort();
     let mut declines: Vec<String> = registries
         .not_transported
@@ -230,10 +193,6 @@ fn main() {
         .map(|p| transfer_table_name(p).to_string())
         .collect();
     declines.sort();
-    out.push_str(
-        "// Tables whose transport arm deliberately carries NOTHING (the `not_transported` marker\n\
-         // kind), sorted by table name. Cross-checked against `transfer::NOT_TRANSPORTED`.\n",
-    );
     out.push_str("pub const CHARACTER_OWNED_NOT_TRANSPORTED: &[&str] = &[\n");
     for table in &declines {
         out.push_str(&format!("    \"{table}\",\n"));
@@ -241,7 +200,6 @@ fn main() {
     out.push_str("];\n");
     write_out(&out_dir, "character_sweeps.rs", &out);
 
-    // ---- package_mods.rs ----
     let mut out = String::new();
     out.push_str(
         "// GENERATED by module/build.rs from packages/*/src/mod.rs discovery. DO NOT EDIT.\n",
@@ -252,7 +210,6 @@ fn main() {
     }
     write_out(&out_dir, "package_mods.rs", &out);
 
-    // ---- package_registries.rs ----
     registries.tick_passes.sort();
     registries
         .encounter_packages
@@ -272,11 +229,8 @@ fn main() {
     out.push_str(
         "// GENERATED by module/build.rs from package markers under src/ and packages/*/src/. DO NOT EDIT.\n",
     );
-    // Same reason as `CHARACTER_OWNED_TRANSFERS` above: the allow has to be emitted, because the
-    // file it lands in is generated and `DO NOT EDIT`.
     out.push_str(
-        "// The `(&str, fn(..))` pair is this registry's row shape: one pass name + the pass.\n\
-         #[allow(clippy::type_complexity)]\n\
+        "#[allow(clippy::type_complexity)]\n\
          pub const GAME_TICK_PASSES: &[(&str, fn(&spacetimedb::ReducerContext))] = &[\n",
     );
     for path in &registries.tick_passes {
@@ -346,9 +300,6 @@ fn main() {
             "pub const GAME_CLIENT_COMMAND: Option<crate::bridge::ClientCommandHandler> = None;\n",
         ),
     }
-    // Every event name, as plain strings a NATIVE test binary can read without materializing the
-    // fn-pointer arrays above — the same reason `CHARACTER_OWNED_TRANSFER_NAMES` exists. This is
-    // what `script_binding.rs` asserts the Package Delta crate's mirror of the catalog against.
     out.push_str("pub const GAME_HOOK_EVENT_NAMES: &[&str] = &[\n");
     for HookEvent { event, .. } in &*HOOK_EVENTS {
         out.push_str(&format!("    \"{event}\",\n"));
@@ -390,19 +341,8 @@ fn main() {
     out.push_str("];\n");
     write_out(&out_dir, "package_registries.rs", &out);
 
-    // ---- hook_dispatch.rs ---- included INSIDE src/hooks.rs, so `payload_for` and the
-    // `fire_*` fns keep their `crate::hooks::` paths. Generated from the same HOOK_EVENTS rows as
-    // the registry arrays above — the catalog cannot drift between alias, dispatch, and array.
     let mut out = String::new();
     out.push_str("// GENERATED by module/build.rs from events.json. DO NOT EDIT.\n");
-    out.push_str(
-        "// Included inside src/hooks.rs — see the module doc there for firing semantics.\n",
-    );
-    out.push_str(
-        "/// Event-name -> payload-type aliases so the `game_hook` marker can resolve the handler\n\
-         /// signature from the event ident alone. The names ARE the event names, hence the\n\
-         /// non-camel-case carve-out.\n",
-    );
     out.push_str("#[allow(non_camel_case_types)]\npub mod payload_for {\n");
     for HookEvent {
         event,
@@ -421,10 +361,7 @@ fn main() {
         fields,
     } in &*HOOK_EVENTS
     {
-        // Two dispatches per event, in this order. The Rust handlers registered by `game_hook!`
-        // are compiled into the build and run first; the Runtime Scripts bound to the event are
-        // data, reconciled onto the shard by a Package, and run after. A Package cannot displace
-        // engine code by shipping a script.
+        // Run Runtime Scripts after compiled hooks so Package data cannot displace engine code.
         let payload = script_payload(fields);
         out.push_str(&format!(
             "pub(crate) fn fire_{event}(ctx: &spacetimedb::ReducerContext, payload: &{payload_ty}) {{\n    \
@@ -467,19 +404,15 @@ struct Registries {
     delete: Vec<String>,
     restamp: Vec<String>,
     transfer: Vec<String>,
-    /// The subset of `transfer` registered through the `not_transported` marker kind — the arms
-    /// that deliberately carry nothing. Emitted as `CHARACTER_OWNED_NOT_TRANSPORTED`.
     not_transported: Vec<String>,
     tick_passes: Vec<String>,
-    hooks: Vec<(String, String)>, // (event, fully-qualified fn path)
-    encounter_packages: Vec<(String, String)>, // (binding variant, fully-qualified fn path)
-    client_commands: Vec<(String, String, String)>, // (parser, admitted apply, reply name) paths
-    package_tables: Vec<(String, String)>, // (package ident, table accessor)
-    package_characters: Vec<(String, String)>, // (package ident, fully-qualified fn path)
+    hooks: Vec<(String, String)>,
+    encounter_packages: Vec<(String, String)>,
+    client_commands: Vec<(String, String, String)>,
+    package_tables: Vec<(String, String)>,
+    package_characters: Vec<(String, String)>,
 }
 
-/// The registry entry for `path`. A Package's fn is wrapped so it stops running once Package
-/// Teardown has run for that Package; the wrapper then returns `otherwise`.
 fn gated(path: &str, params: &str, args: &str, otherwise: &str) -> String {
     match path
         .strip_prefix("crate::pkg_")
@@ -492,8 +425,6 @@ fn gated(path: &str, params: &str, args: &str, otherwise: &str) -> String {
     }
 }
 
-/// The accessor of every `#[table(..)]` and `#[spacetimedb::table(..)]` in stripped source.
-/// Only the attribute's top-level `accessor`, so an index's own `accessor = ..` is never taken.
 fn table_accessors(content: &str) -> Vec<String> {
     let mut accessors = Vec::new();
     for (start, _) in content.match_indices("#[") {
@@ -528,8 +459,7 @@ fn table_accessors(content: &str) -> Vec<String> {
 
 fn accessor_item(item: &str) -> Option<String> {
     let item = item.trim();
-    // Teardown clears a table by name, and `name = ..` would make the name differ from the
-    // accessor this scan reads.
+    // Teardown addresses table names, so an accessor cannot use a different stored name.
     if item
         .strip_prefix("name")
         .is_some_and(|rest| rest.trim_start().starts_with('='))
@@ -548,9 +478,6 @@ fn accessor_item(item: &str) -> Option<String> {
         .then(|| value.to_string())
 }
 
-/// The table accessor a transport arm's fully-qualified fn path names: the same
-/// `sweep_transfer_<table_accessor>` prefix-strip rule the delete sweeps use, so a mover can never
-/// be paired with the wrong manifest entry.
 fn transfer_table_name(path: &str) -> &str {
     let fn_name = path
         .rsplit("::")
@@ -572,8 +499,6 @@ fn write_out(out_dir: &str, name: &str, content: &str) {
         .unwrap_or_else(|e| panic!("build.rs: cannot write {}: {e}", dest.display()));
 }
 
-/// `my-package` -> `my_package`, validated as a Rust identifier — anything else panics (a package
-/// folder name must map cleanly onto the generated `pkg_<name>` module).
 fn package_ident(name: &str) -> String {
     let ident: String = name
         .chars()
@@ -591,8 +516,6 @@ fn package_ident(name: &str) -> String {
     ident
 }
 
-/// Resolve a Core marker through its top-level Module. A nested file exposes its registered
-/// operation through a named re-export; `check_facade_reexport` checks that declaration.
 fn core_module_path(src_root: &Path, file: &Path) -> String {
     let rel = file.strip_prefix(src_root).unwrap_or_else(|_| {
         panic!(
@@ -617,11 +540,6 @@ fn strip_comments_and_strings(src: &str) -> String {
     strip_source(src).code
 }
 
-/// Verify that a marker registered in nested submodule `file` (e.g. `src/spell/spellbook.rs`) is
-/// actually re-exported by its facade (`src/spell/mod.rs` or `src/spell.rs`), so the generated
-/// `crate::spell::<name>` path resolves. Accepts `pub use <sub>::*`, `pub(crate) use <sub>::*`,
-/// and non-glob forms naming `name` (optionally through `self::`). Panics naming the missing
-/// re-export — a build.rs panic beats the opaque rustc error inside `$OUT_DIR` it prevents.
 fn check_facade_reexport(file: &Path, scan_root: &Path, in_package: bool, name: &str) {
     let rel = match file.strip_prefix(scan_root) {
         Ok(r) => r,
@@ -632,14 +550,8 @@ fn check_facade_reexport(file: &Path, scan_root: &Path, in_package: bool, name: 
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
     if rel.file_stem().map(|s| s == "mod").unwrap_or(false) {
-        return; // the facade itself
+        return;
     }
-    // Which facade must re-export this file's items depends on the collapse rule:
-    // - core `src/foo.rs` -> crate::foo resolves DIRECTLY (no facade); `src/foo/bar.rs` needs
-    //   foo's facade (foo/mod.rs or foo.rs) to re-export bar.
-    // - a package's EVERY file collapses to crate::pkg_<name>, so even a depth-1 `src/foo.rs`
-    //   needs the package's src/mod.rs to re-export foo. Deeper nesting than one directory does
-    //   not exist today; if it ever does, the per-level check would need to walk the chain.
     let (facade, sub, collapsed) = if in_package && segs.len() == 1 {
         let sub = rel.file_stem().unwrap().to_string_lossy().into_owned();
         (
@@ -666,12 +578,11 @@ fn check_facade_reexport(file: &Path, scan_root: &Path, in_package: bool, name: 
         };
         (facade, sub, format!("`{dir}`"))
     } else {
-        return; // core depth-1 file: crate::foo::name resolves directly
+        return;
     };
     let content = fs::read_to_string(&facade)
         .unwrap_or_else(|e| panic!("build.rs: cannot read facade {}: {e}", facade.display()));
     let stripped = strip_comments_and_strings(&content);
-    // Normalize whitespace so multi-line use statements match.
     let norm: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     for vis in ["pub use ", "pub(crate) use "] {
         for path_head in [format!("{vis}{sub}::"), format!("{vis}self::{sub}::")] {
@@ -683,11 +594,6 @@ fn check_facade_reexport(file: &Path, scan_root: &Path, in_package: bool, name: 
                     .map(|e| stmt_start + e)
                     .unwrap_or(norm.len());
                 let tail = &norm[stmt_start..stmt_end];
-                // `*` re-exports everything; otherwise the statement must name the fn (as a path
-                // segment or inside a brace list — a substring check bounded by non-ident chars).
-                // A bare `*` re-exports everything. Otherwise the statement must name the fn —
-                // but `name as other` does NOT count (the original spelling is renamed away;
-                // only `other as name`, where `name` is the rename TARGET, keeps it reachable).
                 let toks: Vec<&str> = tail
                     .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                     .filter(|t| !t.is_empty())
@@ -712,9 +618,6 @@ fn check_facade_reexport(file: &Path, scan_root: &Path, in_package: bool, name: 
     );
 }
 
-/// The exact two shapes a `character_owned!` invocation head may take (see the macro doc in
-/// `src/lib.rs`). A `(kind, name)` match is only recorded for input matching ONE of these; any other
-/// occurrence of the literal substring in the file is treated as malformed and panics below.
 fn try_match_character_owned(head: &str) -> Option<(&'static str, String)> {
     for kind in ["delete", "restamp", "transfer", "not_transported"] {
         let prefix = format!("({kind},");
@@ -729,14 +632,11 @@ fn try_match_character_owned(head: &str) -> Option<(&'static str, String)> {
     None
 }
 
-/// `game_tick_pass!` head: `(fn NAME(...` — one shape only.
 fn try_match_tick_pass(head: &str) -> Option<String> {
     let rest = head.strip_prefix('(')?;
     match_fn_name(rest)
 }
 
-/// `game_hook!` head: `(EVENT, fn NAME(...` — EVENT must be in the known catalog (checked by the
-/// caller so the panic can list the valid names).
 fn try_match_hook(head: &str) -> Option<(String, String)> {
     let rest = head.strip_prefix('(')?.trim_start();
     let ev_end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
@@ -749,7 +649,6 @@ fn try_match_hook(head: &str) -> Option<(String, String)> {
     Some((event, name))
 }
 
-/// `game_client_command!` head: `(PARSE, APPLY, REPLY)` — package files only.
 fn try_match_client_command(head: &str) -> Option<(String, String, String)> {
     let mut rest = head.strip_prefix('(')?;
     let mut ident_before = |separator: char| {
@@ -764,7 +663,6 @@ fn try_match_client_command(head: &str) -> Option<(String, String, String)> {
     Some((ident_before(',')?, ident_before(',')?, ident_before(')')?))
 }
 
-/// `encounter_package!` head: `(BINDING, fn NAME(...` — package files only.
 fn try_match_encounter_package(head: &str) -> Option<(String, String)> {
     let rest = head.strip_prefix('(')?.trim_start();
     let binding_end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
@@ -777,8 +675,6 @@ fn try_match_encounter_package(head: &str) -> Option<(String, String)> {
     Some((binding, name))
 }
 
-/// Shared tail matcher: optional whitespace, `fn NAME`, then (after optional whitespace) `(` — the
-/// fn's own param list.
 fn match_fn_name(rest: &str) -> Option<String> {
     let rest = rest.trim_start();
     let rest = rest.strip_prefix("fn ")?;
@@ -795,11 +691,6 @@ fn match_fn_name(rest: &str) -> Option<String> {
     }
 }
 
-/// Scan one file for every marker kind, registering each hit under `prefix` (the file's
-/// collapsed crate path). The scan runs on the comment/string-stripped text, so quoted or
-/// commented-out marker syntax is inert; on real code, any occurrence of a marker's literal
-/// substring that doesn't parse panics — never skip silently. Every registered marker in a nested
-/// submodule also has its facade re-export verified (`check_facade_reexport`).
 fn scan_file(file: &Path, scan_root: &Path, in_package: bool, prefix: &str, reg: &mut Registries) {
     let raw = fs::read_to_string(file)
         .unwrap_or_else(|e| panic!("build.rs: cannot read {}: {e}", file.display()));
@@ -823,17 +714,6 @@ fn scan_file(file: &Path, scan_root: &Path, in_package: bool, prefix: &str, reg:
                     "delete" => reg.delete.push(path),
                     "restamp" => reg.restamp.push(path),
                     "transfer" => reg.transfer.push(path),
-                    // A DECLINING arm is still a transport arm — it is registered in the same
-                    // registry, so `every_manifest_table_can_cross_a_database_boundary` keeps
-                    // seeing an arm for the table — but it is ALSO recorded separately, because
-                    // "these rows deliberately do not cross" is a decision that must be
-                    // cross-checkable against `transfer::NOT_TRANSPORTED`'s written reasons
-                    // instead of being read back out of the arm's source text.
-                    // A PACKAGE's decline is registered as a transport arm like any other, but it
-                    // is NOT cross-checked against `transfer::NOT_TRANSPORTED`. That list is the
-                    // core's written decision about core tables, and it cannot name a table that
-                    // is absent from most builds — a Package is a drop-in. A Package writes its
-                    // reason where the reader looks for it: at its own table.
                     "not_transported" => {
                         reg.transfer.push(path.clone());
                         if !in_package {
@@ -977,22 +857,15 @@ fn scan_file(file: &Path, scan_root: &Path, in_package: bool, prefix: &str, reg:
     );
 }
 
-/// Keep registry discovery on the same whole-file feature boundary as rustc.
-///
-/// The scanner deliberately supports one exact leading inner attribute instead of interpreting
-/// general Rust `cfg` expressions. A parent module may repeat the gate, but the file owns the
-/// registry contract so recursive discovery can decide without reconstructing the module tree.
+// Discovery recognizes exact leading whole-file gates rather than general cfg expressions.
 fn registry_file_enabled(source: &str, debug_reducers: bool) -> bool {
     debug_reducers || !debug_only_file(source)
 }
 
-/// Whether the file's first non-blank line is `DEBUG_REDUCERS_FILE_CFG`.
 fn debug_only_file(source: &str) -> bool {
     file_gate(source) == Some(DEBUG_REDUCERS_FILE_CFG)
 }
 
-/// Find every occurrence of `marker` in `content` and hand its head (text after the marker, left-
-/// trimmed) plus 1-based line number to `on_hit`.
 fn scan_marker(content: &str, _file: &Path, marker: &str, mut on_hit: impl FnMut(&str, usize)) {
     let mut search_from = 0usize;
     while let Some(rel_idx) = content[search_from..].find(marker) {

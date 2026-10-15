@@ -1,9 +1,4 @@
-//! Build 5875 Spell columns shared by spell import and item enchantment import.
-//!
-//! Layout: cmangos/mangos-classic 8ec338a1704e7dcb1c0213eb7ed58f9231ade40f,
-//! src/game/Server/DBCStructure.h, SpellEntry columns 0..172.
-//! wow_dbc 0.3 omits InterruptFlags at column 21. Its equipment, reagent and effect
-//! fields stay shifted until an extra unknown_flag resynchronizes the name at column 120.
+// wow_dbc 0.3 omits build-5875 InterruptFlags at column 21 and realigns at column 120.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
@@ -36,7 +31,6 @@ pub(crate) struct Spell {
     pub(crate) stack_amount: u32,
     pub(crate) reagent: [i32; 8],
     pub(crate) reagent_count: [u32; 8],
-    /// Class, subclass mask and inventory mask in source order.
     pub(crate) equipment: [u32; 3],
     pub(crate) effect: [i32; 3],
     pub(crate) effect_die_sides: [i32; 3],
@@ -61,7 +55,6 @@ pub(crate) struct Spell {
     pub(crate) family_flags: u64,
 }
 
-/// Read only the supported fixed-width layout. Client bytes remain in memory.
 pub(crate) fn read_spells(bytes: &[u8]) -> Result<Vec<Spell>> {
     if bytes.len() < 20 || &bytes[..4] != b"WDBC" {
         bail!("Spell.dbc has no WDBC header");
@@ -78,7 +71,6 @@ pub(crate) fn read_spells(bytes: &[u8]) -> Result<Vec<Spell>> {
     if records_end.and_then(|n| n.checked_add(strings)) != Some(bytes.len()) {
         bail!("Spell.dbc record and string lengths do not match its header");
     }
-    // The length check proves both the record boundary and every fixed column below fit.
     let records_end = records_end.unwrap();
     let strings = &bytes[records_end..];
     let mut ids = BTreeSet::new();

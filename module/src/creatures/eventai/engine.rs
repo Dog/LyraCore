@@ -20,13 +20,8 @@ use crate::{
     game_melee_attack, game_threat, game_world_entity, WorldEntity,
 };
 
-/// The Seam between the EventAI engine and a world: facts read world state, effects change it.
-/// Conditions, target selection and action logic live ABOVE this Seam, in `engine`, `combat` and
-/// `mobility`, so `DatabaseWorld` and the test Fake run the same decisions.
 pub(crate) trait EventAiWorld {
-    // Facts.
     fn eventai_now_ms(&self) -> u64;
-    /// The live melee fights whose attacker runs its entry's EventAI, within `scope`.
     fn eventai_fights(&self, scope: &TickScope) -> Vec<EngagedFight>;
     fn eventai_cycle_actors(&self, scope: &TickScope, active: &HashSet<u64>) -> Vec<CycleActor>;
     fn eventai_definition(&self, creature_guid: u64) -> EventAiDefinition;
@@ -34,10 +29,7 @@ pub(crate) trait EventAiWorld {
     fn eventai_rule_state(&self, creature_guid: u64, rule_id: u64) -> Option<RuleState>;
     fn eventai_unit(&self, guid: u64) -> Option<EventAiUnit>;
     fn eventai_spawner_guid(&self, creature_guid: u64) -> Option<u64>;
-    /// Candidates around `center` in its partition, coarsely: the shared logic re-checks the
-    /// exact distance.
     fn eventai_units_near(&self, center: &EventAiUnit, radius_yd: f32) -> Vec<EventAiUnit>;
-    /// The raw threat rows one creature holds, as `(source guid, threat)`, unordered.
     fn eventai_threat(&self, creature_guid: u64) -> Vec<(u64, i64)>;
     fn eventai_has_aura(&self, guid: u64, spell_id: u32) -> bool;
     fn eventai_aura_stacks(&self, guid: u64, spell_id: u32) -> u32;
@@ -52,16 +44,13 @@ pub(crate) trait EventAiWorld {
     fn eventai_matches_predicate(&self, guid: u64, predicate: EventPredicate) -> bool;
     fn eventai_in_zone_or_area(&self, unit: &EventAiUnit, zone_or_area_id: u32) -> bool;
     fn eventai_combat_action_ready(&self, guid: u64) -> bool;
-    /// The rout clock on this creature's own melee row; `None` without a fight to break off from.
     fn eventai_rout_ends_ms(&self, creature_guid: u64) -> Option<u32>;
     fn eventai_broadcast(&self, id: u32) -> Option<BroadcastLine>;
     fn eventai_summon_location(&self, id: u32) -> Option<SummonLocation>;
     fn eventai_summon_template_exists(&self, entry: u32) -> bool;
     fn eventai_roll(&self) -> u32;
 
-    // Effects.
     fn set_eventai_phase(&mut self, creature_guid: u64, phase: u8);
-    /// Apply one named, reversible creature presentation change for the active lifecycle.
     fn apply_eventai_presentation(
         &mut self,
         creature_guid: u64,
@@ -69,7 +58,6 @@ pub(crate) trait EventAiWorld {
         revision: DefinitionRevision,
         instruction: super::CreaturePresentationInstruction,
     ) -> bool;
-    /// Adopt one normalized definition and clear only reversible state owned by the old revision.
     fn adopt_eventai_revision(
         &mut self,
         creature_guid: u64,
@@ -77,10 +65,7 @@ pub(crate) trait EventAiWorld {
     ) -> CreatureState;
     fn put_eventai_rule_state(&mut self, creature_guid: u64, rule_id: u64, state: RuleState);
     fn delete_eventai_rule_state(&mut self, creature_guid: u64, rule_id: u64);
-    /// Remove state for missing rules on this evaluated creature. Lifecycle edges clean state for
-    /// creatures that no longer produce evaluation contexts.
     fn reap_eventai_rule_state(&mut self, creature_guid: u64, valid_rule_ids: &HashSet<u64>);
-    /// Deliver one line through the say/yell chokepoint; `true` when it was spoken.
     fn eventai_deliver_line(
         &mut self,
         speaker_guid: u64,
@@ -90,7 +75,6 @@ pub(crate) trait EventAiWorld {
         message: String,
     ) -> bool;
     fn eventai_deliver_emote(&mut self, source_guid: u64, emote_id: u32, target_guid: u64) -> bool;
-    /// Start the typed cast; `false` is the spell tier's Refusal.
     fn eventai_start_spell(
         &mut self,
         caster: &EventAiUnit,
@@ -100,11 +84,8 @@ pub(crate) trait EventAiWorld {
         interrupt_previous: bool,
         admission: super::SpellCasterAdmission,
     ) -> bool;
-    /// Scale one selected source's existing threat through threat authority.
     fn eventai_scale_selected_threat(&mut self, operation: crate::threat::ScaleSelectedThreat);
-    /// Scale every existing threat row through threat authority.
     fn eventai_scale_all_threat(&mut self, operation: crate::threat::ScaleAllThreat);
-    /// Route a typed quest-credit instruction through quest authority.
     fn eventai_credit_quest(
         &mut self,
         request: EventAiQuestCredit,
@@ -112,17 +93,13 @@ pub(crate) trait EventAiWorld {
     ) -> QuestCreditOutcome;
     fn stamp_eventai_rout(&mut self, creature_guid: u64, ends_ms: u32);
     fn set_eventai_ranged_posture(&mut self, creature_guid: u64, distance_yd: f32, angle_rad: f32);
-    /// Apply one named movement operation. The cycle remains the only movement-leg authority.
     fn apply_eventai_movement(
         &mut self,
         creature_guid: u64,
         operation: super::MovementOperation,
     ) -> bool;
-    /// The idle friend joins the fight against `victim_guid` as an assist.
     fn eventai_engage_assist(&mut self, creature_guid: u64, victim_guid: u64);
-    /// Reserve the next summon sequence number and its lifetime bookkeeping.
     fn eventai_claim_summon_sequence(&mut self, lifetime_ms: u32) -> u64;
-    /// Give back a claimed sequence whose summon was refused.
     fn eventai_release_summon_sequence(&mut self, sequence: u64);
     fn eventai_place_summon(
         &mut self,
@@ -132,7 +109,6 @@ pub(crate) trait EventAiWorld {
         location: &SummonLocation,
         summoner: &EventAiUnit,
     );
-    /// The fresh summon joins the fight against `target_guid`.
     fn eventai_engage_summon(&mut self, summon_guid: u64, target_guid: u64);
     fn eventai_start_attack(&mut self, creature_guid: u64, target_guid: u64) -> bool;
     fn eventai_remove_aura(&mut self, target_guid: u64, spell_id: u32) -> bool;
@@ -330,8 +306,7 @@ fn evaluate_rule<W: EventAiWorld>(
     };
     world.put_eventai_rule_state(context.creature_guid, rule.source_rule_id, open_state);
 
-    // Chance is one saved decision per authored opportunity. A miss spends both once-only and
-    // repeating opportunities; a repeating rule then waits its next window.
+    // A chance miss spends the saved opportunity and starts the next repeat window.
     if rule.chance_pct < 100
         && invocation_choice(seed, branch, 0) % 100 >= u64::from(rule.chance_pct)
     {
@@ -355,8 +330,7 @@ fn evaluate_rule<W: EventAiWorld>(
         let result = execute_instruction(world, &context, instruction, linked_choice);
         match result {
             ActionResult::Applied => {}
-            // A Refusal from a LATER action does not rewind the actions already applied, so it
-            // spends the opportunity like any other outcome.
+            // A later action's Refusal keeps earlier effects and spends the opportunity.
             ActionResult::Refused
                 if index == 0 && rule.execution == ExecutionPolicy::CombatAction =>
             {
@@ -575,9 +549,6 @@ fn execute_instruction<W: EventAiWorld>(
     }
 }
 
-/// Resolve one authored speech action into a line and deliver it. A broadcast text carries its own
-/// supported chat type; the authored mode is the fallback for other source types. The broadcast
-/// text's emote belongs to the line, so a refusal at delivery silences both.
 fn speak<W: EventAiWorld>(
     world: &mut W,
     context: &EventContext,
@@ -658,9 +629,7 @@ fn finish_opportunity<W: EventAiWorld>(
     world.put_eventai_rule_state(context.creature_guid, rule.source_rule_id, state);
 }
 
-/// A Refusal from a combat action's primary instruction keeps its saved opportunity open. The next
-/// firing retries the same chance and linked choices. Ordinary rules spend a Refusal, and later
-/// instructions never rewind effects already applied.
+// A primary combat Refusal retains the saved chance and linked choices for the next firing.
 fn hold_opportunity_open<W: EventAiWorld>(
     world: &mut W,
     context: &EventContext,
@@ -676,8 +645,6 @@ fn hold_opportunity_open<W: EventAiWorld>(
     world.put_eventai_rule_state(context.creature_guid, rule.source_rule_id, state);
 }
 
-/// The rule state a repeat rule takes after an opportunity: its window rolled from now. `None`
-/// when the rule has no next opportunity to wait for, which spends it instead.
 fn repeat_state<W: EventAiWorld>(
     world: &W,
     context: &EventContext,
@@ -717,8 +684,6 @@ fn repeat_state<W: EventAiWorld>(
     }
 }
 
-/// Random milliseconds in `[min, max]`. A fixed window costs no roll. The loader refuses an
-/// inverted window, and this guard keeps an invalid test definition from wrapping the span.
 fn roll_window<W: EventAiWorld>(world: &W, min: u32, max: u32) -> u64 {
     if max <= min {
         return min as u64;
@@ -1370,8 +1335,6 @@ impl EventAiWorld for DatabaseWorld<'_> {
         let Some(creature) = self.ctx.db.game_world_entity().guid().find(speaker_guid) else {
             return false;
         };
-        // The say/yell chokepoint owns the dead-speaker Gate and the length cap; a creature line
-        // goes through it like a player's rather than writing the event row itself.
         crate::chat::apply_send_chat_to(
             self.ctx,
             creature,
@@ -1681,9 +1644,6 @@ impl EventAiWorld for DatabaseWorld<'_> {
         ) {
             Ok(_) => true,
             Err(error) => {
-                // A relay that cannot start is a catalogue or world-state failure, not a gameplay
-                // Refusal. The caller can only report it as a refusal, so name it here — otherwise a
-                // combat rule re-attempts a missing definition every tick with nothing in the log.
                 spacetimedb::log::error!(
                     "eventai: relay {relay_id} failed to start for creature {source_guid} \
                      (catalogue {catalogue_version}): {error}"

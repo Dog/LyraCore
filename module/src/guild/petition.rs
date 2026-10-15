@@ -1,17 +1,3 @@
-//! Petitions: how players found a Guild. A Character buys a Guild Charter through the Fee Hold
-//! ([`super::fee`]), which opens a Petition here on Realm-core. Nine Characters on nine Realm
-//! Accounts sign it, and the owner turns it in to found the Guild. The Gates and their order are
-//! cmangos-classic's (`cm:PetitionsHandler.cpp`); the cores here are what
-//! [`super::realm_guild_op`] dispatches to.
-//!
-//! The Charter item lives on the owner's Home Shard and the Petition on Realm-core. They share only
-//! the Charter's item guid. The Charter binds when picked up, so trade and mail refuse it, and a
-//! Transfer keeps its guid. A Petition loses its Charter only when the owner destroys the Charter;
-//! nobody can turn that Petition in, and the owner's next Charter purchase closes it first. A
-//! Charter loses its Petition when the owner joins a Guild; the Charter then does nothing, and the
-//! Gateway destroys it at the owner's next world entry. A deleted owner's Petition closes and a
-//! deleted signer's Signature is struck when the Gateway forgets that Character.
-
 use lyracore_shared::guild::{
     event_kind, name_key, petition_signature_key, validate_guild_name, GuildRefusal,
     GUILD_CHARTER_ENTRY, MAX_PETITION_SIGNATURES, MIN_PETITION_SIGNATURES,
@@ -22,8 +8,6 @@ use super::membership::game_guild_invite;
 use super::{add_member, create_guild, game_guild, lowest_rank, member, push_event};
 use crate::items::game_item_instance;
 
-/// One open Petition: a proposed Guild, its owner and the Guild Charter that stands for it. An
-/// owner has at most one.
 #[table(accessor = game_guild_petition)]
 pub struct GuildPetition {
     #[primary_key]
@@ -33,36 +17,27 @@ pub struct GuildPetition {
     pub charter_item_guid: u64,
     #[unique]
     pub owner_guid: u64,
-    /// The owner's name snapshot, for the Guild Leader's member row at founding.
     pub owner_name: String,
-    /// `lyracore_shared::faction::TEAM_*` of the owner. Only the same team signs.
     pub team: u32,
     pub name: String,
     pub created_micros: i64,
 }
 
-/// One Signature on one Petition. At most one per Realm Account on a Petition.
 #[table(
     accessor = game_guild_petition_signature,
     index(accessor = by_petition, btree(columns = [petition_id])),
     index(accessor = by_signer, btree(columns = [signer_guid]))
 )]
 pub struct GuildPetitionSignature {
-    /// `lyracore_shared::guild::petition_signature_key(petition_id, slot)`, so the Gateway reads a
-    /// Petition's Signatures by key.
     #[primary_key]
     pub signature_key: u64,
     pub petition_id: u32,
     pub signer_guid: u64,
-    /// The signer's name snapshot, for its member row at founding.
     pub signer_name: String,
-    /// The signer's Realm Account, never 0: a signer without a known Account is refused.
     pub signer_realm_account: u64,
     pub signed_micros: i64,
 }
 
-/// A Character signs the Petition of `charter_item_guid`. Realm-core holds no row for a
-/// non-member, so the Gateway conveys the signer's name and team.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildPetitionSign {
     pub charter_item_guid: u64,
@@ -70,8 +45,6 @@ pub struct GuildPetitionSign {
     pub actor_team: u32,
 }
 
-/// The owner offers its Petition to a live Character, who then sees the signature window. The
-/// Gateway resolves the target's team from its race.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildPetitionOffer {
     pub charter_item_guid: u64,
@@ -79,30 +52,24 @@ pub struct GuildPetitionOffer {
     pub target_team: u32,
 }
 
-/// The owner renames its Petition.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct GuildPetitionRename {
     pub charter_item_guid: u64,
     pub name: String,
 }
 
-/// One Signature as the Gates read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SignatureFacts {
     signer_guid: u64,
     signer_realm_account: u64,
 }
 
-/// What a signing attempt that passed the Gates does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SignVerdict {
     Sign,
-    /// The signer's Realm Account already signed. Nothing is written, but both sides hear it
-    /// (`cm:PetitionsHandler.cpp:380-396`).
     AlreadySigned,
 }
 
-/// Where a would-be signer stands with the Guilds: a member, invited to one, or neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuildStanding {
     Member,
@@ -126,8 +93,6 @@ fn guild_standing(ctx: &ReducerContext, character_guid: u64) -> GuildStanding {
     }
 }
 
-/// A Guild member, or a Character with a pending Guild Invite, can neither sign nor be offered a
-/// Petition (`cm:PetitionsHandler.cpp:359-369,474-484`).
 fn standing_gate(standing: GuildStanding) -> Result<(), GuildRefusal> {
     match standing {
         GuildStanding::Member => Err(GuildRefusal::AlreadyInGuild),
@@ -136,10 +101,6 @@ fn standing_gate(standing: GuildStanding) -> Result<(), GuildRefusal> {
     }
 }
 
-/// The signature Gates in mangos order (`cm:PetitionsHandler.cpp:338-396`). mangos stays silent
-/// when the owner signs; here the owner hears CANT_SIGN_OWN, as vmangos answers
-/// (`vm:src/game/Handlers/PetitionsHandler.cpp:232-240`). A signer whose Realm Account is unknown
-/// is refused: without it, one Signature per Account cannot hold.
 fn sign_verdict(
     owner_guid: u64,
     petition_team: u32,
@@ -170,7 +131,6 @@ fn sign_verdict(
     Ok(SignVerdict::Sign)
 }
 
-/// The turn-in Gates in mangos order (`cm:PetitionsHandler.cpp:530-571`).
 fn turn_in_gate(
     owner_guid: u64,
     actor_guid: u64,
@@ -193,8 +153,6 @@ fn turn_in_gate(
     Ok(())
 }
 
-/// The signers that join the new Guild, in slot order. A signer who joined another Guild
-/// since it signed is skipped (`cm:Guild.cpp:167-179`).
 fn joining_signers(
     mut signatures: Vec<GuildPetitionSignature>,
     is_member: impl Fn(u64) -> bool,
@@ -238,8 +196,6 @@ fn delete_petition(ctx: &ReducerContext, petition_id: u32) {
         .delete(petition_id);
 }
 
-/// Does `owner_guid` own an open Petition? The Charter decision refuses a second one
-/// (`vm:src/game/Handlers/PetitionsHandler.cpp:69-71`).
 pub(crate) fn owns_petition(ctx: &ReducerContext, owner_guid: u64) -> bool {
     ctx.db
         .game_guild_petition()
@@ -248,7 +204,6 @@ pub(crate) fn owns_petition(ctx: &ReducerContext, owner_guid: u64) -> bool {
         .is_some()
 }
 
-/// Open the Petition an accepted Charter purchase pays for. Answers its id.
 pub(crate) fn open(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -271,9 +226,6 @@ pub(crate) fn open(
         .petition_id
 }
 
-/// `SignPetition`: the actor signs. Both the owner and the signer hear the result through an
-/// addressed Guild Event, so an already-signed Realm Account is an outcome, not a Refusal: the
-/// owner's event must commit even though no Signature does.
 pub(crate) fn sign(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -336,8 +288,6 @@ pub(crate) fn sign(
     Ok(())
 }
 
-/// `OfferPetition` (`cm:PetitionsHandler.cpp:452-512`): the owner shows its Petition to a live
-/// Character of its team outside any Guild and without a pending Guild Invite.
 pub(crate) fn offer(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -364,7 +314,6 @@ pub(crate) fn offer(
     Ok(())
 }
 
-/// `DeclinePetition` (`cm:PetitionsHandler.cpp:424-450`): the owner learns who declined.
 pub(crate) fn decline(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -384,7 +333,6 @@ pub(crate) fn decline(
     Ok(())
 }
 
-/// `RenamePetition` (`cm:PetitionsHandler.cpp:284-319`).
 pub(crate) fn rename(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -404,11 +352,6 @@ pub(crate) fn rename(
     Ok(())
 }
 
-/// `TurnInPetition` (`cm:PetitionsHandler.cpp:514-634`): found the Guild with the owner at rank 0
-/// and every signer still outside a Guild at the lowest Guild Rank. The Petition and its
-/// Signatures go first, so the `add_member` hook finds none of them. The Charter item is the
-/// Gateway's to destroy on the Home Shard afterwards; until then it is inert, because its Petition
-/// is gone.
 pub(crate) fn turn_in(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -457,8 +400,6 @@ pub(crate) fn turn_in(
     Ok(())
 }
 
-/// `ClosePetition`: the owner drops its Petition, as the Gateway does before a new Charter
-/// purchase when the old Charter is gone.
 pub(crate) fn close(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -477,9 +418,6 @@ pub(crate) fn close(
     Ok(())
 }
 
-/// A Character joined a Guild or was deleted: its own Petition closes and every Signature it made
-/// is struck, and each owner who lost one gets a fresh petition query (`cm:Guild.cpp:181-183`,
-/// `cm:Player.cpp:4061-4062,16980-17007`).
 pub(super) fn withdraw(ctx: &ReducerContext, character_guid: u64) {
     if let Some(own) = ctx
         .db
@@ -519,10 +457,6 @@ pub(super) fn withdraw(ctx: &ReducerContext, character_guid: u64) {
     }
 }
 
-/// Destroy a turned-in Guild Charter on the actor's Home Shard. A Charter that is already gone is
-/// Ok, so a repeated call changes nothing. Any other item is left alone. A Charter a failed call
-/// leaves behind has no Petition, founds nothing, and is destroyed through this reducer again at
-/// its owner's next world entry.
 #[reducer]
 pub fn gw_destroy_guild_charter(
     ctx: &ReducerContext,

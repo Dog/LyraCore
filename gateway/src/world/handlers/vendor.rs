@@ -1,12 +1,6 @@
-//! Vendor family: opening a vendor's inventory window, buy/sell/buyback/repair, and the buyback-tab
-//! view. Every vendor opcode enters through `Vendor::handle`; the gossip Browse-goods click
-//! and the world-entry ring replay call the shared builders here rather than reaching for the store.
-
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
 
-/// Durable reads and requests the vendor family needs, in the seam's own vocabulary so it can be
-/// exercised without the broad `WorldStore`.
 pub(crate) trait VendorActionStore: Send + Sync {
     fn vendor_stock(&self, vendor_guid: u64) -> Result<Vec<codec::VendorItemView>>;
 
@@ -15,40 +9,27 @@ pub(crate) trait VendorActionStore: Send + Sync {
     fn vendor_buy(&self, actor: Actor, vendor_guid: u64, item_entry: u32, count: u32)
         -> Result<()>;
 
-    /// The player's buyback ring, newest-first: `(item_entry, stack_count, price, random_property_id)` per entry (≤12).
     fn buyback_slots(&self, player_guid: u64) -> Vec<(u32, u32, u32, u32)>;
 
-    /// The three enchant ids of a Random Property, zero where it names none.
     fn random_property_enchant_ids(&self, random_property_id: u32) -> [u32; 3];
 
-    /// Bag slot of the item instance with `item_guid`. Item guids are globally unique, so no
-    /// owner check is needed here — the module reducer enforces ownership on the repair call.
     fn vendor_item_slot(&self, item_guid: u64) -> Option<u8>;
 
     fn vendor_repair(&self, actor: Actor, npc_guid: u64, slot: u8) -> Result<()>;
 
     fn vendor_sell(&self, actor: Actor, vendor_guid: u64, slot: u8) -> Result<()>;
 
-    /// Re-purchase the ring entry at 0-based `slot` from `vendor_guid`. The gateway maps the wire
-    /// `BuybackSlot` enum via [`BUYBACK_WIRE_SLOT_BASE`] before calling.
     fn vendor_buyback(&self, actor: Actor, vendor_guid: u64, slot: u8) -> Result<()>;
 }
 
-/// Wire slot of the first buyback tab entry (`BuybackSlot::Slot1`); the 12 ring entries render at
-/// base + i and a client's slot enum parses back with − base. Both directions share this.
 pub(crate) const BUYBACK_WIRE_SLOT_BASE: u16 = 69;
 
-/// The ring the client can hold. Slots past the ring's end render cleared, so evictions and shifts
-/// need no memory of what the tab showed before.
 const BUYBACK_SLOTS: u16 = 12;
 
-/// Whether a Module Gate refused the call. Anything else leaves the durable outcome unknown.
 fn is_refusal(error: &anyhow::Error) -> bool {
     matches!(classify(error), DurableFailure::Refusal { .. })
 }
 
-/// The interaction gate fails open on a Refusal — missing standing data must not lock a player
-/// out of a vendor — but a Transport Loss ends the session.
 fn refuses_interaction<St: VendorActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -71,9 +52,6 @@ fn refuses_interaction<St: VendorActionStore + ?Sized>(
     }
 }
 
-/// The one vendor-window-opening implementation, shared by the gated direct open below and the
-/// gossip Browse-goods click (`query.rs`), which does not run the gate — matching each path's
-/// pre-seam behavior. Replies RAW because gtker's typed SMSG_LIST_INVENTORY is the tbc/wrath shape.
 pub(crate) fn vendor_open_outbound<St: VendorActionStore + ?Sized>(
     store: &St,
     vendor_guid: u64,
@@ -83,8 +61,6 @@ pub(crate) fn vendor_open_outbound<St: VendorActionStore + ?Sized>(
     Ok(vec![Outbound::Raw { opcode, body }])
 }
 
-/// Stock presence is the is-vendor signal gossip HELLO synthesizes its Browse-goods row from —
-/// no `npc_flags` bit for it.
 pub(crate) fn vendor_has_stock<St: VendorActionStore + ?Sized>(
     store: &St,
     vendor_guid: u64,
@@ -104,8 +80,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
         let msg = request.message()?;
         let actor = player.self_guid().and_then(Actor::new);
         match msg {
-            // A refusing NPC answers nothing at all; an empty stock still answers, or the client waits
-            // forever on the window it asked for.
             ClientOpcodeMessage::CMSG_LIST_INVENTORY(c) => {
                 let vendor_guid = c.guid.guid();
                 if refuses_interaction(store, player, actor, vendor_guid)? {
@@ -116,8 +90,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                     vendor_guid,
                 )?))
             }
-            // Successful purchases carry no reply — the item/purse subscriptions deliver the row
-            // changes; only a rejection needs an explicit client-visible message.
             ClientOpcodeMessage::CMSG_BUY_ITEM(c) => {
                 let vendor_guid = c.vendor.guid();
                 let item_entry = c.item;
@@ -144,9 +116,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                 };
                 Ok(ProtocolReply::from(outbound))
             }
-            // CMSG_REPAIR_ITEM carries the item INSTANCE guid, but the module's repair takes the
-            // inventory SLOT; guid 0 means repair-all, routed to the whole-body slot instead of a
-            // guid lookup. An unmatched guid (already sold / not ours) is a silent no-op.
             ClientOpcodeMessage::CMSG_REPAIR_ITEM(c) => {
                 let Some(actor) = actor else {
                     return Ok(ProtocolReply::from(Vec::new()));
@@ -176,8 +145,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                     Err(e) => Err(e),
                 }
             }
-            // CMSG_SELL_ITEM carries the item INSTANCE guid; the module's sell takes the inventory
-            // SLOT. An unmatched guid (already sold / not ours) is a silent no-op, same as repair.
             ClientOpcodeMessage::CMSG_SELL_ITEM(c) => {
                 let Some(actor) = actor else {
                     return Ok(ProtocolReply::from(Vec::new()));
@@ -186,7 +153,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                     return Ok(ProtocolReply::from(Vec::new()));
                 };
                 match store.vendor_sell(actor, c.vendor.guid(), slot) {
-                    // Reflect the new ring in the buyback tab immediately.
                     Ok(()) => Ok(ProtocolReply::from(build_buyback_view(store, actor.guid()))),
                     Err(e) if is_refusal(&e) => {
                         log::debug!(
@@ -198,9 +164,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
                     Err(e) => Err(e),
                 }
             }
-            // CMSG_BUYBACK_ITEM carries a wire BuybackSlot enum (69–81); map to the 0-based ring slot
-            // the module reducer takes. A successful re-buy rebuilds the whole tab so shifted and
-            // cleared entries appear immediately, but only once there is an actor to render it for.
             ClientOpcodeMessage::CMSG_BUYBACK_ITEM(c) => {
                 let Some(actor) = actor else {
                     return Ok(ProtocolReply::from(Vec::new()));
@@ -226,10 +189,6 @@ impl<St: VendorActionStore + ?Sized> ProtocolFamily<St> for Vendor {
     }
 }
 
-/// Rebuild the buyback-tab view: a synthesized ITEM object per ring entry (fabricated guid
-/// 0x4090…|slot — a client-only object, never a real instance) and ONE raw VALUES update carrying
-/// all 12 VendorBuyback INV_SLOT pointers + BUYBACK_PRICE/TIMESTAMP arrays (those arrays are
-/// gtker-walled past slot 0 → the shared raw encoder). Cleared slots write guid 0 / price 0.
 pub(crate) fn build_buyback_view<St: VendorActionStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -239,9 +198,6 @@ pub(crate) fn build_buyback_view<St: VendorActionStore + ?Sized>(
     render_buyback_view(store, self_guid, &ring)
 }
 
-/// World-entry replay of the persisted ring. An empty ring renders NOTHING: the client's descriptor
-/// fields start zeroed, so a ring-less login stays byte-identical to one with no buyback tab at all.
-/// In-session refreshes always render — a ring that just became empty must clear the tab.
 pub(crate) fn build_buyback_view_replay<St: VendorActionStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -291,8 +247,7 @@ fn render_buyback_view<St: VendorActionStore + ?Sized>(
             }
             None => (0, 0),
         };
-        // PLAYER_FIELD_INV_SLOT guid pair for the buyback wire slot (base 486, 2 words/slot);
-        // BUYBACK_PRICE_1 = 1226, BUYBACK_TIMESTAMP_1 = 1238 (5875 indices via gtker impls).
+        // Build 5875 fields: INV_SLOT base 486, BUYBACK_PRICE_1 1226, BUYBACK_TIMESTAMP_1 1238.
         mask.set_u64(486 + wire_slot * 2, fab_guid);
         mask.set_u32(1226 + i, price);
         mask.set_u32(1238 + i, 0);
@@ -312,7 +267,6 @@ pub(super) mod tests {
         CMSG_REPAIR_ITEM, CMSG_SELL_ITEM,
     };
 
-    /// How a Fake call fails: a constructor for the typed error, so every call builds a fresh one.
     pub(crate) type Failure = fn() -> ReducerCallError;
 
     #[derive(Debug, Eq, PartialEq)]
@@ -335,7 +289,6 @@ pub(super) mod tests {
         pub(crate) stock_error: Option<Failure>,
         pub(crate) gate_error: Option<Failure>,
         pub(crate) buy_error: Option<Failure>,
-        /// The player's buyback ring; a successful buyback removes the entry it took.
         pub(crate) ring: Mutex<Vec<(u32, u32, u32, u32)>>,
         pub(crate) random_properties: Vec<(u32, [u32; 3])>,
         pub(crate) item_slots: Vec<(u64, u8)>,
@@ -836,8 +789,6 @@ pub(super) mod tests {
 
     const PLAYER_GUID: u64 = 42;
 
-    /// The descriptor half of the tab, rebuilt from the ring independently of the seam so the
-    /// fabricated guids and the price/timestamp indices are pinned, not just echoed.
     fn expected_values_update(ring: &[(u32, u32, u32, u32)]) -> (u16, Vec<u8>) {
         let mut mask = codec::update_mask::UpdateMaskValues::new();
         for i in 0..12u16 {

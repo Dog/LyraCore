@@ -1,76 +1,13 @@
-//! Batched movement republish — the private staging table + the scheduled reducer that
-//! drains it into the public `game_entity_motion` relay.
-//!
-//! # Why
-//!
-//! SpacetimeDB pays its subscription sweep — re-evaluating every distinct query plan that touches a
-//! changed table — **per transaction, not per row**. `movement_update` runs one transaction per
-//! movement packet, so at 500 players the sweep ran ~1000×/s. Measured 2026-08-08 on an 8-core box:
-//! `movement_update` cost 7.8 ms/call of which 1.5% (56.8 µs) was our own wasm and 98.5% was
-//! SpacetimeDB's subscription work — ~80% of one writer core on the hot shard.
-//!
-//! A PRIVATE table has no subscribers, so writing one costs a row update and **no subscription
-//! evaluation at all**. So `movement_update` now writes here, and one scheduled reducer republishes
-//! every queued mover into the public table in ONE transaction (Clockwork's own
-//! `spacetimedb-cookbook/multiple-position-updates` shape, and Blackholio's 50 ms
-//! `move_all_players`). That takes the sweep from ~1000/s to 20/s and — the part that actually
-//! matters — **decouples it from player count**: 20 sweeps/s at 500 players and at 2000.
-//!
-//! # The queue is the dirty set
-//!
-//! There is no `dirty` column and no "republish everything every tick" pass. A row exists in
-//! `game_entity_motion_pending` **iff** that mover has motion the tick has not published yet; the
-//! tick drains (deletes) every row it publishes. An entity that did not move therefore has no row
-//! and is not touched — the tick's cost is O(movers since the last firing), never O(world).
-
-//!
-//! # Discrete transitions (the part that is easy to get subtly wrong)
-//!
-//! The relay carries `(opcode, movement_info)`, not just a position. `MSG_MOVE_JUMP`,
-//! `MSG_MOVE_STOP`, `MSG_MOVE_START_FORWARD` … are **edge events**: a peer plays an animation or
-//! changes extrapolation state off them. Naive "keep the latest packet" loses any transition that
-//! starts and ends inside one 50 ms window. [`coalesce`] is the rule that stops that — see its doc
-//! for the three cases and why each is lossless.
-//!
-//! # Lifecycle
-//!
-//! The pending row is deleted everywhere the public motion row is (logout/disconnect, cascade
-//! delete, creature despawn, pet despawn, teleport), and the tick independently refuses to publish a
-//! guid with no live `game_world_entity` row — so a queued packet can never resurrect a motion row
-//! for an entity that left between the write and the firing.
-
 use spacetimedb::{log, reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::{game_entity_motion, game_world_entity, EntityMotion};
 
-// ===========================================================================================
-//  Cadence
-// ===========================================================================================
-
-/// Default republish cadence — 50 000 µs = **20 Hz** (the default). Peer movement gains at most
-/// one tick (50 ms) of latency; vanilla clients dead-reckon between updates, and BitCraft ships far
-/// coarser (one row per path segment, lerped on read).
 pub const MOTION_TICK_MICROS: i64 = 50_000;
 
-/// Cadence floor for [`set_motion_tick_ms`]. Every firing is a transaction on the one serialized
-/// commit stream, so a very tight interval trades the win this whole item exists to buy back for
-/// scheduler pressure (`debug_arm_instance_tick`'s floor, same reasoning).
 pub const MOTION_TICK_MS_FLOOR: u64 = 10;
-/// Cadence ceiling for [`set_motion_tick_ms`] — a second of staged movement is already well past
-/// what peer dead-reckoning covers; anything larger is a misconfiguration, not a tuning choice.
 pub const MOTION_TICK_MS_CEIL: u64 = 1_000;
 
-// ===========================================================================================
-//  The private staging table [server] — NO `public`, deliberately
-// ===========================================================================================
-
-/// One row per mover whose latest motion has not been republished yet — the whole point of the
-/// item, so **do not make this table `public`**: a subscriber here reinstates exactly the
-/// per-transaction subscription sweep the batching removes.
-///
-/// Carries the same payload `game_entity_motion` does, minus `seq` (minted at publish time from the
-/// public row, so the two can never disagree) and minus any TTL/`created_at` shape (this is a work
-/// queue that the tick drains, not an event table `gc.rs` reaps).
+// Keep staging private; subscribing here restores a subscription sweep per heartbeat.
 #[table(accessor = game_entity_motion_pending)]
 pub struct PendingMotion {
     #[primary_key]
@@ -79,23 +16,11 @@ pub struct PendingMotion {
     pub instance_id: u64,
     pub grid_x: i32,
     pub grid_y: i32,
-    /// `(grid_x, grid_y)` packed — the AOI cell key, carried through to the public row verbatim.
-    /// Written in the SAME statement as `grid_x`/`grid_y` from
-    /// `lyracore_shared::spatial::grid_cell_id` (see `tripwires::grid_cell_tripwire`).
     pub cell: i64,
     pub opcode: u16,
     pub movement_info: Vec<u8>,
 }
 
-/// Drives [`publish_motion`]. ONE row; its `scheduled_at` **is** the cadence knob (the
-/// `CreatureMoveSchedule` precedent: no separate `tick_ms` column, which would only duplicate
-/// `scheduled_at` and then drift from it). [`set_motion_tick_ms`] is the operator lever.
-///
-/// LOAD-BEARING: with this row absent nothing drains `game_entity_motion_pending`, so **peer
-/// movement stops relaying entirely**. `seed::init` arms it on a fresh database and
-/// `debug_repair_after_publish` ensures it after every publish — but `init` does NOT re-run on an
-/// auto-migrate republish and the repair pass needs a claimed operator, so [`ensure_schedule_armed`]
-/// is a third, unconditional net that arms it from the movement path itself. [server]
 #[table(accessor = game_motion_publish_schedule, scheduled(publish_motion))]
 pub struct MotionPublishSchedule {
     #[primary_key]
@@ -104,23 +29,6 @@ pub struct MotionPublishSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-// ===========================================================================================
-//  The coalescing rule — pure, unit-tested below
-// ===========================================================================================
-
-/// Is `opcode` a DISCRETE state transition, i.e. an edge event a peer cannot reconstruct from a
-/// later packet?
-///
-/// Only two movement opcodes are not: `MSG_MOVE_HEARTBEAT` and `MSG_MOVE_SET_FACING`. Both carry
-/// nothing but position + orientation + flags, and **every** movement packet carries all three — so
-/// a superseded one is losslessly droppable. Everything else (start/stop/strafe/turn/jump/fall-land/
-/// swim/run-walk-mode) is an edge the client animates off; dropping one shows a peer sliding into a
-/// run with no start, or landing with no jump.
-///
-/// This mirrors the gateway's own rule 1 (`world/coalesce.rs`): "any non-heartbeat
-/// opcode is ALWAYS a state change", one layer down — it is deliberately the SAME classification,
-/// only stricter about `SET_FACING`, which the gateway forwards eagerly because the module's stored
-/// heading feeds server-side facing checks.
 pub(crate) fn is_discrete(opcode: u16) -> bool {
     use lyracore_shared::opcodes::movement as m;
     !matches!(
@@ -129,33 +37,14 @@ pub(crate) fn is_discrete(opcode: u16) -> bool {
     )
 }
 
-/// What to do with a newly-arrived payload given the one already queued for the same mover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Coalesce {
-    /// Take the new payload and drop the queued one. Lossless: the queued one was a pure state
-    /// refresh (heartbeat / facing) whose entire content — position, orientation, flags — the new
-    /// payload also carries, in fresher form.
     Replace,
-    /// KEEP the queued payload and drop the new one. The queued one is a discrete transition and
-    /// the new one is only a state refresh, so the transition is the strictly more informative of
-    /// the two. Cost: the published position is up to one extra tick stale (~50 ms, a couple of
-    /// yards) — invisible against dead-reckoning, and the very next packet or tick corrects it.
-    /// The caller still re-addresses the row (map/grid/cell) so it is delivered to the cell the
-    /// mover is ACTUALLY in.
     KeepQueued,
-    /// Two discrete transitions inside one window (e.g. START_FORWARD then JUMP). Neither may be
-    /// dropped and one public row cannot express both — two writes to the same row in one
-    /// transaction coalesce into one diff for subscribers, so staging both would still lose one.
-    /// Publish the QUEUED one immediately (in this movement transaction, paying one sweep) and
-    /// stage the new one. This is the only path that still costs a per-packet sweep, and it is
-    /// reachable only when a player produces two input-state changes inside one tick window — with
-    /// the gateway's own 150 ms heartbeat coalescing upstream, that is rare and
-    /// self-limiting, never proportional to player count.
+    // Public updates collapse within a transaction; distinct transitions need separate firings.
     FlushThenReplace,
 }
 
-/// The rule. `queued` is the opcode already staged for this mover, `incoming` the one that just
-/// arrived. See [`Coalesce`] for why each case is the lossless choice.
 pub(crate) fn coalesce(queued: u16, incoming: u16) -> Coalesce {
     match (is_discrete(queued), is_discrete(incoming)) {
         (true, true) => Coalesce::FlushThenReplace,
@@ -164,21 +53,12 @@ pub(crate) fn coalesce(queued: u16, incoming: u16) -> Coalesce {
     }
 }
 
-/// What the tick does with one queued row. The row is deleted from the queue either way — a stale
-/// one must not sit there forever, and a published one is by definition no longer pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickAction {
-    /// The mover still has a live `game_world_entity` row: republish.
     Publish,
-    /// The mover left (logout, despawn, cross-map hop, cascade delete) between staging this packet
-    /// and this firing. Dropping it is what stops the tick from RESURRECTING a `game_entity_motion`
-    /// row for an entity that no longer exists — a resurrected row relays a ghost to every
-    /// subscriber in its cell and nothing ever deletes it again.
     DropStale,
 }
 
-/// Pure per-row tick decision (this crate has no `ReducerContext` test harness by design, so the
-/// decision is a function and the reducer only executes it).
 pub(crate) fn tick_action(entity_alive: bool) -> TickAction {
     if entity_alive {
         TickAction::Publish
@@ -187,12 +67,6 @@ pub(crate) fn tick_action(entity_alive: bool) -> TickAction {
     }
 }
 
-// ===========================================================================================
-//  Write path
-// ===========================================================================================
-
-/// Publish ONE staged payload into the public `game_entity_motion` relay, minting `seq` off the
-/// public row (`+1`, or 0 for a mover's first ever motion) exactly as the earlier inline relay did.
 fn publish(ctx: &ReducerContext, p: &PendingMotion) {
     let motions = ctx.db.game_entity_motion();
     match motions.guid().find(p.guid) {
@@ -225,11 +99,6 @@ fn publish(ctx: &ReducerContext, p: &PendingMotion) {
     }
 }
 
-/// Stage one mover's motion for the next [`publish_motion`] firing — what `movement_update`'s
-/// `plan.relay_motion` block calls instead of writing `game_entity_motion` directly.
-///
-/// `map_id`/`instance_id`/grid come from the entity the caller just moved, so the staged row and the
-/// entity row can never disagree about which AOI box they belong to.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn queue_motion(
     ctx: &ReducerContext,
@@ -258,8 +127,7 @@ pub(crate) fn queue_motion(
         return;
     };
     match coalesce(prev.opcode, opcode) {
-        // Keep the staged TRANSITION's payload; re-address the row so it lands in the cell the
-        // mover is actually in now (`..prev` keeps `opcode`/`movement_info`).
+        // Keep the queued transition but update its AOI address to the current cell.
         Coalesce::KeepQueued => {
             pending.guid().update(PendingMotion {
                 map_id,
@@ -270,7 +138,6 @@ pub(crate) fn queue_motion(
                 ..prev
             });
         }
-        // Two transitions in one window: neither may be lost, so the older one goes out now.
         Coalesce::FlushThenReplace => {
             publish(ctx, &prev);
             pending.guid().update(PendingMotion {
@@ -299,29 +166,10 @@ pub(crate) fn queue_motion(
     }
 }
 
-/// Drop any motion staged for `guid` — called from every path that deletes the mover's
-/// `game_entity_motion` row (and from the teleport primitive, so a pre-teleport packet cannot be
-/// republished at the old position after the entity has been moved). Idempotent.
 pub(crate) fn drop_pending(ctx: &ReducerContext, guid: u64) {
     ctx.db.game_entity_motion_pending().guid().delete(guid);
 }
 
-// ===========================================================================================
-//  The tick
-// ===========================================================================================
-
-/// **The 20 Hz republish.** Drains `game_entity_motion_pending` into the public
-/// `game_entity_motion` in ONE transaction, so SpacetimeDB's subscription sweep runs once per
-/// firing instead of once per movement packet.
-///
-/// Scheduler-only (the `ctx.sender()` gate every scheduled reducer in this module carries).
-///
-/// The `.iter()` here is deliberate and is NOT the whole-world scan `danger-zones.md` §1.7 forbids:
-/// this table is a WORK QUEUE holding only the movers staged since the previous firing (typically a
-/// few dozen), it is written exclusively by movers already resident on this shard, and the whole
-/// point of the pass is to visit every one of them. There is no narrower read to be had — a
-/// `dirty`-flag column plus an index would visit the identical rows and additionally pay for idle
-/// ones.
 #[reducer]
 pub fn publish_motion(ctx: &ReducerContext, _schedule: MotionPublishSchedule) {
     if ctx.sender() != ctx.database_identity() {
@@ -330,16 +178,9 @@ pub fn publish_motion(ctx: &ReducerContext, _schedule: MotionPublishSchedule) {
     publish_staged(ctx);
 }
 
-/// The drain behind [`publish_motion`] — republish every staged mover into the public relay.
-/// Also runs this at the END of `gw_movement_batch`, INSIDE the batch transaction: the
-/// subscription sweep (the whole reason the pending stage exists) is paid once per batch
-/// either way, and draining inline removes the schedule's 50ms latency quantum plus the
-/// pending-row churn for the gateway path. The scheduled tick keeps running for the legacy
-/// per-player path and is a cheap no-op when the batch already drained.
 pub(crate) fn publish_staged(ctx: &ReducerContext) {
     let pending = ctx.db.game_entity_motion_pending();
     let entities = ctx.db.game_world_entity();
-    // Collect first: the loop deletes from the table it is walking.
     let queued: Vec<PendingMotion> = pending.iter().collect();
     for row in queued {
         pending.guid().delete(row.guid);
@@ -350,10 +191,6 @@ pub(crate) fn publish_staged(ctx: &ReducerContext) {
     }
 }
 
-/// Third net under the schedule row (see [`MotionPublishSchedule`]): checked ONCE per wasm instance
-/// (the atomic), so the steady-state cost is nothing, and it self-heals the one failure mode that
-/// would otherwise be silent and total — a republished database where `init` did not re-run and
-/// `debug_repair_after_publish` was never called would stage movement forever and relay none of it.
 static SCHEDULE_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn ensure_schedule_armed(ctx: &ReducerContext) {
@@ -374,21 +211,6 @@ fn ensure_schedule_armed(ctx: &ReducerContext) {
     }
 }
 
-// ===========================================================================================
-//  The knob
-// ===========================================================================================
-
-/// **THE CADENCE KNOB.** Retune the republish rate live, without a republish:
-/// `spacetime call <db> set_motion_tick_ms 50` (20 Hz, the default), `100` (10 Hz), `25` (40 Hz).
-/// Takes effect on the next firing — the row is replaced, so the scheduler re-arms at the new
-/// interval; no re-publish, no re-seed, nothing else to do. Run it on EVERY shard (each database
-/// has its own schedule row).
-///
-/// Operator-gated rather than `debug_reducers`-gated, so the lever exists in a build compiled
-/// without the debug feature. It is deliberately NOT a `game_config` column: the cadence IS
-/// `scheduled_at` (the `CreatureMoveSchedule` precedent), `spacetime sql` cannot write a
-/// `ScheduleAt` anyway, and `game_config` is gateway-SUBSCRIBED — an END-appended column there needs
-/// a hand-patched binding (`danger-zones.md` §1.2) for a value the gateway never reads.
 #[reducer]
 pub fn set_motion_tick_ms(ctx: &ReducerContext, tick_ms: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -417,10 +239,6 @@ pub fn set_motion_tick_ms(ctx: &ReducerContext, tick_ms: u64) -> Result<(), Stri
     Ok(())
 }
 
-// ===========================================================================================
-//  Tests for the movement coalescing decisions
-// ===========================================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,7 +252,6 @@ mod tests {
 
     #[test]
     fn only_heartbeat_and_facing_are_coalescible() {
-        // Every one of the 17 relayed movement opcodes is classified, not a hand-picked subset.
         for &op in m::SLICE_MOVE_OPCODES {
             let discrete = is_discrete(op as u16);
             let expected = op != m::MSG_MOVE_HEARTBEAT && op != m::MSG_MOVE_SET_FACING;
@@ -448,15 +265,12 @@ mod tests {
 
     #[test]
     fn coalesce_never_drops_a_discrete_transition() {
-        // A staged refresh is always superseded — nothing in it survives that the new packet lacks.
         assert_eq!(coalesce(HEARTBEAT, HEARTBEAT), Coalesce::Replace);
         assert_eq!(coalesce(HEARTBEAT, JUMP), Coalesce::Replace);
         assert_eq!(coalesce(FACING, HEARTBEAT), Coalesce::Replace);
         assert_eq!(coalesce(FACING, STOP), Coalesce::Replace);
-        // A staged TRANSITION outranks a mere refresh — the refresh is dropped, not the jump.
         assert_eq!(coalesce(JUMP, HEARTBEAT), Coalesce::KeepQueued);
         assert_eq!(coalesce(START, FACING), Coalesce::KeepQueued);
-        // Two transitions in one window: the older one is flushed rather than overwritten.
         assert_eq!(coalesce(START, JUMP), Coalesce::FlushThenReplace);
         assert_eq!(coalesce(JUMP, STOP), Coalesce::FlushThenReplace);
     }

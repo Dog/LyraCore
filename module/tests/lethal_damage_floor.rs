@@ -9,7 +9,6 @@ const SECOND_WOLF_GUID: u64 = (0xF130_u64 << 48) | ((WOLF_ENTRY as u64) << 24) |
 const THIRD_WOLF_GUID: u64 = (0xF130_u64 << 48) | ((WOLF_ENTRY as u64) << 24) | 3;
 const SOURCE_RULE_ID: u64 = 900_001;
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn authoritative_damage_honors_the_lethal_floor_and_its_lifetime() {
@@ -114,7 +113,6 @@ fn authoritative_damage_honors_the_lethal_floor_and_its_lifetime() {
         "debug_set_lethal_damage_floor_health_fixture",
         &[&THIRD_WOLF_GUID.to_string(), "5"],
     );
-    // The ranged swing lands on a scheduled visit, so the verifier itself is the condition.
     standalone.wait_until_call_succeeds(
         "debug_verify_ranged_lethal_damage_floor_fixture",
         &[

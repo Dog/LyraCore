@@ -1,11 +1,8 @@
-//! Crowd-control diminishing returns advance only when the control aura lands on the target.
-
 mod support;
 
 use lyracore_shared::constants::tracer_spell::{AURA_SLOTS, BUFF_SLOT_COUNT};
 use support::{wolves_beside, Standalone};
 
-/// The `Test Poly` fixture: 10 s of `A_CONTROL` with the polymorph mechanic.
 const TEST_POLY: &str = "50023";
 
 #[test]
@@ -17,7 +14,6 @@ fn a_control_aura_without_a_free_slot_leaves_diminishing_returns_unchanged() {
     shard.assert_call("install_guid_range", &["0"]);
     shard.assert_call("debug_seed_scenario_fixtures", &[]);
     shard.assert_call("debug_spawn_player_entity", &["1"]);
-    // Two casters, so the second cast does not wait out the first caster's global cooldown.
     let casters = wolves_beside(&shard, "1", &[3.0, 5.0]);
     let debuff_slots = (AURA_SLOTS - BUFF_SLOT_COUNT).to_string();
     shard.assert_call(

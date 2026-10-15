@@ -1,5 +1,3 @@
-//! Durable quest progress survives a cross-shard Transfer and world-port entry.
-
 mod support;
 
 use support::{actor, number, Row, Standalone};
@@ -85,7 +83,6 @@ fn quest_progress_survives_cross_shard_transfer_and_world_port() {
     seed_quests(&source);
     let before = quests(&source);
     assert_eq!(before.len(), 4);
-    // The pinned CLI prints a numeric array with its values concatenated.
     for (row, expected_counts) in before.iter().zip(["4321", "3321", "2221", "1111"]) {
         assert_eq!(row["counts"], expected_counts, "{before:?}");
     }

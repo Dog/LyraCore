@@ -1,10 +1,3 @@
-//! `lyracore-delta-check --print-events` — the Event Binding catalogue on stdout, nothing else.
-//!
-//! T2's TypeScript authoring surface is generated from this output, so the shape is the contract:
-//! one event per line, in catalogue order, no artifact read, no file touched. These tests run the
-//! real binary rather than calling a library function, because the binary's argument handling is
-//! part of what T2's build invokes.
-
 use std::process::{Command, Output};
 
 use lyracore_package_delta::HOOK_EVENT_NAMES;
@@ -28,8 +21,6 @@ fn print_events_lists_every_catalogue_name_in_order_one_per_line() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
 }
 
-/// A generator re-running this twice must see the same bytes, or a diff-based "is this stale"
-/// check (T2's `packages check`) would fail on a rebuild that changed nothing.
 #[test]
 fn print_events_output_is_byte_stable_across_runs() {
     let first = run(&["--print-events"]).stdout;

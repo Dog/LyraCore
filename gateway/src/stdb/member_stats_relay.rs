@@ -1,10 +1,3 @@
-//! The Member Stats Relay. Every [`MEMBER_STATS_INTERVAL`] its own thread queues one job per World
-//! Session. Each job runs [`member_stats_tick`] on that session's writer, so no shard pump does the
-//! work and the packets stay in order with the session's other Relays.
-//!
-//! The Relay reads cached rows only. Each Gateway process serves its own sessions from its own
-//! caches, so several Gateways need no coordination.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +5,6 @@ use super::connection::Coordinator;
 use super::world_view::{self, Viewer, WorldView};
 use crate::world::{member_stats_tick, MemberStatsStore, Outbound};
 
-/// The player heartbeat that sends cmangos group updates (cm:Player.cpp:1609-1613, 5000 ms at
-/// cm:Object.h:861).
 const MEMBER_STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) fn spawn_member_stats_relay(coordinator: Coordinator) -> std::thread::JoinHandle<()> {
@@ -29,7 +20,6 @@ pub(super) fn spawn_member_stats_relay(coordinator: Coordinator) -> std::thread:
         .expect("spawn member stats relay")
 }
 
-/// Queue one Member Stats job on every registered viewer's writer.
 fn queue_member_stats<St: MemberStatsStore + Clone + 'static>(view: &WorldView, store: &St) {
     for viewer in view.all_viewers() {
         let store = store.clone();
@@ -37,7 +27,6 @@ fn queue_member_stats<St: MemberStatsStore + Clone + 'static>(view: &WorldView, 
     }
 }
 
-/// A failed read skips this viewer until the next tick. Its record stays as it was.
 fn viewer_member_stats<St: MemberStatsStore + ?Sized>(
     store: &St,
     viewer: &Arc<Viewer>,
@@ -77,7 +66,6 @@ mod tests {
     const VIEWER: u64 = 10;
     const MATE: u64 = 11;
 
-    /// One party of two, the mate live everywhere.
     #[derive(Clone)]
     struct TwoMemberParty;
 

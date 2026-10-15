@@ -1,7 +1,3 @@
-//! The table catalog: every core table accessor and row type, named by its owning family, plus a
-//! row field type where a Package builds that row. The crate root re-exports this list for the
-//! schema parity test and the Package API.
-
 pub use crate::account_ownership::{
     game_account_character_owner, game_account_claim, game_account_fence, AccountCharacterOwner,
     AccountClaim, AccountFence,

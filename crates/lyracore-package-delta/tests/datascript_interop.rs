@@ -1,20 +1,3 @@
-//! The contract between the Datascript authoring library and this crate.
-//!
-//! The library writes artifacts in TypeScript; this crate reads them in Rust. Three things have to
-//! hold across that seam, and each has a test here:
-//!
-//!  * an artifact the library emits parses, traces clean, and canonicalizes to the SAME bytes it was
-//!    written with;
-//!  * both sides name the same durable columns, so a schema move cannot leave one behind;
-//!  * both sides spell an `f32` identically, which is the only value type where two languages could
-//!    plausibly disagree.
-//!
-//! # Licensing
-//!
-//! Every fixture here is hand-written and every value in it is invented. `base-snapshot.json` is a
-//! synthetic Base Snapshot, and `fire-nova.expected.json` was emitted from it. No client data, and
-//! nothing derived from client data, is involved.
-
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -73,7 +56,7 @@ fn the_frozen_artifact_traces_without_a_conflict() {
     let traced = trace(&[fire_nova()]);
 
     assert!(traced.is_clear(), "{:?}", traced.conflicts());
-    assert_eq!(traced.rows().len(), 15); // five ranks, each a header and two effects
+    assert_eq!(traced.rows().len(), 15);
 }
 
 #[test]
@@ -85,7 +68,6 @@ fn the_rank_ladder_inserts_five_package_spells_and_their_child_effects() {
     assert_eq!(counts.updated_rows, 0);
 }
 
-/// The child effects a clone creates follow the packed key rule, derived rather than authored.
 #[test]
 fn every_child_effect_key_packs_from_its_spell_and_index() {
     for claim in fire_nova().claims() {
@@ -103,7 +85,6 @@ fn every_child_effect_key_packs_from_its_spell_and_index() {
     }
 }
 
-/// Every insert the library emits carries the whole row, because a clone copies every column.
 #[test]
 fn every_inserted_row_carries_every_column_of_its_table() {
     for claim in fire_nova().claims() {
@@ -113,10 +94,6 @@ fn every_inserted_row_carries_every_column_of_its_table() {
     }
 }
 
-/// The Datascript catalogue and this crate's catalogue are two hand-maintained lists of one schema.
-/// A column added to one and not the other would let an author write a claim the parser refuses, or
-/// hide a column an author should be able to set. The scanner is deliberately narrow: it reads the
-/// `column:` members of the two exported catalogues and nothing else.
 #[test]
 fn the_datascript_column_catalogue_names_the_same_columns_as_this_crate() {
     let source = authoring_library("schema.ts");
@@ -135,7 +112,6 @@ fn the_datascript_column_catalogue_names_the_same_columns_as_this_crate() {
     }
 }
 
-/// The `column: "…"` members of one exported catalogue, in declaration order.
 fn durable_columns(source: &str, marker: &str) -> Vec<String> {
     let start = source
         .find(marker)
@@ -153,9 +129,6 @@ fn durable_columns(source: &str, marker: &str) -> Vec<String> {
         .collect()
 }
 
-/// The two writers agree on every float, including the ones a shortest-representation algorithm has
-/// to think about. The fixture's literals came from Rust; the TypeScript suite asserts the same
-/// file, so neither side can drift alone.
 #[test]
 fn both_writers_spell_a_float_the_same_way() {
     let cases: serde_json::Value =
@@ -188,11 +161,6 @@ fn both_writers_spell_a_float_the_same_way() {
         "the float fixture went missing: {checked} cases"
     );
 }
-
-// ---------------------------------------------------------------------------------------------
-// Refusal parity: the rules the authoring library mirrors, asserted here on the artifact the
-// library would have had to write to break each one.
-// ---------------------------------------------------------------------------------------------
 
 fn artifact(table: &str, key: &str, operation: &str, fields: &str) -> String {
     format!(

@@ -1,19 +1,3 @@
-//! Spells & auras — the **data-driven effect-row engine** (v2). A spell is a `game_spell` header plus
-//! an ordered list of `game_spell_effect` rows; each effect carries a `kind` (a deduplicated
-//! effect/aura taxonomy), a magnitude, a target, and two **single-meaning** typed params (`p0`/`p1`,
-//! tagged by `p0_kind`) — the mangos `misc_value` union resolved once, at author/import time, never at
-//! runtime. `resolve_cast_at` iterates the effects and dispatches each `kind` to a handler; auras are
-//! placed on `game_aura` with a **frozen typed snapshot** so periodic ticks + combat stat-reads never
-//! re-join the template. Importable from `Spell.dbc` (the importer fills header + effect rows); a
-//! `Scripted` kind + graceful-degradation no-op are the escape hatch for the irreducible tail. [static]
-//!
-//! Runtime tables: `game_aura` (active auras, gateway-relayed as `UNIT_FIELD_AURA`), `game_spell_cooldown`
-//! (GCD), `game_pending_cast` (cast bar), `game_spell_cast_event` (the cast visual). The aura VALUES
-//! relay reuses the proven dirty_reset discipline (the gateway reads slot/spell_id/level/flags). [event]
-
-//!
-//! Named exports below hold the operations and tables shared with other Module files.
-
 pub(crate) mod cast;
 mod outcome;
 mod presentation;
@@ -36,7 +20,6 @@ mod taxonomy;
 #[cfg(test)]
 mod tests;
 
-// Table rows retain public visibility for schema parity. Other operations stay inside the Module.
 #[cfg(test)]
 pub(crate) use cast::passive_applies_effect_kind;
 pub(crate) use cast::{
@@ -147,11 +130,6 @@ pub(crate) use taxonomy::{
     SPELL_POWER_COEFF_PCT, STANCE_DEFENSIVE_DMG_DONE_PCT, STANCE_DEFENSIVE_DR_PCT,
     STANCE_DEFENSIVE_THREAT_PCT,
 };
-// `stacking` is reached explicitly via `crate::spell::stacking::<sym>` (its tables' generated
-// accessor traits — `game_spell_group`/`game_spell_group_rule`/`game_dr_state` — collide-free but its
-// pure types (`ApplyDecision`, `AuraSummary`, ...) are deliberately NOT globbed into this module's flat
-// namespace, since `cast/targeting.rs`/`scheduler.rs`/`math.rs` reference them qualified for
-// readability at each of the few call sites).
 
 pub(crate) use tables::{sweep_delete_game_aura, sweep_transfer_game_aura};
 

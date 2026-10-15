@@ -1,13 +1,4 @@
-# Pins the development toolchain (what you build, test and format with) so `cargo fmt`, `cargo
-# clippy` and `spacetime generate`'s wasm build are reproducible across machines. It is the same
-# version as `workspace.package.rust-version` in Cargo.toml, and that field's comment says why the
-# two cannot differ. rustup fetches this exact toolchain for any cargo command run from this repo,
-# and fails with "toolchain '1.93.0' is not installed" instead of silently using whatever `rustc` is
-# on PATH.
 [toolchain]
 channel = "1.93.0"
 components = ["rustfmt", "clippy"]
-# The module compiles to wasm (see module/Cargo.toml), and the `spacetime generate` schema extraction
-# that `lyracore preflight` runs builds it too. Listed here so a fresh checkout gets the target for
-# free instead of failing on a missing target with no hint why.
 targets = ["wasm32-unknown-unknown"]

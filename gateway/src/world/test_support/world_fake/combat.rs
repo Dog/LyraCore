@@ -3,8 +3,6 @@ use crate::stdb::ReducerCallError;
 
 #[derive(Default)]
 pub(crate) struct CombatState {
-    /// When set, `set_target` fails as a Transport Loss before the reducer can complete. This
-    /// models the call pipe whose transport dies while an admitted World Session is in flight.
     pub(crate) set_target_transport_lost: bool,
 }
 

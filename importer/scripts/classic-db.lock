@@ -1,19 +1,3 @@
-# classic-db.lock — the pin importer/scripts/pull-classic-db.sh reads by default.
-#
-# WHY A LOCKFILE: cmangos/classic-db publishes no release tags, so a bare `master` changes under you
-# silently — two people who "ran the same import" can end up with different worlds, and a regression
-# in a row count looks like a bug in this repo. Pinning a commit makes the pull reproducible; the
-# checksum makes a change of SHAPE at that same commit an abort rather than a silent re-import.
-# Pass CLASSIC_DB_REF=master (plus --skip-verify) to float deliberately instead.
-#
-# BUMP PROCEDURE (one line, see importer/scripts/pull-classic-db.sh's header for the full walkthrough):
-#   CLASSIC_DB_REF=master importer/scripts/pull-classic-db.sh --skip-verify
-# then copy its printed "resolved commit" + "sha256" into the two values below and commit this file.
-# The lockfile ships (it is our own metadata: a commit id and a digest, not cmangos' data); the pulled
-# classic-db content itself NEVER does — see the pull script's licensing-firewall note and this repo's
-# .gitignore ("/.import/").
-#
-# CLASSIC_DB_SHA256 is the digest of the decompressed SQL bytes written to
-# .import/classic-db-full.sql. The EventAI source profile checks the same bytes before apply.
+# CLASSIC_DB_SHA256 covers the decompressed SQL bytes in .import/classic-db-full.sql.
 CLASSIC_DB_SHA="cd0c426a3b2ff56dd518bf009025299468e60fdb"
 CLASSIC_DB_SHA256="d2083bcd2670451279cbf93af138eadae04c6d183a4cd0ff0357047e4a565de6"

@@ -1,5 +1,3 @@
-//! In-memory interruption harness for the cross-database mail protocol.
-
 use super::*;
 use crate::items::ItemSnapshot;
 use lyracore_shared::mail::MailSender;
@@ -362,8 +360,6 @@ impl ReapSink for FakeMailPlane {
 }
 
 impl FakeMailPlane {
-    /// `crate::mail::delivered_mail`: a Mail before its delivery instant does not exist for its
-    /// recipient.
     fn delivered(&self, mail_id: u64) -> Option<XMail> {
         let now = self.ledger.now.get();
         self.mails
@@ -460,7 +456,6 @@ const COST: u32 = MONEY + POSTAGE;
 const ITEM_GUID: u64 = 0x4000_0000_0000_0011;
 const NO_ITEM: u64 = 0;
 const NO_COD_MAIL: u64 = 0;
-/// The sender and the recipient belong to different Realm Accounts, so an item waits an hour.
 const OTHER_ACCOUNT: bool = false;
 const SAME_ACCOUNT: bool = true;
 const NO_DELAY: u32 = 0;
@@ -525,7 +520,6 @@ fn drive(
     if killed == Killed::AfterFence {
         return Ok(());
     }
-    // The Gateway re-derives the attachment and the Delivery Delay from the fence row.
     let (item, delay_secs) = shard
         .escrow(escrow_id)
         .map(|e| (e.item(), e.delivery_delay_secs))
@@ -756,7 +750,7 @@ fn a_driver_killed_before_the_fence_costs_the_sender_nothing() {
     assert_eq!(shard.purse_of(SENDER), PURSE);
     assert!(plane.mailbox_of(RECIPIENT).is_empty());
     shard.advance(MAIL_ESCROW_STALE_MICROS * 10);
-    apply_reap(&mut shard); // an empty ledger reaps nothing
+    apply_reap(&mut shard);
     assert_eq!(shard.purse_of(SENDER), PURSE);
 }
 #[test]
@@ -1488,7 +1482,6 @@ enum ItemTakeKilled {
     AfterConfirm,
     Never,
 }
-/// An item letter to another Account, an hour later, when it has arrived.
 fn delivered_item_fixture() -> (FakeShard, FakeMailPlane, u64) {
     let (mut shard, mut plane) = item_fixture();
     drive(&mut shard, &mut plane, ESCROW, ITEM_GUID, Killed::Never).expect("committed");
@@ -1548,7 +1541,6 @@ fn the_take_moves_a_mails_item_into_the_bags_on_another_database() {
     );
     assert!(!plane.has_fence(TAKE));
 }
-/// A Letter Copy's Plain Letter (item 8383) whose text is Item Text 41.
 fn plain_letter() -> ItemSnapshot {
     ItemSnapshot {
         entry: 8383,
@@ -1872,8 +1864,6 @@ fn a_cod_payment_for_a_mail_not_yet_delivered_is_held_and_pays_nobody() {
         "the buyer's copper stays in the fence"
     );
 }
-/// The payer's copper is already out of their purse and in the fence. A commit that can pay nobody
-/// must still land it somewhere, or the fence is held forever.
 fn assert_the_payment_came_back(plane: &FakeMailPlane, payer: u64, what: &str) {
     let refund = plane
         .mailbox_of(payer)
@@ -2103,7 +2093,6 @@ fn an_item_send_re_driven_after_a_restart_keeps_its_delivery_delay() {
     let restarted_at = 10 * 60 * 1_000_000;
     plane.advance(restarted_at);
 
-    // The Gateway's re-drive reads the whole letter back from the fence row.
     let held = shard.escrow(ESCROW).expect("the fence is held");
     apply_commit(
         &mut plane,
@@ -2190,8 +2179,6 @@ fn a_cod_payment_arrives_at_once_whatever_delay_its_commit_carries() {
         "cmangos MailHandler.cpp:475-477 sends the payment with no delay"
     );
 }
-/// Filed like `mail_reward::file_reward_letter` files quest 3645, Membership Card Renewal: template
-/// 99 attaches item 11423, count 1, after 86,400 s (`cdb:` quest_template, mail_loot_template).
 const REWARD: u64 = 0x5EED_0004;
 const DAY_MICROS: i64 = 86_400 * 1_000_000;
 const CARD_HEADER: RewardHeader = RewardHeader {
@@ -2211,8 +2198,6 @@ fn card_renewal() -> crate::mail_reward::RewardLetter {
         delay_secs: 86_400,
     }
 }
-/// The Gateway's drive of a filed Reward Letter: every commit argument comes from the escrow row,
-/// as `world::mail::redrive` reads it.
 fn drive_reward(
     shard: &mut FakeShard,
     plane: &mut FakeMailPlane,

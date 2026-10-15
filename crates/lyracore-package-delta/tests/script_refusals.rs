@@ -1,8 +1,3 @@
-//! Everything a Script Artifact refuses, and the identifier band it refuses against.
-//!
-//! Each of these is a package author's mistake that must never reach a Shard, and each refusal has
-//! to name the smallest thing that was wrong.
-
 use lyracore_package_delta::ids::{
     CURATED_RESERVED_ID_FLOOR, FIXTURE_RESERVED_ID_CEIL, FIXTURE_RESERVED_ID_FLOOR,
 };
@@ -48,7 +43,6 @@ fn an_unknown_version_is_refused() {
     assert!(refusal.to_string().contains("version 9"), "{refusal}");
 }
 
-/// A typo in a Datascript must never become a silently dropped member.
 #[test]
 fn an_unknown_member_at_the_root_is_refused_rather_than_ignored() {
     let json = format!(
@@ -82,8 +76,6 @@ fn a_script_missing_a_member_is_refused_by_that_members_name() {
 
     assert!(refusal.contains("scripts[0].source"), "{refusal}");
 }
-
-// ---- the identifier band ----
 
 #[test]
 fn a_script_below_the_package_band_is_refused() {
@@ -119,8 +111,6 @@ fn a_script_above_the_package_band_is_refused() {
     );
 }
 
-/// `0` is what `game_spell_effect.script_id` already means by "pure data, no script", so it can
-/// never name one.
 #[test]
 fn script_zero_is_not_a_script() {
     let refusal = refusal(&one(0, "bolt.a", "on_login", "grant_xp(event.actor, 1)"));
@@ -159,8 +149,6 @@ fn no_reserved_identifier_is_inside_the_package_script_band() {
     }
 }
 
-// ---- names, events and source ----
-
 #[test]
 fn a_name_that_is_not_a_name_is_refused() {
     for bad in ["", "Bolt.Greet", "bolt greet", "bolt/greet"] {
@@ -173,8 +161,6 @@ fn a_name_that_is_not_a_name_is_refused() {
     }
 }
 
-/// The hardest failure to diagnose is a script that simply never runs, so an event outside the
-/// catalogue is refused at author time and the refusal lists the events that exist.
 #[test]
 fn an_event_outside_the_hook_catalogue_is_refused_and_names_the_ones_that_exist() {
     let refusal = refusal(&one(
@@ -189,9 +175,6 @@ fn an_event_outside_the_hook_catalogue_is_refused_and_names_the_ones_that_exist(
     assert!(refusal.contains("`on_go_used`"), "{refusal}");
 }
 
-/// A Package Event belongs to the Package that fires it. Binding another Package's event would let
-/// one Package read a decision it has no part in, and would break the moment that Package renamed
-/// the event — so the prefix must be the artifact's own identity.
 #[test]
 fn a_package_event_belonging_to_another_package_is_refused() {
     let refusal = refusal(&one(
@@ -208,8 +191,6 @@ fn a_package_event_belonging_to_another_package_is_refused() {
     assert!(refusal.contains("`example.bolt.<name>`"), "{refusal}");
 }
 
-/// The `<name>` half is narrower than a script name: no dots, so the Package prefix stays the only
-/// one, and nothing but lowercase letters, digits and `_` after the first letter.
 #[test]
 fn a_package_event_with_a_misshapen_name_is_refused() {
     for bad in [
@@ -237,15 +218,12 @@ fn a_script_with_no_source_is_refused() {
     assert!(refusal.contains("bolt.a"), "{refusal}");
 }
 
-/// Whitespace is not a script either. A Datascript that emitted only a newline emitted nothing.
 #[test]
 fn a_script_whose_source_is_only_whitespace_is_refused() {
     let refusal = refusal(&one(100_001, "bolt.a", "on_login", r"  \n\t  "));
 
     assert!(refusal.contains("carries no source"), "{refusal}");
 }
-
-// ---- one Package disagreeing with itself ----
 
 #[test]
 fn one_package_shipping_two_scripts_at_one_identifier_is_refused() {

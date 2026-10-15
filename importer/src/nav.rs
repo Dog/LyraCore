@@ -1,25 +1,3 @@
-//! `--nav <client Data/ dir>` uses rasterize ADT terrain + WMO/M2 collision
-//! geometry into per-cell nav blobs → `game_nav_chunk` (decision: grid tables, no
-//! vmap/Detour runtime). Same licensing firewall as `--terrain`. Honors `--map` + `--box`.
-//!
-//! Pipeline: parse every ADT tile in the box (heights via terrain.rs's `collect_cells` — the
-//! SAME code the heightmap import runs), collect WMO/M2 placements deduped by `unique_id`
-//! (placements repeat on adjacent tiles), load each referenced model's collision triangles
-//! once, transform to world space, bin by terrain cell, then rasterize each cell's 64×64
-//! walkability bitmask + 32×32 obstruction-height grid through `lyracore_shared::nav` (the same
-//! codec the module reads with). The geometry rasterization policy itself lives in
-//! `nav::derive_cell`; this file only adds the terrain-only blockers (slope, MCNK holes) and
-//! merges the two through `nav::merge_cells`.
-//!
-//! The placement ROTATION convention is folkloric (like the ADT filename axis order), so it is
-//! CALIBRATED, not trusted: MODF carries each WMO placement's world AABB; we try the candidate
-//! (axis-shuffle × yaw) transforms and keep the one that reproduces those AABBs, bailing loudly
-//! if none does. MDDF (M2) reuses the WMO-calibrated convention — it has no bounds to check.
-// Deliberate simplification: yaw-only rotation (placements with real pitch/roll rasterize
-// slightly wrong — rare fence-on-slope doodads); tri footprint = tri AABB (overmarks diagonal
-// walls by <1 cell, conservative direction). Move to exact tri-box + full Euler when a live case
-// demands it.
-
 use anyhow::{bail, Context, Result};
 use lyracore_shared::nav::{
     derive_cell, merge_cells, sub_index, walk_set, NavCellData, OBS_BYTES, OBS_NONE, WALK_BYTES,
@@ -32,30 +10,20 @@ use std::io::Cursor;
 use std::path::Path;
 use wow_mpq::PatchChain;
 
-/// 32 tiles × 533.33 yd — the ADT placement-space origin offset.
+// ADT placement origin offset in yards.
 const PLACE_K: f32 = 32.0 * 533.333_3;
-/// Slope gate: a 4.17 yd sub-quad rising more than tan(50°)×4.17 ≈ 4.97 yd is unwalkable.
+// A 50-degree slope rises about 4.97 yards over one 4.17-yard terrain quad.
 const MAX_QUAD_RISE: f32 = 4.97;
-/// Reducer batch ceiling (bytes of packed payload) — same ballpark the other importers respect.
 const BATCH_BYTES: usize = 28_000;
 
 pub(crate) type Tri = [[f32; 3]; 3];
 
-// ---------------------------------------------------------------------------------------------
-// Geometry extraction
-// ---------------------------------------------------------------------------------------------
-
-/// One WMO collision triangle plus the group it came from, `vmap.rs` packs this
-/// per-triangle metadata (source class + group id + MOGP flags); `nav.rs`'s rasterizer only
-/// needs `.tri`.
 pub(crate) struct WmoTri {
     pub(crate) tri: Tri,
     pub(crate) group_id: u32,
     pub(crate) mogp_flags: u32,
 }
 
-/// One placement's loaded collision mesh — WMO carries per-triangle group metadata, M2 doesn't
-/// (a doodad has no groups/MOGP flags).
 pub(crate) enum Mesh {
     Wmo(Vec<WmoTri>),
     M2(Vec<Tri>),
@@ -70,9 +38,7 @@ impl Mesh {
     }
 }
 
-/// Collidable triangles of one WMO (all groups), model-local coords, tagged with group id + MOGP
-/// flags. MOPY rule (wowdev): collidable = F_COLLISION (0x08) set, OR neither F_DETAIL (0x04) nor
-/// F_NOCAMCOLLIDE (0x02).
+// MOPY collision: 0x08 set, or neither 0x04 nor 0x02 set.
 fn wmo_tris(chain: &mut PatchChain, name: &str) -> Result<Vec<WmoTri>> {
     let root_bytes = chain
         .read_file(name)
@@ -119,8 +85,6 @@ fn wmo_tris(chain: &mut PatchChain, name: &str) -> Result<Vec<WmoTri>> {
     Ok(tris)
 }
 
-/// M2 collision mesh in model-local coordinates. Missing or malformed collision is an import
-/// failure, since publishing an empty mesh would mark missing obstacles as clear ground.
 pub(crate) fn m2_tris(chain: &mut PatchChain, name: &str) -> Result<Vec<Tri>> {
     let m2_name = name
         .rsplit_once('.')
@@ -133,24 +97,16 @@ pub(crate) fn m2_tris(chain: &mut PatchChain, name: &str) -> Result<Vec<Tri>> {
         .with_context(|| format!("reading collision from M2 {m2_name}"))
 }
 
-// ---------------------------------------------------------------------------------------------
-// Placement transform (calibrated, not trusted)
-// ---------------------------------------------------------------------------------------------
-
-/// Placement-space position → world: (K − p.z, K − p.x, p.y). Verified empirically in the 240
-/// spike (nsabbey placement (17245, 80, 25964) → world (−8897, −178, 80), matching the live
-/// abbey coords).
+// Placement coordinates map to world as K - z, K - x, y.
 pub(crate) fn place_pos(p: [f32; 3]) -> [f32; 3] {
     [PLACE_K - p[2], PLACE_K - p[0], p[1]]
 }
 
-/// One candidate local→world convention: optional axis shuffle then yaw about world +Z.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Convention {
-    /// false: local verts are already world-axis Z-up (v as-is).
-    /// true: local verts are placement-axis Y-up (shuffle like `place_pos`: (−z, −x, y)).
+    // true converts Y-up local axes to Z-up world axes as -z, -x, y.
     pub(crate) shuffle: bool,
-    /// world yaw = `sign` × rot[1] + `offset_deg`, in degrees.
+    // World yaw in degrees is sign * rotation[1] + offset_deg.
     pub(crate) sign: f32,
     pub(crate) offset_deg: f32,
 }
@@ -207,9 +163,6 @@ fn mohd_calibration_points(bounds_min: [f32; 3], bounds_max: [f32; 3]) -> Result
     Ok(points)
 }
 
-/// MOHD and MODF are the authored local and placed bounds of the same WMO. Comparing their
-/// corners checks the placement transform without depending on how tightly MOVT vertices fill
-/// the authored box.
 fn wmo_calibration_points(chain: &mut PatchChain, name: &str) -> Result<Vec<[f32; 3]>> {
     let root_bytes = chain
         .read_file(name)
@@ -223,9 +176,6 @@ fn wmo_calibration_points(chain: &mut PatchChain, name: &str) -> Result<Vec<[f32
         .with_context(|| format!("validating WMO root bounds {name}"))
 }
 
-/// Pick the convention that reproduces the MODF world AABBs across the calibration placements
-/// (mean per-axis corner error, capped sample). Hard-fails above 1.5 yd — a wrong convention
-/// must never silently rasterize rotated buildings.
 pub(crate) struct Calibration {
     pub(crate) convention: Convention,
     pub(crate) q25_error_yards: f32,
@@ -251,7 +201,6 @@ fn calibration(samples: &[(&Placement, Vec<[f32; 3]>)]) -> Result<Calibration> {
             let (Some(bmin), Some(bmax)) = (p.bounds_min, p.bounds_max) else {
                 continue;
             };
-            // Bounds are placement-space: convert both corners, re-sort per axis.
             let (c1, c2) = (place_pos(bmin), place_pos(bmax));
             let want_lo = [c1[0].min(c2[0]), c1[1].min(c2[1]), c1[2].min(c2[2])];
             let want_hi = [c1[0].max(c2[0]), c1[1].max(c2[1]), c1[2].max(c2[2])];
@@ -270,8 +219,6 @@ fn calibration(samples: &[(&Placement, Vec<[f32; 3]>)]) -> Result<Calibration> {
         if errs.is_empty() {
             continue;
         }
-        // A low quantile keeps an isolated archive outlier from overriding the transform shared
-        // by the retained sample. The refusal below still rejects a sample with no fit.
         errs.sort_by(f32::total_cmp);
         let mean = errs[errs.len() / 4];
         if std::env::var("NAV_DEBUG").is_ok() {
@@ -322,10 +269,6 @@ fn calibration(samples: &[(&Placement, Vec<[f32; 3]>)]) -> Result<Calibration> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
-// Tile collection
-// ---------------------------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub(crate) struct Placement {
     pub(crate) name: String,
@@ -373,10 +316,6 @@ fn resolve<'a>(names: &'a [String], indices: &[u32], name_id: u32) -> Result<&'a
     Ok(&names[idx])
 }
 
-// ---------------------------------------------------------------------------------------------
-// Rasterizer
-// ---------------------------------------------------------------------------------------------
-
 struct NavRow {
     map_id: u32,
     cell_x: u16,
@@ -406,18 +345,15 @@ impl NavRow {
     }
 }
 
-// MCNK four-bit rows follow world X, matching the first heightmap index.
+// MCNK hole rows follow world X, matching the first heightmap index.
 fn has_hole(holes: u32, quad_x: usize, quad_y: usize) -> bool {
     holes & (1 << ((quad_x / 2) * 4 + quad_y / 2)) != 0
 }
 
-/// The terrain half of a cell: slope and MCNK holes, the only blockers the height grid alone
-/// knows. None when the terrain is clear everywhere in the cell.
 fn terrain_cell(cell: &crate::terrain::CellRow) -> Option<NavCellData> {
     let mut walk = vec![0xFFu8; WALK_BYTES];
     let mut dirty = false;
 
-    // Slope: per 4.17 yd sub-quad from the 9×9 outer corners (index i*17+j).
     for qi in 0..8 {
         for qj in 0..8 {
             let corner = |i: usize, j: usize| cell.heights[i * 17 + j];
@@ -446,10 +382,6 @@ fn terrain_cell(cell: &crate::terrain::CellRow) -> Option<NavCellData> {
     })
 }
 
-/// Rasterize one terrain cell against the triangles binned to it: the terrain blockers merged
-/// with the shared collision-geometry derivation (`nav::derive_cell` — the module derives its
-/// coverage through the same function, so the two can never drift). Returns None when the cell
-/// is fully clear (all-walkable, no obstruction) — those emit NO row by design.
 fn rasterize_cell(cell: &crate::terrain::CellRow, tris: &[VmapTri]) -> Option<NavRow> {
     let (cx, cy) = (cell.cell_x, cell.cell_y);
     let data = match (
@@ -470,12 +402,6 @@ fn rasterize_cell(cell: &crate::terrain::CellRow, tris: &[VmapTri]) -> Option<Na
         obs: data.obs,
     })
 }
-
-// ---------------------------------------------------------------------------------------------
-// Shared passes, reused verbatim by `vmap.rs`: tile scan (heights + deduped placements),
-// mesh loading, and rotation calibration are identical between the two importer modes; only the
-// consumption (rasterize vs. transform-and-pack) differs.
-// ---------------------------------------------------------------------------------------------
 
 pub(crate) struct TileScan {
     pub(crate) cells: Vec<crate::terrain::CellRow>,
@@ -519,8 +445,6 @@ fn placements_match(first: &Placement, second: &Placement) -> bool {
         && first.wmo == second.wmo
 }
 
-/// Pass 1: parse every ADT tile in the cell-index box — heights (via the shared `collect_cells`)
-/// plus WMO/M2 placements deduped by `unique_id` (placements repeat on adjacent tiles).
 pub(crate) fn scan_tiles(
     chain: &mut PatchChain,
     map_name: &str,
@@ -556,7 +480,7 @@ pub(crate) fn scan_tiles(
                 let Ok(bytes) = chain.read_file(name) else {
                     continue;
                 };
-                // Patch archives remove terrain tiles with empty ADT entries.
+                // Empty ADT patch entries remove terrain tiles.
                 if bytes.is_empty() {
                     continue;
                 }
@@ -572,7 +496,7 @@ pub(crate) fn scan_tiles(
             }
             let Some((source_path, source_bytes, root)) = accepted else {
                 continue;
-            }; // ocean/empty tiles simply don't exist
+            };
             tiles_read += 1;
             sources.push(TileSource {
                 path: source_path.clone(),
@@ -639,8 +563,6 @@ pub(crate) fn placement_overlaps_cells(placement: &Placement, range: (i32, i32, 
     let (Some(min), Some(max)) = (placement.bounds_min, placement.bounds_max) else {
         return true;
     };
-    // Only known bounds can exclude a model. Preserve malformed bounds for the existing loader
-    // and calibration checks, and retain models whose bounds need their mesh to be determined.
     if !(0..3).all(|axis| min[axis].is_finite() && max[axis].is_finite() && min[axis] <= max[axis])
     {
         return true;
@@ -658,8 +580,6 @@ pub(crate) fn placement_overlaps_cells(placement: &Placement, range: (i32, i32, 
         })
 }
 
-/// Pass 2: load each referenced model's collision mesh once (WMO keeps per-triangle group
-/// metadata; M2 doesn't have groups).
 pub(crate) fn load_meshes(
     chain: &mut PatchChain,
     placements: &[Placement],
@@ -678,8 +598,6 @@ pub(crate) fn load_meshes(
     Ok(meshes)
 }
 
-/// Load one collision mesh for the streaming vmap importer. Keeping this small interface avoids
-/// retaining every unique model of a production-sized selection at once.
 pub(crate) fn load_mesh(chain: &mut PatchChain, placement: &Placement) -> Result<Mesh> {
     if placement.is_wmo {
         Ok(Mesh::Wmo(wmo_tris(chain, &placement.name)?))
@@ -688,7 +606,6 @@ pub(crate) fn load_mesh(chain: &mut PatchChain, placement: &Placement) -> Result
     }
 }
 
-/// Pass 3: calibrate the rotation convention against MODF bounds (WMOs only), capped sample.
 pub(crate) fn calibrate_from_placements(
     chain: &mut PatchChain,
     placements: &[Placement],
@@ -712,10 +629,6 @@ pub(crate) fn calibrate_from_placements_with_evidence(
     }
     calibration(&samples)
 }
-
-// ---------------------------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------------------------
 
 pub(crate) fn run(args: &crate::Args) -> Result<()> {
     let scope = args.world_import_scope()?;
@@ -783,7 +696,6 @@ fn rasterize_slice(
         }
     }
 
-    // Pass 1: parse tiles — heights + deduped placements.
     let scan = scan_tiles(
         chain,
         map_name,
@@ -802,13 +714,11 @@ fn rasterize_slice(
         placements.iter().filter(|p| p.is_wmo).count()
     );
 
-    // Calibration uses tile-wide authored bounds, including when the selected cells have no WMO.
     let conv = calibrate_from_placements(chain, &placements)?;
     placements.retain(|placement| {
         placement_overlaps_cells(placement, (cell_x_min, cell_x_max, cell_y_min, cell_y_max))
     });
 
-    // Pass 2: load each intersecting model's collision mesh once.
     let meshes = load_meshes(chain, &placements)?;
     let mesh_tris: usize = meshes.values().map(Mesh::len).sum();
     println!(
@@ -816,7 +726,6 @@ fn rasterize_slice(
         meshes.len()
     );
 
-    // Pass 4: transform to world space + bin by terrain cell.
     let mut world_tris: Vec<VmapTri> = Vec::new();
     for p in &placements {
         let pos_w = place_pos(p.position);
@@ -843,9 +752,7 @@ fn rasterize_slice(
     }
     let mut by_cell: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, t) in world_tris.iter().enumerate() {
-        // High world coord → LOW cell index; iterate the covered index rectangle. Inflate by
-        // `WALK_MARGIN` so a triangle hugging a cell border reaches the neighbor cell its inset
-        // walk footprint spills into.
+        // Include WALK_MARGIN so inset geometry reaches neighboring terrain cells.
         let (lo, hi) = aabb(t.verts.iter().copied());
         let (Some(cx0), Some(cx1), Some(cy0), Some(cy1)) = (
             cell_index(hi[0] + WALK_MARGIN),
@@ -853,7 +760,7 @@ fn rasterize_slice(
             cell_index(hi[1] + WALK_MARGIN),
             cell_index(lo[1] - WALK_MARGIN),
         ) else {
-            continue; // off the map square (shouldn't happen inside the box)
+            continue;
         };
         for cx in cx0..=cx1 {
             for cy in cy0..=cy1 {
@@ -862,7 +769,6 @@ fn rasterize_slice(
         }
     }
 
-    // Pass 5: rasterize.
     let mut rows: Vec<NavRow> = Vec::new();
     for cell in &cells {
         let empty = Vec::new();
@@ -881,8 +787,6 @@ fn rasterize_slice(
         cells.len() - rows.len()
     );
 
-    // NAV_ASCII="x0,x1,y0,y1": print an ASCII walkability map of that world rectangle from the
-    // in-memory rows (dry-run diagnostic; '#' blocked, '.' walkable, ' ' no row/all-clear).
     if let Ok(spec) = std::env::var("NAV_ASCII") {
         let v: Vec<f32> = spec
             .split(',')
@@ -899,7 +803,7 @@ fn rasterize_slice(
             let mut y = y1;
             while y >= y0 {
                 let mut line = String::new();
-                let mut x = x1; // world x decreases left→right? print x1 (high) at LEFT for map-like reading
+                let mut x = x1;
                 while x >= x0 {
                     let ch = match (cell_index(x), cell_index(y)) {
                         (Some(cx), Some(cy)) => {
@@ -930,8 +834,6 @@ fn rasterize_slice(
         }
     }
 
-    // Self-check: --center must be walkable (the operator points it at a road/spawn, same
-    // contract as the terrain interpolate check). Fails loudly on axis/transform breakage.
     {
         let (ccx, ccy) = (slice.sample.0 as f32, slice.sample.1 as f32);
         let (cx, cy) = (
@@ -939,7 +841,7 @@ fn rasterize_slice(
             cell_index(ccy).context("--center off map")?,
         );
         let walkable = match rows.iter().find(|r| r.cell_x == cx && r.cell_y == cy) {
-            None => true, // no row = all clear
+            None => true,
             Some(r) => {
                 let (nx, ny) = (
                     sub_index(ccx, cx, WALK_DIM).context("--center sub-index")?,
@@ -1040,7 +942,6 @@ mod tests {
         }
     }
 
-    /// A flat 80.0-height cell at the same Northshire-ish coords the shared runtime tests use.
     fn flat_cell() -> crate::terrain::CellRow {
         crate::terrain::CellRow {
             map_id: 0,
@@ -1090,8 +991,6 @@ mod tests {
 
     #[test]
     fn calibration_uses_authored_bounds_when_movt_does_not_fill_their_corners() {
-        // Map 36's retained Deadmines WMO placement, MOHD, and MODF values. MODF matches the
-        // transformed authored box while the actual transformed MOVT cloud is 2.36 yd tighter.
         let expected = Convention {
             shuffle: false,
             sign: 1.0,
@@ -1197,25 +1096,17 @@ mod tests {
 
     #[test]
     fn walk_grid_insets_by_the_agent_radius_but_obs_does_not() {
-        // A thin vertical WMO wall down the x = walk-nx-32 line must
-        // block one extra sub-cell on EACH side (the body inset — the corner-clip fix), while
-        // the obs/LoS grid keeps the true footprint (sight is a line, not a body).
         let cell = flat_cell();
         let (cx, cy) = (cell.cell_x, cell.cell_y);
         let wall_x = sub_center(cx, 32, WALK_DIM);
         let (y0, y1) = (sub_center(cy, 60, WALK_DIM), sub_center(cy, 3, WALK_DIM));
         let wall = wmo_tri([[wall_x, y0, 79.0], [wall_x, y1, 79.0], [wall_x, y0, 92.0]]);
         let row = rasterize_cell(&cell, &[wall]).expect("a wall dirties the cell");
-        // On the wall line: blocked.
         assert!(!walk_get(&row.walk, 32, 32));
-        // One sub-cell out (0.52 yd — inside `WALK_MARGIN`): blocked ONLY by the agent-radius
-        // inset; the bare 0.35 yd `RASTER_MARGIN` left it walkable and the body clipped corners.
         assert!(!walk_get(&row.walk, 31, 32));
         assert!(!walk_get(&row.walk, 33, 32));
-        // Two sub-cells out (1.04 yd — outside the margin): walkable, the inset is bounded.
         assert!(walk_get(&row.walk, 30, 32));
         assert!(walk_get(&row.walk, 34, 32));
-        // Obs: only the wall's own column (ox=16) rises — no body inset on the sight grid.
         assert!(obs_top(&row.obs, row.base_z, 16, 16).is_some());
         assert!(obs_top(&row.obs, row.base_z, 15, 16).is_none());
         assert!(obs_top(&row.obs, row.base_z, 17, 16).is_none());
@@ -1224,7 +1115,6 @@ mod tests {
     #[test]
     fn an_asymmetric_terrain_hole_uses_world_coordinate_axes() {
         let mut cell = flat_cell();
-        // Raw MCNK row one, column zero covers world-X subcells 16..32 and Y 0..16.
         cell.holes = 0x0010;
         let row = rasterize_cell(&cell, &[]).unwrap();
         assert!(!walk_get(&row.walk, 24, 8));
@@ -1233,10 +1123,8 @@ mod tests {
 
     #[test]
     fn a_row_carries_both_the_terrain_blockers_and_the_geometry_ones() {
-        // Holes are the importer's own blocker; the wall comes from the shared derivation. One
-        // row must carry both, and a hole alone must still emit a row.
         let mut cell = flat_cell();
-        cell.holes = 1; // quadrant (0, 0) → walk sub-cells 0..16 on both axes
+        cell.holes = 1;
         assert!(
             rasterize_cell(&cell, &[]).is_some(),
             "a hole dirties the cell"

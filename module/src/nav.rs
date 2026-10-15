@@ -1,39 +1,21 @@
-//! Nav grid: walkability and line-of-sight obstruction data.
-//!
-//! One row per terrain MCNK cell that has ANY obstruction, steep slope, or hole — fully-clear
-//! cells emit no row, so a missing chunk means "no obstacles known here" and every reader keeps
-//! today's straight-line behavior (the same off-slice fallback contract as `game_terrain_chunk`).
-//! Imported from the operator's own client geometry by `importer --nav` (licensing firewall).
-//! Blob layout + cell math live in `lyracore_shared::nav` (one copy, unit-tested there; the importer
-//! rasterizes through the SAME functions).
-
 #[cfg(feature = "debug_reducers")]
 use lyracore_shared::nav::OBS_DIM;
 use lyracore_shared::nav::{self, OBS_BYTES, WALK_BYTES, WALK_DIM};
 use lyracore_shared::terrain::{cell_index, cell_key};
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
-/// One terrain cell's nav data. `walk` is the 64×64 walkability bitmask; `obs` is the 32×32
-/// obstruction-height grid (may be EMPTY when the cell only has slope/hole unwalkability and
-/// nothing tall enough to block sight). [static]
 #[table(accessor = game_nav_chunk, public)]
 pub struct NavChunk {
-    /// (map << 32) | (cell_x << 16) | cell_y — same `cell_key` as `game_terrain_chunk`.
     #[primary_key]
     pub key: u64,
     pub map_id: u32,
     pub cell_x: u16,
     pub cell_y: u16,
-    /// Obs heights quantize against this (the cell's min terrain corner height).
     pub base_z: f32,
-    /// 512-byte walkability bitmask (`lyracore_shared::nav::walk_get`).
     pub walk: Vec<u8>,
-    /// 1024-byte obstruction grid (`lyracore_shared::nav::obs_top`), or empty = all-clear.
     pub obs: Vec<u8>,
 }
 
-/// Terrain and navigation imports, plus effective coverage changes, advance this singleton in
-/// their transaction. An absent row means the installed inputs predate revision tracking.
 #[table(accessor = game_navigation_revision, public)]
 pub struct NavigationRevision {
     #[primary_key]
@@ -51,8 +33,6 @@ pub struct NavigationInputs {
     pub coverage_generation: Option<u64>,
 }
 
-/// Identifies the inputs to movement on one map. It does not certify coverage at a position;
-/// the retained RouteStep carries that evidence. Dynamic obstacles still require bounded expiry.
 pub(crate) fn inputs(ctx: &ReducerContext, map_id: u32) -> NavigationInputs {
     NavigationInputs {
         imported_revision: ctx
@@ -83,8 +63,7 @@ pub(crate) fn record_change(ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Is (x, y) standable? `None` = no nav chunk here (un-imported or fully clear) — callers keep
-/// their current behavior, exactly like `terrain::ground_z`'s off-slice contract. One PK find.
+// Missing chunks mean unimported or fully clear terrain, so they do not prove coverage.
 pub(crate) fn walkable(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<bool> {
     let (cx, cy) = (cell_index(x)?, cell_index(y)?);
     let chunk = ctx
@@ -99,7 +78,6 @@ pub(crate) fn walkable(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Opt
     Some(nav::walk_get(&chunk.walk, nx, ny))
 }
 
-/// Obstruction top-Z over (x, y), or `None` when the column (or the whole cell) is clear.
 #[cfg(feature = "debug_reducers")]
 pub(crate) fn obstruction_top(ctx: &ReducerContext, map_id: u32, x: f32, y: f32) -> Option<f32> {
     let (cx, cy) = (cell_index(x)?, cell_index(y)?);
@@ -114,12 +92,6 @@ pub(crate) fn obstruction_top(ctx: &ReducerContext, map_id: u32, x: f32, y: f32)
     );
     nav::obs_top(&chunk.obs, chunk.base_z, ox, oy)
 }
-
-// ===========================================================================================
-//  Import reducers — blobs ride the packed-string path like terrain (`Vec<u8>` has no
-//  spacetime-SQL literal): rows `;`, fields `,`, blobs hex. An EMPTY walk field means
-//  "all 4096 bits set" (the common some-obs-but-fully-walkable cell, e.g. a low fence).
-// ===========================================================================================
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
@@ -179,7 +151,6 @@ fn load_nav_batch(ctx: &ReducerContext, packed: &str) -> Result<u32, String> {
     Ok(loaded)
 }
 
-/// Clear + load the first nav batch (operator-only), mirroring `import_terrain_chunks`.
 #[reducer]
 pub fn import_nav_chunks(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -194,7 +165,6 @@ pub fn import_nav_chunks(ctx: &ReducerContext, packed: String) -> Result<(), Str
     record_change(ctx)
 }
 
-/// Append a nav batch WITHOUT the reset — a zone spans many `spacetime call` args.
 #[reducer]
 pub fn import_nav_chunks_append(ctx: &ReducerContext, packed: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -204,18 +174,10 @@ pub fn import_nav_chunks_append(ctx: &ReducerContext, packed: String) -> Result<
     Ok(())
 }
 
-// ===========================================================================================
-//  Runtime consumption, the module-side wrappers over `lyracore_shared::nav`'s
-//  pure queries, gated on `game_config.nav_enabled` (default OFF; the benchmark + live
-//  verify flips it). Every wrapper degrades to straight-line behavior when the
-//  flag is off or a chunk is missing. `route_step` holds position when no path exists.
-// ===========================================================================================
-
 use crate::game_config;
 use crate::vmap::game_vmap_nav_coverage;
 use lyracore_shared::nav::NavCellData;
 
-/// The 243 consumption gate. Missing config row = false (fresh DB stays baseline).
 pub(crate) fn nav_enabled(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
@@ -225,7 +187,6 @@ pub(crate) fn nav_enabled(ctx: &ReducerContext) -> bool {
         .unwrap_or(false)
 }
 
-/// The vmap-derived coverage gate. Missing config row = false, like `nav_enabled`.
 pub(crate) fn nav_coverage_enabled(ctx: &ReducerContext) -> bool {
     ctx.db
         .game_config()
@@ -235,9 +196,6 @@ pub(crate) fn nav_coverage_enabled(ctx: &ReducerContext) -> bool {
         .unwrap_or(false)
 }
 
-/// The generation whose derived coverage may join planning on this map, or `None` for the
-/// terrain-only grid. Needs the gate on, an ACTIVE generation, and a COMPLETE manifest — partial
-/// coverage never routes, and a non-active generation's rows are invisible here.
 pub(crate) fn coverage_generation(ctx: &ReducerContext, map_id: u32) -> Option<u64> {
     if !nav_coverage_enabled(ctx) {
         return None;
@@ -245,8 +203,6 @@ pub(crate) fn coverage_generation(ctx: &ReducerContext, map_id: u32) -> Option<u
     crate::vmap::active_vmap_nav_coverage_manifest(ctx, map_id).map(|m| m.generation_id)
 }
 
-/// Fold coverage into the imported terrain cell. Either side may be absent: a cell only the vmap
-/// knows about routes off coverage alone, and a cell only the importer knows about is untouched.
 fn merged_cell(terrain: Option<NavCellData>, coverage: Option<NavCellData>) -> Option<NavCellData> {
     match (terrain, coverage) {
         (Some(terrain), Some(coverage)) => Some(nav::merge_cells(&terrain, &coverage)),
@@ -255,10 +211,6 @@ fn merged_cell(terrain: Option<NavCellData>, coverage: Option<NavCellData>) -> O
     }
 }
 
-/// Chunk fetch closure for the shared queries — one PK find per crossed cell, blobs cloned
-/// (a few KB; the shared layer memoizes per query). With coverage consuming, each cell also costs
-/// one indexed coverage lookup and a blob merge; the generation itself resolves ONCE per query
-/// (the same hoist `vmap::fetcher` does with its active-generation lookup), never per cell.
 fn fetcher(ctx: &ReducerContext, map_id: u32) -> impl FnMut(u16, u16) -> Option<NavCellData> + '_ {
     let generation = coverage_generation(ctx, map_id);
     move |cx, cy| fetch_cell(ctx, map_id, generation, cx, cy).0
@@ -304,7 +256,6 @@ fn fetch_cell(
     (merged_cell(terrain, coverage), matching)
 }
 
-/// Closed doors apply even where static geometry falls back to the coarse navigation grid.
 pub(crate) fn has_los(
     ctx: &ReducerContext,
     map_id: u32,
@@ -321,16 +272,13 @@ pub(crate) fn has_los(
     lyracore_shared::nav::has_los(&mut fetcher(ctx, map_id), a, b)
 }
 
-/// Maximum expansions consumed by one route step. Packages reserve this budget before movement.
 pub(crate) const LEG_MAX_EXPANSIONS: u32 = 16_384;
 
-/// Complete and Partial describe the planned route, including when collision stops this step.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub enum RouteStatus {
     Complete,
     Partial,
     Blocked,
-    /// Navigation is disabled. The collision Gate still applies.
     Direct,
 }
 
@@ -341,8 +289,6 @@ pub enum RouteStatus {
 )]
 pub enum CoverageEvidence {
     Unknown,
-    /// Every consulted navigation cell has a matching derived row from the active generation's
-    /// finalized manifest. This does not certify terrain coverage or the world import scope.
     VerifiedCells(VerifiedRouteCells),
 }
 
@@ -374,8 +320,6 @@ pub struct RouteClip {
     pub hit: RoutePoint,
 }
 
-/// `endpoint == from` means no movement. Complete means a route was planned, not arrival. Static
-/// collision and exact walk-mask validation may shorten the committed endpoint.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq)]
 #[cfg_attr(
     not(has_packages),
@@ -400,7 +344,6 @@ pub struct RoutePath {
     pub points: Vec<(f32, f32, f32)>,
 }
 
-/// Retain a bounded part of one route, including its turns, after checking every segment.
 #[cfg_attr(
     not(has_packages),
     allow(dead_code, reason = "retained Package API operation")
@@ -424,7 +367,6 @@ pub(crate) fn route_path(
     )
 }
 
-/// Use a caller's smaller search allowance while retaining the normal movement limits.
 #[cfg_attr(
     not(has_packages),
     allow(dead_code, reason = "retained Package API operation")
@@ -606,8 +548,7 @@ struct WalkingStep {
     clipping: Option<RouteClip>,
 }
 
-/// Resample a clipped floor segment down to half a navigation cell. A clear shorter step must
-/// pass the original collision point; stopping before it would erode the wall clearance margin.
+// A shortened probe must clear the original collision point to avoid eroding walls.
 #[cfg_attr(
     not(has_packages),
     allow(dead_code, reason = "retained Package API operation")
@@ -647,8 +588,6 @@ fn sample_walking_step(
     original
 }
 
-/// Fit vanilla's quarter-yard points without cutting corners. A small bounded search permits
-/// neighboring points to move together; every accepted segment still passes the normal Gates.
 #[cfg_attr(
     not(has_packages),
     allow(dead_code, reason = "retained Package API operation")
@@ -695,7 +634,6 @@ fn fit_wire_path(
             {
                 continue;
             }
-            // Routes are ordered by total displacement, so the first valid predecessor is best.
             if let Some((route, cost)) = routes.iter().find(|(route, _)| {
                 gate(
                     *route.last().expect("a fitted route includes its start"),
@@ -741,7 +679,6 @@ fn segment_clear_with_fetch(
         && (!enabled || nav::walkable_prefix(fetch, start, end) == end)
 }
 
-/// Recheck a retained segment against current collision and walk coverage without another search.
 pub(crate) fn route_segment_clear(
     ctx: &ReducerContext,
     map_id: u32,
@@ -760,9 +697,7 @@ pub(crate) fn route_segment_clear(
     )
 }
 
-/// Plan one bot movement step. A failed search holds position; sparse missing rows retain
-/// unknown coverage. Collision can shorten complete, partial, and direct steps independently.
-#[allow(clippy::too_many_arguments)] // A movement step carries its partition, endpoints and distances.
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(
     not(has_packages),
     allow(dead_code, reason = "retained Package API operation")
@@ -808,7 +743,6 @@ pub(crate) fn route_step(
         cell
     };
     let attempted = if enabled {
-        // The search exempts its starting sub-cell and may finish without fetching it.
         if let (Some(cx), Some(cy)) = (cell_index(cur.0), cell_index(cur.1)) {
             fetch(cx, cy);
         }
@@ -860,16 +794,7 @@ pub(crate) fn route_step(
     result
 }
 
-/// Steps toward a walkable path's first waypoint, then gates every result against geometry.
-/// A missing path may aim straight at the goal, but the commit gate stops it at obstructions.
-///
-/// PERF NOTE: the gate fires on every committed movement step for chase/return/wander/flee/
-/// pet-follow — the ~500ms movement tick, 8x more often than the ~4s sense tick the benchmark
-/// (`debug_bench_los`) measured `vmap::los_ray` against. `debug_bench_collision_gate`
-/// (`debug/instance.rs`) is the companion harness for THIS path — run it against the same box
-/// before flipping `vmap_enabled` on a populated map, and compare its wall time to
-/// `debug_bench_los(exact=true)`'s on that box.
-#[allow(clippy::too_many_arguments)] // A movement step carries its partition, endpoints and distances.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nav_step(
     ctx: &ReducerContext,
     map_id: u32,
@@ -894,20 +819,14 @@ pub(crate) fn nav_step(
                 let wp = path[0];
                 crate::creatures::chase_step(cur.0, cur.1, wp.0, wp.1, max_step, 0.0)
             }
-            // Keep aiming at an unreachable goal; the commit gate truncates the move at geometry.
             None => crate::creatures::chase_step(cur.0, cur.1, dest.0, dest.1, max_step, stop_dist),
         }
     };
     step_gate(ctx, map_id, instance_id, cur, stepped, z)
 }
 
-/// The margin `nav_step`'s step gate stops short of a ray hit by — same value
-/// `blink_forward`'s clamp uses (`BLINK_CLEARANCE_YD`), so a walked stop and a Blink stop land at
-/// the same distance from a wall.
 const GATE_CLEARANCE_YD: f32 = 1.0;
 
-/// The single commit-point gate for every `nav_step` result.
-/// Exact vmap collision takes precedence; the obstruction grid is the fallback when nav is enabled.
 fn step_gate(
     ctx: &ReducerContext,
     map_id: u32,
@@ -939,7 +858,7 @@ fn step_gate_with_fetch(
     gate_step(cur, stepped, |from, to| {
         let exact = crate::vmap::collision_ray(ctx, map_id, instance_id, from, to);
         let grid = if !crate::vmap::vmap_enabled(ctx, map_id) && nav_enabled(ctx) {
-            // The grid query adds eye height itself, so it starts at foot height.
+            // The grid query adds eye height itself; pass foot height here.
             lyracore_shared::nav::step_hit(fetch, cur, stepped)
                 .map(|p| [p.0, p.1, height_on_segment(from.into(), to.into(), p)])
         } else {
@@ -949,7 +868,6 @@ fn step_gate_with_fetch(
     })
 }
 
-/// Retain the checked segment's slope when a horizontal Gate shortens movement.
 fn height_on_segment(from: (f32, f32, f32), to: (f32, f32, f32), at: (f32, f32)) -> f32 {
     let length = (to.0 - from.0).hypot(to.1 - from.1);
     let fraction = ((at.0 - from.0).hypot(at.1 - from.1) / length.max(0.001)).min(1.0);
@@ -964,7 +882,6 @@ fn gate_step(
     if stepped == cur {
         return ((stepped.0, stepped.1), None);
     }
-    // Probe above walkable steps. A ray at foot height stops on every stair riser.
     let probe_height = lyracore_shared::nav::WALK_STEP_UP;
     let hit = collision(
         [cur.0, cur.1, cur.2 + probe_height],
@@ -976,7 +893,7 @@ fn gate_step(
             let hit_dist = (dx * dx + dy * dy).sqrt();
             let land_dist = hit_dist - GATE_CLEARANCE_YD;
             let endpoint = if land_dist <= 0.0 {
-                (cur.0, cur.1) // hit inside the clearance margin — hold in place
+                (cur.0, cur.1)
             } else {
                 (
                     cur.0 + dx / hit_dist * land_dist,
@@ -995,11 +912,6 @@ fn gate_step(
     }
 }
 
-/// Probe-only: the raw `find_leg_ex` outcome as a printable summary (waypoints + expansions),
-/// tagged with the coverage generation that planned it. That tag is what makes a before/after
-/// pair readable: the same leg run with the gate off and on shows how many expansions routing
-/// around real geometry actually costs against `LEG_MAX_EXPANSIONS`, and `complete=false` means
-/// the budget ran out and the leg is best-effort.
 #[cfg(feature = "debug_reducers")]
 pub(crate) fn debug_find_leg(
     ctx: &ReducerContext,
@@ -1296,7 +1208,6 @@ mod tests {
             },
         ];
         for (from, to, expected_x) in [
-            // The body ray reaches the surface at x=1204; retain one yard of clearance.
             ((1200.0, 1200.0, 49.0), (1205.0, 1200.0, 51.0), 1203.0),
             ((1201.0, 1200.0, 49.0), (1201.0, 1200.0, 51.0), 1201.0),
         ] {
@@ -1315,8 +1226,6 @@ mod tests {
         }
     }
 
-    /// The whole point of the read seam: an imported cell that knows nothing about a wall picks up
-    /// the coverage's blockers, and coverage alone still routes where no nav row was imported.
     #[test]
     fn either_side_can_block_and_a_lone_side_passes_through_unchanged() {
         let mut terrain = open(80.0);
@@ -1333,7 +1242,6 @@ mod tests {
         let coverage_only = merged_cell(None, Some(coverage)).unwrap();
         assert!(walk_get(&coverage_only.walk, 5, 5) && !walk_get(&coverage_only.walk, 9, 9));
 
-        // Neither source covering the cell keeps the missing-chunk contract: no obstacles known.
         assert!(merged_cell(None, None).is_none());
     }
 }

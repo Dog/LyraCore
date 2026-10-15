@@ -1,4 +1,3 @@
-//! One opcode has one owning Protocol Family, independent of declaration order.
 use super::handlers::*;
 use super::social::Social;
 use super::*;

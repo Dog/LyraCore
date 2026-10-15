@@ -1,11 +1,7 @@
-//! Body display derived from active transform effects.
-
 use crate::{game_aura, game_creature_template, game_world_entity};
 use lyracore_shared::spell::taxonomy::{A_TRANSFORM, P_ENTRY};
 use spacetimedb::ReducerContext;
 
-/// The newest transform with a known creature display wins. Removing it restores the
-/// preceding transform, or the native body when none remains.
 pub(crate) fn recompute_display(ctx: &ReducerContext, guid: u64) {
     let Some(mut entity) = ctx.db.game_world_entity().guid().find(guid) else {
         return;

@@ -1,14 +1,12 @@
-//! Unit and golden-vector tests for the wire codec.
-
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
-// Only the loot byte-match test needs gtker's typed loot response (the runtime path is raw).
+
 use wow_world_messages::vanilla::ServerMessage;
 use wow_world_messages::vanilla::{
     EnvironmentalDamageType, MSG_MOVE_HEARTBEAT_Client, SMSG_LOOT_RESPONSE_LootMethod, TimerType,
     SMSG_LOOT_RESPONSE,
 };
-// Group loot methods: the vote-kind byte constants + wire RollVote enum.
+
 use lyracore_shared::loot_roll::vote_kind;
 use wow_world_messages::vanilla::RollVote;
 
@@ -29,7 +27,7 @@ fn warrior_entity() -> EntityView {
         level: 1,
         run_speed_mult_bp: 10_000,
         faction_template: 1,
-        unit_bytes_0: 1 | (1 << 8) | (1 << 24), // human warrior male rage
+        unit_bytes_0: 1 | (1 << 8) | (1 << 24),
         display_id: 49,
         native_display_id: 49,
         ..Default::default()
@@ -73,14 +71,8 @@ fn character_create_restores_the_private_watched_faction() {
     }
 }
 
-/// Reputation relay: a known faction id maps to its `Faction` enum value and the signed standing
-/// survives the wire `u32` bit-cast (the client reads it back as `i32`); an unknown faction id yields
-/// `None` so the relay skips silently instead of sending garbage.
 #[test]
 fn set_faction_standing_raw_sends_the_rep_index_not_the_faction_id() {
-    // 5875 layout: count(u32) + ReputationListID(u32) + standing(u32) = 12 bytes. The CRASH FIX: the middle
-    // field is the rep-list INDEX (Stormwind = 19), NOT the faction id (72). Sending 72 indexed past the
-    // client's 64-slot rep array → null deref → ERROR. The caller passes game_faction.reputation_index.
     let (opcode, body) =
         build_set_faction_standing_raw(19, 500).expect("a valid rep-index always builds");
     assert_eq!(opcode, 0x0124);
@@ -104,7 +96,6 @@ fn set_faction_standing_raw_sends_the_rep_index_not_the_faction_id() {
         500,
         "standing survives"
     );
-    // Negative standing (e.g. Hostile) bit-casts through the u32 unchanged.
     let (_, neg) = build_set_faction_standing_raw(19, -42000).unwrap();
     assert_eq!(
         u32::from_le_bytes(neg[8..12].try_into().unwrap()) as i32,
@@ -112,24 +103,16 @@ fn set_faction_standing_raw_sends_the_rep_index_not_the_faction_id() {
     );
 }
 
-/// The raw-send envelope is byte-identical to gtker's: build the SAME slot-0 aura VALUES update
-/// both ways (gtker's typed `UpdatePlayer` slot-0 aura builder vs our `build_values_update_raw`
-/// fed the equivalent mask) and assert the opcode + the whole body match. Pins the block-count /
-/// has_transport / update-type / packed-guid envelope + the SMSG_UPDATE_OBJECT opcode so the raw
-/// path can carry a multi-slot mask the typed builder can't express, without ever drifting from the
-/// real wire shape.
 #[test]
 fn raw_values_body_matches_gtker_envelope() {
     use super::update_mask::{self, idx, AuraSlot};
     let (guid, spell_id, level, flags) = (0x42u64, 6673u32, 1u8, 0x09u8);
 
-    // gtker's typed slot-0 aura VALUES update, with the same finalize→dirty_reset→re-set-only-changed
-    // discipline the live builders use so OBJECT_FIELD_TYPE never leaks (stripped by dirty_reset).
     let mut player = UpdatePlayer::builder()
         .set_unit_aura(spell_id as i32)
         .set_unit_auraflags(flags, 0, 0, 0)
         .set_unit_auralevels(level, 0, 0, 0)
-        .set_unit_auraapplications(0, 0, 0, 0) // stack count 1 is stored as 0
+        .set_unit_auraapplications(0, 0, 0, 0)
         .finalize();
     player.dirty_reset();
     player.set_unit_aura(spell_id as i32);
@@ -147,7 +130,7 @@ fn raw_values_body_matches_gtker_envelope() {
     .write_unencrypted_server(&mut gtker)
     .unwrap();
     let gtker_opcode = u16::from_le_bytes([gtker[2], gtker[3]]);
-    let gtker_body = &gtker[4..]; // strip [size:2 BE][opcode:2 LE]
+    let gtker_body = &gtker[4..];
 
     let mut mask = update_mask::UpdateMaskValues::new();
     update_mask::write_auras(
@@ -159,7 +142,7 @@ fn raw_values_body_matches_gtker_envelope() {
             level,
         }],
     );
-    mask.set_u32(idx::UNIT_AURAAPPLICATIONS, 0); // gtker's slot-0 aura builder emits this present-zero word
+    mask.set_u32(idx::UNIT_AURAAPPLICATIONS, 0);
     let (our_opcode, our_body) = build_values_update_raw(guid, &mask);
 
     assert_eq!(
@@ -205,8 +188,6 @@ fn movement_info_bytes_roundtrip() {
         fall_time: 0.0,
     };
     let bytes = movement_info_to_bytes(&info).unwrap();
-    // A vanilla MovementInfo with no flags is a fixed 28-byte body (flags u32 + time u32 +
-    // xyz 3×f32 + orientation f32 + fall_time f32).
     assert_eq!(bytes.len(), 28);
     let back = bytes_to_movement_info(&bytes).unwrap();
     assert_eq!(back, info);
@@ -217,9 +198,9 @@ fn name_query_response_maps_seeded_warrior() {
     let c = CharacterView {
         guid: 1,
         name: "Tester".into(),
-        race: 1,   // Human
-        class: 1,  // Warrior
-        gender: 0, // Male
+        race: 1,
+        class: 1,
+        gender: 0,
         ..Default::default()
     };
     let r = build_name_query_response(&c).unwrap();
@@ -233,11 +214,6 @@ fn name_query_response_maps_seeded_warrior() {
 
 #[test]
 fn health_values_update_is_health_only_no_object_type() {
-    // Combat-crash regression (2026-06-16): a partial VALUES update must carry ONLY
-    // UNIT_FIELD_HEALTH (descriptor bit 22). The gtker builder seeds OBJECT_FIELD_TYPE (bit 2)
-    // dirty; `build_health_values` strips it via dirty_reset, because re-sending TYPE in a
-    // partial update crashes the 1.12 client (it overwrites the cached object type, stripping the
-    // PLAYER bit on the player's own object → null deref at 0x0060655A / null+0x110).
     let guid = (0xF130u64 << 48) | (620u64 << 24) | 1;
     let msg = build_health_values(guid, 20);
     match &msg.objects[0] {
@@ -250,12 +226,6 @@ fn health_values_update_is_health_only_no_object_type() {
         }
         other => panic!("expected Object::Values, got {other:?}"),
     }
-    // The update mask is the LAST thing written, so the body tail is exactly:
-    //   block_count(u8)=1 | mask word 0x00400000 LE (bit 22 only, NO bit 2) | value = health LE.
-    // A re-sent OBJECT_FIELD_TYPE would make the mask word 0x00400004 with a 0x09 value word
-    // ahead of the health word — this assertion fails in that case, guarding the regression.
-    // (We deliberately do NOT round-trip: gtker's strict reader rejects a TYPE-less mask, but the
-    // real 5875 client — the only consumer — requires TYPE's absence, like cmangos/vmangos.)
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
     assert!(
@@ -267,10 +237,6 @@ fn health_values_update_is_health_only_no_object_type() {
 
 #[test]
 fn resistance_values_is_unit_only_no_object_type() {
-    // Live armor and magic resistance must use a Unit VALUES mask carrying only
-    // UNIT_FIELD_RESISTANCES[0..=6], never
-    // re-sending OBJECT_FIELD_TYPE (bit 2, value 0x09 = OBJECT|UNIT) whose re-send strips the PLAYER bit
-    // → 5875 null+0x110 crash. Same dirty_reset discipline as build_health_values.
     let guid = (0xF130u64 << 48) | (620u64 << 24) | 1;
     let resistances = [0x1234u32, 1, 2, 3, 4, 5, 6];
     let msg = build_resistance_values(guid, resistances);
@@ -286,30 +252,15 @@ fn resistance_values_is_unit_only_no_object_type() {
     }
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
-    // The update mask is the last thing written: descriptors 155..=161 span blocks 4 and 5. A leaked
-    // OBJECT_FIELD_TYPE would set bit 2 in block 0 and add a 0x09 value word ahead of the armor word, so
-    // this exact-tail assertion fails in that case (guarding the crash regression).
     assert!(
         buf.ends_with(&[
-            0x06, // block_count = 6 (the mask spans blocks 0..=5)
-            0, 0, 0, 0, // block 0 (NO OBJECT_FIELD_TYPE bit 2)
-            0, 0, 0, 0, // block 1
-            0, 0, 0, 0, // block 2
-            0, 0, 0, 0, // block 3
-            0x00, 0x00, 0x00, 0xf8, // block 4 = descriptors 155..=159
-            0x03, 0x00, 0x00, 0x00, // block 5 = descriptors 160..=161
-            0x34, 0x12, 0x00, 0x00, // armor value 0x1234 LE
-            1, 0, 0, 0, // holy
-            2, 0, 0, 0, // fire
-            3, 0, 0, 0, // nature
-            4, 0, 0, 0, // frost
-            5, 0, 0, 0, // shadow
-            6, 0, 0, 0, // arcane
+            0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0xf8, 0x03,
+            0x00, 0x00, 0x00, 0x34, 0x12, 0x00, 0x00, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0,
+            0, 5, 0, 0, 0, 6, 0, 0, 0,
         ]),
         "resistance VALUES must carry only indices 155..=161; tail was {:02x?}",
         &buf[buf.len().saturating_sub(56)..]
     );
-    // Belt-and-suspenders: the OBJECT_FIELD_TYPE value word (0x09 = OBJECT|UNIT) must be absent anywhere.
     let contains = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
     assert!(
         !contains(&[0x09, 0x00, 0x00, 0x00]),
@@ -320,12 +271,8 @@ fn resistance_values_is_unit_only_no_object_type() {
 
 #[test]
 fn dynamic_flags_values_is_unit_only_no_object_type() {
-    // Corpse render bit: the killing-blow dynamic_flags update must be a Unit VALUES
-    // mask carrying ONLY UNIT_DYNAMIC_FLAGS — never re-sending OBJECT_FIELD_TYPE (bit 2, value
-    // 0x09 = OBJECT|UNIT), which crashes the 1.12 client. Same dirty_reset discipline as
-    // build_health_values; this guards that the new builder didn't regress it.
     let guid = (0xF130u64 << 48) | (620u64 << 24) | 1;
-    let msg = build_dynamic_flags_values(guid, 0x20); // UNIT_DYNFLAG_DEAD
+    let msg = build_dynamic_flags_values(guid, 0x20);
     match &msg.objects[0] {
         Object::Values { guid1, mask1 } => {
             assert_eq!(guid1.guid(), guid);
@@ -338,8 +285,6 @@ fn dynamic_flags_values_is_unit_only_no_object_type() {
     }
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
-    // The dynamic_flags value word (0x20 LE) must be present; the OBJECT_FIELD_TYPE value word
-    // (0x09 LE) must be absent — its presence would mean TYPE leaked into the partial mask.
     let contains = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
     assert!(
         contains(&[0x20, 0x00, 0x00, 0x00]),
@@ -355,9 +300,7 @@ fn dynamic_flags_values_is_unit_only_no_object_type() {
 
 #[test]
 fn coinage_values_is_player_mask_without_object_type() {
-    // The live purse update must be a Player VALUES mask carrying ONLY
-    // PLAYER_FIELD_COINAGE — never re-sending OBJECT_FIELD_TYPE (0x09). Same dirty_reset guard.
-    let msg = build_coinage_values(1, 0x111); // 273 copper, a recognizable LE pattern
+    let msg = build_coinage_values(1, 0x111);
     match &msg.objects[0] {
         Object::Values { guid1, mask1 } => {
             assert_eq!(guid1.guid(), 1);
@@ -385,12 +328,6 @@ fn coinage_values_is_player_mask_without_object_type() {
 
 #[test]
 fn aura_values_is_player_mask_without_object_type() {
-    // The aura tracer's buff-icon update goes out on the LIVE relay path (stdb → full_aura_mask +
-    // build_values_update_raw), the multi-slot encoder that replaced the slot-0-only typed builder.
-    // The mask must carry the aura fields but NEVER OBJECT_FIELD_TYPE (0x09), whose re-send crashes
-    // the 5875 client at null+0x110 — the make-or-break guard for the whole spell tier. Here the
-    // trap is structural (full_aura_mask never inserts index 2), and build_values_update_raw also
-    // debug-asserts its absence; this pins it on the wire bytes regardless.
     use super::update_mask::{self, idx, AuraSlot};
     let win = |b: &[u8], needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
 
@@ -411,9 +348,6 @@ fn aura_values_is_player_mask_without_object_type() {
         body
     );
 
-    // OBJECT_FIELD_TYPE-leak check via the CLEAR path: with no auras present every aura field is 0,
-    // so any `09 00 00 00` word would be a leaked OBJECT_FIELD_TYPE (0x09 = OBJECT|UNIT). (We can't
-    // search the apply path for it — auraflags=0x09 legitimately produces the same value word.)
     let clear = update_mask::full_aura_mask(&[]);
     assert!(
         clear.get(idx::OBJECT_TYPE).is_none(),
@@ -429,10 +363,6 @@ fn aura_values_is_player_mask_without_object_type() {
 
 #[test]
 fn loot_response_envelope_matches_gtker() {
-    // The RAW loot response must reuse gtker's exact money-only ENVELOPE (guid u64, loot_method
-    // u8, gold u32, count u8) — only the per-item bytes are ours (gtker's item codec is short).
-    // Pin it: our raw body (no items) must equal gtker's SMSG_LOOT_RESPONSE body byte-for-byte,
-    // and the opcode must match. (Same discipline as the iter-14 raw-aura envelope test.)
     let guid = (0xF130u64 << 48) | (620u64 << 24) | 1;
     let (opcode, body) = build_loot_response_raw(guid, 13, &[]);
     let gtker = ServerOpcodeMessage::SMSG_LOOT_RESPONSE(Box::new(SMSG_LOOT_RESPONSE {
@@ -443,7 +373,6 @@ fn loot_response_envelope_matches_gtker() {
     }));
     let mut framed = Vec::new();
     gtker.write_unencrypted_server(&mut framed).unwrap();
-    // Strip gtker's 4-byte server header ([size:u16 BE][opcode:u16 LE]) to get the body.
     let gtker_opcode = u16::from_le_bytes([framed[2], framed[3]]);
     assert_eq!(
         opcode, gtker_opcode,
@@ -458,11 +387,8 @@ fn loot_response_envelope_matches_gtker() {
 
 #[test]
 fn loot_response_item_layout_is_full_vanilla() {
-    // One item must serialize the FULL vanilla 22-byte layout (slot, id, count, display, 0,0, ty),
-    // NOT gtker's short 6-byte form. Spot-check the offsets + total length.
     let guid = 0xF130_0000_0000_0001;
     let (_op, body) = build_loot_response_raw(guid, 5, &[(0, 25, 2, 1542, 117)]);
-    // envelope = 8 (guid) + 1 (method) + 4 (gold) + 1 (count) = 14; one item = 22 → 36 total.
     assert_eq!(
         body.len(),
         14 + 22,
@@ -490,8 +416,6 @@ fn loot_response_item_layout_is_full_vanilla() {
     assert_eq!(it[21], 0, "slot_type = TypeAllowLoot");
 }
 
-// ---- Group loot methods — codec pins for the roll messages ----
-
 #[test]
 fn loot_start_roll_carries_the_countdown_and_item() {
     let m = build_loot_start_roll(0xF130_0000_0000_0007, 3, 1234, 60_000, 117);
@@ -500,7 +424,6 @@ fn loot_start_roll_carries_the_countdown_and_item() {
     assert_eq!(m.item, 1234);
     assert_eq!(m.item_random_property_id, 117);
     assert_eq!(m.countdown_time, std::time::Duration::from_millis(60_000));
-    // Round-trips through the real vanilla wire encode without error (opcode 0x02A1).
     let msg = ServerOpcodeMessage::SMSG_LOOT_START_ROLL(Box::new(m));
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
@@ -509,10 +432,6 @@ fn loot_start_roll_carries_the_countdown_and_item() {
 
 #[test]
 fn wire_roll_number_signals_pass_as_128_and_passes_a_real_roll_through() {
-    // vanilla's SMSG_LOOT_ROLL has NO separate auto_pass field (confirmed against the vendored
-    // crate — a TBC/WRATH-only addition); a PASS is instead `roll_number > 127` per the field's own
-    // doc comment. `[V]`: the exact sentinel byte (128 vs some other >127 value) is unverified
-    // against a real client — 128 matches cmangos/vmangos.
     assert_eq!(wire_roll_number(vote_kind::PASS, 0), 128);
     assert_eq!(
         wire_roll_number(vote_kind::NEED, 87),
@@ -532,7 +451,6 @@ fn loot_roll_carries_the_voter_item_and_vote() {
     assert_eq!(m.roll_number, 87);
     assert_eq!(m.item_random_property_id, 117);
     assert_eq!(m.vote, RollVote::Need);
-    // A PASS vote's roll_number folds to the >127 sentinel regardless of the stored `rolled` (0).
     let pass = build_loot_roll(0xF130_0000_0000_0007, 3, 55, 1234, 0, vote_kind::PASS, 117);
     assert_eq!(pass.roll_number, 128);
     assert_eq!(pass.vote, RollVote::Pass);
@@ -547,7 +465,6 @@ fn loot_roll_won_carries_the_winner_roll_and_winning_tier() {
     assert_eq!(m.winning_player.guid(), 55);
     assert_eq!(m.winning_roll, 96);
     assert_eq!(m.vote, RollVote::Need);
-    // A greed-only contest reports Greed — the tier is threaded, not hardcoded.
     let g = build_loot_roll_won(0xF130_0000_0000_0007, 3, 1234, 55, 42, vote_kind::GREED, 0);
     assert_eq!(g.vote, RollVote::Greed);
 }
@@ -559,28 +476,20 @@ fn loot_master_list_carries_every_eligible_guid() {
     assert_eq!(m.guids[0].guid(), 10);
     assert_eq!(m.guids[1].guid(), 20);
     assert_eq!(m.guids[2].guid(), 30);
-    // Round-trips through the real vanilla wire encode without error (opcode 0x02A4).
     let msg = ServerOpcodeMessage::SMSG_LOOT_MASTER_LIST(Box::new(m));
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
     assert!(!buf.is_empty());
 }
 
-// ---- Money-loot split — codec pin for the MONEY_SHARE relay ----
-
 #[test]
 fn loot_money_notify_carries_the_share_not_a_hardcoded_total() {
-    // The gateway's grouped-split relay decodes a `MONEY_SHARE` event payload and rebuilds
-    // `SMSG_LOOT_MONEY_NOTIFY` straight from it (`stdb/subscriptions.rs`) — pin that the wire
-    // builder's `amount` field is exactly the decoded share, for a value that would be wrong if the
-    // relay ever passed the corpse's TOTAL instead of the per-recipient share.
     let share = lyracore_shared::loot_roll::decode_money_share(
         &lyracore_shared::loot_roll::encode_money_share(17),
     )
     .unwrap();
     let m = build_loot_money_notify(share);
     assert_eq!(m.amount, 17);
-    // Round-trips through the real vanilla wire encode without error (opcode 0x0154).
     let msg = ServerOpcodeMessage::SMSG_LOOT_MONEY_NOTIFY(m);
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
@@ -589,11 +498,8 @@ fn loot_money_notify_carries_the_share_not_a_hardcoded_total() {
 
 #[test]
 fn ghost_values_is_player_mask_without_object_type() {
-    // The ghost transition relay carries PLAYER_FLAGS (GHOST) + UNIT_FIELD_BYTES_1 only,
-    // and must NOT re-send OBJECT_FIELD_TYPE (0x09) — same dirty_reset discipline as the other
-    // partial-VALUES builders (re-sending TYPE crashes the 5875 client).
     let guid = 1;
-    let msg = build_player_flags_values(guid, 0x10, 0x0100_0000); // PLAYER_FLAGS_GHOST + vis-ghost byte 3
+    let msg = build_player_flags_values(guid, 0x10, 0x0100_0000);
     match &msg.objects[0] {
         Object::Values { guid1, mask1 } => {
             assert_eq!(guid1.guid(), guid);
@@ -626,9 +532,6 @@ fn ghost_values_is_player_mask_without_object_type() {
 
 #[test]
 fn corpse_create_is_a_corpse_object_with_race_in_bytes1() {
-    // The crash regression: the client null-derefs if CORPSE_FIELD_BYTES_1 doesn't carry
-    // the RACE in byte 1. The module packs bytes_1 = 0 | race<<8 | gender<<16 | skin<<24; this
-    // confirms the codec emits a CORPSE object and passes that word through with race in byte 1.
     let corpse = CorpseView {
         guid: (0xF101u64 << 48) | 1,
         owner_guid: 1,
@@ -637,7 +540,7 @@ fn corpse_create_is_a_corpse_object_with_race_in_bytes1() {
         z: 83.0,
         orientation: 0.0,
         display_id: 49,
-        bytes_1: (1u32 << 8) | (1u32 << 16) | (5u32 << 24), // race=1, gender=1, skin=5
+        bytes_1: (1u32 << 8) | (1u32 << 16) | (5u32 << 24),
         bytes_2: 0,
         is_bones: false,
     };
@@ -659,7 +562,6 @@ fn corpse_create_is_a_corpse_object_with_race_in_bytes1() {
     }
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
-    // CORPSE_FIELD_BYTES_1 value word = 0x05010100 → LE [00, 01, 01, 05]: byte1=race(1), byte2=gender(1).
     assert!(
         buf.windows(4).any(|w| w == [0x00, 0x01, 0x01, 0x05]),
         "corpse BYTES_1 must carry race in byte 1 (not the player_bytes layout); buf {:02x?}",
@@ -669,11 +571,6 @@ fn corpse_create_is_a_corpse_object_with_race_in_bytes1() {
 
 #[test]
 fn corpse_create_object_flags_bones_state_work_item_201() {
-    // A live body carries CORPSE_FLAG_UNK2 (0x04, what every real vanilla body sends); once the body
-    // has decayed to bones (`Corpse::is_bones`), the object should instead carry
-    // CORPSE_FLAG_BONE (0x01) so a real client renders bare bones instead of the dead body.
-    // UNVERIFIED-until-observed — no live client has confirmed this bit actually drives the bones
-    // render; the flag mapping is inferred from mangos' `CORPSE_FLAG_BONE` naming.
     let live = CorpseView {
         guid: 1,
         owner_guid: 1,
@@ -732,9 +629,6 @@ fn corpse_query_found_carries_position_else_not_found() {
 
 #[test]
 fn resurrect_request_names_the_caster_and_flags_player() {
-    // The offer must name the CASTER (the client's "<Name> requests to resurrect you" prompt)
-    // and echo the caster's guid — the dead target answers CMSG_RESURRECT_RESPONSE against THIS guid,
-    // not their own. `player` is always true (the module only ever offers this to a player target).
     let msg = build_resurrect_request(42, "Priestly".to_string());
     assert_eq!(msg.guid.guid(), 42);
     assert_eq!(msg.name, "Priestly");
@@ -743,9 +637,6 @@ fn resurrect_request_names_the_caster_and_flags_player() {
 
 #[test]
 fn levelup_values_is_player_mask_without_object_type() {
-    // The ding descriptor update (UNIT_FIELD_LEVEL + maxhealth + health + xp) must be a Player
-    // mask and must NOT re-send OBJECT_FIELD_TYPE (bit 2 / value 0x09) — same dirty_reset
-    // discipline as build_health_values (see that test for the byte-level guard on the pattern).
     let msg = build_levelup_values(1, 2, 75, 75, 0, 900, 0, 1000);
     match &msg.objects[0] {
         Object::Values { guid1, mask1 } => {
@@ -757,9 +648,6 @@ fn levelup_values_is_player_mask_without_object_type() {
         }
         other => panic!("expected Object::Values, got {other:?}"),
     }
-    // OBJECT_FIELD_TYPE (bit 2) lives in mask block 0; its value word is 0x09 (OBJECT|UNIT) — none
-    // of our fields are 9, so its absence in the body proves TYPE wasn't re-sent (level=2,
-    // health/maxhealth=75, xp=0, next=900 never serialize as 0x09_00_00_00).
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
     let type_word = [0x09u8, 0x00, 0x00, 0x00];
@@ -772,12 +660,6 @@ fn levelup_values_is_player_mask_without_object_type() {
 
 #[test]
 fn levelup_values_sets_character_points1_at_l10() {
-    // A mid-session ding to L10 must include PLAYER_CHARACTER_POINTS1=1 in the VALUES packet so the
-    // talent pane shows 1 free point immediately (without relog). Verify by looking for the value
-    // word [0x01, 0x00, 0x00, 0x00] in the wire body — at L10 it MUST be present.
-    // NOTE: we use level=10 (not 9) to avoid the collision where the level value itself serializes
-    // as [0x09, 0x00, 0x00, 0x00] (the same pattern as OBJECT_FIELD_TYPE). The OBJECT_FIELD_TYPE
-    // guard is already proven by levelup_values_is_player_mask_without_object_type at level=2.
     let msg_l10 = build_levelup_values(1, 10, 100, 100, 0, 1500, 0, 1500);
     let mut buf = Vec::new();
     msg_l10.write_unencrypted_server(&mut buf).unwrap();
@@ -796,7 +678,6 @@ fn attack_start_carries_attacker_and_victim() {
     let msg = build_attack_start(player, chicken);
     assert_eq!(msg.attacker.guid(), player);
     assert_eq!(msg.victim.guid(), chicken);
-    // Round-trip through the wire codec.
     let server: ServerOpcodeMessage = ServerOpcodeMessage::SMSG_ATTACKSTART(Box::new(msg));
     let mut buf = Vec::new();
     server.write_unencrypted_server(&mut buf).unwrap();
@@ -856,8 +737,6 @@ fn attacker_state_update_is_one_physical_normal_swing() {
     let player = 1u64;
     let chicken = (0xF130u64 << 48) | (620u64 << 24) | 1;
     let msg = build_attacker_state_update(player, chicken, 7, 0, 0, 0);
-    // A landed normal swing must carry AffectsVictim (0x02) + VictimState NORMAL (1) so the
-    // 5875 client renders damage, not "MISS" (the symptom of VictimState=UNAFFECTED).
     assert_eq!(msg.hit_info, HitInfo::AffectsVictim);
     assert_eq!(msg.damage_state, 1);
     assert_eq!(msg.attacker.guid(), player);
@@ -867,7 +746,6 @@ fn attacker_state_update_is_one_physical_normal_swing() {
     assert_eq!(msg.damages[0].spell_school_mask, 0);
     assert_eq!(msg.damages[0].damage_uint, 7);
     assert_eq!(msg.damages[0].damage_float, 7.0);
-    // Round-trip through the wire codec (the Vec<DamageInfo> + HitInfo must survive).
     let server = ServerOpcodeMessage::SMSG_ATTACKERSTATEUPDATE(Box::new(msg));
     let mut buf = Vec::new();
     server.write_unencrypted_server(&mut buf).unwrap();
@@ -882,9 +760,6 @@ fn attacker_state_update_is_one_physical_normal_swing() {
 
 #[test]
 fn attacker_state_update_maps_hit_info_discriminant() {
-    // module hit_info: 0 normal, 1 crit, 2 miss → SMSG HitInfo enum + VictimState (damage_state).
-    // Landed hits get VictimState NORMAL (1); a miss gets UNAFFECTED (0) — matching mangos so the
-    // client shows the swing as a hit (normal/crit) vs. "MISS".
     let normal = build_attacker_state_update(1, 2, 7, 0, 0, 0);
     assert_eq!(normal.hit_info, HitInfo::AffectsVictim);
     assert_eq!(normal.damage_state, 1);
@@ -896,8 +771,6 @@ fn attacker_state_update_maps_hit_info_discriminant() {
     assert_eq!(miss.hit_info, HitInfo::Miss);
     assert_eq!(miss.damage_state, 0);
     assert_eq!(miss.total_damage, 0);
-    // Dodge/parry (3/4): zero damage, "Dodge"/"Parry" from VictimState (2/3), no HitInfo flag
-    // (NormalSwing clears AFFECTS_VICTIM so no being-hit animation plays on the avoided swing).
     let dodge = build_attacker_state_update(1, 2, 0, 3, 0, 0);
     assert_eq!(dodge.hit_info, HitInfo::NormalSwing);
     assert_eq!(dodge.damage_state, 2);
@@ -905,25 +778,19 @@ fn attacker_state_update_maps_hit_info_discriminant() {
     let parry = build_attacker_state_update(1, 2, 0, 4, 0, 0);
     assert_eq!(parry.hit_info, HitInfo::NormalSwing);
     assert_eq!(parry.damage_state, 3);
-    // Glancing (5): a landed hit with reduced damage — HitInfo::Glancing, VictimState NORMAL (1).
     let glancing = build_attacker_state_update(1, 2, 4, 5, 0, 0);
     assert_eq!(glancing.hit_info, HitInfo::Glancing);
     assert_eq!(glancing.damage_state, 1);
     assert_eq!(glancing.total_damage, 4);
-    // Block (7): a landed hit whose damage a shield reduced — AffectsVictim (the swing connected, so the
-    // being-hit animation plays) + VictimState BLOCK (4) + blocked_amount, the vanilla "Block N" path.
     let block = build_attacker_state_update(1, 2, 5, 7, 25, 0);
     assert_eq!(block.hit_info, HitInfo::AffectsVictim);
     assert_eq!(block.damage_state, 4);
     assert_eq!(block.total_damage, 5);
     assert_eq!(block.blocked_amount, 25);
-    // Ranged: a normal shot carries its spell id (75 Auto Shot) in spell_id so the client attributes
-    // it to the ability; HitInfo is identical to a melee normal hit (vanilla has no ranged HitInfo flag).
     let ranged = build_attacker_state_update(1, 2, 9, 0, 0, 75);
     assert_eq!(ranged.spell_id, 75);
     assert_eq!(ranged.hit_info, HitInfo::AffectsVictim);
     assert_eq!(ranged.total_damage, 9);
-    // The blocked_amount must survive the wire round-trip (a message-level u32, after damage_state).
     let server = ServerOpcodeMessage::SMSG_ATTACKERSTATEUPDATE(Box::new(block));
     let mut buf = Vec::new();
     server.write_unencrypted_server(&mut buf).unwrap();
@@ -938,8 +805,6 @@ fn attacker_state_update_maps_hit_info_discriminant() {
 
 #[test]
 fn create_object_builds_unit_for_a_creature() {
-    // A creature row (type Unit, no PLAYER bit) must yield ObjectType::Unit + UpdateMask::Unit,
-    // not the player descriptor block.
     let chicken = EntityView {
         guid: (0xF130u64 << 48) | (620u64 << 24) | 1,
         map_id: 0,
@@ -951,7 +816,7 @@ fn create_object_builds_unit_for_a_creature() {
         level: 1,
         run_speed_mult_bp: 10_000,
         faction_template: 31,
-        unit_bytes_0: 0x0101, // dummy-but-valid Human/Warrior/Male/Mana
+        unit_bytes_0: 0x0101,
         display_id: 304,
         native_display_id: 304,
         ..Default::default()
@@ -978,9 +843,6 @@ fn create_object_builds_unit_for_a_creature() {
 
 #[test]
 fn creature_create_carries_npc_flags() {
-    // A gossip+vendor NPC (UNIT_NPC_FLAGS 0x1 gossip | 0x4 vendor — vanilla 1.12 numbering, where
-    // VENDOR is 0x4, not the 0x80 of later cores) must surface those flags in the Unit mask so the
-    // client shows the gossip-eye / vendor cursor (item 6). The packet must also serialize end-to-end.
     let vendor = EntityView {
         guid: (0xF130u64 << 48) | (6741u64 << 24) | 1,
         map_id: 0,
@@ -995,7 +857,7 @@ fn creature_create_carries_npc_flags() {
         unit_bytes_0: 0x0101,
         display_id: 2068,
         native_display_id: 2068,
-        npc_flags: 0x1 | 0x4, // gossip + vendor
+        npc_flags: 0x1 | 0x4,
         ..Default::default()
     };
     let msg = build_create_object(&vendor, CreateKind::Peer, &[], &[]).unwrap();
@@ -1011,7 +873,6 @@ fn creature_create_carries_npc_flags() {
         }
         other => panic!("expected a Unit CreateObject2, got {other:?}"),
     }
-    // A player carries no NPC flags (npc_flags 0; the player arm never sets the field).
     let player = build_create_object(&warrior_entity(), CreateKind::SelfPlayer, &[], &[]).unwrap();
     match &player.objects[0] {
         Object::CreateObject2 {
@@ -1088,7 +949,7 @@ fn self_player_create_object_carries_player_controlled_unit_flag_on_the_wire() {
 #[test]
 fn create_object_uses_entity_run_speed_multiplier() {
     let mut e = warrior_entity();
-    e.run_speed_mult_bp = 30_000; // `.speed 3` survives a destination-shard entity rebuild
+    e.run_speed_mult_bp = 30_000;
     let msg = build_create_object(&e, CreateKind::SelfPlayer, &[], &[]).unwrap();
     match &msg.objects[0] {
         Object::CreateObject2 { movement2, .. } => {
@@ -1111,9 +972,6 @@ fn create_object_uses_entity_run_speed_multiplier() {
 
 #[test]
 fn self_and_peer_create_carry_the_self_flag_on_only_the_self_side() {
-    // Was WEAK (only asserted `me != peer`, never which side carries SELF). The movement SELF flag
-    // is what tells the client "this is MY character" (drives the local-player camera/controls); a
-    // peer create must NOT carry it, or the client would fight over which object is itself.
     let e = warrior_entity();
     let me = build_create_object(&e, CreateKind::SelfPlayer, &[], &[]).unwrap();
     let peer = build_create_object(&e, CreateKind::Peer, &[], &[]).unwrap();
@@ -1129,16 +987,11 @@ fn self_and_peer_create_carry_the_self_flag_on_only_the_self_side() {
         !self_flag(&peer),
         "a Peer create must NOT carry the SELF flag"
     );
-    // Only the movement SELF flag differs; the descriptor mask itself is unaffected.
     assert_ne!(me, peer);
 }
 
 #[test]
 fn warrior_create_carries_skills_and_serializes() {
-    // Skill lines give the spellbook its class tabs; Battle Shout (6673) lives in Fury (256), so
-    // without Fury the client throws SpellBookFrame.lua:342 "invalid spell slot". The existing
-    // CREATE tests only pattern-match, so SERIALIZE here to actually run the writer over the new
-    // PLAYER_SKILL_INFO words (a malformed skill mask would otherwise slip past the suite).
     let mut entity = warrior_entity();
     entity.magic_resistances = [1, 2, 3, 4, 5, 6];
     let msg = build_create_object(&entity, CreateKind::SelfPlayer, &[], &[]).unwrap();
@@ -1155,16 +1008,12 @@ fn warrior_create_carries_skills_and_serializes() {
                 Some(SkillInfo::new(Skill::Fury, 0, 1, 1, 0, 0)),
                 "Fury (256) must anchor the Battle Shout spellbook tab"
             );
-            // All five base attributes (UNIT_FIELD_STAT0..4) must survive the serializer so the
-            // character sheet reads the cmangos curve values, not zero.
             let e = warrior_entity();
             assert_eq!(p.unit_strength(), Some(e.strength as i32));
             assert_eq!(p.unit_agility(), Some(e.agility as i32));
             assert_eq!(p.unit_stamina(), Some(e.stamina as i32));
             assert_eq!(p.unit_intellect(), Some(e.intellect as i32));
             assert_eq!(p.unit_spirit(), Some(e.spirit as i32));
-            // EFFECTIVE armor (UNIT_FIELD_RESISTANCES[0]) is read from `entity.effective_armor` (base +
-            // worn gear, folded at the self-login call site; the fixture has no gear → effective == base).
             assert_eq!(p.unit_normal_resistance(), Some(e.effective_armor as i32));
             assert_eq!(p.unit_holy_resistance(), Some(1));
             assert_eq!(p.unit_fire_resistance(), Some(2));
@@ -1196,9 +1045,6 @@ fn char_enum_maps_seeded_warrior() {
     assert_eq!(msg.characters[0].guid.guid(), 1);
 }
 
-/// CMaNGOS enumerates Characters by ascending guid, and the client keeps the order the list
-/// arrives in. The Store may return subscription-cache or cross-Shard probe order, which changes
-/// between logins, so the message must order the list itself.
 #[test]
 fn char_enum_orders_the_characters_by_ascending_guid() {
     let view = |guid: u64| CharacterView {
@@ -1246,20 +1092,16 @@ fn movement_relay_roundtrips_under_same_opcode() {
 
     match ServerOpcodeMessage::read_unencrypted(&mut buf.as_slice()).unwrap() {
         ServerOpcodeMessage::MSG_MOVE_START_FORWARD(m) => {
-            assert_eq!(m.guid.guid(), 7); // mover guid, packed on the wire
+            assert_eq!(m.guid.guid(), 7);
             assert_eq!(m.info.position.x, 1.0);
             assert_eq!(m.info.timestamp, 99);
         }
         other => panic!("expected relayed MSG_MOVE_START_FORWARD, got {other}"),
     }
 
-    // A non-relayed opcode yields nothing.
     assert!(build_movement_relay(0x9999, 7, info).is_none());
 }
 
-/// Every `MovementInfo` shape the wire can carry: the plain 28-byte block, plus each optional block
-/// the flags can switch on (they change the body LENGTH and ORDER, which is exactly what a
-/// memcpy-based relay would get wrong if the layout assumption were false).
 #[cfg(test)]
 fn movement_info_cases() -> Vec<(&'static str, MovementInfo)> {
     use wow_world_messages::vanilla::{
@@ -1342,16 +1184,11 @@ fn movement_info_cases() -> Vec<(&'static str, MovementInfo)> {
     ]
 }
 
-/// Non-transport movement agrees with the typed codec across all supported opcodes and
-/// packed mover guids. Benilla checks transport movement independently.
 #[test]
 fn raw_movement_relay_is_byte_identical_to_the_typed_path() {
-    // 1 = one low byte; 0x0100 = one HIGH byte (a zero low byte must be skipped, not written);
-    // u64::MAX = all eight; 0 = the empty bit pattern; the last is a realistic player guid.
     const GUIDS: &[u64] = &[1, 0x0100, u64::MAX, 0, 0x0000_00F3_0000_0042];
     let mut compared = 0usize;
     for (label, info) in movement_info_cases() {
-        // The bytes the module stores are produced by exactly this call (`SessionStore::movement_update`).
         let stored = movement_info_to_bytes(&info).unwrap();
         for &opcode in movement_opcodes::SLICE_MOVE_OPCODES {
             for &guid in GUIDS {
@@ -1359,8 +1196,6 @@ fn raw_movement_relay_is_byte_identical_to_the_typed_path() {
                     .unwrap_or_else(|| panic!("typed relay missing for opcode 0x{opcode:03X}"));
                 let mut framed = Vec::new();
                 typed.write_unencrypted_server(&mut framed).unwrap();
-                // gtker's server framing: [size u16 BE][opcode u16 LE][body...] — the same 4 bytes
-                // `Outbound::Raw`'s writer re-creates from `(opcode, body.len())`.
                 let typed_opcode = u16::from_le_bytes([framed[2], framed[3]]);
                 let typed_body = &framed[4..];
                 assert_eq!(
@@ -1390,11 +1225,6 @@ fn raw_movement_relay_is_byte_identical_to_the_typed_path() {
     );
 }
 
-/// The other half of the equivalence: the two builders must accept and REJECT the same opcodes.
-/// Exhaustive over the whole u16 opcode space rather than a sample, because the raw path re-derives
-/// the accepted set from `is_slice_move` while the typed path spells it out as match arms — two
-/// lists that can drift, and a drift means a movement opcode silently stops relaying (peers freeze
-/// mid-strafe) or a non-movement one gets framed as movement.
 #[test]
 fn raw_and_typed_movement_relays_accept_exactly_the_same_opcodes() {
     let info = movement_info_cases()[0].1.clone();
@@ -1408,10 +1238,6 @@ fn raw_and_typed_movement_relays_accept_exactly_the_same_opcodes() {
     }
 }
 
-/// A row whose `movement_info` is too short to be a `MovementInfo` must produce NO packet. The typed
-/// path got this for free (the decode failed and logged); the raw path memcpys, so without the
-/// length floor a truncated block would be framed with a `size` the client trusts — it would read
-/// past the body and desync the header stream for every subsequent packet.
 #[test]
 fn a_truncated_movement_block_is_never_framed() {
     let info = movement_info_cases()[0].1.clone();
@@ -1443,20 +1269,16 @@ fn destroy_object_carries_guid() {
     }
 }
 
-// ---- Items ---------------------------------------------------------------------------
-
-/// The hand-authored "Worn Shortsword" template the gateway maps to the wire (mirrors the
-/// module seed: a Poor one-hand sword, mainhand-equip, durability 20).
 fn worn_shortsword() -> ItemTemplateView {
     ItemTemplateView {
         entry: 25,
-        class: 2,    // Weapon
-        subclass: 7, // Sword (one-hand)
-        sheath: 3,   // the REAL dump value for entry 25 (hip posture on the live client)
+        class: 2,
+        subclass: 7,
+        sheath: 3,
         name: "Worn Shortsword".to_string(),
         display_id: 1542,
-        quality: 0,         // Poor
-        inventory_type: 21, // WeaponMainHand
+        quality: 0,
+        inventory_type: 21,
         item_level: 2,
         required_level: 1,
         max_durability: 20,
@@ -1466,7 +1288,6 @@ fn worn_shortsword() -> ItemTemplateView {
         damage_min: 1.0,
         damage_max: 3.0,
         delay_ms: 1900,
-        // No stat bonuses on a plain weapon — all stat fields remain zero.
         ..Default::default()
     }
 }
@@ -1474,12 +1295,12 @@ fn worn_shortsword() -> ItemTemplateView {
 fn blackrock_gauntlets() -> ItemTemplateView {
     ItemTemplateView {
         entry: 1448,
-        class: 4,    // Armor
-        subclass: 1, // Leather
+        class: 4,
+        subclass: 1,
         name: "Blackrock Gauntlets".to_string(),
         display_id: 7836,
-        quality: 1,         // Common
-        inventory_type: 10, // INVTYPE_HAND
+        quality: 1,
+        inventory_type: 10,
         item_level: 20,
         required_level: 15,
         max_durability: 30,
@@ -1488,17 +1309,15 @@ fn blackrock_gauntlets() -> ItemTemplateView {
         max_stack: 1,
         stat_armor: 105,
         stat_strength: 3,
-        bonding: 2, // Bind on Equip (BoE) — greens/blues at 1-10 bind when worn
+        bonding: 2,
         ..Default::default()
     }
 }
 
-/// A hand-authored BoP (Bind on Pickup) template — a quest reward / starter-kit analogue — so the
-/// `bonding=1` wire value is pinned independently of the BoE fixture above.
 fn bound_on_pickup_relic() -> ItemTemplateView {
     ItemTemplateView {
         entry: 90001,
-        class: 12, // Quest
+        class: 12,
         subclass: 0,
         name: "Ancient Relic".to_string(),
         display_id: 1542,
@@ -1510,16 +1329,13 @@ fn bound_on_pickup_relic() -> ItemTemplateView {
         buy_price: 0,
         sell_price: 0,
         max_stack: 1,
-        bonding: 1, // Bind on Pickup (BoP)
+        bonding: 1,
         ..Default::default()
     }
 }
 
 #[test]
 fn item_query_response_maps_worn_shortsword_and_serializes() {
-    // The item query is NOT independently live-verifiable (the 1.12 client only queries an item
-    // it already holds an object for), so the typed mapping is pinned here: serialize + read back
-    // through the opcode so a malformed field (a bad enum cast, a wrong array len) is caught.
     let t = worn_shortsword();
     let msg = build_item_query_response(t.entry, Some(&t));
     let mut buf = Vec::new();
@@ -1537,15 +1353,11 @@ fn item_query_response_maps_worn_shortsword_and_serializes() {
             assert_eq!(found.inventory_type, InventoryType::WeaponMainHand);
             assert_eq!(found.max_durability, 20);
             assert_eq!(found.item_level, Level::new(2));
-            // The per-item dump value rides through (wire 3) instead of the old blanket
-            // MainHand — gtker NAMES it LargeWeaponLeft, but the value is what the client reads.
             assert_eq!(found.sheathe_type, SheatheType::LargeWeaponLeft);
             assert_eq!(found.sheathe_type.as_int(), 3);
             assert_eq!(found.damages[0].damage_minimum, 1.0);
             assert_eq!(found.damages[0].damage_maximum, 3.0);
             assert_eq!(found.delay, 1900);
-            // RangedModRange: the vanilla-default 100% (NOT the struct Default of 0.0, which zeroed a
-            // ranged weapon's effective range → Auto Shot "out of range" everywhere).
             assert_eq!(found.ranged_range_modification, 100.0);
         }
         other => panic!("expected SMSG_ITEM_QUERY_SINGLE_RESPONSE, got {other}"),
@@ -1554,9 +1366,6 @@ fn item_query_response_maps_worn_shortsword_and_serializes() {
 
 #[test]
 fn item_query_response_armor_and_stats_reach_wire() {
-    // Pins that stat_armor and equip stats are NOT zeroed out by the codec path — the fix for
-    // ItemTemplateView having dropped the stat/armor/block columns. Serialize + read back
-    // through the opcode so the full round-trip is verified.
     use wow_world_messages::vanilla::ItemStatType;
     let t = blackrock_gauntlets();
     let msg = build_item_query_response(t.entry, Some(&t));
@@ -1566,7 +1375,6 @@ fn item_query_response_armor_and_stats_reach_wire() {
         ServerOpcodeMessage::SMSG_ITEM_QUERY_SINGLE_RESPONSE(m) => {
             let found = m.found.expect("Blackrock Gauntlets must be found");
             assert_eq!(found.armor, 105, "stat_armor must reach the wire");
-            // First stat slot must carry Strength=3; remaining slots padded with Mana=0.
             assert_eq!(
                 found.stats[0].stat_type,
                 ItemStatType::Strength,
@@ -1588,9 +1396,6 @@ fn item_query_response_armor_and_stats_reach_wire() {
     }
 }
 
-/// Item binding: a BoP template's item query carries `bonding=1` (Bonding::PickUp)
-/// over the wire — the "Done when" criterion for the feature, pinned as a serialize+read round-trip
-/// like the other item-query tests, independent of the BoE fixture above.
 #[test]
 fn item_query_response_bop_template_carries_bonding_pickup() {
     let t = bound_on_pickup_relic();
@@ -1610,18 +1415,14 @@ fn item_query_response_bop_template_carries_bonding_pickup() {
     }
 }
 
-/// Sheathe posture is a RAW passthrough, not a remap: a shield's dump byte (Dented Buckler,
-/// entry 1166, `sheath=4`) must reach the wire as 4. gtker names that variant `LargeWeaponRight`,
-/// which is why the assertion pins `as_int()` too — the name is noise, the byte is the contract.
-/// Pairs with the entry-25 (`sheath=3`) leg in `item_query_response_maps_worn_shortsword_and_serializes`.
 #[test]
 fn item_query_response_shield_carries_its_own_sheathe_byte() {
     let t = ItemTemplateView {
         entry: 1166,
-        class: 4,           // Armor
-        subclass: 6,        // Shield
-        inventory_type: 14, // Shield
-        sheath: 4,          // the REAL dump value for entry 1166
+        class: 4,
+        subclass: 6,
+        inventory_type: 14,
+        sheath: 4,
         name: "Dented Buckler".to_string(),
         ..worn_shortsword()
     };
@@ -1642,11 +1443,9 @@ fn item_query_response_shield_carries_its_own_sheathe_byte() {
     }
 }
 
-/// The default (unbound) template — every item that predates these columns — must still carry
-/// `bonding=0` (NoBind), baseline-safe: an unbound item's tooltip renders no binding line.
 #[test]
 fn item_query_response_default_bonding_is_no_bind() {
-    let t = worn_shortsword(); // bonding left at its ..Default::default() value (0)
+    let t = worn_shortsword();
     assert_eq!(t.bonding, 0);
     let msg = build_item_query_response(t.entry, Some(&t));
     let mut buf = Vec::new();
@@ -1660,18 +1459,15 @@ fn item_query_response_default_bonding_is_no_bind() {
     }
 }
 
-/// A hand-authored resist ring exercising every one of these item-query columns at once: 6 resistances, spell
-/// slots 3-5, the skill/reputation gates, maxcount/flags/page_text/startquest/bag_family. Mirrors
-/// a real vanilla "... of Fire Resistance" ring.
 fn ring_of_fire_resistance() -> ItemTemplateView {
     ItemTemplateView {
         entry: 90002,
-        class: 4,    // Armor
-        subclass: 0, // Miscellaneous (rings/trinkets/necks)
+        class: 4,
+        subclass: 0,
         name: "Ring of Fire Resistance".to_string(),
         display_id: 5001,
-        quality: 2,         // Uncommon (green)
-        inventory_type: 11, // INVTYPE_FINGER
+        quality: 2,
+        inventory_type: 11,
         item_level: 15,
         required_level: 10,
         max_durability: 0,
@@ -1685,20 +1481,20 @@ fn ring_of_fire_resistance() -> ItemTemplateView {
         shadow_res: 0,
         arcane_res: 0,
         spellid_3: 12345,
-        spelltrigger_3: 1, // on-equip
+        spelltrigger_3: 1,
         spellid_4: 12346,
-        spelltrigger_4: 2, // chance-on-hit
+        spelltrigger_4: 2,
         spellid_5: 12347,
-        spelltrigger_5: 0,   // on-use
-        required_skill: 165, // Leatherworking (arbitrary nonzero marker)
+        spelltrigger_5: 0,
+        required_skill: 165,
         required_skill_rank: 150,
         required_reputation_faction: 69,
         required_reputation_rank: 3,
         max_count: 1,
-        item_flags: 0x200, // ItemFlag::WRAPPER bit — any nonzero marker
+        item_flags: 0x200,
         page_text: 999,
         start_quest: 777,
-        bag_family: 6, // Herbs
+        bag_family: 6,
         allowed_class: 0x8000_0002,
         allowed_race: 0x8000_0004,
         random_property: 509_0100,
@@ -1706,10 +1502,6 @@ fn ring_of_fire_resistance() -> ItemTemplateView {
     }
 }
 
-/// The "free gateway win" columns: the resistances, spells 3-5, skill/rep gates, and
-/// maxcount/flags/page_text/startquest/bag_family the item-query response already had wire slots
-/// for (previously hardcoded 0/default) now carry the template's real values end-to-end through a
-/// serialize+read round-trip.
 #[test]
 fn item_query_response_carries_the_work_item_213_columns() {
     let t = ring_of_fire_resistance();
@@ -1768,12 +1560,9 @@ fn item_query_response_carries_the_work_item_213_columns() {
     }
 }
 
-/// The default (all-zero) template — every item that predates these columns — keeps every new
-/// item-query wire field at its default/empty value: baseline-safe, byte-identical to the
-/// response shape before these columns existed.
 #[test]
 fn item_query_response_default_template_keeps_the_work_item_213_columns_zero() {
-    let t = worn_shortsword(); // every new field left at its ..Default::default() value (0)
+    let t = worn_shortsword();
     let msg = build_item_query_response(t.entry, Some(&t));
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
@@ -1809,7 +1598,6 @@ fn item_query_response_unknown_entry_is_not_found() {
         msg.found.is_none(),
         "an unknown item must reply NotFound (found: None)"
     );
-    // Must still serialize (a NotFound is a valid one-field reply).
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
     assert!(!buf.is_empty());
@@ -1818,7 +1606,7 @@ fn item_query_response_unknown_entry_is_not_found() {
 #[test]
 fn item_create_object_is_item_typed_and_serializes() {
     let inst = ItemInstanceView {
-        guid: (0x4000u64 << 48) | (1 << 8) | 23, // HIGHGUID_ITEM | char-derived low | slot 23
+        guid: (0x4000u64 << 48) | (1 << 8) | 23,
         entry: 25,
         owner_guid: 1,
         slot: 23,
@@ -1894,8 +1682,6 @@ fn a_copied_letters_create_block_carries_its_item_text_id() {
 
 #[test]
 fn player_create_seeds_inventory_slot_descriptor() {
-    // A backpack item's guid must land in its inventory slot (ItemSlot::Inventory0 == 23) of the
-    // player's PLAYER_FIELD_INV_SLOT descriptors, and a NON-equipment slot carries NO visible item.
     let item_guid = (0x4000u64 << 48) | (1 << 8) | 23;
     let msg = build_create_object(
         &warrior_entity(),
@@ -1929,9 +1715,6 @@ fn player_create_seeds_inventory_slot_descriptor() {
 
 #[test]
 fn skill_block_reads_learned_rows_override_and_append() {
-    // A learned row for a line already in the static class base (Defense 95) OVERRIDES it, a
-    // learned profession (Mining 186) APPENDS at its real current/max, an unknown line id is
-    // skipped, and the old Cooking fixture is GONE unless actually learned.
     let msg = build_create_object(
         &warrior_entity(),
         CreateKind::SelfPlayer,
@@ -1968,11 +1751,8 @@ fn skill_block_reads_learned_rows_override_and_append() {
 
 #[test]
 fn create_object_carries_the_sheath_state_for_player_and_creature() {
-    // The CREATE is how a peer entering AOI range learns a unit's sheath state. Omit
-    // UNIT_FIELD_BYTES_2 and everyone who walks up to a player with a drawn sword sees them
-    // empty-handed until the next toggle. Byte 0 is the state; bytes 1-3 ride along untouched.
     let mut e = warrior_entity();
-    e.unit_bytes_2 = 0xAB_CD_EF_01; // MELEE in byte 0, neighbours occupied
+    e.unit_bytes_2 = 0xAB_CD_EF_01;
     let msg = build_create_object(&e, CreateKind::SelfPlayer, &[], &[]).unwrap();
     match &msg.objects[0] {
         Object::CreateObject2 {
@@ -1986,7 +1766,6 @@ fn create_object_carries_the_sheath_state_for_player_and_creature() {
         other => panic!("expected a Player CreateObject2, got {other:?}"),
     }
 
-    // Same field on the Unit branch — a creature draws its weapon on engage too.
     let mut c = warrior_entity();
     c.type_mask = lyracore_shared::constants::type_mask::CREATURE;
     c.unit_bytes_2 = 1;
@@ -2006,8 +1785,6 @@ fn create_object_carries_the_sheath_state_for_player_and_creature() {
 
 #[test]
 fn player_create_equips_mainhand_renders_visible_item() {
-    // a weapon in the main-hand equipment slot (15) must set BOTH the inv-slot guid AND
-    // PLAYER_VISIBLE_ITEM[15] to the item ENTRY, so the 3D model renders the weapon.
     let item_guid = (0x4000u64 << 48) | (1 << 8) | 15;
     let msg = build_create_object(
         &warrior_entity(),
@@ -2050,20 +1827,17 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
         Vec::new(),
         &menu(false, false),
     );
-    assert_eq!(m.guid.guid(), 0xF130_0000_0000_0001); // echoes the NPC the player talked to
-    assert_eq!(m.title_text_id, GOSSIP_GREETING_TEXT_ID); // resolved via CMSG_NPC_TEXT_QUERY
-                                                          // Guard the McBride fix: the npc_text id MUST be low/in-range. A high synthetic id (top byte 0xFF,
-                                                          // the old 0xFFFF_FF01) makes the 5875 client silently drop the gossip packet (no GOSSIP_SHOW).
+    assert_eq!(m.guid.guid(), 0xF130_0000_0000_0001);
+    assert_eq!(m.title_text_id, GOSSIP_GREETING_TEXT_ID);
     const {
         assert!(
             GOSSIP_GREETING_TEXT_ID <= 0xFF_FFFF,
             "title_text_id must be a low, in-range npc_text id"
         )
     };
-    assert_eq!(m.gossips.len(), 1); // non-vendor: one clickable line so the window isn't empty
+    assert_eq!(m.gossips.len(), 1);
     assert_eq!(m.gossips[0].message, "Farewell.");
     assert!(!m.gossips[0].coded);
-    // A vendor NPC gets a "browse goods" option FIRST (index 0), then Farewell.
     let v = build_gossip_message(
         0xF130_0000_0000_0001,
         GOSSIP_GREETING_TEXT_ID,
@@ -2072,13 +1846,10 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
     );
     assert_eq!(v.gossips.len(), 2);
     assert_eq!(v.gossips[0].id, 0);
-    assert_eq!(v.gossips[0].item_icon, 1); // vendor bag icon
+    assert_eq!(v.gossips[0].item_icon, 1);
     assert_eq!(v.gossips[1].message, "Farewell.");
-    assert!(m.quests.is_empty()); // a plain gossip NPC (no quests passed) is unchanged
+    assert!(m.quests.is_empty());
 
-    // INNKEEPER bit numbering (cmangos 1.12): the gate reads `npc_flags & 0x80`. Innkeeper Farley(295)
-    // ships npc_flags=135; assert the corrected constant gates true while VENDOR (0x4) still passes — the
-    // old WRONG literal (0x10000) made `135 & 0x10000 == 0`, silently dropping the "make home" option.
     use lyracore_shared::constants::npc_flags;
     assert_eq!(
         npc_flags::INNKEEPER,
@@ -2097,8 +1868,6 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
         "the VENDOR (0x4) bit still passes — no regression"
     );
 
-    // Innkeeper "make home" lands at slot 0 on a non-vendor, and each id matches its position (the
-    // value the client echoes back).
     let inn = build_gossip_message(
         0xF130_0000_0000_0001,
         GOSSIP_GREETING_TEXT_ID,
@@ -2107,7 +1876,6 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
     );
     assert_eq!(inn.gossips[0].message, "Make this inn your home.");
     assert_eq!(inn.gossips[0].id, 0);
-    // Vendor + innkeeper → browse goods (0), make home (1), Farewell (2).
     let both = build_gossip_message(
         0xF130_0000_0000_0001,
         GOSSIP_GREETING_TEXT_ID,
@@ -2119,8 +1887,6 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
     assert_eq!(both.gossips[1].id, 1);
 }
 
-/// Byte-parity pin: an NPC with NO imported options must produce EXACTLY the same gossip window as
-/// before the option-import feature existed — the flag-derived synthesis must never silently diverge.
 #[test]
 fn gossip_message_with_no_imports_is_byte_identical_to_pre_217() {
     let guid = 0xF130_0000_0000_0042u64;
@@ -2130,7 +1896,7 @@ fn gossip_message_with_no_imports_is_byte_identical_to_pre_217() {
         Vec::new(),
         &gossip_menu_options(Vec::new(), true, true),
     );
-    assert_eq!(m.gossips.len(), 3); // vendor + innkeeper + Farewell, exactly as pre-import
+    assert_eq!(m.gossips.len(), 3);
     assert_eq!(m.gossips[0].message, "I'd like to browse your goods.");
     assert_eq!(m.gossips[1].message, "Make this inn your home.");
     assert_eq!(m.gossips[2].message, "Farewell.");
@@ -2139,8 +1905,6 @@ fn gossip_message_with_no_imports_is_byte_identical_to_pre_217() {
 #[test]
 fn gossip_message_renders_imported_options_verbatim_with_a_trailing_farewell() {
     use lyracore_shared::constants::gossip_option;
-    // An imported innkeeper NPC whose menu already covers both flags: browse goods + make-home + chat,
-    // rendered VERBATIM from the dump. Nothing is synthesized on top.
     let opt = |icon, text: &str, action| GossipOptionView {
         icon,
         text: text.into(),
@@ -2172,9 +1936,6 @@ fn gossip_message_renders_imported_options_verbatim_with_a_trailing_farewell() {
     assert_eq!(m.gossips[3].id, 3);
 }
 
-/// LIVE VICTIMS of the old imports-suppress-synthesis rule: Orphan Matron Nightingale (stock, no
-/// vendor row in her menu) and Katie Hunter (innkeeper, no bind row). The synthesized line must be
-/// APPENDED to an imported menu that lacks it, and never duplicate one that has it.
 #[test]
 fn gossip_menu_options_appends_only_the_missing_flag_lines() {
     use lyracore_shared::constants::gossip_option;
@@ -2184,18 +1945,15 @@ fn gossip_menu_options_appends_only_the_missing_flag_lines() {
         action: gossip_option::GOSSIP,
         ..Default::default()
     };
-    // Vendor with stock but no vendor row → browse-goods appended, marked as synthesized.
     let merged = gossip_menu_options(vec![chat.clone()], true, false);
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[0].row_id, 7, "the imported row keeps its identity");
     assert_eq!(merged[1].text, "I'd like to browse your goods.");
     assert_eq!(merged[1].action, gossip_option::VENDOR);
     assert_eq!(merged[1].row_id, SYNTHESIZED_ROW_ID);
-    // Innkeeper with no bind row → make-home appended.
     let merged = gossip_menu_options(vec![chat.clone()], false, true);
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[1].action, gossip_option::INNKEEPER);
-    // A menu that already carries the row is untouched — no duplicate line.
     let has_vendor = GossipOptionView {
         row_id: 9,
         text: "Let me see your goods.".into(),
@@ -2231,19 +1989,15 @@ fn option_condition_holds_gates_on_quest_status_and_fails_open_for_unknown_types
         true,
         false
     ));
-    // An unrecognized cond_type must fail OPEN (never silently hide an option).
     assert!(option_condition_holds(99, false, false));
 }
 
 #[test]
 fn cast_result_failed_body_and_reason_map() {
-    // The raw failure body is spell(u32 LE) + 0x02 (CAST_FAILED) + the CastFailureReason byte.
     assert_eq!(
         build_cast_result_failed(100, 0x4D),
         vec![100, 0, 0, 0, 0x02, 0x4D]
     );
-    // The substring map covers the module's stable gate phrasings; unknown text falls back to
-    // DontReport (0x17 — silent reset, never a wrong red line).
     assert_eq!(
         cast_failure_reason_for("not enough power: have 0, need 150"),
         0x4D
@@ -2279,40 +2033,27 @@ fn cast_result_failed_body_and_reason_map() {
 
 #[test]
 fn spell_damage_log_renders_crit_and_breakdown() {
-    // A crit cast → hit_info encodes 0x2 (SPELL_HIT_TYPE_CRIT — gtker's AffectsVictim variant; the
-    // MELEE-named CriticalHit encodes 0x80, which the client ignores in THIS packet — the live
-    // find: a 22-damage Heroic Strike crit rendered plain). Breakdown fields propagate unchanged.
     let crit = build_spell_non_melee_damage_log(0x42, 0x7, 133, 30, 4, true, 5, 3);
     assert_eq!(crit.hit_info, HitInfo::AffectsVictim);
-    assert_eq!(crit.hit_info.as_int(), 0x2); // the wire truth this test actually guards
+    assert_eq!(crit.hit_info.as_int(), 0x2);
     assert_eq!(crit.damage, 30);
     assert_eq!(crit.resisted, 5);
     assert_eq!(crit.absorbed_damage, 3);
-    assert_eq!(crit.blocked, 0); // spells aren't blocked in vanilla
-    assert_eq!(crit.school, SpellSchool::Frost); // school index 4 = Frost
-                                                 // A normal (non-crit) cast stays NormalSwing with a zeroed breakdown.
+    assert_eq!(crit.blocked, 0);
+    assert_eq!(crit.school, SpellSchool::Frost);
     let normal = build_spell_non_melee_damage_log(0x42, 0x7, 133, 20, 0, false, 0, 0);
     assert_eq!(normal.hit_info, HitInfo::NormalSwing);
     assert_eq!(normal.resisted, 0);
     assert_eq!(normal.absorbed_damage, 0);
-    assert_eq!(normal.school, SpellSchool::Normal); // index 0 → Normal/physical
+    assert_eq!(normal.school, SpellSchool::Normal);
 }
 
 #[test]
 fn gossip_message_body_is_exact_5875_layout() {
-    // Pin the EXACT 5875 SMSG_GOSSIP_MESSAGE body for a gossip with 1 option + 1 quest, proving the
-    // gtker typed message is byte-faithful to vanilla 1.12.1 (no RAW builder needed — unlike loot,
-    // gtker's vanilla GossipItem is the correct shape; the TBC BoxMoney/BoxText fields are absent).
-    // The McBride bug was the title_text_id VALUE (0xFFFF_FF01, an out-of-range npc_text id the client
-    // refuses), not the wire shape. This locks the layout so a future gtker bump that adds the TBC
-    // fields would fail here. Body (all LE), per the 1.12 gossip-menu wire layout:
-    //   guid u64 | title_text_id u32 | gossip_count u32 |
-    //   per gossip: id u32, icon u8, coded u8, message CString |
-    //   quest_count u32 | per quest: quest_id u32, quest_icon u32, level u32, title CString
     let guid = 0xF130_0000_0000_0001u64;
     let msg = SMSG_GOSSIP_MESSAGE {
         guid: Guid::new(guid),
-        title_text_id: GOSSIP_GREETING_TEXT_ID, // Low, in-range npc_text id.
+        title_text_id: GOSSIP_GREETING_TEXT_ID,
         gossips: vec![GossipItem {
             id: 0,
             item_icon: 1,
@@ -2320,13 +2061,12 @@ fn gossip_message_body_is_exact_5875_layout() {
             message: "Hi".to_string(),
         }],
         quests: vec![QuestItem {
-            quest_id: 0x29A, // 666
-            quest_icon: 7,   // available/turn-in icon
+            quest_id: 0x29A,
+            quest_icon: 7,
             level: Level::new(3),
             title: "Q".to_string(),
         }],
     };
-    // Frame it the way the writer does, then strip the 4-byte server header to get the body.
     let mut framed = Vec::new();
     ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(Box::new(msg))
         .write_unencrypted_server(&mut framed)
@@ -2339,20 +2079,18 @@ fn gossip_message_body_is_exact_5875_layout() {
     let body = &framed[4..];
 
     let mut want: Vec<u8> = Vec::new();
-    want.extend_from_slice(&guid.to_le_bytes()); // guid: u64
-    want.extend_from_slice(&1u32.to_le_bytes()); // title_text_id: u32.
-    want.extend_from_slice(&1u32.to_le_bytes()); // amount_of_gossip_items: u32
-                                                 // gossip item: id u32 | icon u8 | coded u8 | message CString — NO BoxMoney/BoxText (those are TBC)
-    want.extend_from_slice(&0u32.to_le_bytes()); // id
-    want.push(1u8); // item_icon
-    want.push(0u8); // coded (false)
-    want.extend_from_slice(b"Hi\0"); // message CString
-    want.extend_from_slice(&1u32.to_le_bytes()); // amount_of_quests: u32
-                                                 // quest item: quest_id u32 | quest_icon u32 | level u32 (full, not u8) | title CString
-    want.extend_from_slice(&0x29Au32.to_le_bytes()); // quest_id
-    want.extend_from_slice(&7u32.to_le_bytes()); // quest_icon
-    want.extend_from_slice(&3u32.to_le_bytes()); // level: Level32 (a full u32, like SMSG_QUESTGIVER_QUEST_LIST)
-    want.extend_from_slice(b"Q\0"); // title CString
+    want.extend_from_slice(&guid.to_le_bytes());
+    want.extend_from_slice(&1u32.to_le_bytes());
+    want.extend_from_slice(&1u32.to_le_bytes());
+    want.extend_from_slice(&0u32.to_le_bytes());
+    want.push(1u8);
+    want.push(0u8);
+    want.extend_from_slice(b"Hi\0");
+    want.extend_from_slice(&1u32.to_le_bytes());
+    want.extend_from_slice(&0x29Au32.to_le_bytes());
+    want.extend_from_slice(&7u32.to_le_bytes());
+    want.extend_from_slice(&3u32.to_le_bytes());
+    want.extend_from_slice(b"Q\0");
 
     assert_eq!(
         body,
@@ -2365,14 +2103,12 @@ fn gossip_message_body_is_exact_5875_layout() {
 
 #[test]
 fn npc_text_update_carries_the_greeting_in_slot_0() {
-    // None → generic fallback
     let t = build_npc_text_update(GOSSIP_GREETING_TEXT_ID, None);
     assert_eq!(t.text_id, GOSSIP_GREETING_TEXT_ID);
-    assert_eq!(t.texts.len(), 8); // fixed-size NpcText array
-    assert!(t.texts[0].texts[0].contains("Greetings")); // the greeting lives in slot 0...
-    assert_eq!(t.texts[0].probability, 1.0); // ...at probability 1.0 so the client picks it
-    assert_eq!(t.texts[1].probability, 0.0); // the other 7 slots are default/empty
-                                             // Some(imported view) → overrides the generic greeting, single-slot shape (back-compat).
+    assert_eq!(t.texts.len(), 8);
+    assert!(t.texts[0].texts[0].contains("Greetings"));
+    assert_eq!(t.texts[0].probability, 1.0);
+    assert_eq!(t.texts[1].probability, 0.0);
     let mut view = NpcTextView::default();
     view.slots[0] = (
         "Hey, citizen!".to_string(),
@@ -2385,8 +2121,6 @@ fn npc_text_update_carries_the_greeting_in_slot_0() {
     assert_eq!(t2.texts[0].probability, 1.0);
 }
 
-/// All 8 weighted slots ship verbatim (male/female/probability each), not just slot 0 —
-/// the CLIENT does the weighted pick, so the server must never collapse this to a single string.
 #[test]
 fn npc_text_update_ships_every_populated_slot_with_its_own_probability() {
     let mut view = NpcTextView::default();
@@ -2411,19 +2145,12 @@ fn npc_text_update_ships_every_populated_slot_with_its_own_probability() {
         ["Watch yourself.".to_string(), "Watch yourself.".to_string()]
     );
     assert_eq!(t.texts[3].probability, 0.4);
-    // Untouched slots stay default (empty text, 0 probability) — the client never selects them.
     assert_eq!(t.texts[1].probability, 0.0);
     assert!(t.texts[1].texts[0].is_empty());
 }
 
 #[test]
 fn list_inventory_raw_body_is_exact_vanilla_layout() {
-    // SMSG_LIST_INVENTORY is RAW (gtker's typed message is the tbc/wrath shape, with an extra
-    // ExtendedCost u32 per item the 1.12 client doesn't read). Pin the opcode + the exact body for
-    // a vendor + one item, built by hand from the vanilla layout (all LE):
-    //   vendor_guid u64 | count u8 | per item: muid u32 (1-based) | item_entry u32 | display u32 |
-    //   max_count u32 (0 stored → 0xFFFF_FFFF unlimited) | buy_price u32 | max_durability u32 |
-    //   buy_count u32 (=1).
     let vendor_guid = 0xF130_0000_0000_0001u64;
     let item = VendorItemView {
         item_entry: 25,
@@ -2431,30 +2158,22 @@ fn list_inventory_raw_body_is_exact_vanilla_layout() {
         buy_price: 35,
         max_durability: 20,
         max_count: 0,
-        buy_count: 1, // → 0xFFFF_FFFF on the wire (unlimited)
+        buy_count: 1,
     };
     let (opcode, body) = build_list_inventory_raw(vendor_guid, &[item]);
     assert_eq!(opcode, 0x019F, "SMSG_LIST_INVENTORY opcode (vanilla 5875)");
     assert_eq!(opcode, SMSG_LIST_INVENTORY_OPCODE);
 
     let expected: Vec<u8> = vec![
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xF1, // vendor_guid u64 LE
-        0x01, // count = 1
-        0x01, 0x00, 0x00, 0x00, // muid = 1 (1-based slot index)
-        0x19, 0x00, 0x00, 0x00, // item_entry = 25
-        0x06, 0x06, 0x00, 0x00, // display_id = 1542
-        0xFF, 0xFF, 0xFF, 0xFF, // max_count: 0 → unlimited (0xFFFF_FFFF)
-        0x23, 0x00, 0x00, 0x00, // buy_price = 35
-        0x14, 0x00, 0x00, 0x00, // max_durability = 20
-        0x01, 0x00, 0x00, 0x00, // buy_count = 1
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xF1, 0x01, 0x01, 0x00, 0x00, 0x00, 0x19, 0x00,
+        0x00, 0x00, 0x06, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x23, 0x00, 0x00, 0x00, 0x14,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
     ];
     assert_eq!(
         body, expected,
         "raw SMSG_LIST_INVENTORY body must match the vanilla layout byte-for-byte"
     );
 
-    // An empty stock is the vendor guid + a zero count + the error byte the client reads INSTEAD of
-    // an item block. Without that trailing byte it parses past the end and shows no window at all.
     let (_op, empty) = build_list_inventory_raw(vendor_guid, &[]);
     assert_eq!(
         empty,
@@ -2465,8 +2184,6 @@ fn list_inventory_raw_body_is_exact_vanilla_layout() {
 
 #[test]
 fn list_inventory_raw_truncates_stock_to_255_items() {
-    // The wire count is a u8; feeding more stock lines than that must never silently wrap the count
-    // byte (300 % 256 == 44) — the slice is capped so the count and the item bytes always agree.
     let items: Vec<VendorItemView> = (0..300u32)
         .map(|i| VendorItemView {
             item_entry: i,
@@ -2486,18 +2203,10 @@ fn list_inventory_raw_truncates_stock_to_255_items() {
     );
 }
 
-// ---- P1: values.rs OBJECT_FIELD_TYPE-absence pins (the null+0x110 crash class) -----------------
-//
-// The remaining `build_*_values` builders share the same `dirty_reset` discipline as
-// `build_health_values` above (finalize seeds OBJECT_FIELD_TYPE dirty; `dirty_reset` strips it; only
-// the changed field(s) are re-applied). Each of these was previously unpinned.
-
 #[test]
 fn unit_flags_values_is_unit_only_no_object_type() {
-    // The combat-indicator relay (UNIT_FLAG_IN_COMBAT toggling live) must ride a Unit VALUES mask
-    // carrying ONLY UNIT_FIELD_FLAGS — never re-sending OBJECT_FIELD_TYPE (the 5875 crash field).
     let guid = 7u64;
-    let flags = 0x0008_0000u32; // a recognizable flag value, distinct from the TYPE value word (0x09)
+    let flags = 0x0008_0000u32;
     let msg = build_unit_flags_values(guid, flags);
     match &msg.objects[0] {
         Object::Values { guid1, mask1 } => {
@@ -2526,9 +2235,6 @@ fn unit_flags_values_is_unit_only_no_object_type() {
 
 #[test]
 fn power_values_selects_the_descriptor_by_power_byte() {
-    // power_b picks which UNIT_FIELD_POWERn the current-power value lands on, matching
-    // build_create_object's own power_b -> descriptor mapping (mana=0, rage=1, focus=2, energy=3,
-    // happiness=4).
     let cases: [(u8, i32); 5] = [(0, 111), (1, 222), (2, 333), (3, 444), (4, 555)];
     for (power_b, cur) in cases {
         let msg = build_power_values(1, power_b, cur as u32);
@@ -2625,7 +2331,7 @@ fn max_vitals_values_sets_maxhealth_and_selects_max_power_descriptor() {
 
 #[test]
 fn player_ammo_id_values_is_player_only_no_object_type() {
-    let msg = build_player_ammo_id_values(1, 2512); // an arrow entry
+    let msg = build_player_ammo_id_values(1, 2512);
     match &msg.objects[0] {
         Object::Values {
             mask1: UpdateMask::Player(p),
@@ -2646,10 +2352,6 @@ fn player_ammo_id_values_is_player_only_no_object_type() {
 
 #[test]
 fn self_res_spell_values_sets_only_field_1224() {
-    // PLAYER_SELF_RES_SPELL is vanilla update field 1224 (cmangos-classic UpdateFields.h:
-    // PLAYER_AMMO_ID + 1). 1224 = 38 * 32 + 8, so the mask spans 39 blocks: 38 empty ones (block 0
-    // carries no OBJECT_FIELD_TYPE bit 2), then bit 8 of block 38, then the one value word. Minor
-    // Soulstone's self-resurrect spell is 3026 = 0x0BD2.
     let msg = build_self_res_spell_values(1, 3026);
     let mut buf = Vec::new();
     msg.write_unencrypted_server(&mut buf).unwrap();
@@ -2695,8 +2397,6 @@ fn player_xp_values_carries_xp_and_next_level_no_object_type() {
 
 #[test]
 fn item_values_clamps_zero_stack_count_to_one_and_carries_durability() {
-    // A stack count of 0 is nonsensical (an item object always represents at least one item) —
-    // clamp it to 1 rather than emit a wire value the client would render as an empty stack.
     let msg = build_item_values(1, 0, 15);
     match &msg.objects[0] {
         Object::Values {
@@ -2712,7 +2412,6 @@ fn item_values_clamps_zero_stack_count_to_one_and_carries_durability() {
         }
         other => panic!("expected an Item Values update, got {other:?}"),
     }
-    // A real stack count survives unclamped.
     let stacked = build_item_values(1, 5, 15);
     match &stacked.objects[0] {
         Object::Values {
@@ -2732,9 +2431,6 @@ fn item_values_clamps_zero_stack_count_to_one_and_carries_durability() {
 
 #[test]
 fn container_slot_values_computes_the_field_index_from_the_bag_slot() {
-    // CONTAINER_FIELD_SLOT_1 = 50, each slot spans 2 field indices (a u64 guid) — slot 2 must land
-    // at field 50 + 2*2 = 54. Cross-checked against the raw envelope directly, the same discipline
-    // as raw_values_body_matches_gtker_envelope.
     use super::update_mask::{self, idx};
     let (bag_guid, item_guid) = (0x4000_0000_0000_0001u64, 0x4000_0000_0000_0099u64);
     let (opcode, body) = build_container_slot_values(bag_guid, 2, item_guid);
@@ -2748,7 +2444,6 @@ fn container_slot_values_computes_the_field_index_from_the_bag_slot() {
         "slot 2 must set field index 54 (CONTAINER_FIELD_SLOT_1 + 2*2)"
     );
 
-    // Passing 0 CLEARS the slot pointer — a real zero guid on the wire, not a no-op.
     let (_op2, cleared) = build_container_slot_values(bag_guid, 2, 0);
     let mut clear_mask = update_mask::UpdateMaskValues::new();
     clear_mask.set_u64(idx::CONTAINER_FIELD_SLOT_1 + 2 * 2, 0);
@@ -2772,7 +2467,6 @@ fn inv_slot_values_sets_the_slot_pointer_or_none_for_an_invalid_slot() {
         }
         other => panic!("expected a Player Values update, got {other:?}"),
     }
-    // Clearing a slot passes guid 0 — a real (zeroed) pointer, not a skipped update.
     let cleared = build_inv_slot_values(1, 23, 0).unwrap();
     match &cleared.objects[0] {
         Object::Values {
@@ -2783,7 +2477,6 @@ fn inv_slot_values_sets_the_slot_pointer_or_none_for_an_invalid_slot() {
         }
         other => panic!("expected a Player Values update, got {other:?}"),
     }
-    // An out-of-range slot ordinal degrades to None rather than panicking.
     assert!(build_inv_slot_values(1, 255, item_guid).is_none());
 }
 
@@ -2797,12 +2490,8 @@ fn aura_duration_carries_the_slot_and_remaining_window() {
     assert!(!buf.is_empty());
 }
 
-// ---- P1: entity.rs login_sequence_messages + build_create_object derived combat numbers --------
-
 #[test]
 fn login_sequence_dedupes_known_spells_and_builds_the_action_bar() {
-    // ATTACK_SPELL (6603) is always granted first; a duplicate of it (and of a learned id) must not
-    // appear twice in either the spellbook or the action bar.
     let msgs = login_sequence_messages(
         &warrior_entity(),
         &[6603, 100, 100, 200],
@@ -2841,8 +2530,6 @@ fn login_sequence_dedupes_known_spells_and_builds_the_action_bar() {
 
 #[test]
 fn login_sequence_sends_verify_world_at_fresh_login_only() {
-    // A fresh login starts with SMSG_LOGIN_VERIFY_WORLD; a world-port re-entry must not carry it
-    // (a resend commands a second map load). Everything else is identical.
     let fresh =
         login_sequence_messages(&warrior_entity(), &[], &[], &[], WorldEntry::FreshLogin).unwrap();
     assert!(
@@ -2870,10 +2557,7 @@ fn login_sequence_sends_verify_world_at_fresh_login_only() {
 
 #[test]
 fn login_sequence_caps_the_action_bar_at_120_slots_but_not_the_spellbook() {
-    // 130 distinct learned spells (+ the always-granted ATTACK_SPELL) push the known-spell count past
-    // the fixed 120-slot action bar array; SMSG_INITIAL_SPELLS must still list every one of them, while
-    // SMSG_ACTION_BUTTONS truncates to the first 120 (no out-of-bounds write into the fixed array).
-    let learned: Vec<u32> = (1000..1130).collect(); // 130 unique ids
+    let learned: Vec<u32> = (1000..1130).collect();
     let msgs = login_sequence_messages(
         &warrior_entity(),
         &learned,
@@ -2916,9 +2600,6 @@ fn login_sequence_caps_the_action_bar_at_120_slots_but_not_the_spellbook() {
 
 #[test]
 fn login_sequence_folds_reputation_by_index_and_ignores_out_of_range_slots() {
-    // reputation_index must address the SAME Faction.dbc ReputationListID slot the live
-    // SET_FACTION_STANDING relay uses (0..63); an index >= 64 has no slot and must be dropped
-    // silently rather than panicking (a corrupt/import-drifted row must never crash login).
     let reps = [(5, 100, false), (63, -250, true), (64, 999, false)];
     let msgs = login_sequence_messages(&warrior_entity(), &[], &reps, &[], WorldEntry::FreshLogin)
         .unwrap();
@@ -2939,8 +2620,6 @@ fn login_sequence_folds_reputation_by_index_and_ignores_out_of_range_slots() {
         factions.factions[63].standing as i32, -250,
         "a negative standing bit-cast through u32"
     );
-    // The persisted At-War checkbox rides the flag byte — VISIBLE|AT_WAR (0x03) on the
-    // flagged slot, empty everywhere else (a false at_war never writes flags).
     assert!(
         factions.factions[63].flag.is_at_war(),
         "slot 63 carries AT_WAR"
@@ -2961,14 +2640,6 @@ fn login_sequence_folds_reputation_by_index_and_ignores_out_of_range_slots() {
     }
 }
 
-// ---- Imported action-bar rows vs. the synth fallback ----------------------------
-
-/// The BYTE-IDENTICAL synth fallback pin: with NO `game_player_action` rows (pre-import, the state
-/// every existing deployment is in today), the action bar must build EXACTLY as it did before this
-/// feature — Attack (6603) in slot 0, then each known spell, zeros elsewhere. This is a regression
-/// pin on `login_sequence_dedupes_known_spells_and_builds_the_action_bar` above (same fixture, spelled
-/// out again here so a future edit to the imported-bar branch can't silently start also touching the
-/// fallback branch it must leave alone).
 #[test]
 fn login_sequence_empty_player_actions_is_byte_identical_to_the_pre_212_synth() {
     let msgs = login_sequence_messages(
@@ -2994,16 +2665,9 @@ fn login_sequence_empty_player_actions_is_byte_identical_to_the_pre_212_synth() 
     assert!(bar.data[3..].iter().all(|&b| b == 0));
 }
 
-/// Once the character has IMPORTED `game_player_action` rows, the bar builds ENTIRELY from them —
-/// packed as `action | (action_type << 24)` — and the synth (Attack + spellbook) is not consulted at
-/// all, so a button the import omits (e.g. no button 0 row) stays 0, not auto-filled with Attack.
 #[test]
 fn login_sequence_builds_the_bar_from_imported_player_actions_packing_the_type_byte() {
-    let rows = [
-        (0u8, 6603u32, 0u8), // button 0: Attack, type 0 (spell) — packs as the raw id
-        (1u8, 78u32, 0u8),   // button 1: Heroic Strike, type 0
-        (5u8, 1234u32, 4u8), // button 5: some non-spell action, type 4 — must pack into the high byte
-    ];
+    let rows = [(0u8, 6603u32, 0u8), (1u8, 78u32, 0u8), (5u8, 1234u32, 4u8)];
     let msgs = login_sequence_messages(
         &warrior_entity(),
         &[100, 200],
@@ -3019,11 +2683,9 @@ fn login_sequence_builds_the_bar_from_imported_player_actions_packing_the_type_b
             _ => None,
         })
         .expect("SMSG_ACTION_BUTTONS must be in the sequence");
-    assert_eq!(bar.data[0], 6603); // action 6603 | (0 << 24) == 6603
+    assert_eq!(bar.data[0], 6603);
     assert_eq!(bar.data[1], 78);
     assert_eq!(bar.data[5], 1234 | (4 << 24));
-    // Slots the import didn't mention (incl. 2-4) stay zero — the synth's "100, 200" known spells are
-    // NEVER consulted once imported rows exist, confirming there's no merge between the two sources.
     for slot in [2usize, 3, 4, 6, 7, 119] {
         assert_eq!(
             bar.data[slot], 0,
@@ -3032,8 +2694,6 @@ fn login_sequence_builds_the_bar_from_imported_player_actions_packing_the_type_b
     }
 }
 
-/// A button index >= 120 (a corrupt/out-of-range import row) must be dropped, not panic on an
-/// out-of-bounds array write — mirrors the reputation fold's out-of-range-slot handling above.
 #[test]
 fn login_sequence_drops_an_out_of_range_imported_button() {
     let rows = [(255u8, 999u32, 0u8)];
@@ -3206,9 +2866,6 @@ fn active_taxi_mount_is_present_in_the_player_create_mask() {
     }
 }
 
-/// A LAND mount writes the same field with no taxi flag, and an observer's CREATE carries it (story
-/// 5): a peer entering visibility must see the rider on the mount without waiting for a VALUES
-/// update. `unit_flags` stays 0, so the client never renders a land mount as a flight.
 #[test]
 fn a_land_mount_display_is_present_in_the_peer_create_mask() {
     let mut entity = warrior_entity();
@@ -3233,10 +2890,6 @@ fn a_land_mount_display_is_present_in_the_peer_create_mask() {
     }
 }
 
-/// The standalone land-mount VALUES builder (story 11) carries the display it is handed, and writes
-/// an explicit 0 on dismount rather than omitting the field, or the client keeps the model. The
-/// partial mask's freedom from `OBJECT_FIELD_TYPE` is asserted at the wire level by
-/// `values::lint_tests::every_values_builder_serializes_without_the_object_type_bit`.
 #[test]
 fn mount_display_values_carries_the_display_it_is_given() {
     for display in [1147u32, 0] {
@@ -3264,12 +2917,8 @@ fn display_values_carries_only_the_current_appearance() {
     }
 }
 
-// ---- P2: visible_item_index slot-19 boundary (entity.rs) ---------------------------------------
-
 #[test]
 fn visible_item_index_boundary_stops_after_equipment_slot_18() {
-    // Slot 18 (the last equipment slot) must render on the 3D model; slot 19 (the first equipped-bag
-    // slot) must NOT — it still gets an inv-slot pointer, just no VISIBLE_ITEM.
     let (g18, g19) = ((0x4000u64 << 48) | 18, (0x4000u64 << 48) | 19);
     let msg = build_create_object(
         &warrior_entity(),
@@ -3299,8 +2948,6 @@ fn visible_item_index_boundary_stops_after_equipment_slot_18() {
         other => panic!("expected a Player CreateObject2, got {other:?}"),
     }
 }
-
-// ---- P1: movement.rs relayed_move_opcode 17-opcode table loop -----------------------------------
 
 #[test]
 fn relayed_move_opcode_maps_all_seventeen_client_variants() {
@@ -3443,8 +3090,6 @@ fn relayed_move_opcode_maps_all_seventeen_client_variants() {
     }
 }
 
-// ---- P2: teleport_ack / force_run_speed / monster_move spline flags (movement.rs) ---------------
-
 #[test]
 fn teleport_ack_carries_target_position_with_no_movement_flags() {
     let msg = build_teleport_ack(7, 99, 1.0, 2.0, 3.0, 0.5);
@@ -3462,8 +3107,6 @@ fn teleport_ack_carries_target_position_with_no_movement_flags() {
     msg.write_unencrypted_server(&mut buf).unwrap();
     assert!(!buf.is_empty());
 }
-
-// ---- Cross-map teleport wire pins (SMSG_TRANSFER_PENDING / SMSG_NEW_WORLD) --------
 
 #[test]
 fn cross_map_teleport_sends_transfer_pending_then_new_world_carrying_target_map_and_position() {
@@ -3560,9 +3203,6 @@ fn monster_move_run_flag_selects_the_run_spline_bit() {
 
 #[test]
 fn monster_move_facing_carries_the_angle_and_a_degenerate_single_point_spline() {
-    // a stand-and-swing creature turns to face its target without moving. The wire shape must
-    // be the `FacingAngle` variant (the client's ONLY source of a non-moving heading change), zero
-    // duration, and a single-point spline at the mover's own position (there IS no destination).
     let pos = Vector3d {
         x: 5.0,
         y: -3.0,
@@ -3611,13 +3251,13 @@ fn taxi_move_writes_absolute_catmull_rom_points_byte_for_byte() {
     let (opcode, bytes) = build_taxi_move_raw(0xF00D, start, points.clone(), 12_345, 77).unwrap();
     assert_eq!(opcode, 0x00DD);
 
-    let mut expected = vec![0x03, 0x0D, 0xF0]; // PackedGuid(0xF00D)
+    let mut expected = vec![0x03, 0x0D, 0xF0];
     for value in [start.x, start.y, start.z] {
         expected.extend_from_slice(&value.to_le_bytes());
     }
     expected.extend_from_slice(&77u32.to_le_bytes());
-    expected.push(0); // MonsterMoveNormal
-    expected.extend_from_slice(&0x300u32.to_le_bytes()); // RUN_MODE | FLYING/Catmull-Rom
+    expected.push(0);
+    expected.extend_from_slice(&0x300u32.to_le_bytes());
     expected.extend_from_slice(&12_345u32.to_le_bytes());
     expected.extend_from_slice(&3u32.to_le_bytes());
     for point in points {
@@ -3627,8 +3267,6 @@ fn taxi_move_writes_absolute_catmull_rom_points_byte_for_byte() {
     }
     assert_eq!(bytes, expected);
 }
-
-// ---- P1: item.rs build_buy_failed 5-way map + build_item_create_object CONTAINER branch --------
 
 #[test]
 fn buy_failed_maps_module_err_strings_to_the_closest_buy_result() {
@@ -3649,9 +3287,6 @@ fn buy_failed_maps_module_err_strings_to_the_closest_buy_result() {
     }
 }
 
-/// `lyracore_shared::bank::result`'s constants exist so the module can tag a refusal without a
-/// dependency on the wire crate; they must never drift from gtker's own `BuyBankSlotResult::as_int`
-/// numbering, or `parse_buy_bank_slot_result` silently relays the wrong client-visible result.
 #[test]
 fn bank_result_constants_match_gtker_buy_bank_slot_result() {
     use lyracore_shared::bank::result;
@@ -3682,8 +3317,6 @@ fn buy_bank_slot_result_parses_the_leading_bracketed_code_not_the_prose() {
             BuyBankSlotResult::InsufficientFunds,
         ),
         ("[2] target is not a banker", BuyBankSlotResult::NotBanker),
-        // Prose alone (no bracket) must not accidentally match a keyword — the fallback is
-        // the generic refusal, not a guess at intent.
         (
             "insufficient funds but no bracket tag",
             BuyBankSlotResult::NotBanker,
@@ -3702,14 +3335,14 @@ fn buy_bank_slot_result_parses_the_leading_bracketed_code_not_the_prose() {
 #[test]
 fn item_create_object_bag_slots_build_a_container_with_num_slots() {
     let inst = ItemInstanceView {
-        guid: (0x4000u64 << 48) | (1 << 8) | 19, // equipped-bag slot
+        guid: (0x4000u64 << 48) | (1 << 8) | 19,
         entry: 5000,
         owner_guid: 1,
         slot: 19,
         stack_count: 1,
         durability: 0,
         max_durability: 0,
-        container_slots: 8, // an 8-slot bag
+        container_slots: 8,
         random_property_id: 509_0101,
         random_property_enchant_ids: [0; 3],
         item_text_id: 0,
@@ -3743,12 +3376,8 @@ fn item_create_object_bag_slots_build_a_container_with_num_slots() {
     }
 }
 
-// ---- P1: corpse.rs display_id==0 -> 49 fallback -------------------------------------------------
-
 #[test]
 fn corpse_create_object_falls_back_to_display_49_when_zero() {
-    // Defensive floor against a null-model crash: display_id 0 must never reach the wire —
-    // fall back to 49 (Human Male) rather than let the client dereference a null model.
     let corpse = CorpseView {
         guid: 1,
         owner_guid: 1,
@@ -3769,7 +3398,6 @@ fn corpse_create_object_falls_back_to_display_49_when_zero() {
         }
         other => panic!("expected a Corpse CreateObject2, got {other:?}"),
     }
-    // A real display id passes through unchanged.
     let real = CorpseView {
         display_id: 304,
         ..corpse
@@ -3786,8 +3414,6 @@ fn corpse_create_object_falls_back_to_display_49_when_zero() {
     }
 }
 
-// ---- P2: creature query response (npc.rs) + questgiver_status echo -----------------------------
-
 #[test]
 fn creature_query_response_maps_names_and_flags_and_serializes() {
     let c = CreatureView {
@@ -3795,7 +3421,7 @@ fn creature_query_response_maps_names_and_flags_and_serializes() {
         name: "Innkeeper Farley".to_string(),
         subname: "Innkeeper".to_string(),
         display_id: 2068,
-        creature_type: 7, // Humanoid
+        creature_type: 7,
         creature_family: 0,
         type_flags: 0x8,
         rank: 0,
@@ -3829,7 +3455,6 @@ fn worn_item(slot: u8, guid: u64, entry: u32, enchantment: u32) -> ItemInstanceV
 
 #[test]
 fn visible_item_values_render_and_clear_equipment_slots_only_work_item_087() {
-    // Equip: the VALUES partial must carry PLAYER_VISIBLE_ITEM[15] = the item entry.
     let sword = ItemInstanceView {
         random_property_id: 117,
         ..worn_item(15, 1, 25, 0)
@@ -3851,7 +3476,6 @@ fn visible_item_values_render_and_clear_equipment_slots_only_work_item_087() {
         }
         other => panic!("expected a Player Values update, got {other:?}"),
     }
-    // Unequip: entry 0 is a real (zeroed) write, not a skipped update.
     let cleared = build_visible_item_values(1, 15, &ItemInstanceView::default()).unwrap();
     match &cleared.objects[0] {
         Object::Values {
@@ -3870,7 +3494,6 @@ fn visible_item_values_render_and_clear_equipment_slots_only_work_item_087() {
         }
         other => panic!("expected a Player Values update, got {other:?}"),
     }
-    // Non-equipment slots (backpack 23, bags 19, bag contents 120+) are None — no model residue.
     assert!(build_visible_item_values(1, 23, &sword).is_none());
     assert!(build_visible_item_values(1, 19, &sword).is_none());
     assert!(build_visible_item_values(1, 120, &sword).is_none());
@@ -3949,23 +3572,6 @@ fn player_create_carries_each_worn_items_permanent_enchant_for_self_and_peer() {
     }
 }
 
-// ===========================================================================================
-//  "SMSG_COMPRESSED_MOVES corrupts at crowd scale" — negative-finding regression pin against that
-//  report.
-//
-//  The gateway does not construct `SMSG_COMPRESSED_MOVES` anywhere (nothing in `gateway/src` builds
-//  it, and `git log -S "COMPRESSED_MOVES" --all` finds no commit that ever did) — the movement paths
-//  actually in use are `SMSG_MONSTER_MOVE` (typed, one per creature leg) and the raw `MSG_MOVE_*`
-//  peer relay (`codec::build_movement_relay_raw`), both pinned at crowd scale in
-//  `world::tests::writer_thread_survives_movement_bursts_from_100_to_500_movers_without_desync`.
-//
-//  This test instead pins `wow_world_messages` 0.3's OWN codec for the opcode the issue names, since
-//  the crash report's panic site (`smsg_compressed_moves.rs:28`, a flate2 `read_to_end().unwrap()`)
-//  lives entirely inside that dependency. Sweeping 1..3000 movers finds NO corruption — the codec
-//  round-trips cleanly the whole way; it only silently truncates its own u16 size field in the
-//  thousands-of-movers range (see the ignored `_finds_the_actual_gtker_wrap_threshold` case below),
-//  an order of magnitude past anything the report describes. So whatever produced the reported crash, it was
-//  not this codec misbehaving at 150-300 movers — that theory is pinned FALSE here, permanently.
 fn compressed_move_for(i: u64) -> wow_world_messages::vanilla::CompressedMove {
     use wow_world_messages::vanilla::{
         CompressedMove, CompressedMove_CompressedMoveOpcode, MonsterMove,
@@ -3995,10 +3601,6 @@ fn compressed_move_for(i: u64) -> wow_world_messages::vanilla::CompressedMove {
     }
 }
 
-/// Encode `n` `CompressedMove` blocks via the crate's own `write_into_vec` (the deflate + size-prefix
-/// path the panic trace lives inside), frame it as a real unencrypted packet, and decode it back
-/// through `ServerOpcodeMessage::read_unencrypted` — the same dispatcher the gateway's own reader and
-/// the headless wire client use. Returns `Ok(decoded_move_count)` or the decode error.
 fn compressed_moves_roundtrip(n: usize) -> Result<usize, String> {
     use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
     use wow_world_messages::vanilla::SMSG_COMPRESSED_MOVES;
@@ -4010,7 +3612,7 @@ fn compressed_moves_roundtrip(n: usize) -> Result<usize, String> {
     let mut body = Vec::new();
     msg.write_into_vec(&mut body).map_err(|e| e.to_string())?;
 
-    let size = 2 + body.len(); // opcode(2) + body, matching gtker's own server framing
+    let size = 2 + body.len();
     let mut full = Vec::new();
     full.extend_from_slice(&(size as u16).to_be_bytes());
     full.extend_from_slice(&(SMSG_COMPRESSED_MOVES::OPCODE as u16).to_le_bytes());
@@ -4025,9 +3627,6 @@ fn compressed_moves_roundtrip(n: usize) -> Result<usize, String> {
 
 #[test]
 fn compressed_moves_codec_roundtrips_cleanly_from_1_to_3000_movers() {
-    // 100 = the report's own "clean" control; 150/200/300 = the reported-bad range; 500/1000/3000 =
-    // margin well past it. Every one of these must decode back to exactly the mover count it encoded
-    // — if any of them failed, that would BE the reported encode bug, in the one place it could live.
     for n in [1usize, 10, 50, 100, 150, 200, 300, 500, 1000, 3000] {
         match compressed_moves_roundtrip(n) {
             Ok(decoded) => assert_eq!(
@@ -4047,10 +3646,6 @@ fn compressed_moves_codec_roundtrips_cleanly_from_1_to_3000_movers() {
             threshold this crate's SMSG_COMPRESSED_MOVES::write_encrypted_server has — informational, \
             not a regression guard for that report (that opcode is never sent at this scale, or at all)"]
 fn compressed_moves_codec_wraps_its_u16_size_field_only_far_past_reported_scale() {
-    // Documents WHERE the real (latent, currently-unreachable) limit is: `write_encrypted_server`
-    // computes `size = v.len().saturating_sub(2) as u16`, which silently truncates once the encoded
-    // packet exceeds 65535 bytes. This finds the crossover empirically rather than asserting a
-    // hand-derived number, so it stays correct if the wire shape of `CompressedMove` ever changes.
     let mut last_clean = 0usize;
     for n in (1000..=20000).step_by(1000) {
         match compressed_moves_roundtrip(n) {
@@ -4072,9 +3667,6 @@ fn compressed_moves_codec_wraps_its_u16_size_field_only_far_past_reported_scale(
     panic!("expected the encoder to wrap its u16 size field somewhere in 1000..20000 movers");
 }
 
-// ---- SMSG_SET_PROFICIENCY: what the client may wield and wear -----------------------------------
-
-/// Extract the typed proficiency message, or fail loudly.
 fn proficiency(msg: &ServerOpcodeMessage) -> &SMSG_SET_PROFICIENCY {
     match msg {
         ServerOpcodeMessage::SMSG_SET_PROFICIENCY(p) => p,
@@ -4084,16 +3676,12 @@ fn proficiency(msg: &ServerOpcodeMessage) -> &SMSG_SET_PROFICIENCY {
 
 #[test]
 fn set_proficiency_pins_both_masks_on_the_wire() {
-    // A Warrior who has trained Plate Mail (750). Weapons: the class table admits every subclass up
-    // to the fishing pole except the wand. Armor: misc+cloth+leather+mail+shield, plus the plate the
-    // passive just unlocked.
     let msgs = build_set_proficiency_msgs(1, &[750]);
     let bytes = |msg: &ServerOpcodeMessage| {
         let mut buf = Vec::new();
         proficiency(msg).write_unencrypted_server(&mut buf).unwrap();
         buf
     };
-    // size (u16 BE) = 5-byte body + 2-byte opcode; opcode 0x0127 (u16 LE); ItemClass; mask (u32 LE).
     assert_eq!(
         bytes(&msgs[0]),
         vec![0x00, 0x07, 0x27, 0x01, 2, 0xFF, 0xFF, 0x17, 0x00],
@@ -4104,7 +3692,6 @@ fn set_proficiency_pins_both_masks_on_the_wire() {
         vec![0x00, 0x07, 0x27, 0x01, 4, 0x5F, 0x00, 0x00, 0x00],
         "armor mask = misc|cloth|leather|mail|plate|shield"
     );
-    // Each bit is `1 << subclass`, so the mask reads back as the subclass set it stands for.
     let armor = proficiency(&msgs[1]).item_sub_class_mask;
     for subclass in [0u8, 1, 2, 3, 4, 6] {
         assert!(armor & (1 << subclass) != 0, "armor subclass {subclass}");
@@ -4122,14 +3709,11 @@ fn the_armor_mask_follows_the_trained_passives_per_class() {
     const MAIL: u32 = 1 << 3;
     const PLATE: u32 = 1 << 4;
 
-    // A Warrior wears mail from level 1 and plate only once 750 is trained.
     assert_eq!(mask(1, &[]) & MAIL, MAIL);
     assert_eq!(mask(1, &[]) & PLATE, 0);
     assert_eq!(mask(1, &[750]) & (MAIL | PLATE), MAIL | PLATE);
-    // A Mage wears cloth and misc, whatever passives it somehow holds.
     assert_eq!(mask(8, &[]), 0b11);
     assert_eq!(mask(8, &[750, 8737]), 0b11);
-    // The mail upgrade is the Hunter's, and it is the only tier it moves.
     assert_eq!(mask(3, &[]) & MAIL, 0);
     assert_eq!(mask(3, &[8737]) & MAIL, MAIL);
 }
@@ -4176,15 +3760,8 @@ fn login_sequence_carries_both_proficiency_masks_with_the_initial_state() {
     }
 }
 
-// ---- P1: entity.rs realm_datetime — dynamic SMSG_LOGIN_SETTIMESPEED clock ---------------------
-//
-// Expected packed fields below are worked calendar examples verified independently with
-// `date -u`, not recomputed from `realm_datetime`'s own days-to-civil algorithm. Each Unix
-// timestamp's day-count offset and weekday were cross-checked by hand.
-
 #[test]
 fn realm_datetime_year_rollover() {
-    // 2026-12-31T23:59:00Z (a Thursday) rolls to 2027-01-01T00:00:00Z (a Friday) one minute later.
     let before = realm_datetime(1_798_761_540);
     assert_eq!(before.years_after_2000(), 26);
     assert_eq!(before.month(), Month::December);
@@ -4208,7 +3785,6 @@ fn realm_datetime_year_rollover() {
 
 #[test]
 fn realm_datetime_month_rollover() {
-    // 2027-01-31T14:37:00Z (a Sunday) rolls to 2027-02-01T00:05:00Z (a Monday).
     let before = realm_datetime(1_801_406_220);
     assert_eq!(before.month(), Month::January);
     assert_eq!(before.month_day() + 1, 31);
@@ -4230,8 +3806,6 @@ fn realm_datetime_month_rollover() {
 
 #[test]
 fn realm_datetime_leap_year_boundary() {
-    // 2028-02-29T06:15:00Z: 2028 is a leap year (divisible by 4, not by 100), so a 29th of
-    // February exists at all; it is a Tuesday.
     let dt = realm_datetime(1_835_417_700);
     assert_eq!(dt.years_after_2000(), 28);
     assert_eq!(dt.month(), Month::February);
@@ -4243,8 +3817,6 @@ fn realm_datetime_leap_year_boundary() {
 
 #[test]
 fn realm_datetime_round_trips_through_display() {
-    // 2026-06-15T12:00:00Z: the date the removed hard-code intended but packed wrong (it fed 15
-    // into the zero-based month_day field, so the client actually showed the 16th). A Monday.
     let dt = realm_datetime(1_781_524_800);
     assert_eq!(dt.weekday(), Weekday::Monday, "2026-06-15 is a Monday");
     assert_eq!(
@@ -4261,9 +3833,6 @@ fn realm_datetime_round_trips_through_display() {
 
 #[test]
 fn login_sequence_emits_a_current_realm_clock_not_the_old_hardcode() {
-    // World entry's 3rd message stays SMSG_LOGIN_SETTIMESPEED, now carrying today's date within
-    // a couple of minutes of now (proving the removed 2026-06-15 hard-code is gone) at vanilla's
-    // fixed timescale.
     let before_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -4291,9 +3860,6 @@ fn login_sequence_emits_a_current_realm_clock_not_the_old_hardcode() {
         .expect("SMSG_LOGIN_SETTIMESPEED must be in the sequence");
     assert_eq!(settimespeed.timescale, 0.016_666_668);
 
-    // Bound the emitted value against the same real-clock window this test observed around the
-    // call — proving it tracks wall time, not that the packing algorithm is correct (the
-    // boundary tests above establish that against independently derived examples).
     let lower = realm_datetime(before_secs).as_int();
     let upper = realm_datetime(after_secs + 120).as_int();
     let emitted = settimespeed.datetime.as_int();

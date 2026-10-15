@@ -1,5 +1,3 @@
-//! Durable authored movement intent and its named operations.
-
 use spacetimedb::{table, ReducerContext, Table};
 
 use super::edges::game_creature_ai_returning_home;
@@ -26,9 +24,6 @@ pub enum AuthoredWalkingMode {
     WalkWhileChasing,
 }
 
-/// Runtime movement state belongs to one creature lifecycle and one definition revision. An
-/// engagement reset clears only combat-scoped immobilization. Death, despawn, respawn, and a
-/// definition revision drop the full row.
 #[table(accessor = game_creature_ai_movement_intent)]
 #[derive(Clone)]
 pub struct CreatureAiMovementIntent {
@@ -59,8 +54,6 @@ pub struct CreatureAiMovementIntent {
     pub facing_target_guid: u64,
 }
 
-/// An explicit authored patrol path for one creature entry on one map. Path zero never reads this
-/// table. It always means that spawn's existing `game_creature_waypoint` route.
 #[table(
     accessor = game_creature_ai_movement_path_waypoint,
     index(accessor = by_subject, btree(columns = [creature_entry, map_id, path_id]))

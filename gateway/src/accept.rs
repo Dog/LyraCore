@@ -1,15 +1,10 @@
-//! Accept-loop resource policy. See `docs/accept-policy.md` for the contract and rationale.
+//! Before changing listener retries or capacity limits, read docs/accept-policy.md.
 
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Non-waiting capacity shared by both listeners before they submit blocking session tasks.
-///
-/// A permit stays with the task for its whole lifetime. This keeps submitted plus running session
-/// tasks at or below the blocking-pool ceiling instead of moving excess accepted sockets into
-/// Tokio's unbounded blocking-task queue.
 #[derive(Debug, Clone)]
 pub(crate) struct BlockingTaskCapacity {
     permits: Arc<Semaphore>,
@@ -23,7 +18,6 @@ impl BlockingTaskCapacity {
         }
     }
 
-    /// Take a task seat immediately. `None` refuses this connection; it never waits in a queue.
     pub(crate) fn try_admit(&self) -> Option<BlockingTaskPermit> {
         self.permits
             .clone()
@@ -38,30 +32,18 @@ impl BlockingTaskCapacity {
     }
 }
 
-/// One submitted or running blocking session task. Dropping it returns the task seat, including
-/// during unwinding.
 pub(crate) struct BlockingTaskPermit {
     _permit: OwnedSemaphorePermit,
 }
 
-/// What the accept loop should do about an `accept(2)` (or per-socket setup) failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptOutcome {
-    /// Log it and take the next connection. Costs one connection, never the realm.
     Retry,
-    /// The listener itself is unusable — end the task. Retrying would spin forever.
     Fatal,
 }
 
-/// The errnos that mean the *listening socket* is broken rather than one connection.
-///
-/// `docs/accept-policy.md` explains the allowlist and the transient resource errors.
 const FATAL_ACCEPT_ERRNOS: &[i32] = &[libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EFAULT];
 
-/// Decide whether an accept-path error ends the listener task or one connection.
-///
-/// Fatal is a short explicit allowlist ([`FATAL_ACCEPT_ERRNOS`]); everything else — known transient
-/// errnos, errnos we have never seen, and errors with no raw errno at all — is [`AcceptOutcome::Retry`].
 pub fn classify_accept_error(e: &io::Error) -> AcceptOutcome {
     match e.raw_os_error() {
         Some(errno) if FATAL_ACCEPT_ERRNOS.contains(&errno) => AcceptOutcome::Fatal,
@@ -69,26 +51,15 @@ pub fn classify_accept_error(e: &io::Error) -> AcceptOutcome {
     }
 }
 
-/// First failure retries immediately: a lone `ECONNABORTED` is the common case and should not cost
-/// the next player any latency.
 const BACKOFF_BASE_MS: u64 = 10;
-/// Ceiling on the sleep. Under sustained `EMFILE` this is what the loop settles at — one attempt and
-/// one log line per second, rather than a spun core and a flooded log.
 const BACKOFF_CAP_MS: u64 = 1_000;
 
-/// How long to wait after the `consecutive`-th back-to-back transient accept failure.
-///
-/// `1` is zero (retry at once), then 10ms doubling to a 1s cap. Under a saturated fd table
-/// `accept` returns `EMFILE` *immediately*, so without this the loop is a busy-spin that burns a
-/// core and writes a log line per iteration — which makes a recoverable shortage look like a hang.
+/// EMFILE returns immediately, so repeated accept failures need backoff to avoid busy-spinning.
 pub fn backoff_delay(consecutive: u32) -> Duration {
     if consecutive <= 1 {
         return Duration::ZERO;
     }
-    // `checked_shl` is NOT the tool here and the test below caught it being used: it validates only
-    // the shift AMOUNT, so `10u64.checked_shl(63)` is a cheerful `Some(0)` — every set bit shifted
-    // off the top — and `0.min(cap)` restores the exact busy-spin this function exists to prevent.
-    // Clamp the shift, then saturate the multiply, so overshoot lands on the cap instead of zero.
+    // checked_shl checks the shift count, not lost high bits; clamp before multiplying.
     let steps = (consecutive - 2).min(u64::BITS - 1);
     let ms = BACKOFF_BASE_MS
         .saturating_mul(1u64 << steps)
@@ -96,8 +67,6 @@ pub fn backoff_delay(consecutive: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Consecutive-transient-failure counter for one accept loop. Reset by every accepted connection,
-/// so a healthy gateway that sees one bad connection an hour never sleeps at all.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AcceptBackoff {
     consecutive: u32,
@@ -108,19 +77,15 @@ impl AcceptBackoff {
         Self { consecutive: 0 }
     }
 
-    /// A connection came through — the shortage, whatever it was, is over.
     pub fn record_success(&mut self) {
         self.consecutive = 0;
     }
 
-    /// Record one transient failure; returns how long to sleep before the next `accept`.
     pub fn record_failure(&mut self) -> Duration {
         self.consecutive = self.consecutive.saturating_add(1);
         backoff_delay(self.consecutive)
     }
 
-    /// How many failures in a row we are into — for the log line, so an operator can tell one bad
-    /// connection from a gateway that has been out of file descriptors for the last minute.
     pub fn consecutive(&self) -> u32 {
         self.consecutive
     }
@@ -134,7 +99,6 @@ mod tests {
         io::Error::from_raw_os_error(errno)
     }
 
-    /// Resource exhaustion and interrupted connections leave the listener available.
     #[test]
     fn the_errnos_that_killed_the_realm_are_transient() {
         for (errno, name) in [
@@ -156,9 +120,6 @@ mod tests {
         }
     }
 
-    /// The Linux "already-pending network error" family, which `accept(2)` says to retry like
-    /// `EAGAIN`. `EOPNOTSUPP` is in here on purpose — see the module docs for why its other,
-    /// permanent meaning cannot apply to a `TcpListener::bind`.
     #[test]
     fn pending_network_errors_and_per_connection_verdicts_are_transient() {
         for errno in [
@@ -181,8 +142,6 @@ mod tests {
         }
     }
 
-    /// The fatal set, pinned in full. If this test has to change, someone is changing the
-    /// availability policy of the whole realm and should have to say so in a diff.
     #[test]
     fn only_a_broken_listener_is_fatal() {
         for errno in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EFAULT] {
@@ -199,15 +158,11 @@ mod tests {
         );
     }
 
-    /// An errno nobody has enumerated must not end the realm. This is the direction the allowlist
-    /// is shaped for, so pin it against a value that is not in any list above.
     #[test]
     fn an_unknown_errno_retries_rather_than_ending_the_realm() {
         assert_eq!(classify_accept_error(&err(4095)), AcceptOutcome::Retry);
     }
 
-    /// `accept` has never handed us an errno-less error, but if it did, "we cannot prove it is
-    /// permanent" resolves to retry — the backoff bounds the cost of being wrong.
     #[test]
     fn an_error_with_no_raw_errno_retries() {
         let synthetic = io::Error::other("no errno here");
@@ -225,9 +180,6 @@ mod tests {
         assert_eq!(backoff_delay(8), Duration::from_millis(640));
     }
 
-    /// A sustained shortage settles at one attempt per second and stays there — including for
-    /// shift counts past `u64`'s width, which is where a naive `<<` would panic or wrap to zero and
-    /// silently restore the busy-spin.
     #[test]
     fn the_backoff_saturates_at_one_second_and_never_wraps() {
         assert_eq!(backoff_delay(9), Duration::from_millis(1_000));
@@ -252,8 +204,6 @@ mod tests {
         assert_eq!(b.record_failure(), Duration::ZERO);
     }
 
-    /// The counter runs for the life of the process; it must not wrap back into "first failure,
-    /// retry immediately" after 4 billion consecutive errors.
     #[test]
     fn the_counter_saturates_rather_than_wrapping() {
         let mut b = AcceptBackoff {

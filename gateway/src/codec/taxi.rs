@@ -1,6 +1,3 @@
-//! Vanilla taxi query replies. Gameplay has already selected the source and available client node
-//! ids; this layer only maps those facts to the fixed 256-bit build-5875 wire representation.
-
 use super::*;
 use wow_world_messages::vanilla::{
     ActivateTaxiReply, SMSG_ACTIVATETAXIREPLY, SMSG_SHOWTAXINODES, SMSG_TAXINODE_STATUS,
@@ -36,8 +33,6 @@ impl Default for TaxiActivationResult {
     }
 }
 
-/// Map the module's stable primitive result onto the closest vanilla 5875 reply. Unknown future
-/// values fail closed as a server error; refusal prose is diagnostic only and never enters policy.
 pub fn activate_taxi_reply(result_code: u8) -> ActivateTaxiReply {
     use lyracore_shared::constants::taxi_protocol as result;
     match result_code {
@@ -63,8 +58,7 @@ pub fn build_activate_taxi_reply(result: TaxiActivationResult) -> SMSG_ACTIVATET
     }
 }
 
-/// Pack one-based client node ids into exactly eight little-endian u32 words. Invalid ids are
-/// ignored defensively; imported data and module replies already enforce 1..=256.
+/// Node ids are one-based; the wire holds eight little-endian u32 words.
 pub fn build_taxi_mask(ids: impl IntoIterator<Item = u32>) -> [u32; TAXI_MASK_WORDS] {
     let mut words = [0u32; TAXI_MASK_WORDS];
     for id in ids {

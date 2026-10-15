@@ -257,7 +257,6 @@ impl EventCondition {
 pub enum RecurrencePolicy {
     Once,
     Repeat(TimeWindow),
-    /// Every distinct edge may fire. There is no authored cooldown window.
     RepeatOnEvent,
 }
 
@@ -340,9 +339,6 @@ pub(crate) enum SpellCastTarget {
 pub enum SpeechMode {
     Say,
     Yell,
-    /// Source chat type 2: a third-person narrative line. It always carries the universal language
-    /// and reaches clients as a monster emote rather than speech. Appended last so an existing
-    /// encoded rule keeps its variant index.
     Emote,
     BossEmote,
     ZoneYell,
@@ -381,7 +377,6 @@ pub struct EmoteInstruction {
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, Eq, PartialEq)]
 pub struct RandomEmoteInstruction {
-    /// Exactly three source choices. A negative choice is the authored empty branch.
     pub emote_ids: Vec<i32>,
 }
 
@@ -462,7 +457,6 @@ pub struct SetReactStateInstruction {
 
 #[derive(spacetimedb::SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoveGuardiansInstruction {
-    /// Zero removes every owned summon. A nonzero entry removes the first matching summon.
     pub creature_entry: u32,
 }
 
@@ -748,9 +742,6 @@ pub(crate) enum EventKind {
 }
 
 impl EventKind {
-    /// Whether a new firing of this event may wait behind the previous firing's repeat window.
-    /// Aggro, death, evade, spawn, reached-home, and unreachable have no authored cooldown.
-    /// `RepeatOnEvent` can still re-arm any of those rules for its next edge.
     pub(crate) fn supports_repeat_cooldown(self) -> bool {
         !matches!(
             self,
@@ -796,8 +787,6 @@ pub(crate) enum EventAiRequest<'a> {
     Edge(EventContext),
 }
 
-/// One live melee fight the engaged pass evaluates: the creature whose rules run, and the victim
-/// its contexts point at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EngagedFight {
     pub creature_guid: u64,
@@ -811,7 +800,6 @@ pub(crate) struct CycleActor {
     pub engaged: bool,
 }
 
-/// One unit as EventAI conditions and target selection read it, free of any table shape.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EventAiUnit {
     pub guid: u64,
@@ -835,8 +823,6 @@ pub(crate) struct EventAiUnit {
     pub owner_guid: u64,
 }
 
-/// One imported broadcast text as speech reads it: the line, the chat type it carries, and the
-/// animation emote that travels with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BroadcastLine {
     pub text: String,
@@ -845,7 +831,6 @@ pub(crate) struct BroadcastLine {
     pub emote: u32,
 }
 
-/// One authored summon location, with the summon's out-of-combat lifetime.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SummonLocation {
     pub x: f32,

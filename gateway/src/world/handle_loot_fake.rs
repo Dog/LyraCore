@@ -1,7 +1,3 @@
-//! A Fake for the traits `Loot::handle` is bounded on: Death, Loot Window, Npc, Shard Routing and
-//! Loot Roll. Death and the Loot Window carry state. The other three are not reachable from the
-//! tests that use it.
-
 use crate::codec;
 use crate::stdb::ReducerCallError;
 use crate::world::handlers::{
@@ -23,15 +19,11 @@ pub(crate) enum Life {
 #[derive(Default)]
 pub(crate) struct HandleLootFake {
     life: Mutex<HashMap<u64, Life>>,
-    /// Owner guid to the guid of the corpse that owner can reclaim.
     corpses: HashMap<u64, u64>,
-    /// Characters with an unanswered resurrect offer.
     res_offers: Mutex<HashSet<u64>>,
-    /// Characters holding an unspent Self-Resurrection Option.
     self_res_options: Mutex<HashSet<u64>>,
     spirit_healers: HashSet<u64>,
     loot_by_viewer: HashMap<u64, Vec<codec::LootItemView>>,
-    /// When set, every Durable Request fails as a Transport Loss.
     transport_lost: bool,
 }
 
@@ -71,7 +63,6 @@ impl HandleLootFake {
         self
     }
 
-    /// Characters nobody set up are alive.
     pub(crate) fn life(&self, guid: u64) -> Life {
         self.life
             .lock()
@@ -89,7 +80,6 @@ impl HandleLootFake {
         self.self_res_options.lock().unwrap().contains(&guid)
     }
 
-    /// The Module refuses a request the character's state does not allow.
     fn require(&self, operation: &str, guid: u64, needed: Life) -> Result<()> {
         self.reachable(operation)?;
         match self.life(guid) {
@@ -359,7 +349,6 @@ impl LootRollStore for HandleLootFake {
     }
 }
 
-/// A single-database gateway: every handle serves every location, and nothing routes.
 impl ShardRoutingStore for HandleLootFake {
     fn shard_name(&self) -> &str {
         "handle-loot-fake"

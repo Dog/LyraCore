@@ -2,24 +2,12 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct TransferState {
-    /// The fake DATABASE this handle talks to, for the cross-database transfer tests. `None`
-    /// (the default) leaves every transfer trait method at its "this store does not shard" default,
-    /// so every other test in this file is untouched.
     pub(crate) xdb: Option<std::sync::Arc<FakeShardDb>>,
-    /// How many `escrowed_transfer` reads answer `None` before the row shows up — the
-    /// cross-connection lag between a reducer's reply and the coordinator cache, made dialable.
     pub(crate) escrow_reads_before_visible: std::sync::atomic::AtomicUsize,
-    /// The transfer step to fail at, simulating a gateway killed before that step's
-    /// transaction committed. `None` = nothing fails.
     pub(crate) kill_at: Option<String>,
-    /// The REALM-CORE character→shard index this handle's `publish_shard_index` writes. In
-    /// production that write goes to a third database (`realm_core()`); here it is just a map, so a
-    /// test can assert the drive published the destination it settled on.
     pub(crate) realm_index: std::sync::Mutex<Vec<(u64, u32, u64)>>,
-    /// Realm-core's ordered transfer phase for cross-Shard caller tests.
     pub(crate) realm_partition:
         std::sync::Mutex<Option<crate::world::party::RealmCharacterPartition>>,
-    /// When set, `publish_shard_index` fails with this message — an unreachable realm-core.
     pub(crate) publish_error: Option<String>,
 }
 
@@ -70,14 +58,6 @@ impl TransferStore for WorldFake {
         })
     }
 
-    /// `plan_begin`: replay on a matching escrow, refuse without a source copy, refuse a second
-    /// escrow for the same character, otherwise freeze + serialize.
-    ///
-    /// The `escrowed_guid` lookup is the OUT-row with the IN-row as a fallback, exactly as
-    /// `module/src/transfer/mod.rs`'s `begin_transfer` computes it — and that fallback is load-bearing
-    /// now the transfer id IS the character guid: a database holding an unreleased ARRIVAL in-row
-    /// for this character answers `BeginPlan::Replay` to a genuine new transfer, i.e. reports
-    /// success while freezing nothing. A mock that only looked at `out_rows` could not see it.
     fn begin_transfer(
         &self,
         _character: Actor,
@@ -93,7 +73,7 @@ impl TransferStore for WorldFake {
             if existing != plan.character_guid {
                 return Err(anyhow!("transfer id collision"));
             }
-            return Ok(()); // BeginPlan::Replay
+            return Ok(());
         }
         let Some(c) = db.get(plan.character_guid) else {
             return Err(anyhow!("no such character: {}", plan.character_guid));
@@ -125,8 +105,6 @@ impl TransferStore for WorldFake {
         Ok(())
     }
 
-    /// `import_character_blob`: replay on the in-row PK, refuse to land on a LIVE character,
-    /// otherwise materialise the row + its payload at the escrow's destination.
     fn import_character_blob(
         &self,
         transfer_id: u64,
@@ -146,7 +124,7 @@ impl TransferStore for WorldFake {
                 return Err(anyhow!("bot Transfer arrival identity is invalid"));
             }
         }
-        // Drop each `in_rows` guard before `db.live()`, which locks the same non-reentrant Mutex.
+        // Drop each in_rows guard before db.live(), which takes the same non-reentrant mutex.
         let replayed = lk(&db.in_rows).get(&transfer_id).copied();
         if let Some(existing) = replayed {
             if existing != guid {
@@ -177,8 +155,6 @@ impl TransferStore for WorldFake {
         if db.live(guid) {
             return Err(anyhow!("character {guid} is already live on this shard"));
         }
-        // The destination rides IN the blob, exactly as the real `ExportBlob`'s `dest_*` fields do:
-        // cross-database the blob is the only thing that reaches this side.
         lk(&db.characters).insert(guid, arriving);
         lk(&db.in_rows).insert(transfer_id, guid);
         lk(&db.arrival_sources).insert(
@@ -199,7 +175,6 @@ impl TransferStore for WorldFake {
         Ok(())
     }
 
-    /// `confirm_import`: the SOURCE-side attestation. Refuses without a local escrow.
     fn confirm_import(&self, transfer_id: u64) -> Result<()> {
         let db = self.xstep("confirm_import")?;
         let out = lk(&db.out_rows);
@@ -212,13 +187,11 @@ impl TransferStore for WorldFake {
         Ok(())
     }
 
-    /// `plan_finish`: refuses while the in-row (the attestation) is absent — the guard that makes
-    /// "zero durable copies" unreachable — then cascade-deletes the source copy, escrow last.
     fn finish_transfer(&self, transfer_id: u64) -> Result<()> {
         let db = self.xstep("finish_transfer")?;
         let mut out = lk(&db.out_rows);
         let Some(escrow) = out.get(&transfer_id).cloned() else {
-            return Ok(()); // FinishPlan::AlreadyDone
+            return Ok(());
         };
         if !lk(&db.in_rows).contains_key(&transfer_id) {
             return Err(anyhow!(
@@ -231,7 +204,6 @@ impl TransferStore for WorldFake {
         Ok(())
     }
 
-    /// `release_transfer`: refuses on a shard that is the SOURCE; replay-safe otherwise.
     fn release_transfer(&self, transfer_id: u64) -> Result<()> {
         let Some(_) = self.transfer.xdb.as_ref() else {
             return Ok(());
@@ -663,9 +635,6 @@ impl TransferStore for WorldFake {
             _ => {}
         }
         lk(&db.instance_partitions).insert(instance_id, (map_id, party_id));
-        // The module's own shape: a mirror of an instance that is ALREADY here joins it (early
-        // return) instead of spawning a second population. `HashSet::insert` reports that for free,
-        // and the count is what the second-party-member test asserts against.
         if lk(&db.instances).insert(instance_id) {
             lk(&db.populated).push(instance_id);
         }
@@ -682,12 +651,6 @@ impl TransferStore for WorldFake {
     }
 }
 
-// The cross-database transfer fixtures. `TransferStore` above runs on them through `xdb`, and
-// `transfer_tests.rs` and the world-port tests build them directly.
-
-/// One character's durable state, reduced to what a transfer has to preserve: where it is, and a
-/// PAYLOAD marker standing for the character-owned rows (gear/spells/skills/quest log). If the
-/// payload does not arrive, the character arrived NAKED — the failure a manifest-only blob has.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FakeChar {
     pub(crate) map_id: u32,
@@ -704,25 +667,17 @@ pub(crate) struct FakeEscrow {
     pub(crate) blob: Vec<u8>,
 }
 
-/// One SpacetimeDB database, as far as the transfer protocol can see it.
 #[derive(Default)]
 pub(crate) struct FakeShardDb {
     pub(crate) characters: std::sync::Mutex<std::collections::HashMap<u64, FakeChar>>,
-    /// transfer_id → the source escrow (`game_transfer_out`).
     pub(crate) out_rows: std::sync::Mutex<std::collections::HashMap<u64, FakeEscrow>>,
-    /// transfer_id → character guid (`game_transfer_in`): on the DESTINATION the arrival copy's
-    /// fence, on the SOURCE the gateway's `confirm_import` attestation.
     pub(crate) in_rows: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
-    /// Exact bot Transfer identity attached to a destination fence.
     pub(crate) bot_arrivals: std::sync::Mutex<
         std::collections::HashMap<u64, (spacetimedb_sdk::Identity, u64, u64, i64)>,
     >,
-    /// Realm locator predecessor attached to each destination fence.
     pub(crate) arrival_sources: std::sync::Mutex<std::collections::HashMap<u64, (u32, u64, u64)>>,
     pub(crate) instances: std::sync::Mutex<std::collections::HashSet<u64>>,
     pub(crate) instance_partitions: std::sync::Mutex<std::collections::HashMap<u64, (u32, u64)>>,
-    /// Every instance id this database actually SPAWNED a population for — one entry per
-    /// spawn, so "the second party member re-created the dungeon" is visible as a duplicate.
     pub(crate) populated: std::sync::Mutex<Vec<u64>>,
     pub(crate) evicted: std::sync::Mutex<Vec<u64>>,
 }
@@ -746,8 +701,6 @@ impl FakeShardDb {
     pub(crate) fn get(&self, guid: u64) -> Option<FakeChar> {
         lk(&self.characters).get(&guid).cloned()
     }
-    /// A character is LIVE here iff it is durable AND neither escrow row fences it — the module's
-    /// `login_allowed` predicate, which is what `player_login` actually gates on.
     pub(crate) fn live(&self, guid: u64) -> bool {
         self.has(guid)
             && !lk(&self.out_rows)
@@ -760,9 +713,6 @@ impl FakeShardDb {
     }
 }
 
-/// The blob a fake `begin_transfer` produces. Carries the destination and the payload, exactly as
-/// the real `ExportBlob` carries `dest_*` + `character_row` + `payload`: cross-database the blob is
-/// the ONLY thing that reaches the far side.
 pub(crate) fn fake_blob(guid: u64, dest_map: u32, dest_instance: u64, payload: &str) -> Vec<u8> {
     format!("{guid}|{dest_map}|{dest_instance}|{payload}").into_bytes()
 }
@@ -781,8 +731,6 @@ pub(crate) fn parse_blob(blob: &[u8]) -> (u64, FakeChar) {
 }
 
 impl WorldFake {
-    /// Record a transfer step and honour an injected kill. `Err` means "the gateway died
-    /// before this step's transaction committed", which is exactly a truncated drive.
     pub(crate) fn xstep(&self, what: &str) -> Result<&std::sync::Arc<FakeShardDb>> {
         let db = self
             .transfer
@@ -796,8 +744,6 @@ impl WorldFake {
         Ok(db)
     }
 
-    /// The realm-core index publish. Recorded in the shared call log so its POSITION in the
-    /// drive is assertable, not just its effect.
     pub(crate) fn publish_shard_index(
         &self,
         character_guid: u64,
@@ -807,10 +753,6 @@ impl WorldFake {
         if let Some(e) = &self.transfer.publish_error {
             return Err(anyhow!("{e}"));
         }
-        // Through `xstep`, like every other step of the drive — NOT a bare `rec`. Every other
-        // transfer method routes its "gateway killed here" injection through it, and this one
-        // originally did not, so `kill_at = "publish_shard_index"` was silently inert and the
-        // crash matrix reported a PASS for a boundary it never killed at.
         self.xstep("publish_shard_index")?;
         self.transfer
             .realm_index

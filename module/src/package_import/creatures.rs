@@ -1,19 +1,3 @@
-//! The creatures Import Family's half of a Package Delta apply: the setters for the creature
-//! catalogue and its spawns, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not. What is here is only
-//! what is true of creatures.
-//!
-//! `game_creature_template` is a global catalogue, the item shape: one band, checked against the
-//! row's own entry. `game_creature_spawn` is SPATIAL — its claim key names the map that routed it
-//! here — and its durable guid is derived from the template and the spawn identifier, so a spawn
-//! write is a guid the artifact never spelled.
-//!
-//! A spawn row is not the live creature. The respawn pass builds the entity from the spawn row and
-//! its template, so every write here drops the live entity and arms the timer, exactly as
-//! `import_creature_spawns` does for the base import. That is why an apply may only run as an
-//! import stage: it rebuilds the creatures it touches.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -26,14 +10,6 @@ use crate::{game_creature_spawn, game_creature_template, CreatureSpawn, Creature
 
 use super::{as_f32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a creatures claim whose final row would point at no row after this family lands.
-///
-/// Two checks, both of them things only the whole plan can answer. A spawn names a creature
-/// template: the row it places has to exist once the plan lands, or the respawn pass would find a
-/// spawn point it cannot build. And two spawn claims may derive ONE durable guid — the map routes a
-/// claim but never reaches the guid, so the same template and spawn identifier stated on two maps
-/// is one row claimed twice. That is an invalid statement about map ownership, and it is the one
-/// this Module can see: the Shard itself is shard-agnostic and never decides which maps it owns.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     check_one_guid_per_spawn(rows)?;
     for row in rows {
@@ -54,7 +30,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// Refuses a plan whose spawn claims collide on one derived guid.
 fn check_one_guid_per_spawn(rows: &[TracedRow]) -> Result<(), String> {
     let claimed: Vec<&TracedRow> = rows
         .iter()
@@ -76,10 +51,6 @@ fn check_one_guid_per_spawn(rows: &[TracedRow]) -> Result<(), String> {
     Ok(())
 }
 
-/// True when `entry` will name a `game_creature_template` row once this plan lands.
-///
-/// A Package-band template is satisfied by an insert in the same plan; anything else has to be on
-/// the Shard already. The `npc_text_exists_after_apply` shape.
 fn template_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], entry: u32) -> bool {
     if entry == 0 {
         return false;
@@ -98,7 +69,6 @@ fn template_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], entry: 
         .is_some()
 }
 
-/// What this Shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if row.operation() == Operation::Update && updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -131,10 +101,6 @@ fn row_is_present(ctx: &ReducerContext, row: &TracedRow) -> bool {
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The band is checked against the identifier the family owns: a template's own entry, a spawn's
-/// own spawn identifier — never the template a spawn merely names.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     match row.key() {
         PrimaryKey::CreatureTemplate { entry } => is_package_creature_id(entry),
@@ -143,12 +109,6 @@ fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     }
 }
 
-/// Removes every row a Package invented, spawns before the templates they name.
-///
-/// A Package spawn takes its live creature with it, through the canonical despawn checklist: the
-/// spawn row is the source of truth the respawn pass rebuilds from, so leaving the entity would
-/// leave a creature nothing can respawn or explain, and leaving its engagement, threat, motion and
-/// loot rows behind would leave them keyed on a guid nothing holds.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let spawns = ctx.db.game_creature_spawn();
     let package_guids: Vec<u64> = spawns
@@ -173,7 +133,6 @@ pub(super) fn clear_package_range(ctx: &ReducerContext) {
     }
 }
 
-/// True when a durable creature guid carries a Package-invented spawn identifier in its low field.
 fn is_package_spawn_guid(guid: u64) -> bool {
     is_package_creature_id((guid & u64::from(MAX_CREATURE_GUID_COMPONENT)) as u32)
 }
@@ -227,10 +186,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
              dispatch runs, found {other}"
         ),
     }
-    // A written spawn describes a creature that is standing somewhere else, or nowhere. Handing the
-    // live entity back to the respawn pass rebuilds it from this row on the next tick — the
-    // `import_creature_spawns` reset, one creature wide, through the canonical despawn checklist so
-    // no engagement, threat or motion row outlives the creature it named.
     if row.table() == ClaimTable::CreatureSpawn {
         crate::instance::remove_spawn_copies(ctx, row.row_id());
         crate::creatures::despawn_creature_entity(ctx, row.row_id());
@@ -246,7 +201,6 @@ fn gone(row: &TracedRow) -> String {
     format!("`{}` row {} vanished mid-apply", row.table(), row.key())
 }
 
-/// Runs one table's setter over every claimed column.
 fn apply_fields(
     row: &TracedRow,
     mut set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -256,10 +210,6 @@ fn apply_fields(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn blank_template(entry: u32) -> CreatureTemplate {
     CreatureTemplate {
@@ -330,8 +280,6 @@ fn apply_template_field(
     Ok(())
 }
 
-/// A spawn row with everything the key already decided, and the live state a fresh import stamps:
-/// the respawn timer armed at now, so the next tick builds the creature, and no corpse to decay.
 fn blank_spawn(ctx: &ReducerContext, key: PrimaryKey) -> CreatureSpawn {
     let (map_id, entry) = match key {
         PrimaryKey::CreatureSpawn { map_id, entry, .. } => (map_id, entry),
@@ -376,10 +324,6 @@ fn no_such_column(table: &str, column: &str) -> String {
     format!("`{table}` has no claimable column `{column}`")
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -393,8 +337,6 @@ mod tests {
     const A_LEVEL: &str = r#"{"level":{"type":"u32","value":12}}"#;
     const A_POSITION: &str = r#"{"x":{"type":"f32","value":1.5}}"#;
 
-    /// The Package creature range is cleared on every apply, so tuning a Package creature nobody
-    /// enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_template_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -406,8 +348,6 @@ mod tests {
         assert!(updates_an_uninvented_package_row(&plan.rows[0]));
     }
 
-    /// A Package spawn of a REAL creature is the ordinary case: the spawn identifier is banded, the
-    /// template it names is not.
     #[test]
     fn a_package_spawn_of_a_real_creature_is_judged_on_its_spawn_identifier() {
         let package_spawn = plan(&[artifact(
@@ -437,8 +377,6 @@ mod tests {
         assert!(!updates_an_uninvented_package_row(&real_spawn.rows[0]));
     }
 
-    /// The map routes a claim but never reaches the durable guid, so one spawn stated on two maps
-    /// is one row claimed twice.
     #[test]
     fn one_spawn_claimed_on_two_maps_is_refused() {
         let plan = plan(&[
@@ -498,8 +436,6 @@ mod tests {
         assert_eq!(template.armor, 120);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live Shard and nowhere else.
     #[test]
     fn every_claimable_creature_column_has_a_setter() {
         let mut template = blank_template(PACKAGE_CREATURE);
@@ -528,7 +464,6 @@ mod tests {
         }
     }
 
-    /// A durable guid tells a Package spawn from an imported one by its low field alone.
     #[test]
     fn a_package_spawn_guid_is_recognised_by_its_spawn_identifier() {
         let package =

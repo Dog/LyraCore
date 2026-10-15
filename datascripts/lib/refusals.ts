@@ -1,26 +1,3 @@
-// Why a Datascript's Package Delta was refused.
-//
-// A STRICT MIRROR of `DeltaError` in `crates/lyracore-package-delta/src/error.rs`. Every rule the
-// Rust parser enforces is enforced here too, under the same name, so a Datascript that emits fails
-// at author time rather than in the importer. Nothing here is a rule the parser does not have: an
-// author who works around a refusal here would only meet it again at import.
-//
-// # The variants that cannot happen here
-//
-// `Malformed`, `UnsupportedVersion`, `MissingMember`, `UnexpectedMember` and `WrongJsonType` are the
-// parser's answers to untrusted JSON; this library writes the JSON, so it cannot produce them.
-// `UnknownTable` and `UnknownOperation` cannot happen because neither is authored — the table
-// follows from the object an author holds, and the operation from whether it was cloned.
-// `DeleteNotSupported` cannot happen because there is no delete surface to call.
-// `FieldTypeMismatch` cannot happen because a claim always declares the column's OWN type: a value
-// that does not fit it is `ValueOutOfRange`, exactly as the parser would rule on the same artifact.
-//
-// # What is NOT a refusal
-//
-// Missing base data is a different failure: it is about the snapshot an author is reading, not about
-// the artifact they are writing, and the Rust parser has no opinion on it because it never sees base
-// data. It raises `BaseDataError` instead, so the mirror stays exact.
-
 import {
   FIXTURE_RESERVED_ID_CEIL,
   FIXTURE_RESERVED_ID_FLOOR,
@@ -32,7 +9,6 @@ import {
 } from "./ids.ts";
 import type { FieldType } from "./schema.ts";
 
-/// The `DeltaError` variant a refusal mirrors.
 export type RefusalKind =
   | "InvalidPackageId"
   | "InvalidSourceHash"
@@ -47,8 +23,6 @@ export type RefusalKind =
   | "EmptyUpdate"
   | "DuplicateClaim";
 
-/// A Package Delta this Datascript may not emit. Thrown, never returned: a refused Datascript
-/// writes nothing at all, so a half-built artifact can never reach a Package folder.
 export class DeltaRefusal extends Error {
   readonly kind: RefusalKind;
 
@@ -59,8 +33,6 @@ export class DeltaRefusal extends Error {
   }
 }
 
-/// The Base Snapshot does not hold what the Datascript asked for. Distinct from a `DeltaRefusal`:
-/// the artifact would have been valid, the base data it was to be derived from is not there.
 export class BaseDataError extends Error {
   constructor(message: string) {
     super(message);

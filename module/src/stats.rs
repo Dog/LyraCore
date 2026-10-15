@@ -1,42 +1,22 @@
-//! Player base stats from the real vanilla curve. Two cmangos-loaded tables —
-//! `game_class_level_stats` (base HP/mana per class+level) and `game_level_stats` (the five base
-//! attributes per race+class+level) — plus the vanilla derived-stat formulas, replace the flat
-//! placeholder `xp::max_health_for_level` and the `max_power = 1000`-for-everyone hardcode. Loaded by
-//! the importer's `--dump` mode (plain `spacetime sql` — no Timestamp columns).
-//!
-//! Every lookup **falls back to the placeholder curve / power-type constant when a row is missing**,
-//! so login never depends on the data being present (a fresh `-c` reprovision before an import still
-//! works, and an L1 character is 60 HP either way — zero behavior change until the curve is loaded).
-//! The base HP/mana is BEFORE the attribute contribution (Warrior L1 `base_health` is 20, not 60);
-//! the real pool adds `hp_from_stamina` / `mana_from_intellect`. [static]
-
 use lyracore_shared::packing::power_type;
 use spacetimedb::{table, ReducerContext};
 
 use crate::{game_character, game_world_entity, WorldEntity};
 
-// ===========================================================================================
-//  Stat-curve tables [static] — loaded from cmangos by the importer (no Timestamp → SQL-loadable)
-// ===========================================================================================
-
-/// Base HP/mana per (class, level) — cmangos `player_classlevelstats`. PK packs `(class<<8)|level`
-/// (level ≤ 60 fits a byte). The base is pre-attribute; the live pool adds the stamina/intellect bonus.
 #[table(accessor = game_class_level_stats, public)]
 pub struct ClassLevelStats {
     #[primary_key]
-    pub class_level: u32, // (class << 8) | level
+    pub class_level: u32,
     pub class: u8,
     pub level: u32,
     pub base_health: u32,
     pub base_mana: u32,
 }
 
-/// The five base attributes per (race, class, level) — cmangos `player_levelstats`. PK packs
-/// `(race<<16)|(class<<8)|level`.
 #[table(accessor = game_level_stats, public)]
 pub struct LevelStats {
     #[primary_key]
-    pub race_class_level: u32, // (race<<16) | (class<<8) | level
+    pub race_class_level: u32,
     pub race: u8,
     pub class: u8,
     pub level: u32,
@@ -47,20 +27,13 @@ pub struct LevelStats {
     pub spirit: u32,
 }
 
-/// Lookup key for `game_class_level_stats`.
 pub(crate) fn class_level_key(class: u8, level: u32) -> u32 {
     ((class as u32) << 8) | (level & 0xFF)
 }
-/// Lookup key for `game_level_stats`.
 pub(crate) fn race_class_level_key(race: u8, class: u8, level: u32) -> u32 {
     ((race as u32) << 16) | ((class as u32) << 8) | (level & 0xFF)
 }
 
-// ===========================================================================================
-//  Vanilla derived-stat formulas (pure — unit-tested)
-// ===========================================================================================
-
-/// Vanilla health from stamina: the first 20 points give 1 HP each, every point beyond gives 10.
 pub(crate) fn hp_from_stamina(stamina: u32) -> u32 {
     if stamina <= 20 {
         stamina
@@ -69,7 +42,6 @@ pub(crate) fn hp_from_stamina(stamina: u32) -> u32 {
     }
 }
 
-/// Vanilla mana from intellect: the first 20 points give 1 mana each, every point beyond gives 15.
 pub(crate) fn mana_from_intellect(intellect: u32) -> u32 {
     if intellect <= 20 {
         intellect
@@ -78,12 +50,6 @@ pub(crate) fn mana_from_intellect(intellect: u32) -> u32 {
     }
 }
 
-// ===========================================================================================
-//  Lookups (DB + formula, with fallback) — the single source of truth for vitals
-// ===========================================================================================
-
-/// Max health for (race, class, level): class/level base HP + the stamina contribution. Falls back
-/// to the flat placeholder curve when the curve data isn't loaded, so login never breaks on a miss.
 pub(crate) fn max_health_for(ctx: &ReducerContext, race: u8, class: u8, level: u32) -> u32 {
     let base = ctx
         .db
@@ -101,9 +67,6 @@ pub(crate) fn max_health_for(ctx: &ReducerContext, race: u8, class: u8, level: u
     }
 }
 
-/// Max power for (race, class, level), power-type-aware: mana classes get class/level base mana + the
-/// intellect contribution; **rage = 1000** (a 100-point bar stored ×10 — what the live slice uses);
-/// **energy = 100**. Falls back to the power-type constant (or 0 mana) when the curve isn't loaded.
 pub(crate) fn max_power_for(ctx: &ReducerContext, race: u8, class: u8, level: u32) -> u32 {
     match power_type::for_class(class) {
         power_type::MANA => {
@@ -123,14 +86,10 @@ pub(crate) fn max_power_for(ctx: &ReducerContext, race: u8, class: u8, level: u3
             }
         }
         power_type::ENERGY => 100,
-        _ => 1000, // RAGE (and any default): a 100-point rage bar stored ×10
+        _ => 1000,
     }
 }
 
-/// Starting `power` for a freshly materialized PLAYER: mana classes spawn with a FULL mana pool,
-/// energy classes (Rogue) also spawn full (energy is non-persisted in vanilla — always 100/100 at
-/// login), and rage starts at 0. Pure so it's unit-testable without a live DB. Lives next to
-/// `max_power_for`, which owns power-type semantics.
 pub(crate) fn starting_power(pt: u8, max_power: u32) -> u32 {
     if pt == power_type::MANA || pt == power_type::ENERGY {
         max_power
@@ -139,11 +98,6 @@ pub(crate) fn starting_power(pt: u8, max_power: u32) -> u32 {
     }
 }
 
-/// The five base attributes for (race, class, level) — `(strength, agility, stamina, intellect,
-/// spirit)` — from the cmangos curve, for the player's character sheet (`UNIT_FIELD_STAT0..4`).
-/// Falls back to all-zero when the row isn't loaded (the sheet then reads 0s until the importer
-/// runs — login is unaffected, and these are display-only state). Reads the SAME `game_level_stats`
-/// row `max_health_for`/`max_power_for` use, so the stamina/intellect stay consistent with HP/mana.
 pub(crate) fn base_attributes_for(
     ctx: &ReducerContext,
     race: u8,
@@ -161,10 +115,6 @@ pub(crate) fn base_attributes_for(
     }
 }
 
-/// Old (pre-recompute) stat-curve values `apply_level_stats` returns alongside its write, so a caller
-/// that needs a per-stat popup delta (the ding loop) can diff against the freshly-written `new`
-/// side without a second curve lookup. Callers that only want the write (login, a bare level-set)
-/// ignore the return value.
 pub(crate) struct LevelStatsDelta {
     pub old_max_health: u32,
     pub old_max_power: u32,
@@ -175,12 +125,6 @@ pub(crate) struct LevelStatsDelta {
     pub old_spirit: u32,
 }
 
-///
-/// This was three hand-mirrored copies (`build_player_entity` at login, `grant_xp`'s ding loop, and
-/// `set_character_level`) held in sync only by a comment ("mirrors build_player_entity"). The third
-/// one drifted and dropped the armor line, so a level-SET character kept stale armor until its next
-/// relog. One function now, called from all three sites — the drift class is gone structurally,
-/// not just patched at the one site that happened to be caught.
 pub(crate) fn apply_level_stats(
     ctx: &ReducerContext,
     e: &mut WorldEntity,
@@ -204,7 +148,7 @@ pub(crate) fn apply_level_stats(
     e.stamina = stamina;
     e.intellect = intellect;
     e.spirit = spirit;
-    e.armor = agility * 2; // classic base armor from agility (2/point); item armor folds in later
+    e.armor = agility * 2;
     e.max_health = max_health_for(ctx, race, class, level);
     e.max_power = max_power_for(ctx, race, class, level);
     old
@@ -215,9 +159,6 @@ pub(crate) fn set_character_level(
     character_guid: u64,
     level: u32,
 ) -> Result<(), String> {
-    // Read the character's (race, class) to key the curve (the entity carries neither directly —
-    // race/class live in unit_bytes_0 and on the durable character row). Fall back to the entity's
-    // current level on a missing character (a creature has no character row → curve uses placeholder).
     let char_row = ctx.db.game_character().guid().find(character_guid);
     let (race, class) = char_row
         .as_ref()
@@ -233,32 +174,20 @@ pub(crate) fn set_character_level(
     }
     if let Some(mut e) = live {
         e.level = level;
-        e.xp = 0; // matches the character-row reset below — banked xp must not re-ding past the set level
-                  // …and the THRESHOLD, which the xp reset alone does not fix. `grant_xp`'s ding loop compares
-                  // `xp >= next_level_xp`, so a character left holding its OLD level's (much smaller) threshold
-                  // dings on its very next kill: a bot set to level 10 hit 11 after one wolf, in every bot test
-                  // that stages a level. Same defect family as the xp reset above — that fixed the banked
-                  // side and left the bar where it was.
+        e.xp = 0;
         e.next_level_xp = crate::xp::xp_to_next_level(level);
-        apply_level_stats(ctx, &mut e, race, class, level); // attributes + armor + max health/power
+        apply_level_stats(ctx, &mut e, race, class, level);
         e.health = e.max_health;
-        e.power = e.max_power; // refill power to the new max
+        e.power = e.max_power;
         entities.guid().update(e);
-        // Sheet AP/damage-range are level-derived and only ever move via `recompute_sheet` —
-        // without this a GM `.level` set leaves the paperdoll's AP/damage numbers frozen at the
-        // pre-set level until an unrelated trigger (aura/gear/relog) fires.
         crate::spell::recompute_sheet(ctx, character_guid);
     }
 
-    // Persist the level to the character row so a relog keeps it. XP resets to 0: banked
-    // xp survives a level-set otherwise, and any pool past the new level's threshold re-dings
-    // the character on the next xp pass — "set level 5" on a played character silently became
-    // level 6+, skewing every level-keyed fixture (exploration's L5 discovery paid the L6 value).
     let chars = ctx.db.game_character();
     if let Some(mut c) = chars.guid().find(character_guid) {
         c.level = level as u8;
         c.xp = 0;
-        c.next_level_xp = crate::xp::xp_to_next_level(level); // see the entity write above
+        c.next_level_xp = crate::xp::xp_to_next_level(level);
         chars.guid().update(c);
     }
     spacetimedb::log::info!("set_character_level: guid {character_guid} -> level {level}");
@@ -272,27 +201,22 @@ mod tests {
     #[test]
     fn stamina_curve_matches_vanilla_breakpoints() {
         assert_eq!(hp_from_stamina(0), 0);
-        assert_eq!(hp_from_stamina(20), 20); // 1 HP/pt up to 20
-        assert_eq!(hp_from_stamina(21), 30); // each point beyond 20 = 10 HP
-                                             // L1 human Warrior: cmangos basehp 20 + stamina 22 → 20 + (20 + 2*10) = 60, the documented value.
+        assert_eq!(hp_from_stamina(20), 20);
+        assert_eq!(hp_from_stamina(21), 30);
         assert_eq!(20 + hp_from_stamina(22), 60);
     }
 
     #[test]
     fn intellect_curve_matches_vanilla_breakpoints() {
-        assert_eq!(mana_from_intellect(20), 20); // 1 mana/pt up to 20
-        assert_eq!(mana_from_intellect(21), 35); // each point beyond 20 = 15 mana
+        assert_eq!(mana_from_intellect(20), 20);
+        assert_eq!(mana_from_intellect(21), 35);
     }
 
     #[test]
     fn starting_power_full_for_mana_and_energy_empty_for_rage() {
-        // Mana classes spawn with a full pool (matches login: `power = max_power`).
         assert_eq!(starting_power(power_type::MANA, 1500), 1500);
-        // Energy (Rogue) is non-persisted in vanilla — always full at login.
         assert_eq!(starting_power(power_type::ENERGY, 100), 100);
-        // Rage always starts at 0 (earned only through combat/damage).
         assert_eq!(starting_power(power_type::RAGE, 1000), 0);
-        // A zero-mana class (curve not loaded) stays 0 even on the mana branch.
         assert_eq!(starting_power(power_type::MANA, 0), 0);
     }
 

@@ -1,5 +1,3 @@
-//! Source populations stay dormant until an Instance creates independent spawn and patrol copies.
-
 mod support;
 
 use std::time::Duration;

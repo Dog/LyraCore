@@ -1,10 +1,5 @@
-//! Guild session facts over an encrypted World Session: sign-on at world entry, sign-off at
-//! logout, and the guild cleanup a Character delete triggers. Guild opcode behaviour is tested
-//! against `InMemoryGuildActions` in `handlers/guild.rs`.
-
 use super::*;
 
-/// Character 1 as a member of Guild 7 at rank 3.
 fn guild_member_store() -> WorldFake {
     let base = tester_store(7);
     WorldFake {
@@ -26,7 +21,6 @@ fn guild_member_store() -> WorldFake {
     }
 }
 
-/// The recorded operations, in call order, without their Shard.
 fn recorded(store: &WorldFake) -> Vec<String> {
     store
         .topology
@@ -120,7 +114,6 @@ fn a_world_port_that_fails_after_sign_on_still_signs_off() {
         let base = guild_member_store();
         WorldFake {
             session: SessionState {
-                // The world-port ack is only actionable after teleport_player removed the old entity.
                 entity_in_world: false,
                 worldport_login_error: Some("character 1 is stranded on map 36".into()),
                 ..base.session
@@ -153,9 +146,6 @@ fn a_world_port_that_fails_after_sign_on_still_signs_off() {
     assert!(position(&calls, "guild_op:SignOff") < position(&calls, "logout"));
 }
 
-/// Guild state on Realm-core for the deleted-Character reconciliation: Leader 5 and member 6 in
-/// one Guild, and a Petition owned by 7 with a Signature by 8. Characters 5 and 7 still exist on
-/// the `instances` peer; 6 and 8 exist on no World Shard.
 fn guild_cleanup_topology() -> std::sync::Arc<WorldFake> {
     guild_cleanup_topology_failing_lookup_for(None)
 }
@@ -255,8 +245,6 @@ fn only_characters_absent_from_every_world_shard_are_forgotten() {
     );
 }
 
-/// A Character row in any Shard's cache proves the Character exists, so the pass takes no durable
-/// snapshot for it. Only 6 and 8, gone from every cache, pay for the absence check.
 #[test]
 fn a_character_still_in_a_shard_cache_takes_no_durable_snapshot() {
     let world = guild_cleanup_topology();
@@ -269,8 +257,6 @@ fn a_character_still_in_a_shard_cache_takes_no_durable_snapshot() {
     assert!(forgotten(&kept).is_empty());
 }
 
-/// A `game_character` delete owes cleanup for that Character only, and none at all for a
-/// Character that no Guild, Petition or Signature names.
 #[test]
 fn a_single_delete_checks_only_its_own_character() {
     let world = guild_cleanup_topology();
@@ -279,8 +265,6 @@ fn a_single_delete_checks_only_its_own_character() {
     assert_eq!(durable_absence_checks(&world), 1);
 }
 
-/// A lookup that fails for one deleted Character does not hold up the others. The pass still
-/// fails, so the worker keeps the work and retries it.
 #[test]
 fn a_failed_lookup_still_cleans_the_other_deleted_characters() {
     let world = guild_cleanup_topology_failing_lookup_for(Some(6));
@@ -313,8 +297,6 @@ fn an_unavailable_world_shard_defers_every_guild_cleanup() {
     assert!(forgotten(&incomplete).is_empty());
 }
 
-/// A Guild Leader's delete answers 0x3A, FAILED_GUILD_LEADER in mangos, and never reaches the
-/// Home Shard (`cm:CharacterHandler.cpp:540-546`).
 #[test]
 fn char_delete_of_a_guild_leader_replies_failed_and_deletes_nothing() {
     let store = std::sync::Arc::new({

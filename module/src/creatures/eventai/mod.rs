@@ -1,5 +1,3 @@
-//! Native creature EventAI rules and their durable state.
-
 mod engine;
 mod fixtures;
 mod loader;
@@ -104,7 +102,6 @@ pub use tables::{
 
 use spacetimedb::ReducerContext;
 
-/// Run one explicit EventAI request against durable Module state.
 pub(crate) fn evaluate_context(ctx: &ReducerContext, request: EventAiRequest) -> u64 {
     engine::evaluate(&mut engine::DatabaseWorld::new(ctx), request)
 }

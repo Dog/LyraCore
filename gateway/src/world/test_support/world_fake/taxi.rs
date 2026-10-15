@@ -4,7 +4,6 @@ use wow_world_messages::vanilla::Vector3d;
 
 #[derive(Default)]
 pub(crate) struct TaxiState {
-    /// The taxi map the open operation returns, for the TAXI gossip socket tests.
     pub(crate) taxi_map: Option<codec::TaxiMapView>,
     pub(crate) taxi_error: Option<fn() -> anyhow::Error>,
     pub(crate) activation: codec::TaxiActivationResult,
@@ -13,7 +12,6 @@ pub(crate) struct TaxiState {
     pub(crate) flight_tx: Mutex<Option<SessionTx>>,
 }
 
-/// Taxi state for World Session tests. Arming publishes a flight spline to its passenger.
 impl TaxiActionStore for WorldFake {
     fn taxi_node_status(
         &self,

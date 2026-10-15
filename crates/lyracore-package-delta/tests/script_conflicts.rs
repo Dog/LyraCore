@@ -1,8 +1,3 @@
-//! Several Packages' scripts, together: what merges (nothing) and what collides.
-//!
-//! A Package Delta's tracer merges columns because a row has a base import behind it. A Runtime
-//! Script has none, so there is nothing to merge and identity is the only thing to trace.
-
 use lyracore_package_delta::{trace_scripts, ScriptArtifact, ScriptConflict};
 
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -34,8 +29,6 @@ fn packages_shipping_different_scripts_all_reach_the_plan() {
     assert_eq!(trace.scripts().len(), 2);
 }
 
-/// Several Packages may bind to ONE event without disagreeing. That is the normal case, and
-/// `priority` is what orders them — not a conflict to resolve.
 #[test]
 fn two_packages_binding_to_one_event_is_not_a_conflict() {
     let trace = trace_scripts(&[
@@ -139,8 +132,6 @@ fn one_package_cannot_supply_two_artifacts_even_when_the_scripts_do_not_collide(
     ));
 }
 
-/// The operator fixing a broken Package Inventory wants the whole list in one pass, not one
-/// refusal per re-run.
 #[test]
 fn every_disagreement_is_reported_rather_than_the_first() {
     let trace = trace_scripts(&[
@@ -163,8 +154,6 @@ fn every_disagreement_is_reported_rather_than_the_first() {
     assert_eq!(trace.conflicts().len(), 2);
 }
 
-/// One Package's own scripts never collide with each other here: the artifact parser already
-/// refused that, so a conflict in a trace is always BETWEEN Packages.
 #[test]
 fn one_package_alone_can_never_produce_a_conflict() {
     let trace = trace_scripts(&[artifact(

@@ -1,17 +1,10 @@
-//! Chat Channel reads from the Realm-core cache, through [`ChannelIndex`] so a request never scans
-//! the channel or member tables.
-
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
 
-/// The Gateway-side index over `game_chat_channel` and `game_chat_channel_member`, kept current by
-/// the cache's insert, update and delete callbacks. The SDK cache has only unique-index finds, and a
-/// whole-table scan would copy every row under the lock the pump needs.
 #[derive(Default)]
 pub(crate) struct ChannelIndex {
     by_name: HashMap<(u32, String), u64>,
-    /// Channel id to its members by member row id, which is join order: `(guid, member flags)`.
     members: HashMap<u64, BTreeMap<u64, (u64, u8)>>,
 }
 
@@ -105,7 +98,6 @@ mod tests {
         index.insert_member(&member(4, 1, 40, 0x03));
         index.insert_member(&member(5, 2, 50, 0));
         assert_eq!(index.members(1), [(40, 0x03), (90, 0)]);
-        // An update arrives as remove then insert.
         index.remove_member(&member(9, 1, 90, 0));
         index.insert_member(&member(9, 1, 90, 0x08));
         assert_eq!(index.members(1), [(40, 0x03), (90, 0x08)]);
@@ -115,7 +107,6 @@ mod tests {
         assert_eq!(index.members(2), [(50, 0)]);
     }
 
-    /// A replaced channel's late delete must not unmap the channel now holding its name.
     #[test]
     fn a_stale_channel_delete_keeps_the_current_mapping() {
         let mut index = ChannelIndex::default();

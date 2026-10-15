@@ -1,5 +1,3 @@
-//! GameObject use: its routing by GameObject type over a World Session, and the general-use path.
-
 use super::death_tests::handle_loot_fake::HandleLootFake;
 use super::death_tests::{in_world_conn, run, SELF_GUID};
 use super::*;
@@ -34,7 +32,6 @@ fn questgiver_gameobject_bypasses_the_chest_lifecycle() {
         }
         other => panic!("expected quest details from a questgiver GameObject, got {other}"),
     }
-    // The loot window would have answered before the status query's reply.
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {}
         other => panic!("a questgiver GameObject opened a loot window: {other}"),
@@ -100,7 +97,6 @@ fn door_gameobject_use_takes_the_general_path_and_opens_no_loot_window() {
     .write_encrypted_client(&mut client, &mut c_enc)
     .unwrap();
 
-    // A loot window or a take reply would arrive before the status query's answer.
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_QUESTGIVER_STATUS(_) => {}
         other => panic!("a door GameObject opened a loot window: {other}"),

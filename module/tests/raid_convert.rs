@@ -1,6 +1,3 @@
-//! A leader converts a Party to a Raid through the Realm-core party reducer, and a World Shard
-//! mirror takes the kind and every Raid Slot, on a private Standalone.
-
 mod support;
 
 use lyracore_shared::group::{GroupKind, RaidSlot, RosterPayload};
@@ -41,7 +38,6 @@ fn failure_text(node: &Standalone, reducer: &str, args: &[&str]) -> String {
     text
 }
 
-/// Every LIST row one reducer call inserted, decoded.
 fn lists_pushed_by(node: &Standalone, action: impl FnOnce()) -> Vec<(u64, RosterPayload)> {
     let newest = node
         .query_rows("SELECT id FROM game_group_event")
@@ -103,7 +99,6 @@ fn expired_roster_rows_do_not_end_the_next_roster_capture() {
     join(&realm, 1, 2);
 
     let lists = lists_pushed_by(&realm, || {
-        // Let event GC delete the old Party list while the subscription is open.
         std::thread::sleep(std::time::Duration::from_secs(3));
         group_op(&realm, RAID_CONVERT, 1, 0);
     });
@@ -149,8 +144,6 @@ fn a_converted_raid_takes_members_past_five_into_the_next_subgroup() {
             .all(|member| member.slot == RaidSlot::default()));
     }
 
-    // Converting a Raid again writes nothing: the Roster Revision stays, and the first LIST after
-    // it comes from the next op that changes the Group, here the loot rules.
     let revision_converted = roster_revision(&realm);
     let lists = lists_pushed_by(&realm, || {
         group_op(&realm, RAID_CONVERT, 1, 0);
@@ -233,7 +226,6 @@ fn partition(group_id: u64, guid: u64) -> serde_json::Value {
     })
 }
 
-/// Arguments for one `sync_group_mirror` push. The first member leads.
 fn mirror_args(group_id: u64, guids: &[u64], revision: u64, kind: u8, slots: &[u8]) -> Vec<String> {
     let partitions: Vec<_> = guids
         .iter()
@@ -266,7 +258,6 @@ fn mirror(node: &Standalone, revision: u64, kind: u8, slots: &[u8]) {
     node.assert_call("sync_group_mirror", &args);
 }
 
-/// The first push of a Group of `guids`, Raid members five to a Subgroup.
 fn first_push_args(group_id: u64, guids: &[u64], kind: GroupKind) -> Vec<String> {
     let slots: Vec<u8> = (0..guids.len())
         .map(|index| match kind {
@@ -336,7 +327,6 @@ fn a_raid_past_five_certifies_a_companion_order_for_any_member() {
     assert_eq!(slot_of(&realm, 7), "1");
     let group_id = realm.query_rows("SELECT group_id FROM game_group")[0]["group_id"].clone();
 
-    // The bot sits in Subgroup 1 and the named member in Subgroup 0.
     let all_members: Vec<u64> = (1..=10).collect();
     let current = serde_json::to_string(&all_members).unwrap();
     realm.assert_call(
@@ -362,7 +352,6 @@ fn a_raid_past_five_certifies_a_companion_order_for_any_member() {
         "a Raid member who is not the leader: {text}"
     );
 
-    // With no Package installed, the Module's fixture command applies past every Core Gate.
     realm.assert_call("debug_spawn_player_entity", &["1"]);
     let outcome = applied_order_outcome(&realm, group_id.as_str(), &all_members);
     assert_eq!(
@@ -400,11 +389,9 @@ fn a_party_mirror_past_five_is_stale_at_both_companion_order_readers() {
     realm.publish_module();
     realm.assert_call("claim_operator", &[]);
     realm.assert_call("debug_spawn_player_entity", &["1"]);
-    // The writer refuses a Party past five, so plant the damage: a Raid of six turned into a Party.
     mirror_group(&realm, 900, &[1, 2, 3, 4, 5, 6], GroupKind::Raid);
     realm.assert_sql("UPDATE game_group SET group_type = 0 WHERE group_id = 900");
 
-    // The certified list matches the six rows, so these refuse on the Party cap.
     let party = serde_json::to_string(&[1, 2, 3, 4, 5, 6]).unwrap();
     let text = failure_text(
         &realm,
@@ -419,8 +406,6 @@ fn a_party_mirror_past_five_is_stale_at_both_companion_order_readers() {
 
 const SOURCE_IDENTITY: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
 
-/// Apply a Companion Order for the fixture bot (Character 1) as `leader`, certifying `members`
-/// for `group_id`, then return the outcome the Command Receipt recorded.
 fn applied_order_outcome(node: &Standalone, group_id: &str, members: &[u64]) -> String {
     let members = serde_json::to_string(members).unwrap();
     let identity = format!("\"{SOURCE_IDENTITY}\"");

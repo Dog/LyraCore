@@ -1,14 +1,3 @@
-//! Test/mock-seed FIXTURES — synthetic spells, items, NPCs, and quests (5xxxx ids) that keep
-//! engine mechanics headlessly verifiable on a no-import sandbox (no Spell.dbc — the licensing
-//! firewall keeps real client data out of the repo). This is a DIFFERENT fixture family from
-//! `seed.rs`'s own map-0 (Northshire) demo content (see that file's header, layer 2): these are
-//! mostly synthetic engine-mechanic probes with no map presence, kept in their own file so the kit
-//! can grow without dragging `init` itself past readability. The taxi fixture is the exception: its
-//! source flight master is restored from the same constructor as its reserved catalogue rows.
-//! Every fn here is IDEMPOTENT (insert-if-absent, upsert, or reserved-id replacement) and is shared
-//! by `init` and its feature-gated re-runner reducer (init does NOT re-run on an auto-migrate
-//! publish, so a dev DB re-seeds through a reducer).
-
 use spacetimedb::{ReducerContext, Table};
 
 use crate::items::{ALL_PLAYABLE_CLASS_MASK, ALL_PLAYABLE_RACE_MASK};
@@ -20,16 +9,6 @@ use crate::{
     GameTaxiPathNode, ItemTemplate, Spell, SpellEffect, SpellProcEvent,
 };
 
-/// Canonical fixture-NPC/item constructors — the single source of truth for the synthetic rows
-/// that BOTH `seed::init` (fresh publish) and the post-import fixture-restore path
-/// (`seed_scenario_fixtures`, invoked by `debug_seed_scenario_fixtures` after a world-ETL
-/// re-import truncates `game_creature_template`/`game_item_template`) insert. Before this
-/// the restore path re-authored these as hand-copied literals that drifted from `init`'s own
-/// (Profession Trainer: level 30/1500hp/"Cooking & Skinning" vs level 10/100hp/"Fixture"; Test
-/// Wolf: money_min/max 0/0 vs 25/50) — the exact cross-shard divergence class was filed to
-/// kill, reintroduced by copy-paste. Both callers now build from these fns so there is nothing
-/// left to hand-copy out of sync. `init`'s values are treated as authoritative (they carry the
-/// original design rationale, preserved below).
 pub(crate) const TEST_WOLF_ENTRY: u32 = 51000;
 pub(crate) const PROFESSION_TRAINER_ENTRY: u32 = 51001;
 pub(crate) const TEST_TAME_BEAST_SPELL: u32 = 50300;
@@ -38,24 +17,20 @@ const TEST_TAME_BOAR_FAMILY: u32 = 5;
 const TEST_HUNTER_CLASS: u8 = 3;
 pub(crate) const RIDING_TRAINER_ENTRY: u32 = 51007;
 
-/// "Test Wolf": a dedicated SKINNABLE beast so the skin verify is IMPORT-INDEPENDENT (the demo
-/// Chicken is creature_type 8 = Critter → not skinnable). LEVEL 1 is intentional: the skill gate
-/// is (creature_level - 1) * 10, so a level-1 beast requires skill 0 — a freshly-trained skinner
-/// (skill=1) can skin it immediately without needing debug_set_skill.
 pub(crate) fn test_wolf_template() -> CreatureTemplate {
     CreatureTemplate {
         entry: TEST_WOLF_ENTRY,
         name: "Test Wolf".to_string(),
         subname: String::new(),
-        display_id: 720, // a wolf model that ships in 5875
+        display_id: 720,
         level: 1,
         health: 60,
-        faction_template: 14, // Monster (hostile → a usable kill target, like the demo chicken)
+        faction_template: 14,
         npc_flags: 0,
         unit_flags: 0,
-        creature_type: 1, // BEAST (the skinnable gate — cmangos CREATURE_TYPE_BEAST)
-        creature_family: 1, // Wolf (cmangos CreatureFamily)
-        type_flags: 0x100, // SKINNABLE (cmangos CreatureTypeFlags bit; the creature_type==1 gate is sufficient)
+        creature_type: 1,
+        creature_family: 1,
+        type_flags: 0x100,
         rank: 0,
         scale: 1.0,
         base_attack_time_ms: 2000,
@@ -63,35 +38,30 @@ pub(crate) fn test_wolf_template() -> CreatureTemplate {
         money_max: 0,
         max_level: 0,
         max_level_health: 0,
-        aggro_range: 0, // PASSIVE (engages only when attacked) so the test wolf doesn't maul the login demo
+        aggro_range: 0,
         damage_min: 0,
         damage_max: 0,
-        armor: 0,              // set via `spacetime sql` on this row to mock-test mitigation
-        pickpocket_loot_id: 0, // not imported — the test wolf has no pickpocket table
-        // 0 ⇒ `skin_corpse` falls back to the flat Light Leather — the verify flow
-        // (debug_skin_nearest → 1x Light Leather) stays byte-identical without a seeded skin table.
+        armor: 0,
+        pickpocket_loot_id: 0,
         skin_loot_id: 0,
-        trainer_type: 0, // the test wolf is a beast, not a trainer
+        trainer_type: 0,
         trainer_class: 0,
     }
 }
 
-/// "Profession Trainer": a dedicated trainer NPC so LEARN-A-PROFESSION is verifiable on a
-/// NO-IMPORT dev DB. npc_flags = GOSSIP|TRAINER (0x11) so the trainer window opens, faction 35
-/// (FRIENDLY — a trainer you walk up to, NOT a combat target).
 pub(crate) fn profession_trainer_template() -> CreatureTemplate {
     CreatureTemplate {
         entry: PROFESSION_TRAINER_ENTRY,
         name: "Profession Trainer".to_string(),
         subname: "Cooking & Skinning".to_string(),
-        display_id: 3167, // a generic humanoid model that ships in 5875
+        display_id: 3167,
         level: 30,
         health: 1500,
-        faction_template: 35, // FRIENDLY (a trainer, not a kill target)
+        faction_template: 35,
         npc_flags: lyracore_shared::constants::npc_flags::GOSSIP
-            | lyracore_shared::constants::npc_flags::TRAINER, // 0x11 — gossip-eye + trainer window
+            | lyracore_shared::constants::npc_flags::TRAINER,
         unit_flags: 0,
-        creature_type: 7, // Humanoid
+        creature_type: 7,
         creature_family: 0,
         type_flags: 0,
         rank: 0,
@@ -101,21 +71,17 @@ pub(crate) fn profession_trainer_template() -> CreatureTemplate {
         money_max: 0,
         max_level: 0,
         max_level_health: 0,
-        aggro_range: 0, // never aggros (friendly trainer)
+        aggro_range: 0,
         damage_min: 0,
         damage_max: 0,
-        armor: 0,              // a trainer never takes damage anyway
-        pickpocket_loot_id: 0, // not imported — a friendly trainer is never pickpocketed
-        skin_loot_id: 0,       // not imported — a Humanoid trainer isn't skinnable anyway
-        trainer_type: 2, // TRADESKILLS — serves every class; the gate keys on trainer_class, which stays 0
+        armor: 0,
+        pickpocket_loot_id: 0,
+        skin_loot_id: 0,
+        trainer_type: 2,
         trainer_class: 0,
     }
 }
 
-/// "Riding Trainer": a `trainer_type::MOUNTS` NPC so BUY-RIDING-THEN-MOUNT is verifiable on a NO-IMPORT
-/// dev DB, and so the riding fork of `trainer::apply_trainer_buy` has a real trainer to accept. Same shape
-/// as `profession_trainer_template` (GOSSIP|TRAINER, faction 35 FRIENDLY) — only the trainer type differs,
-/// and that difference is what the fork checks.
 pub(crate) fn riding_trainer_template() -> CreatureTemplate {
     CreatureTemplate {
         entry: RIDING_TRAINER_ENTRY,
@@ -142,8 +108,6 @@ fn test_tame_boar_template() -> CreatureTemplate {
     }
 }
 
-/// Import-independent Hunter/tame/boar catalogue fixture. The runtime branches only on the generic
-/// effect kind; the synthetic spell id exists solely for headless sandbox scenarios.
 pub(crate) fn seed_hunter_tame_fixture(ctx: &ReducerContext) {
     if !ctx
         .db
@@ -213,13 +177,6 @@ pub(crate) fn seed_hunter_tame_fixture(ctx: &ReducerContext) {
     );
 }
 
-/// The reserved taxi fixture: two nodes, one directed route, three ordered points, and one nearby
-/// source flight master. This is the single module-side constructor used by fresh-database seeding
-/// and the operator restore reducer after a map-0 world import replaces the creature roster.
-///
-/// Delete-then-insert corrects mutated canonical rows and is safe because every id is in the shared
-/// reserved namespace. The DBC family's wholesale clear removes obsolete fixture ids if this shape
-/// changes; imported low ids are never touched.
 pub(crate) fn seed_taxi_fixture(ctx: &ReducerContext) {
     use lyracore_shared::constants::taxi_fixture as taxi;
 
@@ -363,17 +320,13 @@ pub(crate) fn seed_taxi_fixture(ctx: &ReducerContext) {
     );
 }
 
-/// "Tempered Blade" — hand-authored reference weapon (licensing firewall: never bulk-imported;
-/// display 1542 ships in 5875). `entry` is parameterized: `seed::init` uses the real id 50, the
-/// fixture-restore path uses the reserved id `FIXTURE_BLADE` (5090050) so a world-ETL re-import
-/// can never collide with it.
 pub(crate) fn tempered_blade_template(entry: u32) -> ItemTemplate {
     ItemTemplate {
-        class: 2,    // Weapon
-        subclass: 7, // Sword (one-hand)
+        class: 2,
+        subclass: 7,
         display_id: 1542,
-        quality: 2,         // Uncommon (green)
-        inventory_type: 21, // main-hand
+        quality: 2,
+        inventory_type: 21,
         item_level: 12,
         required_level: 1,
         max_durability: 70,
@@ -383,71 +336,50 @@ pub(crate) fn tempered_blade_template(entry: u32) -> ItemTemplate {
         damage_min: 8.0,
         damage_max: 12.0,
         delay_ms: 2600,
-        // Uncommon (green) gear binds on equip — vanilla's "greens are BoE" rule.
         bonding: crate::items::bonding::BIND_ON_EQUIP,
         ..base_item(entry, "Tempered Blade")
     }
 }
 
-/// "Tough Jerky" — hand-authored reference food (licensing firewall: never bulk-imported;
-/// display 1542 ships in 5875, placeholder icon). `entry` parameterized the same way as
-/// `tempered_blade_template`. spellid_1 points at "Eating" (50115) — the same food HoT the
-/// real Tough Jerky (117) / Tough Hunk of Bread (4540) items use — so this NO-IMPORT fixture stays
-/// usable now that `apply_item_use` reads spellid_1 as the single on-use authority.
 pub(crate) fn tough_jerky_template(entry: u32) -> ItemTemplate {
     ItemTemplate {
-        class: 0,    // Consumable
-        subclass: 0, // Food & Drink
+        class: 0,
+        subclass: 0,
         display_id: 1542,
-        quality: 0,        // Poor
-        inventory_type: 0, // not equippable
+        quality: 0,
+        inventory_type: 0,
         item_level: 1,
         required_level: 1,
         buy_price: 10,
         sell_price: 2,
         max_stack: 20,
-        food_type: 1,                         // Meat
-        spellid_1: 50115,                     // "Eating" — A_PERIODIC_HEAL food HoT
-        spelltrigger_1: 0,                    // on-use
-        bonding: crate::items::bonding::NONE, // plain food — unbound/tradeable
+        food_type: 1,
+        spellid_1: 50115,
+        spelltrigger_1: 0,
+        bonding: crate::items::bonding::NONE,
         ..base_item(entry, "Tough Jerky")
     }
 }
 
-/// "Test Riding Reins" — the reserved reusable MOUNT item. spellid_1 points at the fixture mount spell
-/// (`FIXTURE_MOUNT_SPELL`) at trigger slot 0 (on-use), so `apply_item_use` casts it through the ordinary
-/// item path. The stack survives the use: `items::ops::spell_keeps_item` classifies the spell by its
-/// `A_MOUNTED` effect, with no item-entry allowlist, so this template needs no flag of its own.
-/// `max_stack: 1` and BIND_ON_PICKUP match a real vanilla mount.
 pub(crate) fn riding_reins_template(entry: u32) -> ItemTemplate {
     ItemTemplate {
-        class: 15,   // Miscellaneous
-        subclass: 5, // Mount
+        class: 15,
+        subclass: 5,
         display_id: 1542,
-        quality: 1,        // Common (white) — the vanilla apprentice-tier mounts
-        inventory_type: 0, // not equippable
+        quality: 1,
+        inventory_type: 0,
         item_level: 40,
-        required_level: 1, // the RIDING SKILL is the gate, never the character level
+        required_level: 1,
         buy_price: 800_000,
         sell_price: 160_000,
         max_stack: 1,
         spellid_1: FIXTURE_MOUNT_SPELL,
-        spelltrigger_1: 0, // on-use
+        spelltrigger_1: 0,
         bonding: crate::items::bonding::BIND_ON_PICKUP,
         ..base_item(entry, "Test Riding Reins")
     }
 }
 
-/// Base-row constructors — every meaningful field of a fixture `Spell`/`SpellEffect`/
-/// `ItemTemplate` is a struct-update override at the call site; every OTHER field (the ~80% that
-/// are 0/false/empty on a synthetic fixture row) comes from one of these three fns. Mirrors the
-/// `seed.rs` `spell`/`effect` closures' own implicit defaults exactly (so a fixture built this way
-/// and one built through the closure agree byte-for-byte), just spelled as a real fn so
-/// struct-update syntax can reach it, plus a matching `base_item`. `base_spell`'s `gcd_ms: 1500` is
-/// the one non-zero default — it is the vanilla global cooldown, and every fixture spell wants it
-/// except the handful that are proc-applied or item-triggered, which override it to 0 at the call
-/// site (the override IS the data point, not a workaround). `base_item`'s `buy_count: 1` mirrors
-/// `ItemTemplate`'s own `#[default(1u32)]` migration default for the same reason.
 pub(crate) fn base_spell(spell_id: u32, name: &str) -> Spell {
     Spell {
         spell_id,
@@ -478,8 +410,6 @@ pub(crate) fn base_spell(spell_id: u32, name: &str) -> Spell {
     }
 }
 
-/// See `base_spell`'s doc. `id` is the deterministic `(spell_id<<2)|effect_index` PK every
-/// hand-authored effect row in this crate uses.
 pub(crate) fn base_effect(spell_id: u32, effect_index: u8) -> SpellEffect {
     SpellEffect {
         id: ((spell_id as u64) << 2) | effect_index as u64,
@@ -503,7 +433,6 @@ pub(crate) fn base_effect(spell_id: u32, effect_index: u8) -> SpellEffect {
     }
 }
 
-/// See `base_spell`'s doc.
 pub(crate) fn base_item(entry: u32, name: &str) -> ItemTemplate {
     ItemTemplate {
         entry,
@@ -568,39 +497,7 @@ pub(crate) fn base_item(entry: u32, name: &str) -> ItemTemplate {
     }
 }
 
-/// Seed Weakened Soul (6788) + the Test PW:Shield fixture (50072) — the generic linked-debuff mechanic.
-/// IDEMPOTENT (inserts only rows that are absent), mirroring `talent::seed_talents`, so
-/// it is safe to call from `init` (fresh install) AND from `debug_seed_pw_shield_fixture` on an
-/// already-migrated dev DB (where `init` did not re-run).
-///
-/// Weakened Soul (REAL vanilla id 6788) is the hardcoded Power Word: Shield lockout debuff. Its real
-/// Spell.dbc shape (CONFIRMED via a DBC dry-run; it is NOT the effectless marker
-/// earlier believed) is a single `A_IMMUNITY` (0xB1) aura with MiscValue 19 (MECHANIC_SHIELD): vanilla's
-/// actual "immune to the shield mechanic" (i.e. can't be re-shielded) effect. 15s duration, holy school
-/// (school_mask 2), dispel_type 0 — mirroring the importer's DBC output so a seed-only dev DB matches a
-/// full-import DB byte-for-byte. Applied generically by `spell::apply_linked_debuff` whenever an aura
-/// effect's `p1` names it; the PW:Shield lockout gate keys on `has_aura(target, 6788)` (presence of ANY
-/// 6788 aura), so this aura fires the refusal exactly like the old marker did — now DBC-faithful.
-///
-/// Test Power Word: Shield (50072) is a PW:Shield-shaped fixture (a single A_ABSORB effect, matching the
-/// real live spell 17's DBC shape) that links Weakened Soul (6788) via `p1` —
-/// headlessly exercises the generic linked-debuff apply + refusal gate without needing a live client
-/// Spell.dbc (none is available in every dev environment; the licensing firewall keeps it out of the
-/// repo). Ally-targeted, holy school, absorbs 50 damage. `debug_cast_at(caster_guid, 50072, target_guid)`:
-/// places the shield + Weakened Soul; a second cast at the same target within ~15s returns Err (the
-/// linked-debuff refusal gate in resolve_cast_at); once Weakened Soul expires, a re-cast succeeds again.
-///
-/// The REAL live spell 17's imported `A_ABSORB` effect also carries `p1 = 6788` via a by-NAME override in
-/// `importer/src/spell.rs` (`power_word_shield_p1_override`, mirroring the `synthetic_seal_effect`
-/// precedent) — an operator who re-runs the importer against their own Spell.dbc gets the real spell 17
-/// wired through the exact same generic mechanic as this fixture, no engine spell-id references needed.
-/// This dev sandbox has no Spell.dbc (licensing firewall), so 50072 remains here purely so the mechanic is
-/// headlessly exercisable without one.
 pub(crate) fn seed_pw_shield_fixture(ctx: &ReducerContext) {
-    // UPSERT (not insert-only): a `debug_seed_pw_shield_fixture` re-run on a dev DB that already has a
-    // stale/earlier-shape fixture row corrects it in place, instead of silently keeping the stale data —
-    // safe because these are TEST fixture ids (6788 is real-but-otherwise-unused; 50072 is a reserved
-    // synthetic id), never touched by player state.
     let ws_hdr = Spell {
         duration_ms: 15000,
         school_mask: 2,
@@ -611,56 +508,45 @@ pub(crate) fn seed_pw_shield_fixture(ctx: &ReducerContext) {
     } else {
         ctx.db.game_spell().insert(ws_hdr);
     }
-    // Drop any stale-shape 6788 effect rows (an earlier fixture seeded an inert A_FLAG at index 0), then
-    // insert the DBC-faithful A_IMMUNITY at its real effect index (1). Mirrors the live import shape.
     for e in ctx.db.game_spell_effect().by_spell().filter(&6788u32) {
         ctx.db.game_spell_effect().id().delete(e.id);
     }
     upsert_effect(
         ctx,
         SpellEffect {
-            kind: 0xB1, // A_IMMUNITY
+            kind: 0xB1,
             base_points: 1,
-            target: 2, // T_TARGET_ENEMY (DBC target 2)
+            target: 2,
             p0: 19,
-            p0_kind: 3, // MECHANIC_SHIELD, P_MECHANIC
+            p0_kind: 3,
             ..base_effect(6788, 1)
         },
     );
     if let Some(mut s) = ctx.db.game_spell().spell_id().find(50072u32) {
-        s.duration_ms = 30000; // must be nonzero — 0ms would reap the A_ABSORB instantly
+        s.duration_ms = 30000;
         ctx.db.game_spell().spell_id().update(s);
     } else {
         ctx.db.game_spell().insert(Spell {
             range_yd: 30,
-            duration_ms: 30000, // 30s shield (vanilla R1 is longer; a real duration is required — A_ABSORB is an aura, 0ms would reap it instantly)
+            duration_ms: 30000,
             school_mask: 2,
             ..base_spell(50072, "Test Power Word: Shield")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
-            kind: 0xA2, // A_ABSORB
+            kind: 0xA2,
             base_points: 50,
-            target: 2, // T_TARGET_ALLY
+            target: 2,
             p0: 2,
-            p0_kind: 2, // holy school mask, P_SCHOOL_MASK
-            p1: 6788,   // links Weakened Soul — the linked-debuff mechanic under test
+            p0_kind: 2,
+            p1: 6788,
             ..base_effect(50072, 0)
         },
     );
 }
 
-/// Hand-seed the Soul Shard item template (real vanilla item 6265). The import ETL
-/// doesn't reliably carry it, so — mirroring `seed_pw_shield_fixture`'s precedent for a mechanic whose
-/// live-DBC row isn't available in every dev environment — it's authored here. A plain, non-equippable,
-/// non-sellable trade good (vanilla: Soul Shard cannot be sold to a vendor; `sell_price: 0` encodes
-/// that), stacking to 20 like the real item. IDEMPOTENT (inserts only if absent), so it's safe from both
-/// `init` (fresh install) and `debug_seed_soul_shard_item` (an already-migrated dev DB where `init` did
-/// not re-run).
 pub(crate) fn seed_soul_shard_item(ctx: &ReducerContext) {
     const SOUL_SHARD: u32 = crate::combat::SOUL_SHARD_ENTRY;
     if ctx
@@ -673,26 +559,19 @@ pub(crate) fn seed_soul_shard_item(ctx: &ReducerContext) {
         return;
     }
     ctx.db.game_item_template().insert(ItemTemplate {
-        class: 7,         // Trade Goods
-        subclass: 0,      // Trade Goods (generic)
-        display_id: 1542, // placeholder icon (5875 fixture, like the other hand-authored items above)
-        quality: 1,       // Common (white)
+        class: 7,
+        subclass: 0,
+        display_id: 1542,
+        quality: 1,
         item_level: 1,
         required_level: 1,
-        sell_price: 0, // vendors refuse Soul Shards in real vanilla
+        sell_price: 0,
         max_stack: 20,
-        bonding: crate::items::bonding::BIND_ON_PICKUP, // real vanilla Soul Shard: unsellable + BoP
+        bonding: crate::items::bonding::BIND_ON_PICKUP,
         ..base_item(SOUL_SHARD, "Soul Shard")
     });
 }
 
-/// Mock-seed Drain Soul (real vanilla spell 1120) as a channel headlessly exercisable
-/// without a live Spell.dbc (licensing firewall, same precedent as `seed_pw_shield_fixture`'s Test
-/// PW:Shield). A single `A_PERIODIC_DAMAGE` effect on the enemy target — the real spell's periodic
-/// shadow-damage tick; the real vanilla script effect (`ChannelDeathItem`, the shard-on-kill grant) has
-/// no Rust hook of its own here — it's implemented directly in `combat::kill_creature` (an aura naming
-/// this spell id, cast by the killer, on the dying creature). 3s cast, 15s duration / 5 ticks (3s each),
-/// shadow school. IDEMPOTENT (inserts only if absent).
 pub(crate) fn seed_drain_soul_fixture(ctx: &ReducerContext) {
     const DRAIN_SOUL: u32 = crate::combat::DRAIN_SOUL_SPELL_ID;
     if ctx.db.game_spell().spell_id().find(DRAIN_SOUL).is_none() {
@@ -704,30 +583,20 @@ pub(crate) fn seed_drain_soul_fixture(ctx: &ReducerContext) {
             ..base_spell(DRAIN_SOUL, "Drain Soul")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
-            kind: 0x90, // A_PERIODIC_DAMAGE
+            kind: 0x90,
             base_points: 45,
             period_ms: 3000,
-            target: 1, // T_TARGET_ENEMY
+            target: 1,
             p0: 32,
-            p0_kind: 2, // shadow school mask, P_SCHOOL_MASK
+            p0_kind: 2,
             ..base_effect(DRAIN_SOUL, 0)
         },
     );
 }
 
-/// Mock-seed Mana Burn (real vanilla spell 8129) as a single `E_POWER_BURN` effect,
-/// headlessly exercisable without a live Spell.dbc import (same precedent as `seed_pw_shield_fixture`'s
-/// Test PW:Shield / `seed_drain_soul_fixture`). `base_points 100` = drain up to 100 mana (floor-at-
-/// available); `p1 50` = the vanilla EffectMultipleValue 0.5 in basis-points, so a full 100-mana drain
-/// deals exactly 50 damage. `p0 0 / p0_kind 4 (P_POWER_TYPE)` documents the MANA gate for data parity
-/// with the real importer mapping, though the module's E_POWER_BURN handler reads the target's power
-/// type straight off `unit_bytes_0` (never p0). Shadow school (32), enemy target. IDEMPOTENT (inserts
-/// only if absent).
 pub(crate) fn seed_mana_burn_fixture(ctx: &ReducerContext) {
     const MANA_BURN: u32 = 8129;
     if ctx.db.game_spell().spell_id().find(MANA_BURN).is_none() {
@@ -739,37 +608,19 @@ pub(crate) fn seed_mana_burn_fixture(ctx: &ReducerContext) {
             ..base_spell(MANA_BURN, "Mana Burn")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
-            kind: 0x19, // E_POWER_BURN
+            kind: 0x19,
             base_points: 100,
-            target: 1,  // T_TARGET_ENEMY
-            p0_kind: 4, // MANA, P_POWER_TYPE (documentation only — the handler reads unit_bytes_0)
-            p1: 50,     // 50bp = vanilla EffectMultipleValue 0.5
+            target: 1,
+            p0_kind: 4,
+            p1: 50,
             ..base_effect(MANA_BURN, 0)
         },
     );
 }
 
-/// Mock-seed Stealth (real vanilla spell 1784) as a self-targeted `A_STEALTH` presence
-/// marker, headlessly exercisable without a live Spell.dbc import (same precedent as
-/// `seed_pw_shield_fixture`'s Test PW:Shield / `seed_drain_soul_fixture`). A single `A_FLAG`-shaped
-/// effect carrying `A_STEALTH` as its `kind` — matches the importer's real mapping (`importer/src/
-/// spell.rs`: `"Stealth" => A_STEALTH`). `duration_ms: 0` because A_STEALTH is permanent-until-broken
-/// (never timer-reaped; see `spell::taxonomy::A_STEALTH` / `scheduler.rs`'s reap-skip). IDEMPOTENT
-/// (inserts only if absent).
-///
-/// Audit: until this call was wired into `init` below, this fixture was reachable ONLY via
-/// `debug_seed_stealth_fixture` — the exact bug class fixed for the item/faction fixtures, just
-/// for `game_spell`/`game_spell_effect` (the `spells` catalogue-fingerprint family) instead. It was
-/// masked live only because 1784 is a REAL vanilla id the Spell.dbc importer already seeds on every
-/// shard that has imported, so the insert-if-absent guards below silently no-op post-import — but a
-/// freshly-published, not-yet-imported shard that had only this debug reducer run against it would
-/// diverge from a sibling that didn't, same as the items/faction case. Now called from `init` too, so
-/// every fresh shard agrees unconditionally regardless of import order.
 pub(crate) fn seed_stealth_fixture(ctx: &ReducerContext) {
     const STEALTH: u32 = 1784;
     if ctx.db.game_spell().spell_id().find(STEALTH).is_none() {
@@ -779,38 +630,17 @@ pub(crate) fn seed_stealth_fixture(ctx: &ReducerContext) {
             ..base_spell(STEALTH, "Stealth")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
             kind: crate::spell::A_STEALTH,
-            target: 0,  // T_SELF
-            p0_kind: 7, // P_FLAG
+            target: 0,
+            p0_kind: 7,
             ..base_effect(STEALTH, 0)
         },
     );
 }
 
-/// Mock-seed Chilled (real vanilla spell 6136) + Frost Armor (real vanilla spell 168) —
-/// the reactive proc-on-being-hit-in-melee primitive, headlessly exercisable without a live Spell.dbc
-/// import (same precedent as `seed_pw_shield_fixture`/`seed_drain_soul_fixture`/`seed_stealth_fixture`).
-///
-/// Chilled (6136) is the move-slow the proc applies to a melee attacker: ONE `A_MOD_SPEED` effect, p0 =
-/// `SPEED_MOVE` (p0_kind `P_SPEED_KIND`), amount −30 (signed percent, matching vanilla Chilled's slow),
-/// frost school, 5s duration. It is loaded through `apply_linked_debuff` (the same "apply spell X's aura
-/// effects onto Y" machinery PW:Shield's Weakened Soul link already uses) — its OWN `target` field is
-/// irrelevant to that path (the caller supplies the target explicitly), so it's left `T_TARGET_ENEMY` for
-/// self-documentation / any future direct-cast use.
-///
-/// Frost Armor (168) mirrors the real DBC shape the importer maps (`importer/src/spell.rs`): eff0 is the
-/// `+armor` self-buff (`A_MOD_RESISTANCE`, p0 = `RESIST_ARMOR` bit); eff1 is the reactive chill, an
-/// `A_PROC_TRIGGER` Proc with `trigger_spell = 6136`. The header carries Frost Armor's real Spell.dbc proc
-/// data — `proc_flags 0x28` (melee hit taken | melee spell hit taken) and `proc_chance 100`, no charges —
-/// which the aura freezes at apply, so the proc pass in `combat::apply_hit` starts a Triggered Cast of
-/// Chilled at whoever landed the hit. Permanent self-buff (`duration_ms = u32::MAX`, the importer's
-/// infinite-aura sentinel — matches vanilla armor spells' -1 DBC duration). IDEMPOTENT (inserts only if
-/// absent), mirroring the other mock-seed fixtures.
 pub(crate) fn seed_frost_armor_fixture(ctx: &ReducerContext) {
     const CHILLED: u32 = 6136;
     const FROST_ARMOR: u32 = 168;
@@ -823,24 +653,20 @@ pub(crate) fn seed_frost_armor_fixture(ctx: &ReducerContext) {
             ..base_spell(CHILLED, "Chilled")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
             kind: crate::spell::A_MOD_SPEED,
             base_points: -30,
-            target: 1,  // T_TARGET_ENEMY
-            p0_kind: 6, // SPEED_MOVE, P_SPEED_KIND
+            target: 1,
+            p0_kind: 6,
             ..base_effect(CHILLED, 0)
         },
     );
     if ctx.db.game_spell().spell_id().find(FROST_ARMOR).is_none() {
         ctx.db.game_spell().insert(Spell {
-            duration_ms: u32::MAX, // permanent until replaced/dispelled
+            duration_ms: u32::MAX,
             school_mask: 16,
-            // Frost Armor's real Spell.dbc proc data: melee hit taken (0x8) | melee spell hit taken
-            // (0x20), always, unlimited charges.
             proc_flags: 0x28,
             proc_chance: 100,
             ..base_spell(FROST_ARMOR, "Frost Armor")
@@ -851,9 +677,9 @@ pub(crate) fn seed_frost_armor_fixture(ctx: &ReducerContext) {
         SpellEffect {
             kind: crate::spell::A_MOD_RESISTANCE,
             base_points: 150,
-            target: 0, // T_SELF
+            target: 0,
             p0: 1,
-            p0_kind: 2, // RESIST_ARMOR bit, P_SCHOOL_MASK
+            p0_kind: 2,
             ..base_effect(FROST_ARMOR, 0)
         },
     );
@@ -861,62 +687,25 @@ pub(crate) fn seed_frost_armor_fixture(ctx: &ReducerContext) {
         ctx,
         SpellEffect {
             kind: crate::spell::A_PROC_TRIGGER,
-            target: 0, // T_SELF
+            target: 0,
             trigger_spell: CHILLED,
             ..base_effect(FROST_ARMOR, 1)
         },
     );
 }
 
-/// The shared Proc-fixture mark the two test Procs below trigger. An inert 1 s `A_FLAG` debuff on the
-/// Counterparty: it does nothing, which is the point — a proc fire is COUNTED off the Triggered Cast's
-/// own cast-GO row, so the mark only has to land somewhere observable without perturbing combat.
 pub(crate) const TEST_PROC_MARK: u32 = 50140;
-/// A 50-percent Proc off a melee hit taken, unlimited charges — the chance roll's fixture. A scripted
-/// 100-hit run against it should land its fire count inside binomial bounds.
 pub(crate) const TEST_PROC_COIN: u32 = 50141;
-/// A certain Proc with 3 charges off a melee hit taken — the charge fixture. It fires 3 times and then
-/// the whole buff comes off.
 pub(crate) const TEST_PROC_CHARGES: u32 = 50142;
-/// A certain Proc off a melee hit taken with a 5 s internal cooldown, authored through an overlay row
-/// — the cooldown fixture. However fast the hits come, it fires at most once per window.
 pub(crate) const TEST_PROC_COOLDOWN: u32 = 50143;
-/// A 2-per-minute Proc off a melee hit DEALT, authored through an overlay row — the rate fixture. Its
-/// header chance is 0, so every fire it ever makes came from the rate.
 pub(crate) const TEST_PROC_PPM: u32 = 50144;
-/// A certain DAMAGE Proc off a melee hit taken — the aura-43 fixture, Lightning Shield's shape without
-/// an import. It zaps its attacker for a frost figure and logs the number.
 pub(crate) const TEST_PROC_ZAP: u32 = 50145;
 
-/// The internal cooldown `TEST_PROC_COOLDOWN` carries, in milliseconds.
 const TEST_PROC_ICD_MS: u32 = 5_000;
-/// The rate `TEST_PROC_PPM` carries, in procs per minute.
 const TEST_PROC_PPM_RATE: f32 = 2.0;
-/// The damage `TEST_PROC_ZAP` deals per fire.
 const TEST_PROC_ZAP_DAMAGE: i32 = 5;
-/// The frost school bit `TEST_PROC_ZAP` deals in — the school the damage log names.
 const TEST_PROC_ZAP_SCHOOL_MASK: i32 = 0x10;
 
-/// Mock-seed the Proc-engine test fixtures: one inert mark, four self-buff trigger Procs that exercise
-/// the chance roll, the charge count, the internal cooldown and the rate, and one damage Proc — all on
-/// a development database, with no Spell.dbc import and no world dump.
-///
-/// Four of the five are an `A_PROC_TRIGGER` self-buff. Three of those fire off a melee hit TAKEN, so a plain
-/// melee swing at the Carrier — or `debug_apply_damage`, which routes through the same chokepoint —
-/// fires them; the rate fixture fires off a melee hit DEALT instead, because procs-per-minute is a
-/// per-swing rate and only the unit that swung has an attack time to scale it by (a taken-side Proc
-/// would ignore the rate and read its header chance of 0, i.e. never fire). Drive them with a REAL
-/// attacker guid: a Proc with no Counterparty in the world fires nothing, so the anonymous
-/// `attacker_guid = 0` form of that reducer deliberately does not exercise them. Count the fires as
-/// `game_spell_cast_event` rows naming `TEST_PROC_MARK`.
-///
-/// The fifth is the damage kind (`A_PROC_DAMAGE`): it casts nothing, so it has no mark to count — its
-/// fires are the log-only `game_spell_cast_event` rows naming the zap itself, carrying its damage.
-///
-/// The cooldown and the rate have no Spell.dbc column, so their two fixtures carry a seeded
-/// `game_spell_proc_event` overlay row — the same table and the same precedence the importer loads
-/// real data into, rather than a second source invented for the fixtures. IDEMPOTENT, like every
-/// other mock-seed fixture.
 pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
     if ctx
         .db
@@ -935,8 +724,8 @@ pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
         ctx,
         SpellEffect {
             kind: crate::spell::A_FLAG,
-            target: 1,  // T_TARGET_ENEMY — the mark lands on the Counterparty
-            p0_kind: 7, // P_FLAG
+            target: 1,
+            p0_kind: 7,
             ..base_effect(TEST_PROC_MARK, 0)
         },
     );
@@ -964,7 +753,7 @@ pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
     ] {
         if ctx.db.game_spell().spell_id().find(spell_id).is_none() {
             ctx.db.game_spell().insert(Spell {
-                duration_ms: u32::MAX, // permanent until its charges run out
+                duration_ms: u32::MAX,
                 proc_flags: flags,
                 proc_chance: chance,
                 proc_charges: charges,
@@ -975,13 +764,11 @@ pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
             ctx,
             SpellEffect {
                 kind: crate::spell::A_PROC_TRIGGER,
-                target: 0, // T_SELF — the Proc sits on its Carrier
+                target: 0,
                 trigger_spell: TEST_PROC_MARK,
                 ..base_effect(spell_id, 0)
             },
         );
-        // The overlay row carries only what Spell.dbc cannot express; everything else stays 0, which
-        // is exactly "the header already said it".
         if let Some((icd_ms, ppm_rate)) = overlay {
             if ctx
                 .db
@@ -1004,9 +791,6 @@ pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
             }
         }
     }
-    // The damage kind. A self-buff like the others, but it deals its frozen amount instead of casting:
-    // `p0` is the school the damage is dealt in (`P_SCHOOL_MASK`, what the importer freezes off the
-    // header for a real aura-43 spell) and `base_points` is the figure.
     if ctx.db.game_spell().spell_id().find(TEST_PROC_ZAP).is_none() {
         ctx.db.game_spell().insert(Spell {
             duration_ms: u32::MAX,
@@ -1021,50 +805,31 @@ pub(crate) fn seed_test_proc_fixtures(ctx: &ReducerContext) {
         SpellEffect {
             kind: crate::spell::A_PROC_DAMAGE,
             base_points: TEST_PROC_ZAP_DAMAGE,
-            target: 0, // T_SELF — the Proc sits on its Carrier
+            target: 0,
             p0: TEST_PROC_ZAP_SCHOOL_MASK,
-            p0_kind: 2, // P_SCHOOL_MASK
+            p0_kind: 2,
             ..base_effect(TEST_PROC_ZAP, 0)
         },
     );
 }
 
-/// Mock-seed Demon Skin (real vanilla spell 696, rank 2) — the COMBAT-INDEPENDENT
-/// health-per-5 periodic-tick primitive, headlessly exercisable without a live Spell.dbc import (same
-/// precedent as `seed_frost_armor_fixture`/`seed_pw_shield_fixture`/`seed_drain_soul_fixture`).
-///
-/// Observed vanilla behaviour (cross-checked against the reference cores — a behaviour citation, not a
-/// port): aura 84 `SPELL_AURA_MOD_REGEN` ticks on a forced 5000ms period regardless of the DBC's own
-/// EffectAmplitude, and heals a LIVING target with no combat gate at all — i.e. it ticks the SAME
-/// in-combat or out, unlike the natural spirit-regen pass (out-of-combat-only)
-/// or its during-combat-percent cousin `ModRegenDuringCombat`/`A_COMBAT_HEALTH_REGEN_PCT` (implemented
-/// separately for Troll Regeneration — a DIFFERENT mechanic, not conflated here). This is
-/// exactly the same primitive the engine already runs for Renew/bandages/food (`A_PERIODIC_HEAL`, folded
-/// through `tick_auras` with no combat gate), so Demon Skin's eff2 is mock-seeded straight onto it: 5
-/// health every 5000ms, matching wowhead classic's "restores 5 Health per 5 sec." tooltip for rank 2.
-///
-/// eff0 is the existing `+armor` self-buff (`A_MOD_RESISTANCE`, p0 = `RESIST_ARMOR` bit, +120); eff1 is
-/// the `A_PERIODIC_HEAL` regen tick. Permanent-for-30-min per the tooltip (`duration_ms = 1_800_000`).
-/// IDEMPOTENT (inserts only if absent), mirroring the other mock-seed fixtures.
 pub(crate) fn seed_demon_skin_fixture(ctx: &ReducerContext) {
     const DEMON_SKIN: u32 = 696;
     if ctx.db.game_spell().spell_id().find(DEMON_SKIN).is_none() {
         ctx.db.game_spell().insert(Spell {
-            duration_ms: 1_800_000, // 30 min
+            duration_ms: 1_800_000,
             school_mask: 1,
             ..base_spell(DEMON_SKIN, "Demon Skin")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
             kind: crate::spell::A_MOD_RESISTANCE,
             base_points: 120,
-            target: 0, // T_SELF
+            target: 0,
             p0: 1,
-            p0_kind: 2, // RESIST_ARMOR bit, P_SCHOOL_MASK
+            p0_kind: 2,
             ..base_effect(DEMON_SKIN, 0)
         },
     );
@@ -1074,20 +839,12 @@ pub(crate) fn seed_demon_skin_fixture(ctx: &ReducerContext) {
             kind: crate::spell::A_PERIODIC_HEAL,
             base_points: 5,
             period_ms: 5000,
-            target: 0, // T_SELF
+            target: 0,
             ..base_effect(DEMON_SKIN, 1)
         },
     );
 }
 
-/// Mock-seed COMBAT-REGEN fixture: Test Regeneration (50137) — the one
-/// `A_COMBAT_HEALTH_REGEN_PCT` (0xA9) source on a no-import sandbox. Demon Skin 696's regen effect
-/// is `A_PERIODIC_HEAL`, not `A_COMBAT_HEALTH_REGEN_PCT`, so without a dedicated source the combat-
-/// regen integration probe (test-combat-regen.sh) finds ZERO kind-169 rows on a fresh node and its
-/// `HAS_COMBAT_REGEN_EFFECT` gate skips it forever. This fixture (operator-pick over the Troll
-/// racial import — no DBC dependency) keeps the combat-regen-gate mechanic headlessly
-/// exercisable: self-buff, 5 min, allows 5% of health_regen_per_tick THROUGH combat.
-/// IDEMPOTENT (insert-if-absent), same precedent as every other fixture here.
 pub(crate) fn seed_regen_fixture(ctx: &ReducerContext) {
     if ctx.db.game_spell().spell_id().find(50137u32).is_none() {
         ctx.db.game_spell().insert(Spell {
@@ -1096,30 +853,19 @@ pub(crate) fn seed_regen_fixture(ctx: &ReducerContext) {
             ..base_spell(50137, "Test Regeneration")
         });
     }
-    // upsert_effect is delete-then-insert, so this is self-correcting on every call — no
-    // insert-if-absent guard needed (see upsert_effect's doc).
     upsert_effect(
         ctx,
         SpellEffect {
-            kind: 0xA9, // A_COMBAT_HEALTH_REGEN_PCT
+            kind: 0xA9,
             base_points: 5,
-            target: 0, // self
+            target: 0,
             ..base_effect(50137, 0)
         },
     );
 }
 
-/// Reserved fixture ITEM entries (2026-07-16): the scenarios used the mock-seed items 50 (Tempered
-/// Blade) and 52 (Tough Jerky), but the world ETL replaces those low entries with whatever real
-/// imported items happen to occupy them — the vendor scenario bought a few-copper item where it
-/// asserted a 1200c sword, and the quest rewarded something else entirely. Same reserved-id fix as
-/// the 509xxxx quest/vendor rows: fixture entries the import never touches. Unlike
-/// `seed_scenario_fixtures` below, these consts are read unconditionally from `init` (via
-/// `seed_fixture_catalogue`), so they carry no `debug_reducers` `cfg_attr` — they are never dead in
-/// a production build.
 pub(crate) const FIXTURE_BLADE: u32 = 5090050;
 pub(crate) const FIXTURE_JERKY: u32 = 5090052;
-/// The reserved reusable MOUNT item — same reserved-entry rationale as the two above.
 pub(crate) const FIXTURE_REINS: u32 = 5090054;
 
 fn seed_fixture_items(ctx: &ReducerContext) {
@@ -1135,35 +881,11 @@ fn seed_fixture_items(ctx: &ReducerContext) {
     }
 }
 
-// --- LAND-MOUNT FIXTURE -------------------------------------------------------------
-// Reserved ids so a headless sandbox can ride, dismount and fail every mount gate with no Spell.dbc.
-// A real imported world reaches the same behaviour through taxonomy + skill data alone; nothing here
-// is referenced by runtime code.
-
-/// The fixture mount spell: an `A_MOUNTED` display effect plus the paired 60% `SPEED_MOUNTED` effect,
-/// self-cast and instant. Reserved 503xx, alongside `TEST_TAME_BEAST_SPELL`.
 pub(crate) const FIXTURE_MOUNT_SPELL: u32 = 50310;
-/// The synthetic Dazed stand-in: an `A_MOD_SPEED` slow plus `E_DISMOUNT`. It exists ONLY to prove that
-/// a landed spell's dismount effect removes a mount and an unlanded one changes nothing. It does NOT
-/// implement vanilla's mob-chase rear-hit proc — that mechanic is absent, and when it lands it will cast
-/// the real imported Dazed and inherit the same `E_DISMOUNT` behaviour with no new integration point.
 pub(crate) const FIXTURE_DAZED_SPELL: u32 = 50311;
-/// The mount display frozen on the fixture's `A_MOUNTED` effect. Reuses the one mount model this repo
-/// has already confirmed ships in 5875 (the taxi fixture's Alliance flight display) — a fixture only
-/// needs a display the unmodified client renders; attended acceptance rides a real imported mount.
 const FIXTURE_MOUNT_DISPLAY: i32 = 1147;
-/// `game_skill_ability` PK for the fixture's (mount spell → Riding, min_skill 75) pairing. Explicit and
-/// reserved, not the `#[auto_inc]` 0 sentinel: the DBC import loads this table with explicit ids and
-/// leaves the sequence behind the data, so an id-0 insert allocates a live id and panics (errno 12).
 const FIXTURE_MOUNT_ABILITY_ID: u64 = 5_090_020;
 
-/// Seed the land-mount fixture: the Riding skill line, the mount spell and its two effects, the
-/// `SkillAbility` row that gates the spell behind Riding 75, and the synthetic Dazed spell. Idempotent —
-/// spells upsert, the skill-line and ability rows are reserved-id delete-then-insert — so it is safe from
-/// both `init` and the post-import fixture restore.
-///
-/// The riding TRAINER and its offerings live in `seed_scenario_fixtures` with the other trainer NPCs; the
-/// mount ITEM lives in `seed_fixture_items` with the other reserved catalogue rows.
 pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
     use crate::{game_skill_ability, game_skill_line, SkillAbility, SkillLine};
 
@@ -1181,8 +903,8 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
     }
 
     let mount = Spell {
-        gcd_ms: 0,             // item-triggered, like the other on-use fixture spells
-        duration_ms: u32::MAX, // a mount lasts until it is cancelled or a dismount trigger fires
+        gcd_ms: 0,
+        duration_ms: u32::MAX,
         ..base_spell(FIXTURE_MOUNT_SPELL, "Test Riding Horse")
     };
     if ctx
@@ -1196,8 +918,6 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
     } else {
         ctx.db.game_spell().insert(mount);
     }
-    // The STATE OF RECORD: p0 is the resolved creature display id (p0_kind P_DISPLAY_ID), frozen here and
-    // projected onto `mount_display_id` by `mount::recompute_mount`.
     upsert_effect(
         ctx,
         SpellEffect {
@@ -1207,9 +927,6 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
             ..base_effect(FIXTURE_MOUNT_SPELL, 0)
         },
     );
-    // The paired mounted-speed effect: +60%, the nominal vanilla slow-mount figure. It folds into run
-    // speed only while an `A_MOUNTED` aura is present, and `mount::dismount` removes both together
-    // because they belong to the same spell.
     upsert_effect(
         ctx,
         SpellEffect {
@@ -1221,9 +938,6 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
         },
     );
 
-    // Riding 75 gates the mount spell — the same `(spell, skill_line, min_skill)` join an imported
-    // SkillLineAbility row carries, so the gate has nothing fixture-specific in it. Universal masks (0)
-    // keep the fixture usable from any race/class.
     ctx.db
         .game_skill_ability()
         .id()
@@ -1235,7 +949,7 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
         race_mask: 0,
         class_mask: 0,
         min_skill: 75,
-        acquire_method: 0, // never auto-learned: the mount ITEM casts it, the spellbook never holds it
+        acquire_method: 0,
         gray: 0,
         green: 0,
     });
@@ -1278,24 +992,8 @@ pub(crate) fn seed_mount_fixture(ctx: &ReducerContext) {
     );
 }
 
-/// Reserved fixture FACTION entry (2026-07-16): SYNTHETIC id — was 79, a REAL Faction.dbc id, so on
-/// an imported node the insert-if-absent no-op'd against the real row (reputation_index -1, no bar)
-/// and the quest's rep reward silently vanished (grant_reputation skips bar-less factions →
-/// scenario-quest's "+250 rep" assert failed). 50900 collides with nothing the DBC ships (ids top
-/// out ~1000).
 pub(crate) const FIXTURE_FACTION: u32 = 50900;
 
-/// Seed the reserved-id CATALOGUE rows the scenario fixtures reference: the two fixture items
-/// (`FIXTURE_BLADE`/`FIXTURE_JERKY`) and the fixture faction above. Split out from
-/// `seed_scenario_fixtures` and called from `init` too — same precedent as
-/// `seed_pw_shield_fixture` — because these rows land in tables the cross-shard catalogue parity
-/// check fingerprints whole (`game_item_template`, `game_faction`): before this, only a shard
-/// that had `debug_seed_scenario_fixtures` run against it (historically the wire-suite's target,
-/// lyracore) carried them, so its `items`/`dbc_reference` fingerprints permanently disagreed
-/// with siblings that never ran the harness reducer — a false catalogue-skew signal, not a real one.
-/// Calling this from `init` makes every freshly published shard agree unconditionally, matching how
-/// `seed_pw_shield_fixture` already keeps `spells` in agreement. Idempotent (insert-if-absent), so
-/// the repeat call from `debug_seed_scenario_fixtures` below is a no-op once `init` has run.
 pub(crate) fn seed_fixture_catalogue(ctx: &ReducerContext) {
     seed_fixture_items(ctx);
     if ctx
@@ -1307,40 +1005,15 @@ pub(crate) fn seed_fixture_catalogue(ctx: &ReducerContext) {
     {
         ctx.db.game_faction().insert(Faction {
             faction_id: FIXTURE_FACTION,
-            // Slot 60: the real import claims indices 0..=54 of the client's 64-entry rep array
-            // (danger-zones §1.4) — 60 stays clear of both the import and the array bound.
+            // The client has 64 reputation slots; the real import uses 0..=54.
             reputation_index: 60,
             base_standing: 0,
         });
     }
 }
 
-/// Scenario-runner seed: everything the four wire scenarios need on a
-/// no-import sandbox, insert-if-absent like every other fixture here. Same precedent as
-/// `seed_pw_shield_fixture` — call via `debug_seed_scenario_fixtures` post-publish.
-///
-/// - faction 79 with a real reputation bar (rep index 5) so a quest rep reward lands in
-///   `game_player_reputation` (grant_reputation skips bar-less factions).
-/// - quest 50900 "Wolf Cull": kill 2x Test Wolf (51000), rewards 150c + 90 XP + 2x Tough Jerky (52)
-///   + 250 rep with faction 79. REPEATABLE so suite runs stay green without deleting the log row.
-/// - questgiver NPC template 51003 (starts + ends 50900).
-/// - vendor/repairer NPC template 51004 selling Tempered Blade (50) + Tough Jerky (52).
-/// - trainer offering on the seeded Profession Trainer (51001): Lesser Heal (2050, a seeded 1.5s
-///   heal) for 100c at level 1 — the train-and-cast scenario's purchase.
-/// - Weapon Master NPC template 51005 ("Woo Ping"): a second GOSSIP|TRAINER creature
-///   (mirrors the 51004 vendor block) offering 1H Axe (skill line 44, marker 50130, required_level 1,
-///   100c) and Polearm (skill line 229, marker 50131, required_level 60, 100c — the level-refusal
-///   fixture). Both rows carry `learn_skill_line` set to a COMBAT line, so `apply_trainer_buy` routes
-///   them onto the weapon fork (level-derived cap, presence-known) instead of the profession fork;
-///   `learn_skill_cap` is irrelevant/ignored on that fork (kept at 0, never read).
-///
-/// Sole consumer today is the feature-gated harness reducer (`debug::debug_seed_scenario_fixtures`),
-/// so a build WITHOUT `debug_reducers` (a production publish, or a `cargo clippy` that does not
-/// unify the module's features) sees this fn itself as dead — silenced ONLY here, never
-/// unconditionally (contrast `FIXTURE_BLADE`/`FIXTURE_JERKY` above, which stay reachable from `init`
-/// in every build and so carry no such attribute).
 #[cfg_attr(not(feature = "debug_reducers"), allow(dead_code))]
-#[allow(clippy::too_many_lines)] // A seed data table written as code.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
     use crate::quest::quest_role;
 
@@ -1349,9 +1022,6 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
         game_quest_template, game_quest_text, game_trainer_spell,
     };
 
-    // Reserved fixture items + faction first — the quest reward/rep/vendor stock below reference
-    // them. Also called unconditionally from `init` now (see `seed_fixture_catalogue`'s doc); this
-    // call stays so an already-migrated dev DB that only ever runs the debug reducer still gets them.
     seed_fixture_catalogue(ctx);
     seed_hunter_tame_fixture(ctx);
 
@@ -1380,7 +1050,7 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             repeatable: true,
             next_quest_id: 0,
             limit_time: 0,
-            reward_money_max_level: 0, // fixture sets reward_xp explicitly, so this is unused here
+            reward_money_max_level: 0,
             quest_type: 0,
         });
         ctx.db.game_quest_text().insert(crate::QuestText {
@@ -1390,11 +1060,7 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             offer_reward_text: "The pack thins. Well done.".to_string(),
             request_items_text: "Are the wolves culled?".to_string(),
         });
-        // EXPLICIT reserved ids (not the auto_inc 0 sentinel): the world ETL imports these quest
-        // tables with explicit dump ids, leaving the table's sequence allocator BEHIND the data —
-        // an id-0 insert then allocates an id that already exists and PANICS (errno 12; the
-        // fixture-seed rollback found live 2026-07-15). Fixed ids in the 509xx fixture range are
-        // idempotent with the delete below and can never collide with dump rows.
+        // Explicit reserved ids avoid collisions with the import, which does not advance auto_inc.
         ctx.db.game_quest_objective().id().delete(5090000u64);
         ctx.db.game_quest_objective().insert(crate::QuestObjective {
             id: 5090000,
@@ -1410,7 +1076,7 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             .insert(crate::QuestRewardItem {
                 id: 5090001,
                 quest_entry: QUEST,
-                item_entry: FIXTURE_JERKY, // reserved fixture Tough Jerky (see seed_fixture_items)
+                item_entry: FIXTURE_JERKY,
                 count: 2,
             });
         ctx.db.game_creature_quest().id().delete(5090002u64);
@@ -1433,10 +1099,6 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
     if templates.entry().find(WOLF).is_none() {
         templates.insert(test_wolf_template());
     }
-    // The quest-loop's LOOT step needs a coin window: give the Test Wolf pocket change if it has
-    // none yet (runs AFTER the insert-if-absent above so it converges to the same values whether
-    // the wolf was just (re)inserted by this reducer or already existed from `init`; kill-time
-    // money rolls read the template either way).
     if let Some(mut wolf) = templates.entry().find(WOLF) {
         if wolf.money_max == 0 {
             wolf.money_min = 25;
@@ -1447,12 +1109,6 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
     if templates.entry().find(PROFESSION_TRAINER_ENTRY).is_none() {
         templates.insert(profession_trainer_template());
     }
-    // "Test Wolf Elder" (51002) — the BOT-SUITE fight fixture. The Package bot tests level
-    // their bots to clear the cast level-gate (Taunt 355 = spell_level 10), which greys the L1
-    // Test Wolf 51000 (aggro_radius returns 0 at a >=8 level gap) — so its wolves stop aggroing and
-    // the tank has nothing to Taunt. This one is level 9: non-grey to a level-10 bot (20-level gap
-    // rule), so it proximity-aggros and pays real kill XP. SEPARATE id keeps the scenario_quest
-    // "grey L1 wolf pays 0 kill XP" fixture (51000) untouched — the done-when's hard constraint.
     const WOLF_ELDER: u32 = 51002;
     if templates.entry().find(WOLF_ELDER).is_none() {
         templates.insert(CreatureTemplate {
@@ -1460,14 +1116,14 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             name: "Test Wolf Elder".to_string(),
             subname: String::new(),
             display_id: 720,
-            level: 8, // diff 2 vs an L10 bot — inside the goals.rs GRIND ±3 band, non-grey
-            health: 300, // survives a 1s top-up window vs an L10 trio's burst; solo-killable in ~15s
-            faction_template: 14, // Monster (hostile — same as 51000)
+            level: 8,
+            health: 300,
+            faction_template: 14,
             npc_flags: 0,
             unit_flags: 0,
-            creature_type: 1, // BEAST (flee_eligible false — never routs mid-fight)
-            creature_family: 1, // Wolf
-            type_flags: 0x100, // SKINNABLE
+            creature_type: 1,
+            creature_family: 1,
+            type_flags: 0x100,
             rank: 0,
             scale: 1.0,
             base_attack_time_ms: 2000,
@@ -1475,15 +1131,13 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             money_max: 50,
             max_level: 0,
             max_level_health: 0,
-            // EXPLICIT 20yd (aggro_radius returns an override verbatim, beating the grey rule) —
-            // so proximity aggro survives ANY future bot level, not just level 10.
             aggro_range: 20,
-            damage_min: 2, // low on purpose: a solo bot-goals bot survives 3 grind kills healer-less
+            damage_min: 2,
             damage_max: 4,
             armor: 0,
             pickpocket_loot_id: 0,
             skin_loot_id: 0,
-            trainer_type: 0, // not a trainer
+            trainer_type: 0,
             trainer_class: 0,
         });
     }
@@ -1495,10 +1149,10 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             display_id: 3167,
             level: 10,
             health: 500,
-            faction_template: 35, // FRIENDLY
-            npc_flags: lyracore_shared::constants::npc_flags::GOSSIP | 0x2, // 0x2 = UNIT_NPC_FLAG_QUESTGIVER (1.12)
+            faction_template: 35,
+            npc_flags: lyracore_shared::constants::npc_flags::GOSSIP | 0x2,
             unit_flags: 0,
-            creature_type: 7, // Humanoid
+            creature_type: 7,
             creature_family: 0,
             type_flags: 0,
             rank: 0,
@@ -1512,9 +1166,9 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             damage_min: 0,
             damage_max: 0,
             armor: 0,
-            pickpocket_loot_id: 0, // not imported — a Humanoid questgiver has no pickpocket table
-            skin_loot_id: 0,       // not imported — a Humanoid questgiver isn't skinnable anyway
-            trainer_type: 0,       // not a trainer
+            pickpocket_loot_id: 0,
+            skin_loot_id: 0,
+            trainer_type: 0,
             trainer_class: 0,
         });
     }
@@ -1545,15 +1199,13 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             damage_min: 0,
             damage_max: 0,
             armor: 0,
-            pickpocket_loot_id: 0, // not imported — a Humanoid vendor has no pickpocket table
-            skin_loot_id: 0,       // not imported — a Humanoid vendor isn't skinnable anyway
-            trainer_type: 0,       // not a trainer
+            pickpocket_loot_id: 0,
+            skin_loot_id: 0,
+            trainer_type: 0,
             trainer_class: 0,
         });
     }
     let vendor_rows = ctx.db.game_npc_vendor();
-    // Explicit reserved ids (same errno-12 sequence-desync fix as the quest rows above: the ETL
-    // imports vendor/trainer rows with explicit ids, leaving the sequence behind the data).
     if !vendor_rows
         .by_vendor()
         .filter(&VENDOR)
@@ -1583,7 +1235,7 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
         });
     }
 
-    const TRAINER: u32 = 51001; // the init-seeded Profession Trainer (already GOSSIP|TRAINER)
+    const TRAINER: u32 = 51001;
     const LESSER_HEAL: u32 = 2050;
     let offerings = ctx.db.game_trainer_spell();
     if !offerings
@@ -1603,16 +1255,9 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
         });
     }
 
-    // --- WEAPON MASTER: "Woo Ping" (51005) sells weapon proficiencies for gold,
-    // the vanilla weapon-master shape (a trainer-list row whose `learn_skill_line` names a weapon line
-    // instead of a spell/profession). Mirrors the 51004 vendor block: GOSSIP|TRAINER, faction 35
-    // (FRIENDLY, never a kill target).
     const WEAPON_MASTER: u32 = 51005;
-    // Marker spell ids for the weapon-learn offerings — NEVER resolved as real spells (no `game_spell`
-    // header/effects), same convention as the profession markers in `skill.rs`; MUST match
-    // `skill::LEARN_AXE_1H_SPELL_ID` / `skill::LEARN_POLEARM_SPELL_ID` (the debug reducer's twin lookup).
-    const LEARN_AXE_1H: u32 = 50130; // -> learn_skill_line = AXE_1H (44)
-    const LEARN_POLEARM: u32 = 50131; // -> learn_skill_line = POLEARM (229)
+    const LEARN_AXE_1H: u32 = 50130;
+    const LEARN_POLEARM: u32 = 50131;
     if templates.entry().find(WEAPON_MASTER).is_none() {
         templates.insert(CreatureTemplate {
             entry: WEAPON_MASTER,
@@ -1621,11 +1266,11 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             display_id: 3167,
             level: 30,
             health: 1500,
-            faction_template: 35, // FRIENDLY (a trainer, not a kill target)
+            faction_template: 35,
             npc_flags: lyracore_shared::constants::npc_flags::GOSSIP
                 | lyracore_shared::constants::npc_flags::TRAINER,
             unit_flags: 0,
-            creature_type: 7, // Humanoid
+            creature_type: 7,
             creature_family: 0,
             type_flags: 0,
             rank: 0,
@@ -1635,13 +1280,13 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             money_max: 0,
             max_level: 0,
             max_level_health: 0,
-            aggro_range: 0, // never aggros (friendly trainer)
+            aggro_range: 0,
             damage_min: 0,
             damage_max: 0,
             armor: 0,
-            pickpocket_loot_id: 0, // not imported — a friendly weapon master has no pickpocket table
-            skin_loot_id: 0,       // not imported — a Humanoid trainer isn't skinnable anyway
-            trainer_type: 2, // TRADESKILLS: the weapon master serves every class, matching the real Woo Ping (entry 11867) in the dump
+            pickpocket_loot_id: 0,
+            skin_loot_id: 0,
+            trainer_type: 2,
             trainer_class: 0,
         });
     }
@@ -1658,7 +1303,7 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             cost: 100,
             required_level: 1,
             learn_skill_line: crate::skill::skill_line::AXE_1H,
-            learn_skill_cap: 0, // ignored on the weapon fork (cap is level-derived)
+            learn_skill_cap: 0,
         });
     }
     if !offerings
@@ -1672,16 +1317,12 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             trainer_entry: WEAPON_MASTER,
             spell_id: LEARN_POLEARM,
             cost: 100,
-            required_level: 60, // the level-refusal fixture (Ginger's default level is well below 60)
+            required_level: 60,
             learn_skill_line: crate::skill::skill_line::POLEARM,
             learn_skill_cap: 0,
         });
     }
 
-    // --- RIDING TRAINER: the `trainer_type::MOUNTS` NPC that teaches the Riding skill line
-    // at its two vanilla tiers. Same offering shape as the weapon master, but `learn_skill_line` names
-    // Riding, so `apply_trainer_buy` takes the riding fork (grant whole at the offering's tier) and
-    // refuses the row on any trainer that is not a MOUNTS trainer.
     seed_mount_fixture(ctx);
     if templates.entry().find(RIDING_TRAINER_ENTRY).is_none() {
         templates.insert(riding_trainer_template());
@@ -1693,7 +1334,6 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             100u32,
             1u8,
         ),
-        // Journeyman is the level-refusal fixture as well as the second tier: vanilla gates it at 60.
         (
             5090016u64,
             crate::skill::LEARN_JOURNEYMAN_RIDING_SPELL_ID,
@@ -1701,9 +1341,6 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             60,
         ),
     ] {
-        // A marker with no tier behind it would seed an offering that grants riding 0 — skip it rather
-        // than write a dead row. Structurally unreachable for the two markers above; the guard is what
-        // keeps it that way if a third tier is added without extending `riding_marker_rank`.
         let Some(tier) = crate::skill::riding_marker_rank(marker) else {
             continue;
         };
@@ -1722,54 +1359,20 @@ pub(crate) fn seed_scenario_fixtures(ctx: &ReducerContext) {
             cost,
             required_level,
             learn_skill_line: crate::skill::skill_line::RIDING,
-            // The TIER the buy grants — read by the riding fork as both the cap and the granted rank.
             learn_skill_cap: tier as u32,
         });
     }
 }
 
-/// Idempotent fixture effect write: `SpellEffect.id` is a DETERMINISTIC PK
-/// `(spell_id<<2)|effect_index` (NOT auto_inc), so a plain `insert` PANICS (errno 12,
-/// unique-exists) whenever the curated importer has already written the same effect row — a
-/// re-imported kit + a fixture re-seed collided live 2026-07-15. Delete-then-insert keeps the
-/// fixture authoritative for its own rows without tripping the constraint.
-///
-/// THE DISCIPLINE: delete-then-insert is idempotent BY CONSTRUCTION — calling it twice with
-/// the same row is a no-op, and calling it with a changed shape self-corrects the row in place. So
-/// every call site below calls this UNCONDITIONALLY, with no `if find(id).is_none() { ... }` guard
-/// around it. A guard doesn't just add noise: it makes the delete dead code (the branch that would
-/// run it never fires when the row already exists), which silently turns "re-seed self-corrects"
-/// back into "re-seed only fills gaps" — exactly the bug class this fn exists to prevent. If a
-/// future fixture effect ever needs to preserve an operator's hand-edit instead of overwriting it,
-/// that is a genuinely different policy and needs a differently-named helper, not a guard bolted
-/// onto this one.
 fn upsert_effect(ctx: &spacetimedb::ReducerContext, row: SpellEffect) {
     ctx.db.game_spell_effect().id().delete(row.id);
     ctx.db.game_spell_effect().insert(row);
 }
 
-/// Stacking-family probe fixture — the four real family members a live aura-stacking probe needs
-/// (`docs/verification/aura-stacking-probes.md`).
-///
-/// A curated sandbox carries only rank 1 of each aura family and every one of those is self-cast,
-/// so neither "the stronger member wins from either caster" nor "two paladins, one target" can be
-/// staged on it without these rows. Power Word: Fortitude and Prayer of Fortitude are the
-/// magnitude-compared EXCLUSIVE_STRONGER pair (family 2); Blessing of Might and Blessing of Wisdom
-/// are the EXCLUSIVE_PER_CASTER pair (family 3). All four are ally-targeted so a second caster can
-/// reach somebody else's target.
-///
-/// These are REAL vanilla ids, so a database whose catalogue already holds one keeps its own row:
-/// an imported Spell.dbc is authoritative and a fixture must never overwrite it.
 pub(crate) fn seed_stacking_probe_fixture(ctx: &ReducerContext) {
-    // (spell_id, name, effect kind, p0, p0_kind, magnitude)
     const PROBE_SPELLS: &[(u32, &str, u8, i32, u8, i32)] = &[
-        // Family 2 — A_MOD_STAT(STAT_STA), compared by magnitude. The pair is deliberately drawn from
-        // the family's two DIFFERENT chains: `aura_apply` displaces a same-NAME other rank before any
-        // family policy runs, so two ranks of one chain would never reach the strength comparison.
         (1243, "Power Word: Fortitude", 0xA0, 2, 1, 3),
         (21562, "Prayer of Fortitude", 0xA0, 2, 1, 26),
-        // Family 3 — one Blessing per paladin per target. Might is A_MOD_COMBAT(attack power),
-        // Wisdom an A_MOD_STAT(STAT_SPI) stand-in for its mana regen.
         (19740, "Blessing of Might", 0xA3, 0, 5, 20),
         (19742, "Blessing of Wisdom", 0xA0, 4, 1, 10),
     ];
@@ -1788,7 +1391,7 @@ pub(crate) fn seed_stacking_probe_fixture(ctx: &ReducerContext) {
             SpellEffect {
                 kind,
                 base_points: magnitude,
-                target: 2, // T_TARGET_ALLY — the probe's second caster buffs someone else's target
+                target: 2,
                 p0,
                 p0_kind,
                 ..base_effect(spell_id, 0)

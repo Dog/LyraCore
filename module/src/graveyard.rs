@@ -1,15 +1,5 @@
-//!
-//! Graveyard resolution and its imported tables. `tables.rs` exports the accessors and row types.
-
 use spacetimedb::{table, ReducerContext, Table};
 
-/// One `WorldSafeLocs.dbc` row (a graveyard's fixed position) — imported by the importer's `--dbc`
-/// mode (see `importer/src/dbc.rs::graveyard_sql`). Replaces the hardcoded
-/// `{NORTHSHIRE, GOLDSHIRE, ...}` consts below as the primary data source once imported; those
-/// consts remain as the no-import fallback (`nearest`), and `seed.rs` row-seeds the SAME five points
-/// here too, mirroring the `game_start_position` seed/import precedent (init seeds, import
-/// clear+reloads over it). No orientation column — `WorldSafeLocs.dbc` carries none (a graveyard
-/// release always faces 0.0). No Timestamp → plain SQL. [static]
 #[table(accessor = game_graveyard, public)]
 pub struct GraveyardLoc {
     #[primary_key]
@@ -23,12 +13,6 @@ pub struct GraveyardLoc {
     pub name: String,
 }
 
-/// One cmangos `game_graveyard_zone` row — links a `game_graveyard.id` (`safe_loc_id`) to the zone
-/// it serves, with an optional faction restriction (0 = both factions; else the cmangos team-faction
-/// id, see `team_for_race`). Imported by the importer's `--dump` mode; see
-/// `importer/src/main.rs::build_graveyard_zone_sql`. `resolve_graveyard` reads it via `by_zone` to
-/// prefer a zone-linked graveyard over a merely-closer unlinked one (the cmangos release rule). No
-/// Timestamp → plain SQL. [static]
 #[table(
     accessor = game_graveyard_zone,
     public,
@@ -52,7 +36,6 @@ pub(crate) struct Graveyard {
     pub(crate) o: f32,
 }
 
-// world_safe_locs id 105 — Northshire Abbey
 const NORTHSHIRE: Graveyard = Graveyard {
     map: 0,
     x: -8935.33,
@@ -61,7 +44,6 @@ const NORTHSHIRE: Graveyard = Graveyard {
     o: 2.72271,
 };
 
-// world_safe_locs id 106 — Goldshire
 const GOLDSHIRE: Graveyard = Graveyard {
     map: 0,
     x: -9339.59,
@@ -70,7 +52,6 @@ const GOLDSHIRE: Graveyard = Graveyard {
     o: 0.0,
 };
 
-// world_safe_locs id 854 — Eastvale Logging Camp
 const EASTVALE: Graveyard = Graveyard {
     map: 0,
     x: -9552.73,
@@ -79,26 +60,21 @@ const EASTVALE: Graveyard = Graveyard {
     o: 0.0,
 };
 
-// world_safe_locs id ≈80 [V], Sentinel Hill (Westfall, zone 40). Hand-added for
-// the Westfall 1-20 slice; coords are an UNVERIFIED estimate (this sandbox has no reference
-// world-database to read the real row from); orientation defaults to 0.0 (not sourced). CONFIRM
-// x/y/z against your own imported world_safe_locs before relying on this for a live release.
+// These Westfall fallback coordinates are unsourced estimates.
 const SENTINEL_HILL: Graveyard = Graveyard {
     map: 0,
-    x: -10650.0, // [V]
-    y: 1180.0,   // [V]
-    z: 34.0,     // [V]
-    o: 0.0,      // [V] — orientation not sourced
+    x: -10650.0,
+    y: 1180.0,
+    z: 34.0,
+    o: 0.0,
 };
 
-// world_safe_locs id ≈81 [V] — Westfall coast (the western shoreline graveyard, zone 40). Same
-// provenance caveat as SENTINEL_HILL: coords UNVERIFIED.
 const WESTFALL_COAST: Graveyard = Graveyard {
     map: 0,
-    x: -11390.0, // [V]
-    y: 1590.0,   // [V]
-    z: 6.0,      // [V]
-    o: 0.0,      // [V] — orientation not sourced
+    x: -11390.0,
+    y: 1590.0,
+    z: 6.0,
+    o: 0.0,
 };
 
 const STATIC_CANDIDATES: [Graveyard; 5] = [
@@ -109,14 +85,10 @@ const STATIC_CANDIDATES: [Graveyard; 5] = [
     WESTFALL_COAST,
 ];
 
-// ---- Instance-map release --------------------------------------------------
-//
-
 pub(crate) fn instance_release_zone(map_id: u32) -> Option<u32> {
     crate::instance::dungeon(map_id).map(|d| d.release_zone)
 }
 
-/// Bootstrap release location when the fixture has no imported graveyards.
 pub(crate) fn instance_static_fallback(map_id: u32) -> Option<Graveyard> {
     crate::instance::dungeon(map_id).map(|d| {
         let (map, x, y, z, o) = d.release_fallback;
@@ -133,9 +105,6 @@ pub(crate) fn pick_instance_graveyard(
     nearest_of(linked, px, py).or(static_fallback)
 }
 
-/// The pure nearest-by-squared-2D-distance picker, shared by every candidate source (the static
-/// fallback list AND the DB-resolved zone-linked/all-imported lists `resolve_graveyard` builds).
-/// `None` for an empty slice — never panics; the caller chains to the next fallback.
 pub(crate) fn nearest_of(candidates: &[Graveyard], px: f32, py: f32) -> Option<Graveyard> {
     candidates
         .iter()
@@ -147,10 +116,6 @@ pub(crate) fn nearest_of(candidates: &[Graveyard], px: f32, py: f32) -> Option<G
         .copied()
 }
 
-/// Return the graveyard whose 2-D position is closest (squared distance) to `(px, py)`, among
-/// ONLY the five hardcoded fallback consts (never touches the DB). Kept for
-/// the unit tests below and as `resolve_graveyard`'s last-resort floor; live release code should
-/// call `resolve_graveyard` instead so an imported `game_graveyard` table actually gets consulted.
 pub(crate) fn nearest(px: f32, py: f32) -> Graveyard {
     nearest_of(&STATIC_CANDIDATES, px, py).unwrap_or(NORTHSHIRE)
 }
@@ -166,10 +131,6 @@ pub(crate) fn pick_graveyard(
         .unwrap_or_else(|| nearest(px, py))
 }
 
-/// The team-faction id `game_graveyard_zone.faction` carries, for a character's race. Moved to
-/// `lyracore_shared::faction` when the mail faction gate needed it: that gate runs in the GATEWAY
-/// (realm-core holds no characters), and a second copy of the race table over there would agree
-/// with this one only until somebody added a race to one of them.
 pub(crate) use lyracore_shared::faction::team_for_race;
 
 fn to_gy(g: GraveyardLoc) -> Graveyard {
@@ -182,10 +143,6 @@ fn to_gy(g: GraveyardLoc) -> Graveyard {
     }
 }
 
-/// Zone-linked graveyards for `zone_id`, faction-filtered (`faction == 0 || faction == team`),
-/// resolved to positions via `game_graveyard`. A `game_graveyard_zone` row whose `safe_loc_id` has
-/// no matching `game_graveyard` row is silently dropped — an inconsistent import shouldn't panic a
-/// release.
 fn zone_linked(
     ctx: &ReducerContext,
     zone_id: u32,
@@ -203,9 +160,6 @@ fn zone_linked(
         .collect()
 }
 
-/// Every imported graveyard on `map_id`, regardless of zone — the fallback once zone-scoping
-/// isn't available or didn't resolve (see `resolve_graveyard`). Map-only — same RESOLVED note
-/// as `zone_linked`: only non-instance-map releases ever reach this chain.
 fn all_on_map(ctx: &ReducerContext, map_id: u32) -> Vec<Graveyard> {
     ctx.db
         .game_graveyard()
@@ -215,10 +169,6 @@ fn all_on_map(ctx: &ReducerContext, map_id: u32) -> Vec<Graveyard> {
         .collect()
 }
 
-/// The real entry point for a release: resolve the nearest graveyard to `(x, y)` on `map_id` for
-/// a player of `race`, per the fallback chain zone-linked → all-imported-on-map → static consts
-/// (see `pick_graveyard`). Never panics on an empty DB — every step degrades gracefully; the
-/// static consts are the final floor.
 pub(crate) fn resolve_graveyard(
     ctx: &ReducerContext,
     map_id: u32,
@@ -285,9 +235,6 @@ mod tests {
 
     #[test]
     fn deadmines_release_resolves_cross_map_to_westfall_never_by_raw_distance() {
-        // Map 36 is an instance map: its release zone is The Deadmines (1581 [V]) and its no-import
-        // static floor is Sentinel Hill on MAP 0 — the release itself is cross-map by design
-        // (corpse stays on 36; the ghost walks back in through the portal).
         assert_eq!(instance_release_zone(36), Some(1581));
         assert_eq!(
             instance_release_zone(0),
@@ -306,9 +253,6 @@ mod tests {
         );
         assert!(instance_static_fallback(0).is_none());
 
-        // The pick order: an imported zone-linked external graveyard wins over the static floor;
-        // with nothing imported the floor applies; a non-instance map (no floor, no links) yields
-        // None so the caller falls through to the normal open-world chain.
         let linked = Graveyard {
             map: 0,
             x: -10600.0,
@@ -334,7 +278,6 @@ mod tests {
 
     #[test]
     fn nearest_graveyard_picks_the_closest_of_the_three_by_squared_distance() {
-        // Dying at each graveyard's own coordinates picks that graveyard (distance 0 beats the others).
         let n = nearest(-8935.33, -188.646);
         assert_eq!(
             (n.x, n.y),
@@ -353,23 +296,14 @@ mod tests {
             (-9552.73, -1374.84),
             "Eastvale death releases at Eastvale"
         );
-        // A south-east Elwynn death picks Eastvale (~380yd) over Northshire (~990yd) and Goldshire
-        // (~1180yd) — the exact wrong-direction corpse run `nearest` exists to avoid.
         let s = nearest(-9500.0, -1000.0);
         assert_eq!((s.x, s.y), (-9552.73, -1374.84));
-        // a Westfall-ish death point (near Sentinel Hill) picks Sentinel Hill over
-        // Eastvale — the nearest Elwynn graveyard is nowhere close once Westfall is in the candidate
-        // set (Sentinel Hill ~95yd away vs Eastvale's ~2700yd), proving the two new graveyards
-        // actually widen the release map rather than sitting unreachable in the candidate slice.
         let w = nearest(-10700.0, 1100.0);
         assert_eq!((w.x, w.y), (-10650.0, 1180.0));
     }
 
     #[test]
     fn pick_graveyard_prefers_a_zone_linked_graveyard_over_a_closer_unlinked_one() {
-        // game_graveyard_zone's whole point is that a graveyard EXPLICITLY linked to
-        // the death position's resolved zone wins even when an unlinked (or wrong-zone) graveyard
-        // sits geometrically closer — the cmangos release rule.
         let close_unlinked = Graveyard {
             map: 0,
             x: 0.0,
@@ -396,8 +330,6 @@ mod tests {
 
     #[test]
     fn pick_graveyard_falls_back_through_all_then_to_the_static_consts() {
-        // No zone-linked candidates (empty zone-link set, e.g. an unresolved zone) → falls to `all`
-        // (every imported graveyard on the map).
         let only_all = [Graveyard {
             map: 0,
             x: 42.0,
@@ -407,8 +339,6 @@ mod tests {
         }];
         let picked = pick_graveyard(&[], &only_all, 0.0, 0.0);
         assert_eq!((picked.x, picked.y), (42.0, 42.0));
-        // BOTH empty (nothing imported at all) → falls to the static consts (never panics), matching
-        // `nearest` directly.
         let picked_static = pick_graveyard(&[], &[], -10700.0, 1100.0);
         let expected = nearest(-10700.0, 1100.0);
         assert_eq!((picked_static.x, picked_static.y), (expected.x, expected.y));
@@ -416,14 +346,14 @@ mod tests {
 
     #[test]
     fn team_for_race_maps_alliance_and_horde_and_defaults_alliance() {
-        assert_eq!(team_for_race(1), 469); // Human
-        assert_eq!(team_for_race(3), 469); // Dwarf
-        assert_eq!(team_for_race(4), 469); // Night Elf
-        assert_eq!(team_for_race(7), 469); // Gnome
-        assert_eq!(team_for_race(2), 67); // Orc
-        assert_eq!(team_for_race(5), 67); // Undead
-        assert_eq!(team_for_race(6), 67); // Tauren
-        assert_eq!(team_for_race(8), 67); // Troll
+        assert_eq!(team_for_race(1), 469);
+        assert_eq!(team_for_race(3), 469);
+        assert_eq!(team_for_race(4), 469);
+        assert_eq!(team_for_race(7), 469);
+        assert_eq!(team_for_race(2), 67);
+        assert_eq!(team_for_race(5), 67);
+        assert_eq!(team_for_race(6), 67);
+        assert_eq!(team_for_race(8), 67);
         assert_eq!(
             team_for_race(200),
             469,

@@ -1,6 +1,3 @@
-//! A party formed after one member entered an Instance alone shares that Instance, so the members
-//! who follow never mint a second one.
-
 mod support;
 
 use support::{actor, Standalone};

@@ -9,7 +9,6 @@ const LINES: &str = "SELECT * FROM game_realm_chat_event";
 const HUMAN: u8 = 1;
 const ORC: u8 = 2;
 
-// Notice codes, cm:Channel.h:33-69.
 const JOINED: u64 = 0x00;
 const YOU_JOINED: u64 = 0x02;
 const YOU_LEFT: u64 = 0x03;
@@ -24,7 +23,6 @@ const PLAYER_UNBANNED: u64 = 0x15;
 const INVITE: u64 = 0x18;
 const PLAYER_INVITED: u64 = 0x1D;
 
-// realm_channel_op op codes, crates/lyracore-shared/src/channel.rs::channel_op.
 const JOIN: &str = "0";
 const LEAVE: &str = "1";
 const OP_SET_OWNER: &str = "3";
@@ -39,8 +37,6 @@ const OP_INVITE: &str = "11";
 const OP_ANNOUNCEMENTS: &str = "12";
 const OP_MODERATE: &str = "13";
 
-/// The Character an op names, as the Gateway resolves and conveys it. ANNOUNCEMENTS and MODERATE
-/// carry [`Target::NONE`], exactly as the Gateway's untargeted path does.
 #[derive(Clone, Copy)]
 struct Target<'a> {
     guid: u64,
@@ -106,7 +102,6 @@ fn start(name: &str) -> Standalone {
     realm
 }
 
-/// JOIN and LEAVE, the only ops with no target.
 fn join(realm: &Standalone, who: &str, channel: &str, race: u8) {
     realm.assert_call(
         "realm_channel_op",
@@ -114,9 +109,6 @@ fn join(realm: &Standalone, who: &str, channel: &str, race: u8) {
     );
 }
 
-/// Every op that names a target: SET_OWNER, MODERATOR, UNMODERATOR, MUTE, UNMUTE, KICK, BAN, UNBAN.
-/// ANNOUNCEMENTS and MODERATE also run through here with [`Target::NONE`], exactly as the
-/// Gateway's untargeted path conveys them.
 fn op(realm: &Standalone, who: &str, code: &str, channel: &str, target: Target, race: u8) {
     realm.assert_call(
         "realm_channel_op",
@@ -124,7 +116,6 @@ fn op(realm: &Standalone, who: &str, code: &str, channel: &str, target: Target, 
     );
 }
 
-/// INVITE, the only op that reads `target_ignores_actor`.
 fn invite(
     realm: &Standalone,
     who: &str,
@@ -165,8 +156,6 @@ fn wait_until_empty(realm: &Standalone, query: &str) {
     );
 }
 
-/// The rows one action inserts into `table` in insert order, captured from its single transaction.
-/// The table is drained first so the capture holds no GC delete.
 fn inserted(realm: &Standalone, query: &str, table: &str, action: impl FnOnce()) -> Vec<Value> {
     wait_until_empty(realm, query);
     let updates = realm.capture_updates(query, 1, action);
@@ -206,8 +195,6 @@ fn recipients(row: &Value) -> Vec<u64> {
         .collect()
 }
 
-/// A character can belong to more than one channel, so this filters by channel too (unlike a
-/// query keyed on `character_guid` alone).
 fn member_flags(realm: &Standalone, channel: &str, guid: u64) -> String {
     let id = channel_id(realm, channel);
     realm.query_rows(&format!(
@@ -230,9 +217,6 @@ fn owner_guid(realm: &Standalone, name: &str) -> String {
         .clone()
 }
 
-/// Criteria 1, 2, 3 and 7: promoting a moderator, a plain member refused, the owner protected from
-/// everyone but themselves, and SET_OWNER moving ownership while the old owner keeps MODERATOR. A
-/// built-in channel refuses SET_OWNER with NOT_OWNER along the way, since it has no owner to be.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn moderator_rights_gate_ownership_and_moderator_changes() {
@@ -246,7 +230,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
         "the first joiner owns and moderates"
     );
 
-    // Criterion 2: a plain member (3) may not moderate.
     refused(
         &realm,
         "realm_channel_op",
@@ -259,7 +242,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     );
     assert_eq!(member_flags(&realm, "Raiders", 2), "0");
 
-    // Criterion 1: the owner promotes member 2. Every member sees MODE_CHANGE 0x00 to 0x02.
     let promoted = notice_rows(&realm, || {
         op(
             &realm,
@@ -278,7 +260,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     assert_eq!(recipients(&promoted[0]), [1, 2, 3]);
     assert_eq!(member_flags(&realm, "Raiders", 2), "2");
 
-    // Criterion 3: the new moderator (2) may not touch the owner (1).
     refused(
         &realm,
         "realm_channel_op",
@@ -305,9 +286,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
         "the owner is untouched"
     );
 
-    // The owner's own MODERATOR bit never changes: a silent no-op (cm:Channel.cpp:359-360). A
-    // genuine no-op writes no row at all, so this checks state rather than capturing a Notice that
-    // never arrives.
     op(
         &realm,
         &actor("1"),
@@ -318,8 +296,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     );
     assert_eq!(member_flags(&realm, "Raiders", 1), "3");
 
-    // A built-in channel has no owner, so `owner_guid` is 0 and every actor fails the owner
-    // check, the same NOT_OWNER a custom channel answers a non-owner with.
     join(&realm, &actor("1"), "Trade - City", HUMAN);
     refused(
         &realm,
@@ -333,8 +309,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     );
     assert_eq!(owner_guid(&realm, "Trade - City"), "0");
 
-    // Criterion 7: SET_OWNER hands ownership to the existing moderator (2). The old owner (1)
-    // keeps MODERATOR and loses OWNER; the new owner gains both.
     let handed = notices_of(&realm, || {
         op(
             &realm,
@@ -365,7 +339,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     );
     assert_eq!(owner_guid(&realm, "Raiders"), "2");
 
-    // The former owner (1) has no standing left to hand ownership again.
     refused(
         &realm,
         "realm_channel_op",
@@ -378,8 +351,6 @@ fn moderator_rights_gate_ownership_and_moderator_changes() {
     );
 }
 
-/// Criteria 4, 5 and 6: MUTE gates channel speech, KICK and BAN remove a member (a repeat BAN just
-/// kicks), and the owner removing themselves runs succession.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn mute_kick_and_ban_remove_or_silence_members() {
@@ -396,7 +367,6 @@ fn mute_kick_and_ban_remove_or_silence_members() {
         HUMAN,
     );
 
-    // Criterion 4: MUTE silences, UNMUTE restores.
     let muted = notices_of(&realm, || {
         op(
             &realm,
@@ -432,7 +402,6 @@ fn mute_kick_and_ban_remove_or_silence_members() {
     });
     assert_eq!(recipients(&spoken[0]), [1, 2, 3]);
 
-    // Criterion 5: KICK removes a member who can rejoin; BAN removes one who cannot, until UNBAN.
     join(&realm, &actor("4"), "Raiders", HUMAN);
     let kicked = notices_of(&realm, || {
         op(
@@ -490,9 +459,6 @@ fn mute_kick_and_ban_remove_or_silence_members() {
     );
     join(&realm, &actor("4"), "Raiders", HUMAN);
 
-    // Banning the same Character twice kicks the second time. A ban always removes its target, so
-    // this exercises the "already banned" branch directly: an already-banned member is a state a
-    // normal BAN cannot itself reach twice in a row, since the first BAN always removes its target.
     let raiders = channel_id(&realm, "Raiders");
     realm.assert_sql(&format!(
         "INSERT INTO game_chat_channel_ban (id, channel_id, character_guid) VALUES (9101, {raiders}, 4)"
@@ -516,7 +482,6 @@ fn mute_kick_and_ban_remove_or_silence_members() {
         "no second ban row"
     );
 
-    // Criterion 6: the owner (1) removes themselves; succession runs the same as a plain leave.
     let self_banned = notices_of(&realm, || {
         op(
             &realm,
@@ -538,11 +503,6 @@ fn mute_kick_and_ban_remove_or_silence_members() {
     assert_eq!(owner_guid(&realm, "Raiders"), "2");
 }
 
-/// cmangos measures `m_players.size()` after the erase for both a plain leave
-/// (cm:Channel.cpp:120,165-166) and a kick or ban (cm:Channel.cpp:210-236), and passes it as
-/// `SetOwner`'s `exclaim` argument, so OWNER_CHANGED is conditional on the remaining member count
-/// in both, never sent by default. A kick or ban of the owner that leaves exactly one member
-/// behind sends MODE_CHANGE alone; leaving two or more sends OWNER_CHANGED too.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn kick_or_ban_of_the_owner_sends_owner_changed_only_past_one_remaining_member() {
@@ -550,7 +510,6 @@ fn kick_or_ban_of_the_owner_sends_owner_changed_only_past_one_remaining_member()
     join(&realm, &actor("1"), "Pair", HUMAN);
     join(&realm, &actor("2"), "Pair", HUMAN);
 
-    // One member remains: MODE_CHANGE alone.
     let departed = notices_of(&realm, || {
         op(
             &realm,
@@ -567,7 +526,6 @@ fn kick_or_ban_of_the_owner_sends_owner_changed_only_past_one_remaining_member()
     );
     assert_eq!(owner_guid(&realm, "Pair"), "2");
 
-    // Two members remain: OWNER_CHANGED follows.
     join(&realm, &actor("3"), "Pair", HUMAN);
     join(&realm, &actor("4"), "Pair", HUMAN);
     let departed = notices_of(&realm, || {
@@ -590,15 +548,12 @@ fn kick_or_ban_of_the_owner_sends_owner_changed_only_past_one_remaining_member()
     );
 }
 
-/// Criterion 8: invites reach their target unless ignored, a same-team-only Gate, and the already
-/// member and invite-banned Refusals.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
     let realm = start("chat-channel-moderation-invite");
     join(&realm, &actor("1"), "Raiders", HUMAN);
 
-    // An enemy-team target is refused before anything is written.
     refused(
         &realm,
         "realm_channel_op",
@@ -610,7 +565,6 @@ fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
         "chat:channel:invite_wrong_faction",
     );
 
-    // INVITE reaches the target and PLAYER_INVITED answers the inviter with the target's name.
     let invited = notice_rows(&realm, || {
         invite(
             &realm,
@@ -629,7 +583,6 @@ fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
     assert_eq!(invited[1]["text"], "Two");
     assert_eq!(recipients(&invited[1]), [1]);
 
-    // A target who ignores the inviter gets nothing; the inviter still sees PLAYER_INVITED.
     let ignored_invite = notice_rows(&realm, || {
         invite(
             &realm,
@@ -644,7 +597,6 @@ fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
     assert_eq!(ignored_invite[0]["notice"], PLAYER_INVITED);
     assert_eq!(ignored_invite[0]["text"], "Three");
 
-    // A member already in the channel is refused.
     join(&realm, &actor("2"), "Raiders", HUMAN);
     refused(
         &realm,
@@ -657,7 +609,6 @@ fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
         "chat:channel:player_already_member",
     );
 
-    // A banned Character cannot be invited back in.
     join(&realm, &actor("3"), "Raiders", HUMAN);
     op(
         &realm,
@@ -679,8 +630,6 @@ fn invite_notifies_the_target_and_follows_faction_and_ban_rules() {
     );
 }
 
-/// Criterion 9: MODERATE gates channel speech to moderators, and ANNOUNCEMENTS off stops JOINED
-/// and LEFT while YOU_JOINED and YOU_LEFT keep answering the joiner and leaver.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn moderation_and_announcements_toggle_for_moderators_only() {
@@ -748,7 +697,6 @@ fn moderation_and_announcements_toggle_for_moderators_only() {
     });
     assert_eq!(announcements_off, [(ANNOUNCEMENTS_OFF, 1, vec![1, 2])]);
 
-    // A join still answers YOU_JOINED to the joiner alone; nobody sees JOINED.
     let joined = notices_of(&realm, || join(&realm, &actor("3"), "Officers", HUMAN));
     assert_eq!(joined, [(YOU_JOINED, 0, vec![3])]);
     assert!(
@@ -756,7 +704,6 @@ fn moderation_and_announcements_toggle_for_moderators_only() {
         "announcements are off"
     );
 
-    // A leave still answers YOU_LEFT to the leaver alone; nobody sees LEFT.
     let left = notices_of(&realm, || {
         realm.assert_call(
             "realm_channel_op",
@@ -766,11 +713,6 @@ fn moderation_and_announcements_toggle_for_moderators_only() {
     assert_eq!(left, [(YOU_LEFT, 0, vec![3])]);
 }
 
-/// cmangos checks membership, then rights, then the target name. `target_guid` 0 is the
-/// Gateway's sentinel for a name that did not resolve to an online Character, so a non-member or
-/// a plain member naming an unknown Character sees NOT_MEMBER or NOT_MODERATOR, never
-/// PLAYER_NOT_FOUND first; only once membership and rights clear does an unresolved target answer
-/// PLAYER_NOT_FOUND.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_unresolved_target_refuses_after_membership_and_rights_checks() {
@@ -778,7 +720,6 @@ fn an_unresolved_target_refuses_after_membership_and_rights_checks() {
     join(&realm, &actor("1"), "Raiders", HUMAN);
     join(&realm, &actor("2"), "Raiders", HUMAN);
 
-    // A non-member naming an unknown Character gets NOT_MEMBER.
     refused(
         &realm,
         "realm_channel_op",
@@ -790,7 +731,6 @@ fn an_unresolved_target_refuses_after_membership_and_rights_checks() {
         "chat:channel:not_member",
     );
 
-    // A plain member (2) naming an unknown Character gets NOT_MODERATOR.
     refused(
         &realm,
         "realm_channel_op",
@@ -802,8 +742,6 @@ fn an_unresolved_target_refuses_after_membership_and_rights_checks() {
         "chat:channel:not_moderator",
     );
 
-    // The owner (1) clears membership and rights for every op that needs them, so each of these
-    // falls through to PLAYER_NOT_FOUND on the unresolved target.
     for op_code in [OP_SET_OWNER, OP_KICK, OP_UNBAN, OP_INVITE] {
         refused(
             &realm,

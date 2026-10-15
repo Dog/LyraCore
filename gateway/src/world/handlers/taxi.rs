@@ -1,6 +1,3 @@
-//! Taxi query dispatcher. The store operations are cohesive module requests: handlers never read
-//! catalogue, discovery, range, or topology tables and therefore cannot fork module policy.
-
 use super::super::*;
 use crate::world::family::{
     ProtocolFamily, ProtocolReply, ProtocolRequest, ProtocolSession, WorldSessionAction,
@@ -70,8 +67,6 @@ fn activate_taxi_outbound<St: TaxiActionStore + ?Sized>(
     ))
 }
 
-/// The single gateway entry to the module's open operation. Both the direct taxi query and TAXI
-/// gossip selection call this exact function. No Character yet gets no window.
 pub(crate) fn open_taxi_outbound<St: TaxiActionStore + ?Sized>(
     store: &St,
     actor: Option<Actor>,
@@ -140,10 +135,7 @@ pub(super) mod tests {
         pub(crate) map: Mutex<Option<codec::TaxiMapView>>,
         pub(crate) activation: Mutex<codec::TaxiActivationResult>,
         pub(crate) activation_inputs: Mutex<Vec<(u64, u64, u32, u32)>>,
-        /// Every Durable Request fails with this error.
         pub(crate) fail: Option<fn() -> anyhow::Error>,
-        /// The one (source, destination) node pair the Module accepts; any other pair answers
-        /// `ACTIVATE_NO_SUCH_PATH`. `None` accepts every pair.
         pub(crate) route: Option<(u32, u32)>,
     }
 
@@ -356,7 +348,6 @@ pub(super) mod tests {
         }
     }
 
-    /// A taxi answer arrives only after the request commits, so any failure ends the World Session.
     #[test]
     fn a_refusal_ends_the_world_session() {
         let store = InMemoryTaxiActions {

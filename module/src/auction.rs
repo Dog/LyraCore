@@ -1,6 +1,3 @@
-//! Durable imported auction houses, value-preserving bid and Cancellation transport, and atomic
-//! settlement.
-
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use lyracore_shared::auction::bid_outcome::{
@@ -17,7 +14,6 @@ use crate::import_meta::game_import_meta;
 use crate::mail::game_mail;
 use crate::{game_faction_template, game_item_instance, game_item_template, game_world_entity};
 
-/// Client-authored auction-house policy imported from `AuctionHouse.dbc`.
 #[table(accessor = game_auction_house, public)]
 pub struct AuctionHouseDefinition {
     #[primary_key]
@@ -28,8 +24,6 @@ pub struct AuctionHouseDefinition {
     pub name: String,
 }
 
-/// One active listing in its imported house market. The complete item-instance snapshot is the
-/// item while it is listed; no inventory row exists until ordinary mail returns or delivers it.
 #[table(
     accessor = game_auction,
     public,
@@ -61,15 +55,11 @@ pub struct Auction {
     pub consignment_rate: u32,
     #[default(0)]
     pub random_property_id: u32,
-    /// The listed Plain Letter's `ITEM_FIELD_ITEM_TEXT_ID`. 0 for every other item.
     #[default(0u32)]
     pub item_text_id: u32,
 }
 
-/// Source-shard value reserved by a sharded listing operation. An active operation receipt makes
-/// the row recovery evidence rather than spendable value; it is deleted only after that evidence
-/// is durably copied back to the source. A refused listing instead keeps this Hold until
-/// Realm-core durably commits its refund Mail and zero-id receipt.
+// Retain the Hold until matching source evidence or a durable Realm-core refund exists.
 #[table(
     accessor = game_auction_hold,
     index(accessor = by_seller, btree(columns = [seller_guid]))
@@ -95,19 +85,10 @@ pub struct AuctionHold {
     pub consignment_rate: u32,
     #[default(0)]
     pub random_property_id: u32,
-    /// The listed Plain Letter's `ITEM_FIELD_ITEM_TEXT_ID`. 0 for every other item.
     #[default(0u32)]
     pub item_text_id: u32,
 }
 
-// A listing Hold keeps the item and the deposit on the seller's Home Shard, and its refund mails
-// them back from that Shard. It travels with its Character like the bid Hold, so the next
-// MSG_AUCTION_HELLO on the new Home Shard finishes the listing. This sweep deletes only a Hold that
-// travelled: a Transfer's cascade keeps every Hold its payload does not carry
-// (`transfer::ListingHolds::Keep`). That is the destination's own Hold on an import, and the
-// source's Hold under a blob from the build before Holds travelled. A kept Hold finishes on the
-// next MSG_AUCTION_HELLO its seller sends from that Shard. Character deletion is refused while a
-// Hold exists.
 crate::character_owned!(delete, fn sweep_delete_game_auction_hold(ctx, character_guid) {
     let operations: Vec<u64> = ctx
 .db
@@ -126,9 +107,7 @@ crate::character_owned!(transfer, fn sweep_transfer_game_auction_hold(ctx, chara
     keep_key,
 });
 
-/// Durable idempotency receipt. The full listing payload makes identical replay distinguishable
-/// from conflicting reuse even after the source Hold has been deleted. Realm-core alone uses
-/// `auction_id == 0` as a refused-listing refund receipt; that sentinel never reaches the source.
+// auction_id == 0 certifies a refused listing refund only on Realm-core.
 #[table(
     accessor = game_auction_operation_receipt,
     index(accessor = by_actor, btree(columns = [actor_guid]))
@@ -155,16 +134,10 @@ pub struct AuctionOperationReceipt {
     pub consignment_rate: u32,
     #[default(0)]
     pub random_property_id: u32,
-    /// The listed Plain Letter's `ITEM_FIELD_ITEM_TEXT_ID`. 0 for every other item.
     #[default(0u32)]
     pub item_text_id: u32,
 }
 
-/// Source-shard copper Hold for one caller-identified bid or Cancellation. `outcome == 0` is
-/// pending; every nonzero outcome is terminal. `accepted_price` records realm-core's normalized
-/// charge, while `deferred_refund` retains any remainder that could not fit back in the purse. On a
-/// Cancellation (`operation == hold_operation::CANCEL`) `bidder_guid` is the seller and `offer` is
-/// the Auction Cut the seller agreed to pay.
 #[table(
     accessor = game_auction_bid_hold,
     index(accessor = by_bidder, btree(columns = [bidder_guid]))
@@ -189,10 +162,6 @@ pub struct AuctionBidHold {
     pub operation: u8,
 }
 
-// A Hold is copper on the Character's Home Shard, so it travels with the Character. A Hold left on
-// a Shard the Character has left could never be refunded there, because the refund credits the
-// purse on the Shard that holds the Hold. Deletion is refused while a Hold is unfinished, so the
-// delete sweep only removes finished rows.
 crate::character_owned!(delete, fn sweep_delete_game_auction_bid_hold(ctx, character_guid) {
     let operations: Vec<u64> = ctx
 .db
@@ -211,9 +180,6 @@ crate::character_owned!(transfer, fn sweep_transfer_game_auction_bid_hold(ctx, c
     keep_key,
 });
 
-/// Realm-core's terminal serialized decision for one bid or Cancellation payload. Auction changes,
-/// buyout and Cancellation mail, displaced mail, and any later source-refund mail are exact-once
-/// updates recorded on this row.
 #[table(accessor = game_auction_bid_decision)]
 pub struct AuctionBidDecision {
     #[primary_key]
@@ -231,10 +197,7 @@ pub struct AuctionBidDecision {
     #[default(0)]
     pub accepted_price: u32,
     pub house: u32,
-    /// The auctioned item's catalogue entry and Random Property, captured while the Auction row
-    /// still exists. A deferred refund can fire after that row is gone (the auction settled or
-    /// expired between the decision and the refund), and this is the only place left to read the
-    /// item the refund's Outbid subject names.
+    // Preserve the item for refund subjects after the Auction row settles or expires.
     #[default(0u32)]
     pub item_entry: u32,
     #[default(0u32)]
@@ -243,7 +206,6 @@ pub struct AuctionBidDecision {
     pub operation: u8,
 }
 
-/// One one-shot scheduler row for each active Auction.
 #[table(
     accessor = game_auction_expiry,
     scheduled(expire_auction)
@@ -257,11 +219,6 @@ pub struct AuctionExpiry {
     pub auction_id: u32,
 }
 
-/// Private Relay event: a live outbid/won/sold/expired/new-bid/removed notice for one online seller
-/// or bidder,
-/// inserted in the same transaction as the Auction Mail it accompanies. `kind` is one of
-/// `lyracore_shared::auction::auction_notice`. Reaped by the shared event GC, same as
-/// `game_whisper_event`.
 #[table(
     accessor = game_auction_notice,
     index(accessor = by_recipient, btree(columns = [recipient_guid]))
@@ -282,17 +239,6 @@ pub struct AuctionNotice {
     pub created_at: Timestamp,
 }
 
-// Auction durability belongs to the listing protocol, not character transport. Active Auction or
-// Hold value blocks character deletion, and every row except the two Holds stays on the database
-// that owns its protocol phase rather than entering the character movement manifest.
-
-// A build 5875 client offers only three listing durations, 2, 8 and 24 hours
-// (`AuctionsRadioButton_OnClick`, fx:Blizzard_AuctionUI.lua:991-1006; the default selection at
-// line 798 picks the 8-hour middle button). cmangos-classic accepts exactly the matching etime,
-// 1, 4 or 12 times its `MIN_AUCTION_TIME` of 2 hours (cm:AuctionHouseHandler.cpp:250-262,
-// cm:AuctionHouseMgr.h:30), and the deposit scales by that same multiplier:
-// `SellPrice * count * (etime / MIN_AUCTION_TIME) * depositPercent / 100`
-// (cm:AuctionHouseMgr.cpp:65-77, `GetAuctionDeposit`).
 fn duration_multiplier(duration_minutes: u32) -> Option<u64> {
     match duration_minutes {
         120 => Some(1),
@@ -482,7 +428,7 @@ enum OperationMatch {
     Fresh,
 }
 
-/// What a bid Hold row pays for. Stored as `hold_operation` codes by position, so only append.
+// Stored variant ordinals are protocol codes; append new operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HoldOperation {
     Bid,
@@ -506,8 +452,6 @@ impl HoldOperation {
     }
 }
 
-/// One Hold's identity. On a Cancel, `bidder_guid` is the seller and `offer` is the Auction Cut
-/// the Gateway read, which Realm-core must still find current.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HoldRequest {
     operation: HoldOperation,
@@ -560,8 +504,6 @@ enum HoldDecision {
     BidIncrement,
     BidOwn,
     Database,
-    /// The seller withdrew the listing and pays `cut`. A displaced bidder gets `displaced_bid`
-    /// back by mail.
     Cancelled {
         cut: u32,
         displaced_bidder_guid: u64,
@@ -570,8 +512,6 @@ enum HoldDecision {
 }
 
 impl HoldDecision {
-    /// Whether Realm-core can reach this decision for `operation`. A decision for the other
-    /// operation is a forged or crossed payload.
     fn belongs_to(self, operation: HoldOperation) -> bool {
         match self {
             Self::Accepted(_) | Self::HigherBid { .. } | Self::BidIncrement | Self::BidOwn => {
@@ -583,10 +523,6 @@ impl HoldDecision {
     }
 }
 
-/// The vanilla `MailAuctionAnswers` action code embedded in an Auction Mail's subject
-/// (`cm:Mail.h:100-109`). `Cancelled` (5) returns a cancelled listing's item to its seller; a
-/// refused listing's return uses it too, as the closest client string for a return with no vanilla
-/// twin. `CancelledToBidder` (4) refunds the displaced bid of a cancelled listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuctionMailAction {
     Outbid = 0,
@@ -597,11 +533,6 @@ enum AuctionMailAction {
     Cancelled = 5,
 }
 
-/// An Auction Mail's own vanilla shape: `MAIL_AUCTION` from the house, `checked = COPIED`
-/// (`cm:Mail.cpp:81-84`), a machine subject the client turns into `AUCTION_*_MAIL_SUBJECT`
-/// (`fx:GlobalStrings.lua:83,87,88,89,99`), and — for Won/Successful — an invoice body the client
-/// turns into the auction details (`fx:MailFrame.lua:300-361`). `item_entry`/`random_property_id`
-/// name the AUCTIONED item, which the subject always carries even when nothing is attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AuctionMail {
     recipient_guid: u64,
@@ -611,8 +542,6 @@ struct AuctionMail {
     random_property_id: u32,
     money: u32,
     attached_item: crate::items::ItemSnapshot,
-    /// The invoice's other party: the seller on a Won mail, the winning bidder on a Successful
-    /// mail. Unused (0) on every other action.
     counterparty_guid: u64,
     bid: u32,
     buyout: u32,
@@ -707,10 +636,6 @@ fn buyout_settlement_mail(
     )
 }
 
-/// Mail that returns a refused listing's item and deposit to the seller. No vanilla auction
-/// refuses a listing after acceptance, so this renders as the closest client string, a Cancelled
-/// mail carrying the item and the deposit, and hides Return the same way every other Auction Mail
-/// does.
 fn listing_release_mail(listing: &PreparedListing) -> AuctionMail {
     AuctionMail {
         recipient_guid: listing.request.seller_guid,
@@ -728,9 +653,6 @@ fn listing_release_mail(listing: &PreparedListing) -> AuctionMail {
     }
 }
 
-/// A Cancellation's mail (`cm:AuctionHouseHandler.cpp:167-189,440-456`): the item goes back to the
-/// seller in a Cancelled mail, and a displaced bidder gets the bid back in a Cancelled-to-bidder
-/// mail. No mail carries the deposit, because the house keeps it.
 fn cancellation_mail(
     auction: BidAuction,
     displaced_bidder_guid: u64,
@@ -769,9 +691,7 @@ fn cancellation_mail(
         .collect()
 }
 
-/// `"{item_entry}:{random_property_id}:{action}"` (`cm:AuctionHouseMgr.cpp:134,181,229`,
-/// `cm:AuctionHouseHandler.cpp:155,180,451`). The client builds the visible subject from this and
-/// the item's name (`fx:GlobalStrings.lua:83,87,88,89,99`).
+// The client parses subjects as item_entry:random_property_id:action.
 fn auction_mail_subject(
     item_entry: u32,
     random_property_id: u32,
@@ -780,10 +700,7 @@ fn auction_mail_subject(
     format!("{item_entry}:{random_property_id}:{}", action as u8)
 }
 
-/// The invoice the client renders from a Won or Successful mail's body
-/// (`fx:MailFrame.lua:300-361`). The guid is lowercase hex, right-aligned in a 16-character,
-/// space-filled field — cmangos prints the low guid, which a 1.12 character guid equals whole.
-/// Every other action carries no body.
+// Invoice guids use lowercase hex in a 16-character, space-filled field.
 fn auction_mail_body(mail: &AuctionMail) -> String {
     match mail.action {
         AuctionMailAction::Won => format!(
@@ -819,7 +736,6 @@ fn insert_auction_mail(ctx: &ReducerContext, mail: AuctionMail) {
     );
 }
 
-/// One `game_auction_notice` row before its id and timestamp are stamped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AuctionNoticeDraft {
     recipient_guid: u64,
@@ -849,8 +765,6 @@ fn insert_auction_notice(ctx: &ReducerContext, draft: AuctionNoticeDraft) {
     });
 }
 
-/// Won (to the buyer) and Sold (to the seller): the two notices every settled sale sends, whether
-/// it settled by buyout or by expiry with a bid (`cm:AuctionHouseMgr.cpp:146-147,195-199`).
 #[allow(clippy::too_many_arguments)]
 fn settlement_notices(
     house: u32,
@@ -888,11 +802,6 @@ fn settlement_notices(
     ]
 }
 
-/// Outbid, to the displaced bidder, sent before the bid changes (`cm:AuctionHouseHandler.cpp:93-107,157-158`).
-/// No displaced bidder (a fresh listing's first bid), or the displaced bidder raising their own
-/// bid, sends nothing: cmangos's `UpdateBid` charges a self-raise only the delta and never calls
-/// `SendAuctionBidderNotification` for it (`cm:AuctionHouseMgr.cpp:780-793`), because the bidder
-/// was never actually outbid.
 #[allow(clippy::too_many_arguments)]
 fn outbid_notice(
     house: u32,
@@ -917,8 +826,6 @@ fn outbid_notice(
     )
 }
 
-/// New bid, to the owner: the client refreshes its list and prints nothing
-/// (`cm:AuctionHouseMgr.cpp:802-806`).
 fn new_bid_notice(
     house: u32,
     auction_id: u32,
@@ -940,7 +847,6 @@ fn new_bid_notice(
     }
 }
 
-/// Expired, to the owner: an unsold listing (`cm:AuctionHouseMgr.cpp:231-232`).
 fn expired_notice(
     house: u32,
     auction_id: u32,
@@ -955,16 +861,12 @@ fn expired_notice(
         item_entry: item.entry,
         random_property_id: item.random_property_id,
         bid: 0,
-        // `bid_increment` returns 0 for a zero bid — nothing to raise — but the client always
-        // shows a nonzero minimum raise, even on an unsold listing. Floor it the same way cmangos
-        // does (`cm:AuctionHouseMgr.cpp:739-745`: `if (!outbid) outbid = 1`).
+        // The client requires a nonzero minimum raise even on an unsold listing.
         out_bid: 1,
         bidder_guid: 0,
     }
 }
 
-/// Removed, to the bidder a Cancellation displaces (`cm:AuctionHouseHandler.cpp:131-139,182-183`).
-/// The client prints `ERR_AUCTION_REMOVED_S` with the item's name.
 fn removed_notice(
     house: u32,
     auction_id: u32,
@@ -1075,7 +977,7 @@ fn bid_decision_from_fields(fields: BidDecisionFields, legacy_offer: u32) -> Opt
         }),
         BID_INCREMENT => Some(HoldDecision::BidIncrement),
         BID_OWN => Some(HoldDecision::BidOwn),
-        // No legacy fallback: a Cancellation's cut of 0 is a real charge of nothing.
+        // A Cancellation cut of zero is a real charge, not a missing legacy value.
         BID_CANCELLED => Some(HoldDecision::Cancelled {
             cut: fields.accepted_price,
             displaced_bidder_guid: fields.result_bidder_guid,
@@ -1132,8 +1034,6 @@ trait BidSource {
     fn confirm_refund(&mut self, request: HoldRequest) -> Result<(), AuctionRefusal>;
 }
 
-/// A request no Hold can carry: a zero operation, Character, listing or house, or a bid of 0. A
-/// Cancellation's cut is 0 for a listing nobody bid on.
 fn request_is_malformed(request: &HoldRequest) -> bool {
     request.operation_id == 0
         || request.bidder_guid == 0
@@ -1142,7 +1042,6 @@ fn request_is_malformed(request: &HoldRequest) -> bool {
         || (request.operation == HoldOperation::Bid && request.offer == 0)
 }
 
-/// The listing `request` names, while it is still active in the request's Auction Market.
 fn active_listing(
     auction: Option<BidAuction>,
     request: &HoldRequest,
@@ -1156,9 +1055,6 @@ fn active_listing(
     })
 }
 
-/// Move a Hold's value out of the purse. A bid holds its full offer. A Cancellation holds the Auction
-/// Cut, which is 0 for a listing nobody bid on, and still takes the Hold so the interaction Gate
-/// runs on the Home Shard.
 fn fence_bid<S: BidSource>(source: &mut S, request: HoldRequest) -> Result<(), AuctionRefusal> {
     if request_is_malformed(&request) {
         return Err(AuctionRefusal::Database);
@@ -1208,7 +1104,6 @@ fn refundable_bid_value(decision: HoldDecision, offer: u32) -> Option<u32> {
             offer.checked_sub(price)
         }
         HoldDecision::Accepted(_) => None,
-        // A Cancellation spends exactly the cut it held; a different cut was never agreed.
         HoldDecision::Cancelled { cut, .. } if cut == offer => Some(0),
         HoldDecision::Cancelled { .. } => None,
         _ => Some(offer),
@@ -1278,10 +1173,6 @@ fn decide_bid(auction: Option<BidAuction>, request: HoldRequest, now_micros: i64
     })
 }
 
-/// Realm-core's Cancellation Gate (`cm:AuctionHouseHandler.cpp:403-468`). Only the seller cancels,
-/// only an active listing of the auctioneer's market, and only at the cut the seller's Hold paid
-/// for: a bid that landed after the Gateway read the listing changes the cut and refuses the
-/// Cancellation, so the Hold refunds and the seller can try again.
 fn decide_cancel(
     auction: Option<BidAuction>,
     request: HoldRequest,
@@ -1295,8 +1186,6 @@ fn decide_cancel(
     else {
         return HoldDecision::ItemNotFound;
     };
-    // A bid without a bidder, or a bidder without a bid, has no one to refund; expiry keeps the
-    // same state for repair.
     if (auction.highest_bidder_guid == 0) != (auction.highest_bid == 0) {
         return HoldDecision::Database;
     }
@@ -1599,8 +1488,7 @@ fn refund_listing<S: ListingRefundSink>(
     }
 }
 
-/// Give a Hold's value back after realm-core refused its listing. A Hold with a matching receipt
-/// backs a live Auction and is never released; a missing Hold is a replay.
+// A listing receipt blocks refunding the Hold even after the Auction settles.
 fn release_listing<S: HoldSink>(
     sink: &mut S,
     operation_id: u64,
@@ -1684,7 +1572,6 @@ fn expire_active<S: ExpirySink>(sink: &mut S, auction_id: u32) -> Result<(), Str
     Ok(())
 }
 
-/// Reducer edge: only the tag crosses to the gateway; the detail stays in module logs.
 fn refused(refusal: AuctionRefusal, detail: &str) -> String {
     let tag = refusal.as_tag();
     spacetimedb::log::info!("auction refused {tag}: {detail}");
@@ -2266,9 +2153,6 @@ impl BidMarket for CtxBidMarket<'_> {
             )?;
         }
         let fields = bid_decision_fields(decision);
-        // The Auction row this decision is about may be deleted later (settled or expired) before
-        // a purse-overflow refund on it fires. Keep the item the refund's subject needs here,
-        // while the row is still guaranteed present.
         let (item_entry, random_property_id) =
             auction.map_or((0, 0), |a| (a.item.entry, a.item.random_property_id));
         self.ctx
@@ -2296,8 +2180,6 @@ impl BidMarket for CtxBidMarket<'_> {
 }
 
 impl CtxBidMarket<'_> {
-    /// Remove the listing the decision read, return its item to the seller, and refund the
-    /// displaced bidder, all in the decision's transaction.
     fn commit_cancellation(
         &mut self,
         expected: BidAuction,
@@ -2365,12 +2247,6 @@ impl BidRefundSink for CtxBidMarket<'_> {
         if decided_request(&row) != Some(request) || row.deferred_refund != 0 {
             return Err(AuctionRefusal::Database);
         }
-        // The Auction this Hold was about may already be settled and gone (this refund is the
-        // purse-overflow remainder of a bid that did not win, or of a refused Cancellation's cut).
-        // No vanilla auction sends this mail at all; it renders as the closest client string,
-        // Outbid, carrying the refund. The item comes from the decision row itself, not a fresh
-        // Auction lookup, because the row this refund is about can outlive the Auction it was
-        // decided against.
         insert_auction_mail(
             self.ctx,
             AuctionMail {
@@ -2416,8 +2292,6 @@ fn hold_request(
     }
 }
 
-/// The request a Realm-core decision row records. An operation code this Module does not know
-/// reads as no request, so every comparison against it fails closed.
 fn decided_request(row: &AuctionBidDecision) -> Option<HoldRequest> {
     Some(hold_request(
         HoldOperation::from_code(row.operation)?,
@@ -2429,9 +2303,6 @@ fn decided_request(row: &AuctionBidDecision) -> Option<HoldRequest> {
     ))
 }
 
-/// The operation a stored Hold or decision row pays for. The later phases take their operation
-/// from the row, never from the caller, so one reducer finishes bids and Cancellations alike. A
-/// missing row reads as a bid; the phase then finds no matching Hold and refuses.
 fn stored_hold_operation(ctx: &ReducerContext, operation_id: u64) -> HoldOperation {
     ctx.db
         .game_auction_bid_hold()
@@ -2562,7 +2433,6 @@ impl ExpirySink for CtxExpiry<'_> {
     }
 }
 
-/// Single-database listing: item, deposit, Auction, receipt, and expiry are one transaction.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn gw_auction_list_local(
@@ -2621,7 +2491,6 @@ pub fn gw_auction_list_local(
     .map_err(|refusal| refused(refusal, "listing rejected"))
 }
 
-/// Sharded listing: atomically move the source value into a caller-identified Hold.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn gw_auction_hold_listing(
@@ -2687,7 +2556,6 @@ pub fn gw_auction_hold_listing(
     .map_err(|refusal| refused(refusal, "listing Hold rejected"))
 }
 
-/// Sharded listing: create the realm Auction and idempotency receipt from a held payload.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn realm_auction_commit_listing(
@@ -2771,7 +2639,6 @@ fn require_listing_actor(
     Ok(())
 }
 
-/// Sharded listing: copy the matching realm receipt onto the source shard.
 #[reducer]
 pub fn realm_auction_confirm_listing(
     ctx: &ReducerContext,
@@ -2799,7 +2666,7 @@ pub fn realm_auction_confirm_listing(
     .map_err(|refusal| refused(refusal, "listing receipt conflict"))
 }
 
-/// Sharded listing: delete the Hold only after the source has matching receipt evidence.
+// Delete the Hold only after its matching Realm-core receipt is durable on the source.
 #[reducer]
 pub fn realm_auction_settle_listing(
     ctx: &ReducerContext,
@@ -2812,10 +2679,8 @@ pub fn realm_auction_settle_listing(
         .map_err(|refusal| refused(refusal, "listing Hold is not confirmed"))
 }
 
-/// Sharded listing abort: Realm-core commits the seller's exact return Mail and durable
-/// refund receipt together. Replays with the same payload do not create a second Mail.
 #[reducer]
-#[allow(clippy::too_many_arguments)] // The persisted refund receipt's value columns.
+#[allow(clippy::too_many_arguments)]
 pub fn realm_auction_refund_listing(
     ctx: &ReducerContext,
     operation_id: u64,
@@ -2867,9 +2732,7 @@ pub fn realm_auction_refund_listing(
     .map_err(|refusal| refused(refusal, "listing refund conflict"))
 }
 
-/// Sharded listing abort: after realm-core refuses, mail the held item and deposit back
-/// to the seller and delete the Hold. The gateway calls this only after Realm-core has committed
-/// the matching refund receipt and Mail. Refused once the Hold has a receipt.
+// Release only after Realm-core commits the matching refund receipt and Mail.
 #[reducer]
 pub fn gw_auction_release_listing_hold(
     ctx: &ReducerContext,
@@ -2882,8 +2745,6 @@ pub fn gw_auction_release_listing_hold(
         .map_err(|refusal| refused(refusal, "listing Hold is confirmed"))
 }
 
-/// The Home Shard half every Hold starts with: the interaction Gate on a fresh operation, then the
-/// fence. A replay skips the Gate, because the Hold already proves it passed.
 fn gate_and_fence(
     ctx: &ReducerContext,
     request: HoldRequest,
@@ -2908,8 +2769,6 @@ fn gate_and_fence(
         .map_err(|refusal| refused(refusal, "Hold rejected"))
 }
 
-/// Single-database Hold: the fence, the realm decision, its Auction and mail effects, the terminal
-/// source outcome and any purse-overflow refund mail commit in one transaction.
 fn drive_local_hold(
     ctx: &ReducerContext,
     request: HoldRequest,
@@ -2935,8 +2794,6 @@ fn drive_local_hold(
     Ok(())
 }
 
-/// Single-database bid: full-offer Hold, realm decision, Auction update or buyout settlement,
-/// ordinary mail, and terminal source outcome commit atomically.
 #[reducer]
 pub fn gw_auction_bid_local(
     ctx: &ReducerContext,
@@ -2960,8 +2817,6 @@ pub fn gw_auction_bid_local(
     drive_local_hold(ctx, request, auctioneer_guid)
 }
 
-/// Single-database Cancellation: the cut's Hold, the realm decision, the listing's removal, its
-/// Cancelled and refund mail, and the terminal source outcome commit atomically.
 #[reducer]
 pub fn gw_auction_cancel_local(
     ctx: &ReducerContext,
@@ -2985,7 +2840,6 @@ pub fn gw_auction_cancel_local(
     drive_local_hold(ctx, request, auctioneer_guid)
 }
 
-/// Sharded bid: move the complete offer into a source-shard Hold before realm-core decides.
 #[reducer]
 pub fn gw_auction_hold_bid(
     ctx: &ReducerContext,
@@ -3009,8 +2863,6 @@ pub fn gw_auction_hold_bid(
     gate_and_fence(ctx, request, auctioneer_guid)
 }
 
-/// Sharded Cancellation: move the Auction Cut into a source-shard Hold before realm-core
-/// decides. A seller who cannot pay it is refused with nothing held.
 #[reducer]
 pub fn gw_auction_hold_cancel(
     ctx: &ReducerContext,
@@ -3034,7 +2886,6 @@ pub fn gw_auction_hold_cancel(
     gate_and_fence(ctx, request, auctioneer_guid)
 }
 
-/// Sharded bid: serialize against the realm Auction and persist one terminal decision.
 #[reducer]
 pub fn realm_auction_decide_bid(
     ctx: &ReducerContext,
@@ -3061,9 +2912,6 @@ pub fn realm_auction_decide_bid(
     .map_err(|refusal| refused(refusal, "bid decision conflict"))
 }
 
-/// Sharded Cancellation: serialize against the realm Auction and persist one terminal
-/// decision. A Cancelled decision removes the listing and writes its mail and notice in the same
-/// transaction; a replay changes nothing.
 #[reducer]
 pub fn realm_auction_decide_cancel(
     ctx: &ReducerContext,
@@ -3090,8 +2938,6 @@ pub fn realm_auction_decide_cancel(
     .map_err(|refusal| refused(refusal, "Cancellation decision conflict"))
 }
 
-/// Sharded for a bid or a Cancellation: consume the accepted price or the cut, or restore
-/// refused value, exactly once. The operation comes from the stored Hold.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn gw_auction_finish_bid(
@@ -3138,8 +2984,6 @@ pub fn gw_auction_finish_bid(
     .map_err(|refusal| refused(refusal, "Hold outcome conflict"))
 }
 
-/// Sharded for a bid or a Cancellation: place an unrepresentable purse refund in
-/// realm-core mail exactly once. The operation comes from the stored decision.
 #[reducer]
 pub fn realm_auction_refund_bid(
     ctx: &ReducerContext,
@@ -3167,8 +3011,6 @@ pub fn realm_auction_refund_bid(
     .map_err(|refusal| refused(refusal, "Hold refund conflict"))
 }
 
-/// Sharded for a bid or a Cancellation: record on the source that realm-core durably
-/// accepted the refund mail. The operation comes from the stored Hold.
 #[reducer]
 pub fn gw_auction_confirm_bid_refund(
     ctx: &ReducerContext,
@@ -3196,7 +3038,6 @@ pub fn gw_auction_confirm_bid_refund(
     .map_err(|refusal| refused(refusal, "Hold refund confirmation conflict"))
 }
 
-/// Scheduler-only one-shot expiry. Replays see no active Auction and therefore create no mail.
 #[reducer]
 pub fn expire_auction(ctx: &ReducerContext, schedule: AuctionExpiry) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
@@ -3205,7 +3046,7 @@ pub fn expire_auction(ctx: &ReducerContext, schedule: AuctionExpiry) -> Result<(
     expire_active(&mut CtxExpiry { ctx }, schedule.auction_id)
 }
 
-/// Character deletion must not destroy value held by or listed for that character.
+// Character deletion must not destroy held or listed value.
 pub(crate) fn character_has_auction_value(ctx: &ReducerContext, character_guid: u64) -> bool {
     ctx.db
         .game_auction_bid_hold()
@@ -3235,22 +3076,15 @@ pub(crate) fn character_has_auction_value(ctx: &ReducerContext, character_guid: 
             .is_some()
 }
 
-/// The exact English subjects LyraCore's earlier auction code sent, each a `Character` mail with
-/// no vanilla twin. A real player's letter can carry the same words, so the subject alone never
-/// authorizes a re-tag; [`legacy_mail_matches_shape`] is the rest of the check.
 const LEGACY_AUCTION_SUBJECTS: &[(&str, AuctionMailAction)] = &[
     ("Auction outbid", AuctionMailAction::Outbid),
     ("Auction won", AuctionMailAction::Won),
     ("Auction sold", AuctionMailAction::Successful),
     ("Auction expired", AuctionMailAction::Expired),
     ("Auction listing refused", AuctionMailAction::Cancelled),
-    // The deferred bid refund shares no subject with the ordinary Outbid mail, so it needs its
-    // own row here; it also renders as Outbid (see `CtxBidMarket::commit_refund`).
     ("Auction bid refund", AuctionMailAction::Outbid),
 ];
 
-/// The pure half of the repair: which `AuctionMailAction` a legacy row's exact English subject
-/// maps to, or `None` for a subject this repair does not recognize.
 fn legacy_auction_action(subject: &str) -> Option<AuctionMailAction> {
     LEGACY_AUCTION_SUBJECTS
         .iter()
@@ -3258,18 +3092,6 @@ fn legacy_auction_action(subject: &str) -> Option<AuctionMailAction> {
         .map(|(_, action)| *action)
 }
 
-/// Whether `mail` carries the exact field shape the earlier auction code produced for its
-/// subject — the first of two checks that tell a real letter apart from a look-alike. A player's
-/// own mail can share the subject text (nothing stops them from titling a letter "Auction won"),
-/// but every legacy row also carries `cod == 0` and an empty body (auction mail never used
-/// either), and:
-/// - Outbid, Expired, Cancelled and the deferred bid refund came from guid 0 — no player-sent
-///   letter ever does, since a send always stamps the sender's own actor guid. That alone rules
-///   out a look-alike for these four subjects.
-/// - Expired and Cancelled carry an item; Outbid and the bid refund carry none.
-/// - Won carries an item and no money; Sold carries money and no item. Neither has a guid-0 tell —
-///   a real player letter can be titled either with a real sender and the right shape — so
-///   [`legacy_repair_authorization`] is what actually clears them, not this function.
 fn legacy_mail_matches_shape(mail: &crate::Mail) -> bool {
     if mail.cod != 0 || !mail.body.is_empty() {
         return false;
@@ -3285,43 +3107,13 @@ fn legacy_mail_matches_shape(mail: &crate::Mail) -> bool {
     }
 }
 
-/// A converted row's house and the item reference its vanilla subject encodes.
 struct LegacyRepairTarget {
     house: u32,
     item_entry: u32,
     random_property_id: u32,
 }
 
-/// The second, and for Won/Sold the decisive, check: whether a durable listing receipt backs
-/// `mail`'s claim, and if so, the house and subject-item that receipt supplies. Every other legacy
-/// subject already cleared [`legacy_mail_matches_shape`]'s guid-0 tell, so a receipt only sharpens
-/// its house; Won and Sold do not have that tell, because nothing else in the mail row tells a
-/// real settlement apart from a same-titled player letter with an unrelated real sender:
-/// - Won: some receipt's actor is the mail's claimed sender (the seller who listed this exact
-///   item) and its item entry and stack count match what the mail carries. A look-alike sent by an
-///   uninvolved player never has a receipt naming them as that item's seller.
-/// - Sold: some receipt's actor is the mail's recipient and its `auction_id` is not the
-///   refused-listing sentinel (0) — proceeds mail carries no item of its own to cross-check, so a
-///   refused listing's refund receipt is not a settlement at all. A seller can have more than one
-///   real receipt, so when more than one candidate remains, only the one whose listing terms could
-///   have produced this exact proceeds figure ([`receipt_could_pay_out`]) is trusted; if that still
-///   leaves more than one, or none, the row is left unmapped rather than guessed at. The subject
-///   also borrows the winning receipt's item, since the mail's own item fields are 0 (Sold never
-///   attaches the item).
-/// - Expired and Cancelled: some receipt's actor is the mail's recipient (the seller the item
-///   returned to) and its item entry and stack count match what the mail carries, the same
-///   assurance Won uses. A `Cancelled` (refused-listing) row's own receipt IS the `auction_id == 0`
-///   sentinel, so unlike Sold this does not exclude it.
-///
-/// Every subject above takes its house from that receipt rather than the recipient's own race
-/// (`house_for_faction_template`'s approach for a live sale,
-/// `crates/lyracore-shared/src/auction.rs`): Realm-core, the database this repair runs against,
-/// carries no Character rows at all, so a race lookup would always miss and fall back to the
-/// neutral house. A receipt's `house` is durable state recorded when the listing was created, so
-/// it needs no Character lookup and is correct on Realm-core too. Expired and Cancelled fall back
-/// to the race lookup only if no receipt matches their item (a legacy row that predates receipts,
-/// say); Outbid and the deferred bid refund have no receipt to draw from at all — a bidder is never
-/// a receipt's actor — and always use the race lookup.
+// Won/Sold subjects can be real letters; retag them only with a matching durable listing receipt.
 fn legacy_repair_authorization(
     ctx: &ReducerContext,
     mail: &crate::Mail,
@@ -3361,7 +3153,7 @@ fn legacy_repair_authorization(
                         .filter(|receipt| receipt_could_pay_out(receipt, mail.money));
                     let only = paying.next()?;
                     if paying.next().is_some() {
-                        return None; // still ambiguous — more than one listing could have paid this
+                        return None;
                     }
                     only
                 }
@@ -3400,12 +3192,6 @@ fn legacy_repair_authorization(
     }
 }
 
-/// Whether some winning price within `receipt`'s listed range (`start_bid..=buyout`, or
-/// `start_bid..` when `buyout` is 0 — an auction the vanilla protocol lets bidding pass without a
-/// cap) pays the seller exactly `money`. `seller_proceeds` is non-decreasing in price and never
-/// skips a whole copper as price climbs by one (its cut grows by at most one copper per copper of
-/// price), so every integer between its low and high ends is reachable — checking the two ends
-/// bounds every price in between too.
 fn receipt_could_pay_out(receipt: &AuctionOperationReceipt, money: u32) -> bool {
     let Some(low) = seller_proceeds(receipt.start_bid, receipt.deposit, receipt.consignment_rate)
     else {
@@ -3419,16 +3205,10 @@ fn receipt_could_pay_out(receipt: &AuctionOperationReceipt, money: u32) -> bool 
     }
     match seller_proceeds(receipt.buyout, receipt.deposit, receipt.consignment_rate) {
         Some(high) => money <= high,
-        None => true, // the buyout's own proceeds overflow u32; some in-range price still might not
+        None => true,
     }
 }
 
-/// The house a converted row shows the client on a deployment where Realm-core's Character rows
-/// exist, chosen from the recipient's own team: Alliance goes to Stormwind (1), Horde to Orgrimmar
-/// (6), matching `house_for_faction_template`'s own team fallback
-/// (`crates/lyracore-shared/src/auction.rs`). Falls back to the neutral house (7) for a recipient
-/// with no Character row — the same fallback that function uses for a template it cannot place on
-/// either team, and Realm-core's only outcome, since it carries no Character rows at all.
 fn legacy_character_house(ctx: &ReducerContext, recipient_guid: u64) -> u32 {
     match crate::helpers::character_by_guid(ctx, recipient_guid) {
         Some(character)
@@ -3442,28 +3222,8 @@ fn legacy_character_house(ctx: &ReducerContext, recipient_guid: u64) -> u32 {
     }
 }
 
-/// Family name `repair_legacy_auction_mail` stamps in `game_import_meta` once it has run on a
-/// database, so a later publish's repair pass does not re-scan mail a player wrote after the
-/// re-tag — including a letter that happens to name one of [`LEGACY_AUCTION_SUBJECTS`].
 const LEGACY_AUCTION_MAIL_REPAIR_FAMILY: &str = "repair_legacy_auction_mail";
 
-/// Re-tag auction mail written before the vanilla Auction Mail format shipped to the vanilla
-/// `AuctionHouse` sender and machine subject, once per database. A legacy row still reads as
-/// `Character` mail: once the Mail Timer is live, its expiry returns an already-settled "Auction
-/// won" to the seller, who was already paid — cmangos deletes a Character mail's item at expiry
-/// only when it is unreturned (`cm:ObjectMgr.cpp:6188-6232`), and a legacy Auction Mail was never
-/// meant to be returnable at all. Re-tagging moves it out from under that rule, the same way
-/// `mail::plan_return` already refuses Return on any current Auction Mail.
-///
-/// Runs at most once: a marker in `game_import_meta` (`LEGACY_AUCTION_MAIL_REPAIR_FAMILY`) records
-/// that this database has already been swept, so a later publish's repair pass leaves every mail
-/// alone, including a real player letter that happens to match one of the legacy subjects. Within
-/// that one run, [`legacy_mail_matches_shape`] and [`legacy_repair_authorization`] are the two
-/// safeguards for every row already on the table: a row converts only if its sender, cod, body,
-/// item and money exactly match what the old code produced, and — for "Auction won" and "Auction
-/// sold", which carry no tell of their own — a durable listing receipt backs its claim. Returns
-/// `(converted, unmapped)`; a nonzero `unmapped` is an auction-looking row this repair left alone,
-/// worth a human look.
 pub(crate) fn repair_legacy_auction_mail(ctx: &ReducerContext) -> (u64, u64) {
     if ctx
         .db

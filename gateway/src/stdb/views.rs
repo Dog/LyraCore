@@ -1,6 +1,3 @@
-//! Row→view converters and the thin row mirrors the gateway reads from subscription caches.
-//! Pure projections from the generated `bindings` row types into the codec's view structs.
-
 use super::bindings::*;
 
 pub(crate) fn hunter_pet_protocol_view(
@@ -21,8 +18,6 @@ pub(crate) fn hunter_pet_protocol_view(
     }
 }
 
-/// Flatten a `game_character` row into the codec's `CharacterView` (the char-select projection).
-/// One mapper so the 17-field projection isn't copy-pasted per query (mirrors `entity_view`).
 pub(crate) fn character_view(c: Character) -> crate::codec::CharacterView {
     crate::codec::CharacterView {
         guid: c.guid,
@@ -42,14 +37,13 @@ pub(crate) fn character_view(c: Character) -> crate::codec::CharacterView {
         y: c.y,
         z: c.z,
         first_login: c.first_login,
-        equipment: Default::default(), // filled by Coordinator::characters from item tables
+        equipment: Default::default(),
         played_total_secs: c.played_total_secs,
         session_start_micros: c.session_start_micros,
-        guild_id: 0, // filled by Coordinator::characters from Realm-core membership
+        guild_id: 0,
     }
 }
 
-/// Flatten a `game_item_template` row into the codec's `ItemTemplateView`.
 pub(crate) fn item_template_view(t: ItemTemplate) -> crate::codec::ItemTemplateView {
     crate::codec::ItemTemplateView {
         entry: t.entry,
@@ -108,12 +102,6 @@ pub(crate) fn item_template_view(t: ItemTemplate) -> crate::codec::ItemTemplateV
     }
 }
 
-/// Map a `game_world_entity` row into the codec's `EntityView`.
-///
-/// The entity carries its own live zone, resolved from terrain by the Module wherever a position is
-/// established. `durable_zone` is the `game_character` copy, used only when the live row says `0` —
-/// the Module's "no terrain covers this position", which a character parked off the imported slice
-/// really can have.
 pub(crate) fn entity_view(e: WorldEntity, durable_zone: u32) -> crate::codec::EntityView {
     crate::codec::EntityView {
         guid: e.guid,
@@ -171,26 +159,19 @@ pub(crate) fn entity_view(e: WorldEntity, durable_zone: u32) -> crate::codec::En
         sheet_ranged_dmg_min: e.sheet_ranged_dmg_min,
         sheet_ranged_dmg_max: e.sheet_ranged_dmg_max,
         npc_flags: e.npc_flags,
-        // Default the sheet's EFFECTIVE armor to the row's BASE armor (peers/creatures don't fold gear —
-        // your sheet only shows your own armor). The self-login CREATE overrides this with the gear-folded
-        // value (`Coordinator::effective_armor`); the relays then keep it live.
         effective_armor: e.armor,
         magic_resistances: [0; 6],
         owner_guid: e.owner_guid,
-        // Home fields are not on the world-entity row; caller fills them in from game_character when
-        // building the self-login sequence.  Peer/creature views never need these, so 0 is fine.
         home_map: 0,
         home_zone: 0,
         home_x: 0.0,
         home_y: 0.0,
         home_z: 0.0,
-        // The Guild Projection is not on the entity row; the CREATE paths read it from Realm-core.
         guild_id: 0,
         guild_rank: 0,
     }
 }
 
-/// Map a `game_corpse` row into the codec's `CorpseView` for the CORPSE CREATE_OBJECT.
 pub(crate) fn corpse_view(c: Corpse) -> crate::codec::CorpseView {
     crate::codec::CorpseView {
         guid: c.guid,
@@ -206,8 +187,6 @@ pub(crate) fn corpse_view(c: Corpse) -> crate::codec::CorpseView {
     }
 }
 
-/// Flatten a `game_gameobject` row joined with its `game_gameobject_template` into the codec's
-/// `GameObjectView` for the GameObject CREATE_OBJECT (display + type come from the template).
 pub(crate) fn go_view(go: GameObject, tmpl: &GameObjectTemplate) -> crate::codec::GameObjectView {
     crate::codec::GameObjectView {
         guid: go.guid,
@@ -227,19 +206,12 @@ pub(crate) fn go_view(go: GameObject, tmpl: &GameObjectTemplate) -> crate::codec
     }
 }
 
-// --- thin row mirrors the gateway reads from subscription caches ---
-
 #[derive(Clone, Debug)]
 pub struct RealmRow {
     pub id: u8,
     pub name: String,
     pub address: String,
     pub realm_type: u32,
-    /// `game_realm.flags` / `.timezone`, mirrored for the realm-list reply. Nothing reads them yet —
-    /// `logon::realms` builds `RealmInfo` from the four fields above plus a live character count, and
-    /// the 1.12 realm-list packet's flags/timezone are still written from gtker defaults. Carried
-    /// (rather than dropped) so filling those two wire fields in is a codec edit, not a re-thread of
-    /// the whole read path.
     #[allow(dead_code)]
     pub flags: u8,
     pub population: f32,
@@ -250,8 +222,6 @@ pub struct RealmRow {
 #[derive(Clone, Debug)]
 pub struct AccountRow {
     pub id: u64,
-    /// The account name this row was looked UP by (`account_by_username`), echoed back for callers
-    /// that log or re-key on it. No current caller does — the SRP path already has the name in hand.
     #[allow(dead_code)]
     pub username: String,
     pub salt: Vec<u8>,

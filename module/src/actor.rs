@@ -1,4 +1,4 @@
-//! Actor verbs. See `docs/actor-verbs.md` for the contract and rationale.
+//! Before adding Actor verbs or changing their Gates, read docs/actor-verbs.md.
 
 use crate::import_meta::game_import_meta;
 use spacetimedb::ReducerContext;
@@ -32,7 +32,6 @@ macro_rules! debug_only {
     };
 }
 
-// Each Package selects the Actor operations it needs from these named exports.
 macro_rules! package_only {
     ($(pub(crate) use $path:path as $verb:ident;)+) => {
         $(
@@ -48,16 +47,12 @@ package_only! { pub(crate) use crate::spell::request_cast as request_cast; }
 package_only! { pub(crate) use crate::spell::cast_readiness as cast_readiness; }
 debug_only! { pub(crate) use crate::combat::apply_start_ranged_attack as ranged_attack; }
 
-/// Disarm the actor's outgoing auto-attack (melee or ranged). Shape adapter ONLY: the core returns
-/// `()` (it never fails); this lifts it into the uniform `Result` verb shape.
-#[cfg_attr(not(has_packages), allow(dead_code))] // package-only consumer — see `package_only!`
+#[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn stop_attack(ctx: &ReducerContext, actor_guid: u64) -> Result<(), String> {
     crate::combat::stop_attack_for(ctx, actor_guid);
     Ok(())
 }
 
-/// Compatibility adapter for callers that only need acceptance. Use `request_cast` to retain
-/// the scheduled identity and observe completion through `on_cast_finished`.
 #[allow(
     dead_code,
     reason = "Package API v1 retains the result-only cast_at adapter"
@@ -72,8 +67,6 @@ pub(crate) fn cast_at(
         .map(|_| ())
         .map_err(Into::into)
 }
-
-// ---- quests ----
 
 package_only! {
     pub(crate) use crate::quest::apply_accept_quest as accept_quest;
@@ -98,8 +91,6 @@ package_only! {
 pub(crate) use crate::bridge::party_command_fixture_drive as fixture_command_drive;
 debug_only! { pub(crate) use crate::quest::grant_quest_unchecked as stage_quest; }
 
-// ---- loot / inventory / vendor ----
-
 pub(crate) use crate::loot::open_creature_corpse as open_creature_loot;
 package_only! {
     pub(crate) use crate::items::apply_item_use as use_item;
@@ -108,7 +99,6 @@ package_only! {
     pub(crate) use crate::items::request_profile_item as reconcile_profile_item;
     pub(crate) use crate::items::apply_equip_profile_upgrade as equip_profile_upgrade;
     pub(crate) use crate::items::request_take_loot as request_take_loot;
-    // A Package bot also loots money through this verb.
     pub(crate) use crate::loot::apply_loot_money as loot_money;
 }
 pub(crate) use crate::creatures::apply_item_target_spell as cast_item_target;
@@ -124,8 +114,6 @@ package_only! {
     pub(crate) use crate::talent::select_profile_talent as select_profile_talent;
     pub(crate) use crate::seed::reconcile_curated_starter_role_levels as reconcile_starter_role_spell_levels;
 }
-
-// ---- reads ----
 
 package_only! {
     pub(crate) use crate::helpers::live_entity as live_entity;
@@ -143,8 +131,6 @@ package_only! {
     pub(crate) use crate::gameobject::go_type as go_type;
 }
 
-// ---- loot entitlement ----
-
 package_only! {
     pub(crate) use crate::loot::corpse_access as corpse_access;
     pub(crate) use crate::loot::corpse_eligible_for_access as corpse_eligible_for_access;
@@ -153,8 +139,6 @@ package_only! {
     pub(crate) use crate::loot::tag::live_loot_tag_eligibility as live_loot_tag_eligibility;
     pub(crate) use crate::loot::tag::LiveLootTagEligibility as LiveLootTagEligibility;
 }
-
-// ---- spells ----
 
 package_only! {
     pub(crate) use crate::spell::pending_cast as pending_cast;
@@ -185,8 +169,6 @@ package_only! {
     pub(crate) use crate::spell::T_TARGET_ENEMY as T_TARGET_ENEMY;
 }
 
-// ---- party ----
-
 package_only! {
     pub(crate) use crate::group::party_facts as party_facts;
     pub(crate) use crate::group::group_of as group_of;
@@ -202,8 +184,6 @@ package_only! {
     pub(crate) use crate::group::PartyUnitFacts as PartyUnitFacts;
 }
 
-// ---- NPC services / world ----
-
 package_only! {
     pub(crate) use crate::gameobject::apply_use_gameobject as use_gameobject;
     pub(crate) use crate::gameobject::request_use_gameobject as request_use_gameobject;
@@ -215,8 +195,6 @@ package_only! {
     pub(crate) use crate::world::do_spirit_healer_res as spirit_res;
     pub(crate) use crate::spell::do_self_resurrect as self_resurrect;
 }
-
-// ---- social ----
 
 package_only! {
     pub(crate) use crate::chat::emit_system_message as system_message;
@@ -234,7 +212,6 @@ package_only! {
     pub(crate) use crate::quest::enter_sessionless_areatrigger as enter_sessionless_areatrigger;
 }
 
-/// A Refusal classified at the operation's Gate. Detail preserves existing client messages.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct ActionRefusal {
     pub kind: ActionRefusalKind,
@@ -284,10 +261,6 @@ impl std::fmt::Display for ActionRefusal {
     }
 }
 
-/// Return the existing body or restore it from the available Character row. A released ghost
-/// stays a ghost, and a restored body loses its old movement leg. Without an existing body, an
-/// absent or Transfer-fenced Character returns `None`. The caller owns controller consent and
-/// pending Transfer Intent Gates.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn restore_sessionless_body(
     ctx: &ReducerContext,
@@ -314,8 +287,6 @@ pub(crate) fn restore_sessionless_body(
     Some(entity)
 }
 
-/// Stop the current leg where the client renders it and persist the position. If the body is
-/// absent, remove its stale leg. The caller owns authorization and movement ownership checks.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn stop_movement(ctx: &ReducerContext, actor_guid: u64) {
     use crate::tables::{game_creature_spline, game_world_entity};

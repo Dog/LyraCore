@@ -1,20 +1,13 @@
-//! The Instance Removal countdown on a private Standalone: the Group mirror a World Shard receives
-//! and the membership cores a single-database realm runs both arm and cancel it, and its expiry
-//! moves a Character to its hearthstone home.
-
 mod support;
 
 use support::{actor, Standalone};
 
-// The fixture Characters `debug_stage_instance_removal_fixture` stages. All but ECHO stand in
-// Deadmines instance 509295100. DELTA is a GM. ECHO stands outside. FOXTROT has no World Session.
 const ALPHA: u64 = 509_295_001;
 const BRAVO: u64 = 509_295_002;
 const CHARLIE: u64 = 509_295_003;
 const DELTA: u64 = 509_295_004;
 const ECHO: u64 = 509_295_005;
 const FOXTROT: u64 = 509_295_006;
-/// Has no Character on this database.
 const GOLF: u64 = 509_295_007;
 const INSTANCE: &str = "509295100";
 
@@ -34,8 +27,6 @@ fn start(name: &str) -> Standalone {
     node
 }
 
-/// `(character_guid, instance_id, group_id)` of every running countdown, by guid. Each countdown
-/// is first pushed a day ahead, so only `debug_expire_instance_removal` ever fires one.
 fn countdowns(node: &Standalone) -> Vec<(u64, String, String)> {
     node.assert_call("debug_hold_instance_removals", &[]);
     let mut rows: Vec<_> = node
@@ -60,7 +51,6 @@ fn counting(guids: &[u64], group: &str) -> Vec<(u64, String, String)> {
         .collect()
 }
 
-/// Assert `guid` sits in the open world at the fixture home, Northshire, with no live entity.
 fn assert_at_home(node: &Standalone, guid: u64) {
     let rows = node.query_rows(&format!(
         "SELECT map_id, x, y, z, pending_instance_id FROM game_character WHERE guid = {guid}"
@@ -93,13 +83,10 @@ fn partition(group_id: u64, guid: u64, membership_revision: u64) -> serde_json::
     })
 }
 
-/// Push Group 900's roster at `revision`. `members` pairs each guid with its membership revision,
-/// in that order.
 fn mirror(node: &Standalone, revision: u64, kind: u8, members: &[(u64, u64)], slots: &[u8]) {
     mirror_group(node, 900, revision, kind, members, slots);
 }
 
-/// Push `group_id`'s roster at `revision`, as [`mirror`] does for Group 900.
 fn mirror_group(
     node: &Standalone,
     group_id: u64,
@@ -164,11 +151,9 @@ fn the_group_mirror_arms_and_cancels_the_countdown_in_roster_revision_order() {
         "an older roster cancels nothing"
     );
 
-    // A Raid, an Assistant and a Subgroup move change no membership.
     mirror(&node, 5, 1, &charlie_left, &[0x80, 1, 0]);
     assert_eq!(countdowns(&node), counting(&[CHARLIE], "900"));
 
-    // BRAVO logs out first: a Character removed while logged out gets no countdown.
     node.assert_call("debug_logout_character", &[&BRAVO.to_string()]);
     mirror(&node, 6, 1, &[], &[]);
     assert_eq!(
@@ -204,7 +189,6 @@ fn the_group_mirror_arms_and_cancels_the_countdown_in_roster_revision_order() {
     assert_at_home(&node, ALPHA);
     assert_eq!(countdowns(&node), counting(&[CHARLIE], "900"));
 
-    // A GM teleport out of the instance ends the countdown at once, not at the next login.
     node.assert_call(
         "debug_teleport",
         &[
@@ -305,7 +289,6 @@ fn the_membership_cores_arm_and_cancel_the_countdown_on_one_database() {
     assert_eq!(countdowns(&node), counting(&[BRAVO], &group));
 }
 
-/// The Group that owns the fixture instance now.
 fn instance_owner(node: &Standalone) -> String {
     node.query_rows(&format!(
         "SELECT party_id FROM game_instance WHERE instance_id = {INSTANCE}"
@@ -313,7 +296,6 @@ fn instance_owner(node: &Standalone) -> String {
         .clone()
 }
 
-/// Assert `guid` still stands in the fixture instance.
 fn assert_in_instance(node: &Standalone, guid: u64) {
     let rows = node.query_rows(&format!(
         "SELECT instance_id FROM game_world_entity WHERE guid = {guid}"
@@ -366,9 +348,6 @@ fn a_party_of_two_that_forms_again_reaches_the_instance_pool_mirror_and_cancels(
     }
 }
 
-/// An Assistant's kick arms the countdown the same way the leader's does, and a rejoin through
-/// that same Assistant's invite cancels it. Both rights ride `manages_raid`, so this pins that the
-/// Instance Removal side does not quietly assume "the leader did it".
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_assistants_kick_arms_the_countdown_and_the_assistants_invite_cancels_it() {

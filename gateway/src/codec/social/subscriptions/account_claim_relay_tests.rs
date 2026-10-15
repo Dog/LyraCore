@@ -14,7 +14,6 @@ const HORDE: u32 = lyracore_shared::faction::TEAM_HORDE;
 
 const FRIEND: u64 = 10;
 
-/// A registered viewer for `self_guid` on `shard`, already listing [`FRIEND`].
 fn listener(
     view: &WorldView,
     shard: usize,
@@ -57,9 +56,6 @@ fn claim(generation: u64, character_guid: u64, closed: bool) -> AccountClaim {
     }
 }
 
-/// A `game_character` row with only the columns this relay reads set to something other than
-/// zero, the rest at whatever a fresh row would have. `session_start_micros` is `player_login`'s
-/// own stamp — 0 outside a session, a real timestamp inside one.
 fn character_row(
     guid: u64,
     race: u8,
@@ -119,43 +115,32 @@ fn character_row(
     }
 }
 
-/// One case per bullet in `claim_closed`'s doc comment, rows written by hand.
 #[test]
 fn claim_closed_covers_every_bullet() {
-    // Inserted open (the account's first-ever claim): not a close.
     assert_eq!(claim_closed(None, &claim(1, FRIEND, false)), None);
 
-    // A renewal — only `expires_micros` moves: not a close.
     let old = claim(1, FRIEND, false);
     let mut renewed = old.clone();
     renewed.expires_micros += 1;
     assert_eq!(claim_closed(Some(&old), &renewed), None);
 
-    // Closed (logout): the Character stops being live.
     let old = claim(1, FRIEND, false);
     let closed = claim(1, FRIEND, true);
     assert_eq!(claim_closed(Some(&old), &closed), Some(FRIEND));
 
-    // Reopened after being closed (a fresh login, a new generation): not a close.
     let old = claim(1, FRIEND, true);
     let reopened = claim(2, FRIEND, false);
     assert_eq!(claim_closed(Some(&old), &reopened), None);
 
-    // Replaced while live, by a DIFFERENT Character (a relogin as someone else on the same
-    // Account without an intervening close): the OLD Character stops being live.
     let old = claim(1, FRIEND, false);
     let replaced = claim(2, 99, false);
     assert_eq!(claim_closed(Some(&old), &replaced), Some(FRIEND));
 
-    // Reaped while already closed (the claim reaper closes an already-closed row, or closes it
-    // twice across a race): not a (new) close.
     let old = claim(1, FRIEND, true);
     let still_closed = claim(1, FRIEND, true);
     assert_eq!(claim_closed(Some(&old), &still_closed), None);
 }
 
-/// `friend_notice_candidates` collects every friend-listing viewer on any Shard, and never the
-/// subject's own viewer, whatever it lists.
 #[test]
 fn friend_notice_candidates_lists_every_friend_listing_viewer_but_never_the_subject() {
     let view = WorldView::new(true);
@@ -165,7 +150,7 @@ fn friend_notice_candidates_lists_every_friend_listing_viewer_but_never_the_subj
     let (non_friend, _non_friend_rx) = listener(&view, 0, 23, ALLIANCE);
     non_friend.friends.lock().unwrap().clear();
     let (subject, _subject_rx) = listener(&view, 0, FRIEND, ALLIANCE);
-    subject.friends.lock().unwrap().insert(FRIEND); // hypothetically lists itself
+    subject.friends.lock().unwrap().insert(FRIEND);
 
     let mut candidates: Vec<u64> = friend_notice_candidates(&view, FRIEND)
         .iter()
@@ -189,8 +174,6 @@ fn character_online_changed_reaches_a_same_team_friend_with_the_just_committed_r
     let (non_friend, non_friend_rx) = listener(&view, 0, 22, ALLIANCE);
     non_friend.friends.lock().unwrap().clear();
 
-    // Last logged out at level 21 in zone 12; this login already leveled up and landed the
-    // Character in zone 33 — the row's OWN fields, not a stale earlier read.
     let old = character_row(FRIEND, 1, 4, 21, 12, false, 0);
     let new = character_row(FRIEND, 1, 4, 22, 33, true, 500_000);
 
@@ -231,30 +214,24 @@ fn character_online_changed_reaches_a_same_team_friend_with_the_just_committed_r
     );
 }
 
-/// An UPDATE that is not a login — an already-online Character's level-up, a logout, or a
-/// same-database transfer's freeze/rebuild with no real login in between — fires nothing and
-/// marks nothing.
 #[test]
 fn character_online_changed_ignores_every_update_that_is_not_a_login() {
     let view = WorldView::new(true);
     let (_friend, friend_rx) = listener(&view, 0, 20, ALLIANCE);
 
     let old = character_row(FRIEND, 1, 4, 21, 33, true, 500_000);
-    let new = character_row(FRIEND, 1, 4, 22, 33, true, 500_000); // a level-up, same session
+    let new = character_row(FRIEND, 1, 4, 22, 33, true, 500_000);
     character_online_changed(&view, &old, &new);
     assert!(friend_rx.try_recv().is_err());
     assert!(!view.take_character_online(FRIEND));
 
     let old = character_row(FRIEND, 1, 4, 22, 33, true, 500_000);
-    let new = character_row(FRIEND, 1, 4, 22, 33, false, 0); // a real logout
+    let new = character_row(FRIEND, 1, 4, 22, 33, false, 0);
     character_online_changed(&view, &old, &new);
     assert!(friend_rx.try_recv().is_err());
 
-    // A same-database transfer's freeze zeroes session_start_micros without touching `online`
-    // (`freeze_live_entity` calls `persist_entity` with `set_offline: false`) — no login
-    // happened, so this must not fire either, even though `online` reads true on both sides.
     let old = character_row(FRIEND, 1, 4, 22, 33, true, 500_000);
-    let new = character_row(FRIEND, 1, 4, 22, 33, true, 0); // transfer freeze, still online
+    let new = character_row(FRIEND, 1, 4, 22, 33, true, 0);
     character_online_changed(&view, &old, &new);
     assert!(friend_rx.try_recv().is_err());
     assert!(!view.take_character_online(FRIEND));

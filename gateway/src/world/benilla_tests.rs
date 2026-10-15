@@ -1,5 +1,3 @@
-//! Headless Client checks through the WorldStore Seam, using Benilla's independent codec.
-
 use super::{tester_store, warrior_entity, world_session_socket_pair, WorldFake};
 use crate::logon::{LogonAccount, LogonStore, RealmInfo};
 use crate::world::run_world_session;
@@ -316,8 +314,6 @@ impl MovementWorld {
     }
 }
 
-// The caller lives beside the shard callbacks, so it can supply the production motion callback
-// without exposing a private production operation for tests.
 pub(crate) fn two_clients_observe_movement(
     relay: fn(&crate::stdb::world_view::WorldView, &crate::stdb::bindings::EntityMotion),
 ) {
@@ -354,8 +350,6 @@ pub(crate) fn two_clients_observe_movement(
         clients.push(client);
     }
 
-    // Supply the Fake's initial peer snapshot. Movement delivery below uses the real cell audience,
-    // known-object Gate, writer queue and encryption.
     for index in 0..2 {
         let peer = &entities[1 - index];
         let viewer = view
@@ -391,7 +385,7 @@ pub(crate) fn two_clients_observe_movement(
             info.position.y = -132.0;
             let body = messages::movement(&info);
             clients[sender].send(opcode, &body);
-            clients[sender].ping(u32::from(opcode)); // Also proves no movement echo to the mover.
+            clients[sender].ping(u32::from(opcode));
             assert_movement_packet(
                 clients[1 - sender].recv(),
                 opcode,
@@ -412,7 +406,7 @@ pub(crate) fn two_clients_observe_movement(
     distant.position.y = -132.0;
     clients[1].send(opcode::MSG_MOVE_STOP, &messages::movement(&distant));
     clients[1].ping(100);
-    clients[0].ping(101); // The out-of-range movement must not precede this pong.
+    clients[0].ping(101);
     for client in &mut clients {
         client.logout();
     }
@@ -555,9 +549,9 @@ fn benilla_loots_money_and_an_item_then_moves_it_in_inventory() {
         if let Object::Create { guid, mask, .. } = object {
             if guid == inventory[0].guid {
                 let fields: std::collections::BTreeMap<_, _> = mask.raw_fields().collect();
-                assert_eq!(fields.get(&3), Some(&117)); // OBJECT_FIELD_ENTRY
-                assert_eq!(fields.get(&6), Some(&1)); // ITEM_FIELD_OWNER
-                assert_eq!(fields.get(&14), Some(&3)); // ITEM_FIELD_STACK_COUNT
+                assert_eq!(fields.get(&3), Some(&117));
+                assert_eq!(fields.get(&6), Some(&1));
+                assert_eq!(fields.get(&14), Some(&3));
                 found = true;
             }
         }
@@ -711,7 +705,6 @@ fn authenticate() -> ([u8; 40], [u8; 40]) {
         },
         saved_key: Mutex::new(None),
     });
-    // Match Benilla's logon policy for public keys whose integer encoding has an ambiguous width.
     for _ in 0..8 {
         let (mut socket, mut gateway_socket) = world_session_socket_pair();
         let logon_store = store.clone();
@@ -942,7 +935,6 @@ fn benilla_ticket_refusals_accept_harassment_and_long_text() {
         client.recv(),
         ServerPacket::GmTicketCreated { response: 3 }
     ));
-    // The unavailable service does not decompress or allocate a transcript from its header.
     body.extend_from_slice(&1u32.to_le_bytes());
     body.extend_from_slice(&u32::MAX.to_le_bytes());
     body.extend_from_slice(b"opaque transcript");

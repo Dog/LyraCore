@@ -1,10 +1,3 @@
-//! The swing tick (split of the former monolithic `combat/mod.rs`, on top of the shared damage
-//! pipeline): `tick_melee`'s three passes (`leash_pass`/`aggro_pass`/`resolve_swing`), the positional
-//! gate (`swing_blocked`), and the resolvers that actually roll + fire a hit (`fire_melee_swing`,
-//! `resolve_offhand_swing`, `fire_ranged_shot`, and the scheduled `ranged_impact` reducer). Every
-//! resolver here routes through `death`'s shared `fold_incoming_damage`/`final_damage`/`apply_hit`
-//! pipeline. See `damage_pipeline_drift_tests` below, which pins that wiring. `mod.rs` names the operations shared with other Module files.
-
 use spacetimedb::{reducer, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::spell::SpellCastEventKind;
@@ -13,56 +6,18 @@ use crate::{
     SpellCastEvent, WorldEntity,
 };
 
-// Shared combat operations and formulas are named in the parent module.
 use super::*;
 
-/// Swing tick (scheduled; scheduler-only). Two passes:
-/// 1. **Aggro** — a creature attacked by a player retaliates: ensure a reciprocal creature→player
-///    engagement exists (one target at a time). No creature AI beyond "fight whoever hit me".
-/// 2. **Swings** — for each engagement in range whose swing timer elapsed, deal damage
-///    (player→7, creature→2). A creature target dies at 0 HP (DESTROY + free attackers + arm
-///    respawn); a **player** target also dies at 0 HP (health=0 + `dead`, then release→ghost).
-///
-/// A leash pass runs first: a creature whose pursuit deadline expired with the target away from the
-/// remembered refresh position evades.
-///
-/// (per-instance ticks): DELIBERATELY LEFT GLOBAL, one schedule row, no `instance_id`
-/// scoping. Verified same-instance-by-construction: every pass here outer-loops `game_melee_attack`,
-/// and a melee row's attacker/target pair shares one instance at ARM time on every arming path —
-/// `apply_start_attack`/`apply_start_ranged_attack` reject a cross-instance target explicitly, this
-/// file's `aggro_pass` retaliation mirrors an existing (same-instance) row, and `tick_creatures`'s
-/// aggro/assist/pet passes pair within one instance. So this tick's cost is O(active
-/// engagements) — it scales with combat, NOT with instance count, and scoping it per instance would
-/// divide an already-small table while adding a per-row entity fetch. (Known pre-existing edge, not
-/// widened here: `teleport_player` can move one side of a live pair cross-instance AFTER
-/// arming; the leash pass then evades the creature on raw coordinate distance.) The tick_ms
-/// smoothing knob is `tick_creatures`'s per-instance row; melee swing timing is already 100ms
-/// globally.
 #[reducer]
 pub fn tick_melee(ctx: &ReducerContext, _schedule: MeleeSchedule) {
     if ctx.sender() != ctx.database_identity() {
         return;
     }
-    // Three named passes, run in this order. Each pass re-derives its own table handles /
-    // now-timestamp from `ctx` (SpacetimeDB handles are live views, so a re-fetch is behavior-identical).
-    // There is NO cross-pass shared state: the leash `evaders`, the aggro `new_aggro`, and the swing
-    // `attacks` Vecs are each created and consumed within one pass.
     leash_pass(ctx);
     aggro_pass(ctx);
     resolve_swing(ctx);
 }
 
-/// Pass 0 — leash. A creature evades once its pursuit deadline has expired AND the target has left
-/// `LEASH_RADIUS_SQ` of the position remembered at the last damage exchange (`ai::should_evade`), or
-/// unconditionally past the absolute backstop. Evading drops ALL its combat and heals it to full (the
-/// on_update health-VALUES relay refills the bar); the return pass walks it home.
-///
-/// Distance alone does not end a fight: while damage keeps flowing the engagement is refreshed, so combat
-/// continues however far it travels from the creature's camp.
-///
-/// A row whose clock has never been stamped (freshly armed, or auto-migrated from before the field
-/// existed) is SEEDED here instead of judged — otherwise an engagement that never sees a damage exchange
-/// would never time out, and a max-range Auto Shot pull would evade before its first shot landed.
 fn leash_pass(ctx: &ReducerContext) {
     let melee = ctx.db.game_melee_attack();
     let entities = ctx.db.game_world_entity();
@@ -77,12 +32,9 @@ fn leash_pass(ctx: &ReducerContext) {
         ) else {
             continue;
         };
-        // Only a creature's OWN engagement leashes (attacker is the creature, target is the player).
         if attacker.is_player() || evaders.contains(&attacker.guid) {
             continue;
         }
-        // The absolute backstop, on the raw creature→target distance: the only distance that still
-        // evades, so nothing stays in combat across a zone. 3D, as the old target cap was.
         let (dx, dy, dz) = (
             target.x - attacker.x,
             target.y - attacker.y,
@@ -96,8 +48,6 @@ fn leash_pass(ctx: &ReducerContext) {
             seeds.push((atk.attacker_guid, attacker.x, attacker.y));
             continue;
         }
-        // The target measured against the REMEMBERED position, never the creature against its spawn.
-        // 2D like the wander/return-home math (z varies on slopes).
         let (rx, ry) = (target.x - atk.leash_x, target.y - atk.leash_y);
         if crate::creatures::should_evade(now_ms, atk.pursuit_ends_ms, rx * rx + ry * ry) {
             evaders.push(atk.attacker_guid);
@@ -113,9 +63,7 @@ fn leash_pass(ctx: &ReducerContext) {
     }
     for creature in evaders {
         crate::creatures::eventai_on_evade(ctx, creature);
-        // Drop every engagement touching the creature (its attack + attacks on it).
         disengage(ctx, creature);
-        // Evade-heal to full (the on_update relay refills the bar for observers).
         if let Some(mut c) = entities.guid().find(creature) {
             if c.health != c.max_health {
                 c.health = c.max_health;
@@ -125,13 +73,11 @@ fn leash_pass(ctx: &ReducerContext) {
     }
 }
 
-/// Pass 1 — aggro. A creature with an incoming player attack and no engagement of its own retaliates
-/// against that attacker (one target at a time). Collect first, then insert (don't mutate while iterating).
 fn aggro_pass(ctx: &ReducerContext) {
     let melee = ctx.db.game_melee_attack();
     let entities = ctx.db.game_world_entity();
 
-    let mut new_aggro: Vec<(u64, u64)> = Vec::new(); // (creature, player)
+    let mut new_aggro: Vec<(u64, u64)> = Vec::new();
     for atk in melee.iter() {
         let (Some(attacker), Some(target)) = (
             entities.guid().find(atk.attacker_guid),
@@ -139,33 +85,17 @@ fn aggro_pass(ctx: &ReducerContext) {
         ) else {
             continue;
         };
-        // Retaliate only when the attacker is actually in MELEE RANGE (the same leeway gate the
-        // swing tick uses): arming melee auto-attack from 20 yd out must NOT aggro the creature —
-        // vanilla mobs engage on proximity-aggro range or a LANDED hit, never on a player merely
-        // entering attack stance at distance (user-observed bug). The armed row is harmless until
-        // the player closes: their first in-range swing lands the same tick this pass fires.
-        // A RANGED auto-repeat (Auto Shot / Shoot) retaliates at any distance — but only once a
-        // shot has actually FIRED (the swing tick's `enter_combat` stamped the target IN_COMBAT).
-        // Arming alone is NOT a hit: the first shot is seeded ~500ms out and can be
-        // rejected/suppressed, and retaliating at arm time let the wolf aggro-then-instantly-evade
-        // on a pull whose first shot never fired ("enters combat, leaves combat immediately").
+        // Retaliation requires a fired attack; entering attack stance alone is not a hit.
         let is_ranged = atk.ranged_spell_id != 0;
         let dx = attacker.x - target.x;
         let dy = attacker.y - target.y;
         let dz = attacker.z - target.z;
-        // MELEE retaliation additionally requires a swing to have FIRED (`last_swing_ms` is 0 at
-        // arm/retarget and only the tail-of-loop stamp sets it, after the range/facing/LoS gates
-        // let a swing through). Without this a player standing IN range with their BACK to a
-        // neutral wolf aggro'd it just by toggling attack — the facing gate ate every swing, so
-        // the wolf was retaliating against an attack that never happened (user find; the melee
-        // twin of the ranged IN_COMBAT gate above). Costs one 100ms tick vs the old same-tick arm.
         if attacker.is_player()
             && !target.is_player()
-            && !target.dead // a corpse doesn't retaliate
+            && !target.dead
             && ((is_ranged
                 && target.unit_flags & lyracore_shared::constants::unit_flags::IN_COMBAT != 0)
-                || (atk.last_swing_ms != 0
-                    && dx * dx + dy * dy + dz * dz <= MELEE_RANGE_LEEWAY_SQ))
+                || (atk.last_swing_ms != 0 && dx * dx + dy * dy + dz * dz <= MELEE_RANGE_LEEWAY_SQ))
             && melee.attacker_guid().find(target.guid).is_none()
             && !new_aggro.iter().any(|(c, _)| *c == target.guid)
         {
@@ -177,12 +107,6 @@ fn aggro_pass(ctx: &ReducerContext) {
     }
 }
 
-/// The OFF-HAND swing (dual wield): a second, independent attack rolled by
-/// `resolve_swing` for a MELEE engagement whenever `attacker_guid` has a live off-hand weapon
-/// (`equipped_offhand_weapon_damage` — a shield/holdable off-hand short-circuits at `None`, unchanged
-/// swing count). Runs on its OWN clock — the off-hand weapon's own `delay_ms`, tracked in
-/// `MeleeAttack::last_offhand_swing_ms` — so it fires at a different cadence than the main hand and is
-/// NOT gated by the main-hand swing-timer `continue` in `resolve_swing`.
 fn resolve_offhand_swing(
     ctx: &ReducerContext,
     attacker_guid: u64,
@@ -190,36 +114,26 @@ fn resolve_offhand_swing(
     attacker: &WorldEntity,
     now_ms: u32,
 ) {
-    // No off-hand weapon (empty, shield/holdable, or broken) → no second stream. The common case for
-    // every creature (no equipment) and every player without a second one-hander — a no-op that leaves
-    // `last_offhand_swing_ms` untouched, so this is byte-identical to before for them.
     let Some((dmin, dmax, delay)) = equipped_offhand_weapon_damage(ctx, attacker_guid) else {
         return;
     };
     let melee = ctx.db.game_melee_attack();
     let Some(atk) = melee.attacker_guid().find(attacker_guid) else {
-        return; // engagement row already gone (freed by something earlier this tick)
+        return;
     };
     if atk.last_offhand_swing_ms != 0 && now_ms.wrapping_sub(atk.last_offhand_swing_ms) < delay {
-        return; // off-hand still on its own cooldown
+        return;
     }
     let Some(target) = ctx.db.game_world_entity().guid().find(target_guid) else {
         return;
     };
     if attacker.dead || target.dead {
-        return; // mirrors resolve_swing's corpse guard
+        return;
     }
-    // Warrior Disarm (A_DISARM): mirrors the main-hand read in `swing_range_ctx`, folded
-    // into this range derivation too — a disarmed PLAYER drops to UNARMED on the main hand, so there is
-    // no dual-wield stream left to swing (an unarmed fighter has no off-hand weapon either). Without
-    // this the off-hand kept swinging at full value while Disarm stripped only the main hand. `false`
-    // for any un-disarmed attacker, so this stays a no-op without an A_DISARM aura (baseline-safe).
     if crate::spell::is_disarmed(ctx, attacker_guid) {
         return;
     }
 
-    // Effective AP identical to the main-hand fold (swing_range_ctx's player branch), scaled by the
-    // OFF-HAND weapon's own delay, then halved by the vanilla dual-wield penalty.
     let class = attacker.class();
     let ap = melee_attack_power_for(
         class,
@@ -234,9 +148,6 @@ fn resolve_offhand_swing(
 
     crate::spell::break_stealth(ctx, attacker_guid);
 
-    // The SHARED pipeline: outgoing % → incoming % → absorb → godmode, then the wire event,
-    // then the application (rage/skill/lethal fork/health/break-on-damage/threat). Identical to the
-    // main-hand swing by construction — this is exactly the copy whose Disarm gate drifted.
     let (dmg, _absorbed) = fold_incoming_damage(ctx, attacker_guid, target_guid, rolled);
     let damage = final_damage(ctx, target_guid, dmg);
     let lethal = is_lethal(target.health, damage.amount);
@@ -246,8 +157,6 @@ fn resolve_offhand_swing(
         hit_info,
         killing_blow: lethal,
         blocked_amount: blocked,
-        // the off-hand stream is always melee, never a ranged auto-attack (ranged_spell_id/
-        // ammo_display_id/impact_delay_ms/spell_swing stay at the baseline's 0/0/0/false).
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
     });
 
@@ -260,8 +169,6 @@ fn resolve_offhand_swing(
     )
     .combat_ended()
     {
-        // The kill's `disengage` already freed this engagement row, so there is no off-hand clock
-        // left to stamp (the stamp below would find nothing) — return like the main-hand path does.
         return;
     }
 
@@ -271,8 +178,6 @@ fn resolve_offhand_swing(
     }
 }
 
-/// Pass 2 — swings. For each engagement (re-read, since aggro may have added rows), run the SHARED
-/// ELIGIBILITY GATE and, if it passes, fire the swing.
 fn resolve_swing(ctx: &ReducerContext) {
     let now_ms = (ctx.timestamp.to_micros_since_unix_epoch() / 1000) as u32;
     let melee = ctx.db.game_melee_attack();
@@ -280,8 +185,6 @@ fn resolve_swing(ctx: &ReducerContext) {
 
     let attacks: Vec<MeleeAttack> = melee.iter().collect();
     for atk in attacks {
-        // Drop the engagement if either party left the world (also covers rows freed earlier this
-        // tick by another engagement's killing blow).
         let Some(attacker) = entities.guid().find(atk.attacker_guid) else {
             melee.attacker_guid().delete(atk.attacker_guid);
             continue;
@@ -291,39 +194,18 @@ fn resolve_swing(ctx: &ReducerContext) {
             continue;
         };
 
-        // A corpse neither swings nor is a valid swing target. With a lingering corpse
-        // (the entity persists until the decay pass), a stale snapshot row whose attacker OR target
-        // was killed earlier in THIS tick survives the two existence guards above (the corpse row is
-        // still present). Without this guard such a row would: let a dead unit keep swinging
-        // (attacker.dead); re-enter the killing-blow branch on a 0-HP target (target.dead → double
-        // XP, duplicate death event, reset decay timer); and reach the `update` at the loop tail on a
-        // row already freed by this tick's killing-blow `disengage`, which PANICS on a missing PK and
-        // rolls back the entire tick. `delete` is idempotent if the row was already freed.
         if attacker.dead || target.dead {
             melee.attacker_guid().delete(atk.attacker_guid);
             continue;
         }
         if melee.attacker_guid().find(atk.attacker_guid).is_none() {
-            continue; // an earlier hit in this snapshot already tore the engagement down
+            continue;
         }
         if !crate::combat::may_harm(ctx, &attacker, &target) {
             melee.attacker_guid().delete(atk.attacker_guid);
-            continue; // friendship was restored, including an ended Duel
+            continue;
         }
 
-        // Crowd control: an ACTION-blocked attacker (stunned/polymorphed/feared) cannot swing. Gated HERE — after the existence/corpse
-        // guards (so a stale row is still reaped) but BEFORE the range/swing-timer checks below and the
-        // `last_swing_ms` write at the loop tail — so a stun does NOT even reset the swing timer (the
-        // attacker resumes its prior cadence the instant the stun ends, the vanilla feel). The
-        // engagement ROW is LEFT INTACT (we don't `delete` it): the unit is still in combat, just
-        // locked, so it retaliates the moment the stun lifts. `continue` only skips THIS row's swing —
-        // the outer `for mut atk in attacks` reads an owned snapshot Vec, so skipping a row never
-        // corrupts the iteration (no table cursor is held across the body). A ROOTED attacker is NOT
-        // gated here — root blocks movement, not attacks, so a rooted-but-in-range unit keeps swinging.
-        // Baseline-safe: `is_action_blocked` is `false` for any unit without a stun/poly/fear aura, so an
-        // un-CC'd swing reaches the identical range/timer/roll path it did before — byte-for-byte. A
-        // POLYMORPHED or FEARED attacker is action-blocked too, so it can't swing either (a feared unit
-        // routs without retaliating).
         if !attacker.is_player() && !crate::creatures::melee_enabled(ctx, attacker.guid) {
             continue;
         }
@@ -331,20 +213,10 @@ fn resolve_swing(ctx: &ReducerContext) {
             continue;
         }
 
-        // A creature inside its ROUT window is RUNNING, not fighting — skip its swing while it routs. Like
-        // the CC gate above, the engagement ROW is LEFT INTACT: routing is a SHARED combat state (the flee
-        // pass keeps both sides in combat). Once the window closes the same creature swings again at
-        // whatever health it has left, and a low-HP humanoid whose rout never started (frozen, feared)
-        // keeps swinging throughout — both follow from the one shared predicate.
         if !attacker.is_player() && crate::creatures::tick::creature_is_routing(ctx, &attacker) {
             continue;
         }
 
-        // RANGED vs MELEE: a ranged auto-attack (Auto Shot 75 / wand Shoot 5019) reads the slot-17
-        // weapon, fires on ITS delay over a longer range, and uses a reduced attack table; a melee
-        // engagement (ranged_spell_id == 0) is byte-identical to before. The ranged weapon is fetched
-        // ONCE (a swing needs its damage + delay); if it's gone (unequipped mid-fight) the engagement
-        // ends gracefully rather than firing bare-handed.
         let ranged = if atk.ranged_spell_id != 0 {
             match equipped_ranged_weapon(ctx, atk.attacker_guid) {
                 Some(w) => Some(w),
@@ -357,29 +229,13 @@ fn resolve_swing(ctx: &ReducerContext) {
             None
         };
 
-        // (vanilla) A RANGED engagement whose shot comes DUE against a hard blocker (out of range /
-        // too close / no LoS / not facing) is TORN DOWN, not silently suppressed — the vanilla
-        // auto-repeat rule is that a failed check on a DUE ranged shot interrupts
-        // the loop, and the row's delete relays the server-initiated SMSG_CANCEL_AUTO_REPEAT that
-        // drops the client's toggle. Gated on DUE so a transient blocker BETWEEN shots (the mob
-        // circling behind you, an LoS flicker) never cancels — vanilla only checks when the shot is
-        // ready. Melee rows keep the silent per-tick `continue` (a melee swing resumes by itself).
         let ranged_due =
             ranged.is_some_and(|(_, _, delay, _)| now_ms.wrapping_sub(atk.last_swing_ms) >= delay);
 
-        // (vanilla) Realtime movement rule — vanilla applies this BEFORE any castability
-        // check: a PLAYER who is actually TRANSLATING (MOVE_MASK_MOVING — turning in place does
-        // not count) CANCELS a wand loop outright, and DEFERS an Auto Shot loop: the due shot
-        // re-arms RANGED_INITIAL_SHOT_MS out, over and over while moving, so the first shot after
-        // stopping lands ~0.5s later and never fires mid-run (user bug: "we can shoot while
-        // running"). Placed before the hard-fail gates so a moving out-of-range player defers
-        // rather than cancels (vanilla order). Creatures are exempt (server-driven movement).
         if let Some((_, _, delay, subclass)) = ranged {
             use crate::items::weapon_subclass as ws;
             if attacker.is_player() && attacker.movement_flags & MOVE_MASK_MOVING != 0 {
                 if subclass == ws::WAND {
-                    // Wand Shoot dies on movement (vmangos: Category 351 → InterruptSpell); the row
-                    // delete relays the server-initiated SMSG_CANCEL_AUTO_REPEAT.
                     melee.attacker_guid().delete(atk.attacker_guid);
                 } else if ranged_due {
                     if let Some(mut fresh) = melee.attacker_guid().find(atk.attacker_guid) {
@@ -410,7 +266,7 @@ fn resolve_swing(ctx: &ReducerContext) {
         if ranged.is_none() {
             resolve_offhand_swing(ctx, atk.attacker_guid, atk.target_guid, &attacker, now_ms);
             if melee.attacker_guid().find(atk.attacker_guid).is_none() {
-                continue; // a lethal off-hand Duel hit removed both participants' attack rows
+                continue;
             }
 
             match entities.guid().find(atk.target_guid) {
@@ -425,10 +281,6 @@ fn resolve_swing(ctx: &ReducerContext) {
             }
         }
 
-        // Swing timer — melee uses the ATTACKER's own `base_attack_time_ms` shortened by any melee-haste
-        // aura (`effective_swing_time`); ranged uses the equipped ranged weapon's `delay_ms` (bows are
-        // slow, wands faster). `wrapping_sub` guards the u32 millisecond clock wrapping; the 100ms tick
-        // gives 0.1s resolution. Known limitation: no ranged-haste fold in v1.
         let swing_interval = match ranged {
             Some((_, _, delay, _)) => delay,
             None => effective_swing_time(ctx, &attacker),
@@ -452,12 +304,6 @@ fn resolve_swing(ctx: &ReducerContext) {
     }
 }
 
-/// The POSITIONAL half of the swing gate: may `attacker` reach `target` this tick? `true` = blocked.
-/// Checked in vanilla's order — max range, ranged MINIMUM range, line of sight, then facing — and
-/// deliberately SIDE-EFFECT-FREE, because a block means different things to the two swing kinds and
-/// that decision belongs to the caller: a melee row silently waits for the next tick, while a DUE
-/// ranged row is torn down (vanilla's auto-repeat interrupt, whose row delete relays the
-/// server-initiated SMSG_CANCEL_AUTO_REPEAT that drops the client's toggle).
 fn swing_blocked(
     ctx: &ReducerContext,
     attacker: &WorldEntity,
@@ -466,21 +312,12 @@ fn swing_blocked(
     dist_sq: f32,
     now_ms: u32,
 ) -> bool {
-    // Range (re-checked each swing; the vanilla client walks into range itself). Ranged reaches
-    // farther than melee.
     let range_sq = if is_ranged {
         RANGED_RANGE_SQ
     } else {
-        // Melee LEEWAY: when BOTH the attacker and the target are moving (a chase), the swing reaches
-        // +8/3 yd farther — so a player chasing a FLEEING mob at run-speed parity (stuck ~5yd behind)
-        // can still land the hit. A standstill fight keeps the 5yd base. `last_move_ms` is the per-unit
-        // move clock (player: world::move; creature: the flee/chase tick).
         let both_moving = now_ms.wrapping_sub(attacker.last_move_ms) < MELEE_LEEWAY_WINDOW_MS
             && now_ms.wrapping_sub(target.last_move_ms) < MELEE_LEEWAY_WINDOW_MS;
         if both_moving {
-            // Direction-aware: only a PLAYER chasing a leg-quantized creature needs the
-            // padded 9 yd; a creature attacking a continuously-streamed player uses the
-            // exact classic 7.67 yd (see tables.rs).
             if attacker.is_player() {
                 MELEE_RANGE_LEEWAY_SQ
             } else {
@@ -493,17 +330,9 @@ fn swing_blocked(
     if dist_sq > range_sq {
         return true;
     }
-    // Auto Shot / wand Shoot have a MINIMUM range (~5 yd): a target in melee range is "too close"
-    // (vanilla SPELL_FAILED_TOO_CLOSE → InterruptSpell, so the player's next melee press is a clean
-    // single-press swap). Melee has no minimum.
     if is_ranged && dist_sq < MELEE_RANGE_SQ {
         return true;
     }
-    // 243: no swinging THROUGH geometry — a mob parked at the outside of a thin wall sits
-    // within the 5 yd 3D reach of a player just inside it (live find: the Rogue Wizard
-    // beat a wall-separated player to death by melee). One LoS ray per due swing, both
-    // directions symmetric (players can't hit through walls either). `has_los` is `true`
-    // whenever nav is off.
     if !crate::nav::has_los(
         ctx,
         attacker.map_id,
@@ -513,10 +342,6 @@ fn swing_blocked(
     ) {
         return true;
     }
-    // Facing (PLAYERS only): vanilla refuses a swing at a target behind you — without this a fleeing
-    // player auto-attacked the chaser at their back. Creatures are exempt (they auto-face their
-    // victim; their `orientation` trails their movement direction, so gating them on it would break
-    // legitimate mob melee).
     if attacker.is_player()
         && !crate::spell::is_facing(
             attacker.x,
@@ -531,14 +356,6 @@ fn swing_blocked(
     false
 }
 
-/// Fire one MAIN-HAND MELEE swing that has already passed every eligibility gate in `resolve_swing`.
-/// Rolls the full vanilla attack table, folds in the melee-only procs (the Overpower react window, the
-/// seal's holy portion, a queued on-next-swing strike), writes the wire events, applies the damage
-/// through the SHARED [`apply_hit`] pipeline, then arms the defender's Revenge window and stamps the
-/// swing timer + IN_COMBAT on both sides.
-///
-/// Returns early after a KILLING blow: the kill's `disengage` already freed the engagement row, so
-/// there is no swing timer left to stamp and nothing left to flag in combat.
 fn fire_melee_swing(
     ctx: &ReducerContext,
     attacker: &WorldEntity,
@@ -551,25 +368,12 @@ fn fire_melee_swing(
     let events = ctx.db.game_combat_event();
     let melee = ctx.db.game_melee_attack();
 
-    // The full vanilla attack table: miss / dodge / parry / glancing / block / crit / crushing.
     let (mut rolled, hit_info, blocked) = roll_swing(ctx, attacker, target);
 
-    // React windows: an avoidance outcome ARMS a reactive ability for ~5s. A DODGE of this swing arms
-    // the ATTACKER's Overpower; any avoid (dodge/parry/block) of it arms the DEFENDER's Revenge (armed
-    // AFTER the damage application below, so a partial block's `update(target)` can't clobber the
-    // stamp). Keyed on the HIT_* outcome, never a spell id — the cast gate (SPELL_ATTR_REQ_OVERPOWER /
-    // REQ_REVENGE) reads the stamped `*_until_ms`. Stamped BEFORE the lethal fork so the window always
-    // arms (the dodge already cost the attacker its swing). Ranged shots have no avoidance bands, so
-    // both windows are structurally melee-only now.
     if hit_info == HIT_DODGE {
         arm_react(ctx, attacker_guid, ReactKind::Overpower);
     }
 
-    // Seal proc (Seal of Righteousness): a LANDED swing adds the attacker's seal holy damage — the
-    // swing READS the A_SEAL aura (pull model, no per-spell code). A 0-roll (miss/dodge/parry) lands
-    // nothing and doesn't proc. 114: the portion (and the seal's spell id) is TRACKED so it can be
-    // reported as its own yellow named line — it still folds into `rolled` (one health deduction, one
-    // lethal check).
     let (mut seal_portion, mut seal_spell) = (0u32, 0u32);
     if rolled > 0 {
         let (p, s) = seal_holy_on_swing(ctx, attacker);
@@ -578,23 +382,8 @@ fn fire_melee_swing(
         rolled += seal_portion;
     }
 
-    // On-next-swing QUEUE (Heroic Strike / Cleave): a LANDED swing adds the attacker's queued strike
-    // bonus (the pull-model twin of the seal proc) — reads `attacker.next_swing_spell` and adds its
-    // E_NEXT_SWING base_points. A 0-roll lands nothing. The queue is CLEARED below whenever a swing
-    // FIRES (even a miss), so a missed swing still spends it (vanilla). The bonus flows through absorb
-    // / lethal like the rest of `rolled`. Vanilla REPLACES the white hit — the whole landed swing IS
-    // the spell (one yellow named line; live-confirmed 2026-07-11), so `queued_fired` marks the white
-    // event `spell_swing` (the gateway skips its ATTACKERSTATEUPDATE) and the spell row below carries
-    // the full post-mitigation damage.
     let queued_spell = attacker.next_swing_spell;
-    // 114: the cost was VALIDATED at press but is CHARGED here, when the spell actually fires
-    // (vanilla defers the rage deduction to the swing; a MISSED swing still charges — the spell
-    // cast and missed). FIZZLE: rage fell below cost between press and swing (a Battle Shout in
-    // between) → the strike doesn't fire, power is left alone, the swing stays a plain white swing,
-    // and the queue is cleared below. The fizzle row carries CAST_FAIL_NO_POWER, so the caster gets
-    // the cast-bar teardown AND a failed cast result naming the queued spell (vanilla's
-    // SendInterrupted + SendCastResult pair). The teardown alone left the 1.12 client holding the
-    // ability as its current melee spell: the button stayed lit and refused every later press.
+    // Charge queued-strike rage when the swing fires, including a miss.
     let mut swing_is_spell = false;
     if queued_spell != 0 && attacker.is_player() {
         let cost = ctx
@@ -604,7 +393,6 @@ fn fire_melee_swing(
             .find(queued_spell)
             .map(|h| h.cost)
             .unwrap_or(0);
-        // Fresh row (read-your-writes): the seal/roll path above never wrote power.
         if let Some(mut a) = entities.guid().find(attacker_guid) {
             if a.power >= cost {
                 a.power -= cost;
@@ -612,8 +400,8 @@ fn fire_melee_swing(
                 swing_is_spell = true;
             } else {
                 ctx.db.game_spell_cast_event().insert(SpellCastEvent {
-                    is_interrupted: true, // SMSG_SPELL_FAILURE → the caster's cast bar tears down
-                    failure_reason: crate::spell::CAST_FAIL_NO_POWER, // → "Not enough rage"
+                    is_interrupted: true,
+                    failure_reason: crate::spell::CAST_FAIL_NO_POWER,
                     ..SpellCastEvent::signal_at(
                         ctx,
                         attacker,
@@ -624,89 +412,53 @@ fn fire_melee_swing(
             }
         }
     } else if queued_spell != 0 {
-        swing_is_spell = true; // non-player queued strikes (none today) fire without a pool
+        swing_is_spell = true;
     }
     let queued_fired = swing_is_spell && rolled > 0;
     if queued_fired {
         rolled += queued_strike_on_swing(ctx, attacker);
     }
-    // Spend the queue on ANY melee swing that fires (landed or missed) — re-fetches the row to clear it.
-    // Read-your-writes safe: the bonus above already read `attacker.next_swing_spell` from the snapshot.
     clear_queued_strike(ctx, attacker_guid);
 
-    // Stealth breaks on action: a swing that fires this tick (hit or miss) drops the attacker's
-    // A_STEALTH presence — a stealthed unit that attacks is revealed. The other action chokepoint is
-    // the cast path (resolve_cast_at). No-op for the common un-stealthed swing.
     crate::spell::break_stealth(ctx, attacker_guid);
 
-    // Durability: a player's main-hand weapon wears 1 point per swing (after the roll). Creatures
-    // don't wear gear.
     if attacker.is_player() {
         wear_weapon(ctx, attacker_guid);
     }
 
-    // The SHARED modifier fold: outgoing % → incoming % → absorb → godmode. `lethal` is needed
-    // HERE, before the events, for the wire's `killing_blow` flag; `apply_hit` re-derives it for the
-    // fork from the same shared predicate.
     let (dmg, _absorbed) = fold_incoming_damage(ctx, attacker_guid, target_guid, rolled);
     let damage = final_damage(ctx, target_guid, dmg);
     let lethal = is_lethal(target.health, damage.amount);
     let (projected_swing, projected_seal) = split_damage_projection(damage.amount, seal_portion);
 
-    // One swing event per swing; `lethal` (killing_blow) also tells the relay to send
-    // SMSG_ATTACKSTOP so the attacker leaves combat stance. Logged before any teardown so the
-    // event doesn't depend on whether the target row survives this tick.
-    // 114: the seal's holy portion gets its own named yellow line (the proc insert below), so the
-    // WHITE event reports the swing minus it. A fired queued strike goes further — the WHOLE swing
-    // is the spell (spell_swing → the gateway skips this event's ATTACKERSTATEUPDATE; the spell row
-    // below carries the full damage). `dmg` (the total) still drives health/lethal/rage; the seal
-    // subtraction is display-only (a pre-modifier flat, so a modified/absorbed swing's split is
-    // approximate — totals stay exact).
     events.insert(CombatEvent {
         damage: projected_swing,
         hit_info,
         killing_blow: lethal,
         blocked_amount: blocked,
         spell_swing: swing_is_spell,
-        // ranged_spell_id / ammo_display_id / impact_delay_ms stay at the baseline's 0: a melee
-        // engagement always carries 0 (that is what makes it melee), consumes no ammo, and lands
-        // instantly (only a projectile carries travel time).
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
     });
-    // 114 FIX (a): the queued on-next-swing strike FIRES with this swing — emit its cast event NOW
-    // (never at queue time). is_completion=true rides the timed-completion relay shape, which is
-    // exactly the vanilla on-next-swing fire: CAST_RESULT(OK) to the caster (releases the client's
-    // pending cast = un-lights the button) + SMSG_SPELL_GO alone (no second START) + the yellow
-    // "Heroic Strike hits..." damage log carrying the WHOLE landed swing (weapon roll + bonus,
-    // post-mitigation; the seal's portion stays on its own line). A MISSED swing still emits the
-    // row (damage 0, no log) — the GO must fire or the client's button stays lit forever.
     if swing_is_spell {
         ctx.db.game_spell_cast_event().insert(SpellCastEvent {
             target_guid,
             is_completion: true,
             damage: if queued_fired { projected_swing } else { 0 },
-            // school stays at the baseline's 0 (physical — HS/Cleave are weapon strikes).
             is_crit: hit_info == HIT_CRIT,
-            // The swing outcome — on a 0-damage fire the relay shapes the GO miss list from it
-            // (yellow "Heroic Strike missed/was dodged/was parried", not a white MISS line).
             swing_hit_info: hit_info,
             ..SpellCastEvent::signal_at(ctx, attacker, queued_spell, SpellCastEventKind::Go)
         });
     }
-    // 114 FIX (b): the seal's holy portion — a log-only row (is_proc_log): the gateway sends ONLY
-    // SMSG_SPELLNONMELEEDAMAGELOG named after the seal spell (yellow "Seal of Righteousness hits
     if projected_seal > 0 {
         ctx.db.game_spell_cast_event().insert(SpellCastEvent {
             target_guid,
             damage: projected_seal,
-            school: 1, // holy (school_mask 2 → index 1, the mask→index rule in resolve_cast_at)
+            school: 1,
             is_proc_log: true,
             ..SpellCastEvent::signal_at(ctx, attacker, seal_spell, SpellCastEventKind::ProcLog)
         });
     }
 
-    // The SHARED application: rage both ways, weapon/defense skill-ups, the lethal fork through
-    // kill_player/kill_creature, the health write, break-on-damage, and threat.
     let combat_ended = apply_hit(
         ctx,
         attacker_guid,
@@ -731,26 +483,21 @@ fn fire_melee_swing(
         );
     }
     if combat_ended {
-        return; // the kill's `disengage` freed the row — nothing left to stamp
+        return;
     }
 
-    // Defender's Revenge window: armed AFTER the damage write above so a partial block (dmg>0,
-    // non-lethal) cannot clobber the stamp with a pre-stamp `target` snapshot. `arm_react` re-fetches
-    // the defender fresh, so it works for both the dmg==0 (dodge/parry) and dmg>0 (partial block)
-    // paths. A lethal block returned earlier — a dead defender needs no window.
+    // Arm Revenge after damage so a stale defender snapshot cannot erase its deadline.
     if matches!(hit_info, HIT_DODGE | HIT_PARRY | HIT_BLOCK) {
         arm_react(ctx, target_guid, ReactKind::Revenge);
     }
 
-    // Re-fetch fresh before the tail write: `resolve_offhand_swing` (run by the caller earlier this
-    // tick) may have persisted its own `last_offhand_swing_ms` stamp on this same row.
+    // Re-read before stamping; the off-hand may have updated its clock on this row.
     if let Some(mut fresh) = melee.attacker_guid().find(attacker_guid) {
         fresh.last_swing_ms = now_ms;
         melee.attacker_guid().update(fresh);
     }
 
-    // A swing FIRED this tick (hit or miss) → both combatants are IN COMBAT. Set the flag at the tail
-    // so it lands AFTER every entity write above; `enter_combat` re-fetches fresh.
+    // Enter combat after entity writes so a stale snapshot cannot erase the flag.
     enter_combat(ctx, attacker_guid);
     enter_combat(ctx, target_guid);
 }
@@ -760,17 +507,6 @@ fn split_damage_projection(final_damage: u32, seal_portion: u32) -> (u32, u32) {
     (final_damage - seal, seal)
 }
 
-/// Fire one RANGED shot (Auto Shot 75 / wand Shoot 5019) that has already passed every eligibility
-/// gate in `resolve_swing`. Consumes ammo, rolls the REDUCED ranged attack table (miss / crit /
-/// normal — a shot can't be dodged, parried or blocked here), folds the damage through the SHARED
-/// modifier chain, and launches a PROJECTILE: the wire event relays the SMSG_SPELL_GO (arrow) NOW and
-/// carries `impact_delay_ms`, while the scheduled `ranged_impact` applies the frozen damage through
-/// the SAME [`apply_hit`] pipeline when the arrow actually lands — so the number, the health drop and
-/// the projectile arrive together (user bug: "damage lands earlier than the projectile"). Lethality is
-/// therefore decided AT IMPACT, which is why this event never claims `killing_blow`.
-///
-/// Out of ammo ends the engagement: the row delete relays the server-initiated
-/// SMSG_CANCEL_AUTO_REPEAT that drops the client's toggle.
 fn fire_ranged_shot(
     ctx: &ReducerContext,
     attacker: &WorldEntity,
@@ -787,10 +523,6 @@ fn fire_ranged_shot(
     let melee = ctx.db.game_melee_attack();
     let launcher = matches!(subclass, ws::BOW | ws::GUN | ws::CROSSBOW);
 
-    // Ammo: reaching here means a shot FIRES this tick. A launcher consumes 1 arrow/bullet from the
-    // bag and stamps its display id onto the event (so the gateway renders the arrow projectile);
-    // out of ammo ends the engagement, which stops the client's auto-shoot too. A wand consumes
-    // nothing (display 0). Consumed on the shot regardless of hit/miss, like vanilla.
     let ammo_display_id: u32 = if launcher {
         match find_ammo(ctx, attacker_guid) {
             Some(mut a) => {
@@ -815,12 +547,9 @@ fn fire_ranged_shot(
             }
         }
     } else {
-        0 // wand: flat damage, no ammo
+        0
     };
 
-    // Ranged AP fold: a launcher scales with the shooter's Agility-derived ranged attack power, folded
-    // into the weapon range by speed exactly like melee; a wand is FLAT weapon damage (no ranged AP in
-    // vanilla). Known limitation: no ranged-AP aura (e.g. Aspect of the Hawk) — we have none.
     let (rdmin, rdmax) = if attacker.is_player() {
         let (_, rdmin, rdmax) = ranged_sheet_values(
             effective_agility(ctx, attacker),
@@ -833,12 +562,9 @@ fn fire_ranged_shot(
     };
     let (rolled, hit_info) = roll_ranged_swing(ctx, attacker, target, rdmin, rdmax);
 
-    // Stealth breaks on action — a shot that fires (hit or miss) reveals the shooter, exactly like a
-    // melee swing.
     crate::spell::break_stealth(ctx, attacker_guid);
 
-    // The SHARED modifier fold. Vanilla folds absorb at impact; this engine freezes that
-    // chain at launch, then resolves the lethal floor and damage log together at impact.
+    // Freeze mitigation at launch; resolve lethal floors and the damage log together at impact.
     let (dmg, _absorbed) = fold_incoming_damage(ctx, attacker_guid, target_guid, rolled);
 
     let speed = if subclass == ws::WAND {
@@ -848,19 +574,13 @@ fn fire_ranged_shot(
     };
     let travel_ms = crate::spell::projectile_travel_ms(dist_sq.sqrt(), speed);
     ctx.db.game_combat_event().insert(CombatEvent {
-        // Launch carries SPELL_GO only. The impact transaction emits the one authoritative damage
-        // log after it resolves fresh health and lethal-floor state.
         damage: 0,
         hit_info,
         ranged_spell_id,
         ammo_display_id,
         impact_delay_ms: travel_ms,
-        // killing_blow stays at the baseline's false (decided at IMPACT — health can move
-        // mid-flight); blocked_amount stays 0 (a shot can't be blocked in this engine).
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
     });
-    // A miss / fully-absorbed shot schedules nothing (the GO's miss list, or the absence of a damage
-    // log, is the whole story).
     if dmg > 0 {
         let land_at = ctx
             .timestamp
@@ -878,20 +598,12 @@ fn fire_ranged_shot(
                 is_crit: hit_info == HIT_CRIT,
             });
     }
-    // Same fresh-row stamp discipline as the melee tail (the off-hand never runs on a ranged row, but
-    // the re-fetch is the file's established pattern for a row written mid-tick).
     if let Some(mut fresh) = melee.attacker_guid().find(attacker_guid) {
         fresh.last_swing_ms = now_ms;
         melee.attacker_guid().update(fresh);
     }
 }
 
-/// Scheduled RANGED-projectile impact (scheduler-only): the arrow/bullet/bolt lands — apply the
-/// launch-frozen post-mitigation damage through the SAME shared [`apply_hit`] pipeline the melee swing
-/// uses (health/lethal via the shared kill helpers, rage both ways, weapon/defense skill-ups,
-/// break-on-damage, threat), then stamp IN_COMBAT on both sides. Guards re-checked at landing: either
-/// side gone or the target already dead → the shot fizzles silently (the client saw the arrow; vanilla
-/// eats mid-flight kills the same way). Lethality is decided HERE from fresh health, never at launch.
 #[reducer]
 pub fn ranged_impact(ctx: &ReducerContext, shot: RangedImpactSchedule) {
     if ctx.sender() != ctx.database_identity() {
@@ -899,7 +611,7 @@ pub fn ranged_impact(ctx: &ReducerContext, shot: RangedImpactSchedule) {
     }
     let entities = ctx.db.game_world_entity();
     let Some(attacker) = entities.guid().find(shot.attacker_guid) else {
-        return; // the shooter left the world mid-flight
+        return;
     };
     let Some(target) = entities.guid().find(shot.target_guid) else {
         return;
@@ -908,14 +620,11 @@ pub fn ranged_impact(ctx: &ReducerContext, shot: RangedImpactSchedule) {
         return;
     }
     if !crate::combat::may_harm(ctx, &attacker, &target) {
-        return; // Duel or faction authorization changed while the projectile was in flight
+        return;
     }
 
     let dmg = if target.godmode { 0 } else { shot.damage };
     let damage = final_damage(ctx, shot.target_guid, dmg);
-    // The SHARED pipeline — the same one the main-hand and off-hand swings route through, so a
-    // shot can never again drift from a swing (a godmode-zeroed hit is now a full no-op here too,
-    // instead of running the survivor path with a 0 damage value).
     let outcome = apply_hit(
         ctx,
         shot.attacker_guid,

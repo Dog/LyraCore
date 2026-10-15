@@ -2,13 +2,10 @@ mod support;
 
 use support::Standalone;
 
-/// The seeded Character.
 const PAYER: u64 = 1;
-/// Scenario vendor 51004, spawned at the payer's feet and made a Tabard Designer.
 const VENDOR_ENTRY: &str = "51004";
 const TABARDDESIGNER: u32 = 0x400;
 
-/// A tokenless actor: Realm-core holds no Account Claim for the seeded Character.
 fn actor(guid: u64) -> String {
     format!(r#"{{"guid":{guid},"ownership":null}}"#)
 }
@@ -46,7 +43,6 @@ fn holds(shard: &Standalone) -> usize {
     shard.query_rows("SELECT * FROM game_guild_fee_hold").len()
 }
 
-/// The payer in the world with 15 gold, standing at a vendor. Answers the vendor's guid.
 fn fixture(name: &str) -> (Standalone, String) {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -72,8 +68,6 @@ fn make_tabard_designer(shard: &Standalone, vendor: &str) {
     ));
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
-/// One database plays both the Home Shard and Realm-core.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn the_guild_leader_pays_ten_gold_and_every_refusal_returns_the_copper() {
@@ -90,7 +84,6 @@ fn the_guild_leader_pays_ten_gold_and_every_refusal_returns_the_copper() {
     assert_eq!((purse(&shard), holds(&shard)), (150_000, 0));
     make_tabard_designer(&shard, &vendor);
 
-    // Outside any Guild: the fee is held, Realm-core refuses, the finish refunds it once.
     shard.assert_call("gw_guild_fee_hold", &["5090401", &payer, &request]);
     shard.assert_call("gw_guild_fee_hold", &["5090401", &payer, &request]);
     assert_eq!((purse(&shard), holds(&shard)), (50_000, 1));
@@ -118,7 +111,6 @@ fn the_guild_leader_pays_ten_gold_and_every_refusal_returns_the_copper() {
     shard.assert_call("gw_guild_fee_finish", &["5090401", &payer, "false"]);
     assert_eq!((purse(&shard), holds(&shard)), (150_000, 0));
 
-    // The Guild Leader: the fee is spent and the Guild wears the emblem.
     let founding = format!(
         r#"{{"gmCreate":{{"leader_guid":{PAYER},"leader_name":"Tester","leader_team":469,"leader_realm_account":0,"gm_level":1,"name":"Tabard Guild"}}}}"#
     );
@@ -157,7 +149,6 @@ fn the_guild_leader_pays_ten_gold_and_every_refusal_returns_the_copper() {
     assert_eq!((purse(&shard), holds(&shard)), (50_000, 0));
 }
 
-/// A Hold crosses a Shard Boundary with its Character and is refunded on the new Home Shard.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_fee_hold_travels_with_its_character_and_finishes_on_the_new_home_shard() {
@@ -191,7 +182,6 @@ fn a_fee_hold_travels_with_its_character_and_finishes_on_the_new_home_shard() {
     assert_eq!(arrived[0]["operation_id"], "5090411");
     assert_eq!(arrived[0]["copper"], "100000");
 
-    // The source plays Realm-core: the payer is in no Guild, so the decision refuses.
     source.assert_call("realm_guild_fee_decide", &["5090411", &payer, EMBLEM_TERMS]);
     destination.assert_call("debug_spawn_player_entity", &[&PAYER.to_string()]);
     destination.assert_call("gw_guild_fee_finish", &["5090411", &payer, "false"]);

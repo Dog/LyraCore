@@ -1,11 +1,3 @@
-//! `--dump-collision <client Data/ dir>`, SPIKE: prove we can read WMO/M2
-//! collision geometry out of the operator's own client MPQs before building the nav rasterizer.
-//! Same licensing firewall as `--dbc`/`--terrain`: in-memory read, nothing written.
-//!
-//! Reads the ONE root ADT tile containing `--center`, lists its WMO (MODF) and doodad (MDDF)
-//! placements, then opens every referenced WMO root+group file and M2 model and reports
-//! triangle counts. Dry-run ONLY — no tables, no schema, no `--apply`.
-
 use anyhow::{bail, Context, Result};
 use lyracore_shared::terrain::cell_index;
 use std::collections::BTreeMap;
@@ -13,8 +5,6 @@ use std::io::Cursor;
 use std::path::Path;
 use wow_mpq::PatchChain;
 
-/// Model/WMO/terrain archives in client load order. Wider than the terrain chain: geometry
-/// lives in model.MPQ (M2) and wmo.MPQ; base.MPQ catches strays; patches override everything.
 pub(crate) fn open_geometry_chain(data_dir: &Path) -> Result<PatchChain> {
     let mut chain = PatchChain::new();
     let mut found = 0u32;
@@ -44,8 +34,7 @@ pub(crate) fn open_geometry_chain(data_dir: &Path) -> Result<PatchChain> {
     Ok(chain)
 }
 
-/// MMDX/MWMO name blob order → byte offset of each name (names are nul-terminated back to
-/// back; MMID/MWID store OFFSETS, placements index the offset list).
+// Names are NUL-separated; MMID and MWID store byte offsets, while placements index that list.
 fn offset_to_index(names: &[String]) -> BTreeMap<u32, usize> {
     let mut map = BTreeMap::new();
     let mut off = 0u32;
@@ -111,7 +100,7 @@ fn without_truncated_vertex_colors(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
                     .and_then(|start| start.checked_add(size))
                     .context("WMO nested chunk size overflow")?;
                 if nested_end > bytes.len() {
-                    // Only a terminal rendering chunk may be omitted. Geometry stays byte-for-byte.
+                    // Only a terminal rendering chunk may be omitted; preserve all geometry bytes.
                     if &header[..4] != b"VCOM" || !size.is_multiple_of(4) || nested_end != end {
                         return Ok(None);
                     }
@@ -135,12 +124,11 @@ fn without_truncated_vertex_colors(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
-/// A WMO's collision-relevant totals across all its group files.
 struct WmoStats {
     groups: u32,
     tris: usize,
-    collision_only_tris: usize, // MOPY material_id == 0xFF (invisible collision geometry)
-    detail_tris: usize,         // MOPY flag 0x04 (vmap extractors treat these specially)
+    collision_only_tris: usize, // MOPY material_id 0xFF marks invisible collision geometry.
+    detail_tris: usize,         // MOPY flag 0x04 marks detail triangles.
 }
 
 fn read_wmo(chain: &mut PatchChain, name: &str) -> Result<WmoStats> {
@@ -179,8 +167,7 @@ fn read_wmo(chain: &mut PatchChain, name: &str) -> Result<WmoStats> {
     Ok(stats)
 }
 
-/// M2 bounding (collision) mesh triangle count. Vanilla MMDX names end `.mdx`/`.mdl` but the
-/// archives store `.m2` — swap the extension.
+// Vanilla names use .mdx or .mdl, but the archives store .m2.
 fn read_m2_bounding_tris(chain: &mut PatchChain, name: &str) -> Result<u32> {
     Ok(crate::nav::m2_tris(chain, name)?.len() as u32)
 }
@@ -190,14 +177,12 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
     let mut chain = open_geometry_chain(data_dir)?;
     let map_name = crate::terrain::map_dir(args.map as u32)?;
 
-    // The one tile containing --center (16 cells per tile; same math as terrain.rs).
     let (cx, cy) = (args.center.0 as f32, args.center.1 as f32);
     let (Some(cell_x), Some(cell_y)) = (cell_index(cx), cell_index(cy)) else {
         bail!("--center ({cx},{cy}) outside the map square");
     };
     let (tx, ty) = (cell_x as i32 / 16, cell_y as i32 / 16);
 
-    // Same content-arbitrated candidate trick as terrain.rs (filename axis order is folkloric).
     let candidates = [
         format!("World\\Maps\\{map_name}\\{map_name}_{ty}_{tx}.adt"),
         format!("World\\Maps\\{map_name}\\{map_name}_{tx}_{ty}.adt"),
@@ -227,7 +212,6 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
         root.doodad_placements.len()
     );
 
-    // --- WMOs (MODF) ---
     let wmo_offsets = offset_to_index(&root.wmos);
     let mut wmo_total_tris = 0usize;
     let mut seen: BTreeMap<String, WmoStats> = BTreeMap::new();
@@ -252,10 +236,9 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
         wmo_total_tris += s.tris;
     }
 
-    // --- M2 doodads (MDDF) ---
     let m2_offsets = offset_to_index(&root.models);
     let mut m2_total_tris = 0u32;
-    let mut m2_seen: BTreeMap<String, Option<u32>> = BTreeMap::new(); // None = parse failed
+    let mut m2_seen: BTreeMap<String, Option<u32>> = BTreeMap::new();
     let mut m2_zero = 0u32;
     for p in &root.doodad_placements {
         let name =
@@ -268,7 +251,6 @@ pub(crate) fn run(args: &crate::Args) -> Result<()> {
             Some(t) => m2_total_tris += t,
         }
     }
-    // Doodads are numerous (trees); print unique models, not every placement.
     for (name, tris) in &m2_seen {
         match tris {
             Some(t) => println!("  M2   {name}  bounding_tris={t}"),

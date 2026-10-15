@@ -1,8 +1,3 @@
-//! Client geometry extraction for `--vmap` and `--vmap-prepare-coverage`.
-//! Tile scans reuse nav mesh loading and placement calibration. Collision triangles use full
-//! rotation and the shared per-cell codec. `--apply` sends bounded batches to the import reducers.
-//! Client bytes stay in memory.
-
 use anyhow::{bail, Context, Result};
 use lyracore_shared::terrain::cell_key;
 use lyracore_shared::vmap::{encode, TriClass, VmapTri, HEADER_BYTES, TRI_BYTES};
@@ -15,20 +10,7 @@ use wow_mpq::PatchChain;
 
 use crate::nav::{Mesh, Placement, Tri};
 
-/// Full local→world rotation, unlike `nav::apply`'s yaw-only shortcut (the rasterizer's documented
-/// simplification — thin walls with real pitch/roll rasterize slightly wrong but the walkability
-/// grid tolerates it; an exact triangle store must not).
-///
-/// Axis order confirmed against the reference VMAP extractor convention (TrinityCore
-/// `model.cpp::ExtractSet`): `Matrix3::fromEulerAnglesZYX(Rotation.y, Rotation.x, Rotation.z)`,
-/// i.e. world rotation = Rz(yaw) · Ry(pitch) · Rx(roll) applied to the local vertex, where
-/// yaw = `rotation[1]`, pitch = `rotation[0]`, roll = `rotation[2]` — matching `nav.rs`'s existing
-/// yaw-only convention (which already uses `rotation[1]` as the calibrated Z-axis term). Only the
-/// yaw term is empirically calibrated against MODF bounds (`nav::calibrate`); pitch/roll compose in
-/// the same local frame before that calibrated yaw+translate. Reasonable synthesis of a documented
-/// convention, not verified against a live tilted placement — flag for a measured follow-up if one
-/// turns up wrong (same "deliberate simplification, revisit when a live case demands it" posture
-/// `nav.rs` uses elsewhere).
+// Apply local roll, local pitch, then calibrated world yaw.
 pub(crate) fn apply_full(
     conv: crate::nav::Convention,
     rotation: [f32; 3],
@@ -43,13 +25,10 @@ pub(crate) fn apply_full(
     };
     let mut p = [l[0] * scale, l[1] * scale, l[2] * scale];
 
-    // Roll about local X (rotation[2]).
     let (rs, rc) = rotation[2].to_radians().sin_cos();
     p = [p[0], rc * p[1] - rs * p[2], rs * p[1] + rc * p[2]];
-    // Pitch about local Y (rotation[0]).
     let (ps, pc) = rotation[0].to_radians().sin_cos();
     p = [pc * p[0] + ps * p[2], p[1], -ps * p[0] + pc * p[2]];
-    // Calibrated yaw about world Z (rotation[1], same sign/offset nav.rs's rasterizer uses).
     let theta = (conv.sign * rotation[1] + conv.offset_deg).to_radians();
     let (ys, yc) = theta.sin_cos();
     [
@@ -128,8 +107,6 @@ fn for_each_placement_tri(
     }
 }
 
-/// A world-space triangle's cell-index rectangle (high coord → LOW cell index, same convention as
-/// `terrain::cell_index`/`nav.rs`'s binning). None when the triangle falls off the map square.
 fn tri_cell_range(t: &VmapTri) -> Option<(u16, u16, u16, u16)> {
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for v in &t.verts {
@@ -149,14 +126,12 @@ fn tri_cell_range(t: &VmapTri) -> Option<(u16, u16, u16, u16)> {
     Some((cx0, cx1, cy0, cy1))
 }
 
-/// Bin triangles by the terrain cell key; a triangle spanning a cell boundary lands in EVERY cell
-/// its AABB touches (conservative — matches the nav rasterizer's binning direction).
 #[cfg(test)]
 pub(crate) fn bin_by_cell(map_id: u32, tris: &[VmapTri]) -> HashMap<u64, Vec<VmapTri>> {
     let mut by_cell: HashMap<u64, Vec<VmapTri>> = HashMap::new();
     for t in tris {
         let Some((cx0, cx1, cy0, cy1)) = tri_cell_range(t) else {
-            continue; // off the map square (shouldn't happen inside the box)
+            continue;
         };
         for cx in cx0..=cx1 {
             for cy in cy0..=cy1 {
@@ -172,8 +147,6 @@ pub(crate) fn bin_by_cell(map_id: u32, tris: &[VmapTri]) -> HashMap<u64, Vec<Vma
 
 const SPOOL_RECORD_BYTES: usize = 45;
 
-/// Disk-backed cell spool. Only one transformed triangle and one output shard need be resident;
-/// filesystem ordering is never used as part of the manifest contract.
 struct VmapSpool {
     dir: PathBuf,
 }
@@ -297,8 +270,6 @@ fn sql_has_map(sql_output: &str, map_id: u32) -> Result<bool> {
         .any(|row| row[0].as_u64() == Some(map_id as u64)))
 }
 
-/// SpacetimeDB JSON SQL returns a result set as `schema.elements` plus array rows, not JSON
-/// objects. Match columns by schema name so a query cannot mistake row-count text for ownership.
 fn sql_column_rows<'a>(
     value: &'a serde_json::Value,
     columns: &[&str],
@@ -408,8 +379,6 @@ fn active_generation_status(args: &crate::Args, map_id: u32) -> Result<()> {
     Ok(())
 }
 
-/// A vmap generation follows already-owned spatial data. Fail before opening client archives when
-/// this database cannot authoritatively serve the requested map.
 fn preflight_map_ownership(args: &crate::Args, map_id: u32) -> Result<()> {
     let query = |table: &str| -> Result<String> {
         sql_query(args, &format!("SELECT map_id FROM {table}"))
@@ -1124,8 +1093,6 @@ fn point_in_sphere(point: [f32; 3], center: [f32; 3], radius: f32) -> bool {
 }
 
 const ROUTE_FLOOR_EPSILON_YD: f32 = 0.01;
-/// Static support sampling interval. It finds narrow holes without claiming to reproduce a
-/// Character's committed movement leg, which has caller-specific distance and height behavior.
 const INSTANCE_ROUTE_SAMPLE_YD: f32 = 0.5;
 
 fn instance_route_sample(
@@ -1449,44 +1416,28 @@ fn apply_plan(args: &crate::Args, plan: &VmapPlan) -> Result<()> {
     Ok(())
 }
 
-/// Byte budget per `spacetime call` payload, grouping several shard rows into one call (matches
-/// `nav.rs`'s `BATCH_BYTES`).
 const BATCH_BYTES: usize = 28_000;
 
-/// Keep each hex-encoded row below Linux's ~128 KB argv-string limit.
+// Hex-encoded rows must remain below the Linux argv-string limit of about 128 KB.
 const MAX_ROW_TRI_BYTES: usize = 20_000;
 
-/// Bounds the 45-byte spool records retained by one Instance Vmap Slice to 22.5 MB.
+// The 45-byte spool records occupy at most 22.5 MB per Instance Vmap Slice.
 const MAX_INSTANCE_SELECTED_TRI_REFS: usize = 500_000;
 
-/// Split one cell's triangle list into `lyracore_shared::vmap::encode`d shards, each at most
-/// `MAX_ROW_TRI_BYTES`. Order within a cell doesn't matter (the module concatenates every shard's
-/// decoded triangles back into one list — see `module/src/vmap.rs`'s `fetcher`), so this just
-/// chunks by triangle count.
 #[cfg(test)]
 fn shard_cell(tris: &[VmapTri]) -> Vec<Vec<u8>> {
     let per_shard = ((MAX_ROW_TRI_BYTES.saturating_sub(HEADER_BYTES)) / TRI_BYTES).max(1);
     if tris.is_empty() {
-        return vec![encode(tris)]; // preserve the header-only "cell exists but empty" row
+        return vec![encode(tris)];
     }
     tris.chunks(per_shard).map(encode).collect()
 }
 
-// =============================================================================================
-//  `--vmap-prepare-coverage <generation_id>` — drives `prepare_vmap_nav_coverage` /
-//  `finalize_vmap_nav_coverage` (module/src/vmap.rs) over a generation's OWN staged chunks. No
-//  client Data/ dir: the derivation runs module-side from data already staged by an earlier
-//  `--vmap --apply` run, so this workflow only enumerates cells and drives batches.
-// =============================================================================================
-
-/// The generation's map + lifecycle state, read before any coverage work so an ineligible target
-/// fails closed the same way `preflight_map_ownership` does for `--vmap`.
 struct GenerationInfo {
     map_id: u32,
     state: u64,
 }
 
-/// Lifecycle state codes mirrored from `module/src/vmap.rs` (no shared crate for a bare u8 enum).
 const VERIFIED: u64 = 1;
 const ACTIVE: u64 = 2;
 
@@ -1506,8 +1457,6 @@ fn generation_info(args: &crate::Args, generation_id: u64) -> Result<GenerationI
     Ok(GenerationInfo { map_id, state })
 }
 
-/// Every `(cell_x, cell_y)` the generation's OWN staged chunks touch, deduped across shard rows —
-/// the driving enumeration for coverage preparation (never `game_vmap_chunk`, the live table).
 fn generation_cells(args: &crate::Args, generation_id: u64) -> Result<Vec<(u16, u16)>> {
     let output = sql_query(
         args,
@@ -1526,9 +1475,6 @@ fn generation_cells(args: &crate::Args, generation_id: u64) -> Result<Vec<(u16, 
     Ok(cells.into_iter().collect())
 }
 
-/// Cells this generation already has a `VmapNavCoverage` row for — read directly (the operator
-/// identity that runs this workflow owns the database, same as every other SQL query here; the
-/// table's privacy only hides it from ordinary subscribing clients).
 fn covered_cells(
     args: &crate::Args,
     generation_id: u64,
@@ -1550,9 +1496,6 @@ fn covered_cells(
     Ok(cells)
 }
 
-/// Cells still needing preparation: every generation cell not already covered. Pure so the resume
-/// skip is testable without a live database — mirrors `accepted_chunk_ids`'s already-accepted skip
-/// for the base import above, one level up (whole cells instead of shard rows).
 fn pending_cells(
     all: &[(u16, u16)],
     already_covered: &std::collections::HashSet<(u16, u16)>,
@@ -1563,10 +1506,6 @@ fn pending_cells(
         .collect()
 }
 
-/// Split `cells` into JSON-array `prepare_vmap_nav_coverage` arguments, each bounded by
-/// `BATCH_BYTES` like every other reducer batch in this file. Batch boundaries are an efficiency
-/// detail only — the reducer is idempotent per cell, so splitting differently reproduces the same
-/// final coverage set and manifest digest (deterministic coverage identity).
 fn coverage_batches(cells: &[(u16, u16)]) -> Vec<String> {
     let mut batches = Vec::new();
     let mut cur = String::from("[");
@@ -1588,10 +1527,6 @@ fn coverage_batches(cells: &[(u16, u16)]) -> Vec<String> {
     batches
 }
 
-/// `--vmap-prepare-coverage <generation_id>`: derive and store nav coverage for an already-staged
-/// generation, resumable and manifest-reporting. Reuses `preflight_map_ownership` fail-closed, so
-/// coverage never prepares on a World Shard that does not own the map and, like `--vmap`, only writes
-/// with `--apply`; without it this reports the plan and touches nothing.
 pub(crate) fn run_coverage(args: &crate::Args, generation_id: u64) -> Result<()> {
     let generation = generation_info(args, generation_id)?;
     preflight_map_ownership(args, generation.map_id)?;
@@ -1651,8 +1586,6 @@ mod tests {
 
     const MAP: u32 = 0;
 
-    /// World-coord bounds of terrain cell (cx, cy): (x_hi, x_lo, y_hi, y_lo) — cell indices count
-    /// DOWN as world coords grow, same convention as `terrain::cell_index`.
     fn cell_bounds(cx: u16, cy: u16) -> (f32, f32, f32, f32) {
         let x_hi = MAP_COORD_MAX - cx as f32 * CELL_SIZE;
         let x_lo = x_hi - CELL_SIZE;
@@ -1668,10 +1601,6 @@ mod tests {
         }
     }
 
-    /// Identity convention (no axis shuffle, yaw = rotation[1] verbatim) — isolates the
-    /// pitch/roll math in `apply_full` from the calibrated-convention machinery so the assertions
-    /// below are hand-computable straight from the doc comment's `Rz(yaw)*Ry(pitch)*Rx(roll)`
-    /// formula.
     fn identity_convention() -> crate::nav::Convention {
         crate::nav::Convention {
             shuffle: false,
@@ -1682,8 +1611,6 @@ mod tests {
 
     #[test]
     fn roll_of_90_degrees_rotates_local_y_onto_world_z() {
-        // rotation = [pitch=0, yaw=0, roll=90]. Rx(90) sends the local Y axis to local/world Z
-        // (roll is applied about local X first, before pitch/yaw, both of which are identity here).
         let out = apply_full(
             identity_convention(),
             [0.0, 0.0, 90.0],
@@ -1698,8 +1625,6 @@ mod tests {
 
     #[test]
     fn pitch_of_90_degrees_rotates_local_x_onto_negative_world_z() {
-        // rotation = [pitch=90, yaw=0, roll=0]. Ry(90) sends the local X axis to −Z (roll and yaw
-        // are identity here, so this isolates the pitch term).
         let out = apply_full(
             identity_convention(),
             [90.0, 0.0, 0.0],
@@ -1714,13 +1639,6 @@ mod tests {
 
     #[test]
     fn roll_then_pitch_composition_order_is_roll_first() {
-        // rotation = [pitch=90, yaw=0, roll=90], v = local Y. Isolated-axis tests above can't catch
-        // an axis-order swap (both leave a lone X or lone Y vector on a single output axis either
-        // way); this vector has zero X/Z components, so the two orders diverge. Roll-then-pitch
-        // (the order `apply_full` applies): Rx(90) sends local Y (0,1,0) to local Z (0,0,1), then
-        // Ry(90) sends local Z (0,0,1) to world X (1,0,0). Pitch-then-roll would instead leave the
-        // vector at local Y all the way through pitch (Ry(90) doesn't touch a pure-Y vector), then
-        // Rx(90) would send it to (0,0,1) — a different result, so this test pins the order.
         let out = apply_full(
             identity_convention(),
             [90.0, 0.0, 90.0],
@@ -1747,10 +1665,8 @@ mod tests {
 
     #[test]
     fn a_triangle_spanning_a_cell_boundary_lands_in_every_cell_it_touches() {
-        // Straddle the x boundary between cell 500 and 501 (a wide-enough triangle on the x axis,
-        // centered exactly on the boundary), fully inside one cell on the y axis.
         let (x_hi_500, _x_lo_500, y_hi, y_lo) = cell_bounds(500, 500);
-        let boundary_x = x_hi_500; // the coordinate separating cell 500 from cell 501
+        let boundary_x = x_hi_500;
         let cy = (y_hi + y_lo) / 2.0;
         let t = tri_at(boundary_x, cy, 100.0, CELL_SIZE * 0.4, TriClass::M2);
         let by_cell = bin_by_cell(MAP, &[t]);
@@ -1786,8 +1702,6 @@ mod tests {
         assert!(back.contains(&m2));
     }
 
-    /// A cell whose triangle count fits comfortably under `MAX_ROW_TRI_BYTES` shards to exactly
-    /// ONE blob — the common case shouldn't multiply row count for no reason.
     #[test]
     fn a_small_cell_shards_to_exactly_one_blob() {
         let tris: Vec<VmapTri> = (0..5)
@@ -1799,11 +1713,10 @@ mod tests {
         assert_eq!(back.len(), 5);
     }
 
-    /// Dense cells split into byte-capped shards whose decoded union preserves every triangle.
     #[test]
     fn a_dense_cell_splits_into_byte_capped_shards_that_reassemble_exactly() {
         let per_shard = (MAX_ROW_TRI_BYTES - HEADER_BYTES) / TRI_BYTES;
-        let n = per_shard * 3 + 7; // spans multiple shards, last one partial
+        let n = per_shard * 3 + 7;
         let tris: Vec<VmapTri> = (0..n)
             .map(|i| tri_at(0.0, 0.0, i as f32, 1.0, TriClass::M2))
             .collect();
@@ -1825,9 +1738,6 @@ mod tests {
             .flat_map(|b| lyracore_shared::vmap::decode(b).expect("shard round trip"))
             .collect();
         let mut expected = tris.clone();
-        // Order isn't part of the contract (the module concatenates shards in storage order, not
-        // triangle-original order) — compare as multisets via a stable sort on the z coordinate,
-        // which is unique per triangle in this fixture.
         reassembled.sort_by(|a, b| a.verts[0][2].partial_cmp(&b.verts[0][2]).unwrap());
         expected.sort_by(|a, b| a.verts[0][2].partial_cmp(&b.verts[0][2]).unwrap());
         assert_eq!(reassembled, expected);
@@ -1837,8 +1747,6 @@ mod tests {
     fn disk_spool_orders_cells_and_bounds_live_shard_memory() {
         let spool = VmapSpool::new(77).unwrap();
         let per_shard = (MAX_ROW_TRI_BYTES - HEADER_BYTES) / TRI_BYTES;
-        // Insert deliberately reverse key order; output must be keyed order, independent of
-        // filesystem enumeration. Each cell is read one shard at a time, not as the full slice.
         for key in [9u64, 3] {
             for i in 0..(per_shard * 2 + 1) {
                 spool
@@ -2163,9 +2071,6 @@ mod tests {
         );
     }
 
-    /// A fixture too large for one `BATCH_BYTES` call must split into several, and the split must
-    /// be lossless and order-independent — batch boundaries are an efficiency detail, not part of
-    /// coverage identity (the reducer keys each cell independently).
     #[test]
     fn coverage_batches_split_a_fixture_larger_than_one_batch_and_reassemble_exactly() {
         let cells: Vec<(u16, u16)> = (0..2000u32)

@@ -9,6 +9,9 @@ metadata:
 
 Before filing, check whether a PR for this branch already exists. Review the diff locally against `origin/main` to make sure its contents match the goal.
 
+Complete the [comment review](../../../CODING_STANDARDS.md#comment-review) on that final diff and
+include its scope and result under verification in the PR description.
+
 PR titles usually become commit messages, so follow the repository's title conventions. Look at recently merged PRs and Git history for examples. Prefer a concise, human-readable title that explains why the change matters:
 
 BAD

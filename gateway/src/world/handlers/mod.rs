@@ -1,5 +1,3 @@
-//! Protocol Family handlers, their Stores, and shared protocol operations.
-
 use super::*;
 
 mod auction;
@@ -90,8 +88,6 @@ pub(crate) use vendor::tests::InMemoryVendorActions;
 pub(crate) use vendor::{Vendor, VendorActionStore};
 pub(crate) use weather::{zone_weather_message, WeatherStore};
 
-/// Open the bank window for `banker_guid`. Single chokepoint for `CMSG_BANKER_ACTIVATE` and the
-/// BANKER gossip option, so the two entry points cannot drift apart.
 fn show_bank(banker_guid: u64) -> Outbound {
     Outbound::One(ServerOpcodeMessage::SMSG_SHOW_BANK(codec::build_show_bank(
         banker_guid,

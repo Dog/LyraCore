@@ -107,13 +107,45 @@ Use this order when two good practices compete:
 
 ## Comments and documentation
 
-- Comments explain why a constraint exists, what an interface promises, or which non-obvious protocol
-  fact controls the code. Let names and types explain ordinary mechanics.
-- Keep interface comments concise but complete about invariants, ordering, failure modes, and important
-  performance characteristics.
-- Do not put issue numbers in code comments. Record durable reasoning in the comment or an ADR so it
-  remains understandable without tracker history.
-- Update or remove nearby comments and docs when behavior changes. Stale explanation is a defect.
+- Write code without explanatory comments by default. Let names, types and tests carry ordinary
+  mechanics. This applies to source, tests, scripts, configuration and documentation comments such
+  as Rust's `///` and `//!`.
+- Keep concise interface contracts where names and types leave caller obligations, return values or
+  failure behavior unclear. Keep non-obvious local technical facts: opcodes, packet layouts, regexes,
+  units, constants, compatibility quirks, and safety, atomicity or ordering constraints.
+- Use one short line within the normal line width. Put longer contracts and reasoning in the relevant
+  document and leave a short pointer beside the interface. A pointer names the document and when to
+  read it. Preserve these pointers when removing nearby explanation; do not flatten an essay onto one
+  line or split it into adjacent one-line comments.
+- Preserve comments that tools consume, including script metadata, lint directives and editor type
+  annotations. Preserve interpreter directives, required attribution and generated-file notices.
+  These follow the format their consumer requires, including multiple lines when necessary.
+- Remove narration, section dividers, commented-out code, tracker history and descriptions that repeat
+  the adjacent code. Record work still needed in the tracker.
+- Keep durable design reasoning that needs more than one line in the relevant existing document or
+  an ADR. Check it against the code before moving it; deletion is appropriate for stale or redundant
+  explanation. Standalone documentation remains part of the project.
+- Change generated comments through their generator when we own it. Leave third-party generated
+  output alone. Comment-like text in strings and test fixtures is data; preserve its meaning.
+- Update or remove a retained comment when behavior changes. Review exceptions for their technical
+  content, not merely their length. Apply this policy equally to human and agent contributions.
+
+### Comment review
+
+Before handing off changes or completing a review:
+
+- Inspect the final diff with surrounding code, including new files. Review added and changed comments
+  and retained comments whose code changed in source, tests, scripts and configuration.
+- Match each reviewed comment to a policy exception and check its claim against the implementation.
+  Check that documentation pointers resolve. Remove narration even when it fits on one line.
+- Check removed comments for lost contracts, safety constraints, tool annotations and documentation
+  pointers. Preserve required meaning in code, a permitted comment or a linked document.
+- Repeat the review for subsequent edits. In the handoff, state the scope checked and whether it
+  passed, has findings with file locations, or does not apply because no source, tests, scripts or
+  configuration changed. Cite retained or relocated contracts when they need reviewer judgment.
+
+Formatting and tests do not establish that a comment is necessary or true; report this review
+separately from those checks.
 
 ## Completion and review
 

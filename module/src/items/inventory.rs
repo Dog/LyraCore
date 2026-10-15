@@ -1,8 +1,3 @@
-//! Move / split / equip / unequip + the slot-space vocabulary and free-slot search (split off
-//! `ops.rs`, pure code-motion, no behavior change except the free-slot search's index-scan count — see
-//! `first_free_backpack_slot`/`first_free_bag_slot`). Each `apply_*` is the shared core behind a thin
-//! player reducer and its debug twin (see `reducers.rs`).
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_shared::constants::starter_item;
@@ -32,7 +27,6 @@ fn bag_has_contents(ctx: &ReducerContext, character_guid: u64, slot: u8) -> bool
         .any(|item| (start..start + MAX_BAG_SIZE).contains(&item.slot))
 }
 
-/// Destroy only the addressed owned stack. Zero means the whole stack.
 pub(crate) fn apply_item_destroy(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -76,8 +70,6 @@ pub(crate) fn apply_item_destroy(
     Ok(())
 }
 
-/// Split a proper subset into empty storage, preserving ownership and binding state.
-/// Equipment and bag equipment slots cannot receive a split stack.
 pub(crate) fn apply_item_split(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -85,7 +77,6 @@ pub(crate) fn apply_item_split(
     count: u32,
     to_slot: u8,
 ) -> Result<(), ItemRefusal> {
-    // The bank is a place, not a portable bag: either endpoint in bank space needs an open bank.
     if is_bank_slot(slot) || is_bank_slot(to_slot) {
         bank_access(ctx, player_guid)?;
     }
@@ -95,8 +86,6 @@ pub(crate) fn apply_item_split(
     if crate::trade::item_is_offered(ctx, player_guid, inst.guid) {
         return Err(ItemRefusal::NotRightNow);
     }
-    // A split must leave at least one unit in BOTH slots — splitting off none or the whole stack isn't
-    // a split (the latter is a move).
     if !valid_split_count(count, inst.stack_count) {
         return Err(refuse(ItemRefusal::WrongSlot, "invalid split count"));
     }
@@ -106,10 +95,7 @@ pub(crate) fn apply_item_split(
             format!("invalid destination slot {to_slot}"),
         ));
     }
-    // Bag-content destination: validate that the corresponding bag is equipped and the slot is
-    // within its capacity — same phantom-slot dupe vector as apply_item_move.
     validate_bag_dest_slot(ctx, player_guid, to_slot)?;
-    // The destination slot must be free; we never merge/swap on a split.
     if slot_occupied(ctx, player_guid, to_slot) {
         return Err(refuse(ItemRefusal::WrongSlot, "destination slot occupied"));
     }
@@ -119,8 +105,8 @@ pub(crate) fn apply_item_split(
     let owner_identity = inst.owner_identity;
     let durability = inst.durability;
     let random_property_id = inst.random_property_id;
-    let soulbound = inst.soulbound; // the split half carries the SAME binding state as its source stack
-    let item_text_id = inst.item_text_id; // ditto — a split half stays as readable as its source
+    let soulbound = inst.soulbound;
+    let item_text_id = inst.item_text_id;
     instances.guid().update(inst);
     instances.insert(ItemInstance {
         guid: new_guid,
@@ -131,7 +117,7 @@ pub(crate) fn apply_item_split(
         stack_count: count,
         durability,
         created_at: ctx.timestamp,
-        enchant_id: 0, // a split is only ever on a stackable (non-equippable) item → never enchanted
+        enchant_id: 0,
         soulbound,
         random_property_id,
         item_text_id,
@@ -139,8 +125,6 @@ pub(crate) fn apply_item_split(
     Ok(())
 }
 
-/// Move, swap or merge two owned stacks after both destinations pass their Gates.
-/// Nonempty equipped bags stay in place until contents can follow a bag-slot change.
 pub(crate) fn apply_item_move(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -150,7 +134,6 @@ pub(crate) fn apply_item_move(
     if from_slot == to_slot {
         return Ok(());
     }
-    // Bank access applies to either endpoint.
     if is_bank_slot(from_slot) || is_bank_slot(to_slot) {
         bank_access(ctx, player_guid)?;
     }
@@ -334,14 +317,6 @@ pub(crate) fn apply_item_move(
     Ok(())
 }
 
-/// Shared EQUIP logic for the player + debug paths: take the item in backpack/inventory `from_slot` and
-/// equip it into the correct `EQUIPMENT_SLOT_*` for its `inventory_type` (auto-resolved, including the
-/// first-free of a finger/trinket pair). Rejects an item whose type isn't equippable (`inventory_type`
-/// has no slot — e.g. food/junk). Delegates the actual placement/swap (and the required-level gate) to
-/// the shared `apply_item_move`, so equipping is exactly "a move into the resolved equip slot": an empty
-/// target just receives the item; an occupied target SWAPS its resident back into `from_slot`. Additive
-/// — touches only the item rows' `slot` (no new fields). Errors if `from_slot` is empty, the template is
-/// missing, or the item isn't equippable. [entity]
 pub(crate) fn apply_equip_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -364,22 +339,16 @@ pub(crate) fn apply_equip_item(
                 format!("no template for item entry {}", src.entry),
             )
         })?;
-    // Bags (INVTYPE_BAG) equip into bag-equip slots 19..=22, not the equipment region 0..=18.
-    // Route them separately: find the first free bag-equip slot and move the bag there. A bag
-    // already in the bag slots (dragged manually) won't come through here, but autoequip does.
     if tmpl.inventory_type == invtype::BAG {
         let to_slot = first_free_bag_equip_slot(ctx, player_guid)
             .ok_or_else(|| refuse(ItemRefusal::InventoryFull, "all four bag slots are full"))?;
         return apply_item_move(ctx, player_guid, from_slot, to_slot);
     }
-    // Dual Wield: redirect a second one-hander to OFFHAND (instead of swapping MAINHAND) when the
-    // caster has learned spell 674 — see `resolve_equip_slot`'s doc comment.
     let can_dual_wield = crate::spell::knows_spell(
         ctx,
         player_guid,
         lyracore_shared::constants::dual_wield::SPELL_ID,
     );
-    // Snapshot which equip slots are occupied so the pair-resolver can prefer a free finger/trinket.
     let to_slot = resolve_equip_slot(tmpl.inventory_type, can_dual_wield, |s| {
         slot_occupied(ctx, player_guid, s)
     })
@@ -389,13 +358,9 @@ pub(crate) fn apply_equip_item(
             format!("item {} is not equippable", src.entry),
         )
     })?;
-    // Equip == a validated move into the resolved equip slot (reuses the equip-validation + swap there).
     apply_item_move(ctx, player_guid, from_slot, to_slot)
 }
 
-/// Equip a profile item only when its destination is empty or holds lower item-level gear. The
-/// existing equip operation still owns every slot, level, proficiency, skill, reputation, and bind
-/// Gate. Full bag slots and missing equipped templates preserve what the Character already wears.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn apply_equip_profile_upgrade(
     ctx: &ReducerContext,
@@ -461,10 +426,6 @@ pub(crate) fn apply_equip_profile_upgrade(
     Ok(true)
 }
 
-/// Shared UNEQUIP logic for the player + debug paths: take the item in equipment `from_slot` (0..=18)
-/// and move it to the first free backpack slot. Rejects a non-equipment source slot (it's not equipped)
-/// or a full backpack. Delegates to `apply_item_move` so the placement is the exact same move primitive;
-/// the destination is a backpack slot, so the equip-validation branch there is a no-op for it. Additive.
 pub(crate) fn apply_unequip_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -476,7 +437,6 @@ pub(crate) fn apply_unequip_item(
             format!("slot {from_slot} is not an equipment slot"),
         ));
     }
-    // Must actually hold an equipped item to unequip.
     if !slot_occupied(ctx, player_guid, from_slot) {
         return Err(refuse(
             ItemRefusal::ItemNotFound,
@@ -488,82 +448,43 @@ pub(crate) fn apply_unequip_item(
     apply_item_move(ctx, player_guid, from_slot, free)
 }
 
-/// The loose-inventory ("backpack") slot range in this minimal model: 16 slots, 23..=38, mirroring
-/// `starter_item::BACKPACK_SLOT_0` (23). Equip slots (0..=18) and bag-container slots aren't loose
-/// storage, so auto-store only ever lands an item in the backpack. Expressed as an exclusive 23..39.
-const BACKPACK_SLOT_END: u8 = starter_item::BACKPACK_SLOT_0 + 16; // 39
+const BACKPACK_SLOT_END: u8 = starter_item::BACKPACK_SLOT_0 + 16;
 
-/// First of the four bag-equip slots (the bags themselves live here; NOT their contents).
 const BAG_SLOT_START: u8 = 19;
-/// Last bag-equip slot (inclusive). Vanilla has four: 19..=22.
 const BAG_SLOT_END_INCL: u8 = 22;
-/// Number of bag-equip slots.
 const BAG_SLOT_COUNT: u8 = 4;
-/// Base of the flat bag-content slot space. All values from here to `BAG_CONTENT_END - 1` are
-/// used exclusively for items stored INSIDE equipped bags. The range starts above the largest
-/// vanilla `ItemSlot` ordinal (Keyring32 = 112), so `ItemSlot::try_from(slot)` returns `Err`
-/// for bag-content slots — the gateway correctly sends no `PLAYER_FIELD_INV_SLOT` pointer for
-/// them (items in bags are tracked via the container object, not the player descriptor).
+// Keep bag-content slots above vanilla ItemSlot ordinals, whose last value is 112.
 const BAG_CONTENT_OFFSET: u8 = 120;
-/// Maximum container slots any bag can hold — vanilla's largest (Portable Hole) is 18 slots.
-/// Each bag-equip position (19..=22) is assigned this many flat content slots.
+// Each equipped bag reserves 18 flat slots, the vanilla maximum capacity.
 const MAX_BAG_SIZE: u8 = 18;
-/// Exclusive upper bound of the bag-content region: 120 + 4 × 18 = 192. Slots 120..=191.
-const BAG_CONTENT_END: u8 = BAG_CONTENT_OFFSET + BAG_SLOT_COUNT * MAX_BAG_SIZE; // 192
+const BAG_CONTENT_END: u8 = BAG_CONTENT_OFFSET + BAG_SLOT_COUNT * MAX_BAG_SIZE;
 
-/// The anti-dupe destination-slot gate shared by `apply_item_move` and `apply_item_split`: a valid
-/// destination is the flat equip+bag-equip+backpack range (0..=38), the base bank range (39..=62), or
-/// a bag-content slot (120..=191). Anything else (the bank-bag/buyback/keyring ordinals 63..=119 we
-/// don't model, or 192..255) is an inventory-overflow dupe vector from a modified client and is
-/// rejected. Extracted (pure code-motion, deduplicating the two identical inline expressions) so the
-/// slot-range boundaries are unit-tested without a live module.
 pub(crate) fn valid_dest_slot(to_slot: u8) -> bool {
-    to_slot < BACKPACK_SLOT_END // 0..=38 (equip + bag-equip + backpack)
-        || is_bank_slot(to_slot) // 39..=62 (the 24 base bank slots)
-        || (BAG_CONTENT_OFFSET..BAG_CONTENT_END).contains(&to_slot) // 120..=191
+    to_slot < BACKPACK_SLOT_END
+        || is_bank_slot(to_slot)
+        || (BAG_CONTENT_OFFSET..BAG_CONTENT_END).contains(&to_slot)
 }
 
-/// First base bank slot (vanilla `ItemSlot::Bank1`).
 const BANK_SLOT_START: u8 = 39;
-/// Last base bank slot (`ItemSlot::Bank24`), 24 slots in total.
 const BANK_SLOT_END_INCL: u8 = 62;
 
-/// Whether a slot is one of the 24 base bank slots. Bank bag slots (63..=68) are NOT bank storage
-/// here — their contents have no slot addresses, so they stay refused everywhere.
+// Bank-bag slots 63..=68 have no content addresses in this model.
 pub(crate) fn is_bank_slot(slot: u8) -> bool {
     (BANK_SLOT_START..=BANK_SLOT_END_INCL).contains(&slot)
 }
 
-/// Whether a slot is CARRIED — equipment, bag-equip, backpack, or bag content — as opposed to merely
-/// owned. Bank slots are owned but not carried: they don't count for collect quests, aren't consumed
-/// on turn-in, aren't fired as ammo, and never receive auto-stored loot. Stated as the carried ranges
-/// rather than "not the bank", so the bank-bag region stays uncarried when it opens.
 pub(crate) use lyracore_shared::item::is_carried_slot;
 
-/// Splits target storage slots only. Equipment requires the move path's Gates.
 pub(crate) fn valid_split_dest_slot(to_slot: u8) -> bool {
     valid_dest_slot(to_slot) && to_slot > BAG_SLOT_END_INCL
 }
 
-/// Decompose a bag-content slot (120..=191) into `(bag_idx, slot_in_bag)`: which of the four equipped
-/// bags (0..=3) and which position within it. Extracted from `apply_item_move` / `apply_item_split`
-/// (pure code-motion, deduplicating the two identical inline expressions) — the caller adds `bag_idx` to
-/// `BAG_SLOT_START` to find the bag's equip slot. Only meaningful for `to_slot >= BAG_CONTENT_OFFSET`
-/// (the caller guards that); this does not itself validate the range.
 pub(crate) fn bag_content_decompose(to_slot: u8) -> (u8, u8) {
     let offset = to_slot - BAG_CONTENT_OFFSET;
     (offset / MAX_BAG_SIZE, offset % MAX_BAG_SIZE)
 }
 
-/// The bag-content CAPACITY gate shared by `apply_item_move` and `apply_item_split`: once
-/// `to_slot` has already passed `valid_dest_slot`/`valid_split_dest_slot`, a bag-content destination
-/// (120..=191) additionally needs the corresponding bag-equip slot to actually hold an equipped bag
-/// whose template covers `slot_in_bag`. A no-op (`Ok(())`) for a non-bag-content destination — the
-/// caller only reaches here after its own range gate already accepted `to_slot`. Anti-dupe: a modified
-/// client can otherwise `CMSG_SPLIT_ITEM`/`CMSG_MOVE_ITEM` straight to slot 120 with no bag equipped in
-/// slot 19, creating an orphaned item row that is invisible and can never be freed by normal play.
-/// Extracted (pure code-motion, deduplicating the two byte-identical inline blocks) — every error
-/// string below is preserved verbatim from both call sites.
+// A valid flat slot still needs an equipped bag with enough capacity.
 pub(crate) fn validate_bag_dest_slot(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -598,22 +519,15 @@ pub(crate) fn validate_bag_dest_slot(
     Ok(())
 }
 
-/// The banker-proximity Gate as an item Refusal: its own prose stays in the Module log.
 fn bank_access(ctx: &ReducerContext, player_guid: u64) -> Result<(), ItemRefusal> {
     super::economy::bank_access_gate(ctx, player_guid)
         .map_err(|detail| refuse(ItemRefusal::BankUnavailable, detail))
 }
 
-/// A split must leave at least one unit in each stack.
 pub(crate) fn valid_split_count(count: u32, stack_count: u32) -> bool {
     count != 0 && count < stack_count
 }
 
-/// First backpack slot (23..39) not occupied by any of the player's items, or `None` if the backpack
-/// is full. Collects the owner's occupied slots into a set ONCE (smalls: was one `by_owner_guid`
-/// index scan PER CANDIDATE slot — up to 16 full scans for a nearly-full backpack) then does a plain
-/// membership check per candidate. Vanilla auto-store fills the first free bag slot.
-/// The occupied-slot set behind the two backpack probes below — one spelling of the scan.
 fn occupied_slots(ctx: &ReducerContext, player_guid: u64) -> std::collections::HashSet<u8> {
     ctx.db
         .game_item_instance()
@@ -623,7 +537,6 @@ fn occupied_slots(ctx: &ReducerContext, player_guid: u64) -> std::collections::H
         .collect()
 }
 
-/// Number of free carry slots across the backpack and all equipped bags.
 pub(crate) fn count_free_inventory_slots(ctx: &ReducerContext, player_guid: u64) -> u32 {
     let owned: Vec<ItemInstance> = ctx
         .db
@@ -641,8 +554,6 @@ pub(crate) fn count_free_inventory_slots(ctx: &ReducerContext, player_guid: u64)
     .len() as u32
 }
 
-/// Free storage slots after the planned item consumption. Empty stacks no longer occupy a slot
-/// or provide bag capacity. Backpack slots precede equipped bags in their normal storage order.
 pub(super) fn free_inventory_slots(
     owned: &[ItemInstance],
     mut bag_capacity: impl FnMut(u32) -> u8,
@@ -678,19 +589,10 @@ pub(crate) fn first_free_backpack_slot(ctx: &ReducerContext, player_guid: u64) -
     (starter_item::BACKPACK_SLOT_0..BACKPACK_SLOT_END).find(|slot| !occupied.contains(slot))
 }
 
-/// First free bag-equip slot (19..=22) not currently holding a bag, or `None` if all four are
-/// occupied. Used by `apply_equip_item` to auto-resolve where to drop a bag. Pure scan.
 fn first_free_bag_equip_slot(ctx: &ReducerContext, player_guid: u64) -> Option<u8> {
     (BAG_SLOT_START..=BAG_SLOT_END_INCL).find(|&slot| !slot_occupied(ctx, player_guid, slot))
 }
 
-/// First free content slot across all equipped bags (19..=22), scanning in bag-equip order (bag 1
-/// first). Returns `None` if every equipped bag is full or no bags are equipped. Used by
-/// `store_item` as the fallback after the 16-slot backpack is exhausted — bags thus act as
-/// overflow storage. A bag equip slot with no item is skipped; a bag whose template is missing
-/// or has `container_slots == 0` (not a real bag) is also skipped. Collects the owner's rows ONCE
-/// (smalls, same fix as `first_free_backpack_slot`) instead of one index scan per candidate
-/// content slot — up to 18 scans per bag before this. [entity]
 pub(crate) fn first_free_bag_slot(ctx: &ReducerContext, player_guid: u64) -> Option<u8> {
     let templates = ctx.db.game_item_template();
     let owned: Vec<ItemInstance> = ctx
@@ -723,9 +625,6 @@ pub(crate) fn first_free_bag_slot(ctx: &ReducerContext, player_guid: u64) -> Opt
     None
 }
 
-/// First bank slot (39..=62) not occupied by any of the player's items, or `None` if the bank is
-/// full. Same one-scan shape as `first_free_backpack_slot` — collect the owner's occupied slots
-/// once, then a plain membership check per candidate.
 pub(crate) fn first_free_bank_slot(ctx: &ReducerContext, player_guid: u64) -> Option<u8> {
     let occupied: std::collections::HashSet<u8> = ctx
         .db
@@ -737,11 +636,6 @@ pub(crate) fn first_free_bank_slot(ctx: &ReducerContext, player_guid: u64) -> Op
     (BANK_SLOT_START..=BANK_SLOT_END_INCL).find(|slot| !occupied.contains(slot))
 }
 
-/// Shared auto-bank/auto-store-bank core for the player + debug paths (right-click to bank, right-
-/// click to withdraw): the direction is inferred from `slot` itself rather than taken as an argument
-/// — a bank slot withdraws to the first free carry slot (backpack, then bag space, the same fallback
-/// `store_item` uses for loot); anything else deposits to the first free bank slot. Delegates the
-/// placement to `apply_item_move`, so both directions get the banker-proximity gate for free.
 pub(crate) fn apply_auto_bank_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -765,8 +659,6 @@ mod tests {
         valid_split_dest_slot, BANK_SLOT_END_INCL, BANK_SLOT_START,
     };
 
-    /// BANK SLOT RANGE: exactly the 24 base bank slots (39..=62). The bank-bag ordinals just past them
-    /// (63..=68) are not bank storage in this model.
     #[test]
     fn is_bank_slot_covers_the_24_base_slots_only() {
         for slot in BANK_SLOT_START..=BANK_SLOT_END_INCL {
@@ -777,9 +669,6 @@ mod tests {
         }
     }
 
-    /// CARRIED-SLOT PREDICATE: equipment, bag-equip, backpack, and bag-content slots are carried; the
-    /// base bank range is owned but not carried, and so is every slot past it (the bank-bag region and
-    /// the unaddressed tail).
     #[test]
     fn is_carried_slot_admits_the_two_carry_regions_only() {
         for slot in [0u8, 18, 19, 22, 23, 38, 120, 191] {
@@ -796,9 +685,9 @@ mod tests {
     #[test]
     fn valid_split_count_rejects_zero_and_the_whole_stack_only() {
         const STACK: u32 = 5;
-        assert!(!valid_split_count(0, STACK)); // splitting off nothing isn't a split
-        assert!(!valid_split_count(STACK, STACK)); // splitting off the whole stack is a move, not a split
-        assert!(!valid_split_count(STACK + 1, STACK)); // over the stack is never valid either
+        assert!(!valid_split_count(0, STACK));
+        assert!(!valid_split_count(STACK, STACK));
+        assert!(!valid_split_count(STACK + 1, STACK));
         for count in 1..STACK {
             assert!(
                 valid_split_count(count, STACK),
@@ -807,28 +696,19 @@ mod tests {
         }
     }
 
-    /// ANTI-DUPE DESTINATION-SLOT GATE (`apply_item_move` / `apply_item_split`): the equip+bag-equip+
-    /// backpack range (0..=38), the base bank range (39..=62), and the bag-content range (120..=191) are
-    /// valid; the unmodeled bank-bag/buyback/keyring gap (63..=119) and anything past the bag-content
-    /// region (192+) are rejected.
     #[test]
     fn valid_dest_slot_admits_the_three_modeled_ranges_only() {
-        // Inside 0..=38 (equip 0..=18, bag-equip 19..=22, backpack 23..=38).
         for slot in [0u8, 18, 19, 22, 23, 38] {
             assert!(valid_dest_slot(slot), "slot {slot} is in the 0..=38 range");
         }
-        // The 24 base bank slots.
         for slot in BANK_SLOT_START..=BANK_SLOT_END_INCL {
             assert!(valid_dest_slot(slot), "bank slot {slot} is a valid dest");
         }
-        // Bank bag slots and the rest of the unmodeled gap stay refused.
         assert!(!valid_dest_slot(63));
         assert!(!valid_dest_slot(68));
         assert!(!valid_dest_slot(119));
-        // Inside the bag-content region 120..=191.
         assert!(valid_dest_slot(120));
         assert!(valid_dest_slot(191));
-        // Just past the bag-content region.
         assert!(!valid_dest_slot(192));
         assert!(!valid_dest_slot(255));
     }
@@ -847,13 +727,11 @@ mod tests {
         }
     }
 
-    /// BAG-CONTENT SLOT DECOMPOSITION: a flat bag-content slot (120..=191) decomposes into
-    /// `(bag_idx, slot_in_bag)` — 18 slots per bag, in bag-equip order.
     #[test]
     fn bag_content_decompose_maps_flat_slot_to_bag_index_and_position() {
-        assert_eq!(bag_content_decompose(120), (0, 0)); // first slot of the first bag
-        assert_eq!(bag_content_decompose(137), (0, 17)); // last slot of the first bag (18 slots: 120..=137)
-        assert_eq!(bag_content_decompose(138), (1, 0)); // first slot of the second bag
-        assert_eq!(bag_content_decompose(191), (3, 17)); // last slot of the fourth (last) bag
+        assert_eq!(bag_content_decompose(120), (0, 0));
+        assert_eq!(bag_content_decompose(137), (0, 17));
+        assert_eq!(bag_content_decompose(138), (1, 0));
+        assert_eq!(bag_content_decompose(191), (3, 17));
     }
 }

@@ -3,15 +3,10 @@ use crate::world::Actor;
 
 #[derive(Default)]
 pub(crate) struct VendorState {
-    /// Vendor stock the seam's `vendor_stock` read returns (empty by default).
     pub(crate) vendor_stock: Vec<codec::VendorItemView>,
-    /// The player's buyback ring as `(item_entry, stack_count, price)`; empty by default, so a
-    /// fixture login replays no buyback tab.
     pub(crate) buyback_ring: Vec<(u32, u32, u32, u32)>,
 }
 
-/// Vendor behaviour is tested through `InMemoryVendorActions`; here only the reads the session and
-/// the gossip menu make are live.
 impl VendorActionStore for WorldFake {
     fn vendor_stock(&self, _vendor_guid: u64) -> Result<Vec<codec::VendorItemView>> {
         Ok(self.vendor.vendor_stock.clone())

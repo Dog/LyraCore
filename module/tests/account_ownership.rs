@@ -143,7 +143,6 @@ fn a_new_generation_completes_partial_admission_and_fences_transfer_completion()
     let first = token(1, 201);
     let deadline = claim(&source, "201");
     fence(&source, &first, &deadline);
-    // The first Gateway stopped before reaching the destination. No renewal keeps its claim alive.
     assert!(destination
         .query_rows("SELECT * FROM game_account_fence")
         .is_empty());
@@ -305,7 +304,6 @@ fn expired_account_ownership_is_reaped_while_another_gateway_keeps_its_lease_ali
     assert_eq!(owner["character_guid"], "1");
     assert_eq!(owner["account_id"], "1");
     assert_eq!(owner["account_name"], "TEST");
-    // Retained, expired generations protect old requests without preventing a fresh admission.
     let second = token(2, 302);
     let deadline = claim(&shard, "302");
     fence(&shard, &second, &deadline);

@@ -5,8 +5,6 @@ use super::bindings::GwMove;
 
 const MAX_MOVES_PER_CALL: usize = 128;
 
-/// One shard's queued steady heartbeats. The scheduler decides when to drain it;
-/// this type owns the deterministic queue and bounded submission behavior.
 pub(crate) struct MovementBatch {
     queued: Mutex<Vec<GwMove>>,
     pub(crate) delivery: MotionDelivery,
@@ -33,8 +31,7 @@ impl MovementBatch {
         self.delivery.queued.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Removes the current window before submitting it, so movements queued by a
-    /// submission callback belong to the next drain.
+    // Drain before submitting so movement queued by a submission callback enters the next window.
     pub(crate) fn drain<E>(
         &self,
         mut submit: impl FnMut(Vec<GwMove>) -> Result<(), E>,
@@ -58,8 +55,6 @@ impl MovementBatch {
     }
 }
 
-/// One Shard's accepted movement and incoming motion rows, before AOI selection or writer work.
-/// These counters survive Coordinator replacement. Queue acceptance does not prove Module commit.
 #[derive(Default)]
 pub(crate) struct MotionDelivery {
     queued: AtomicU64,

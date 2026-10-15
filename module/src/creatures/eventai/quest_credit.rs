@@ -1,5 +1,3 @@
-//! EventAI's typed path into quest authority.
-
 use super::engine::EventAiWorld;
 use super::{ActionResult, CreatureInstruction, EventContext};
 use crate::quest::{EventAiQuestCreditContext, QuestCreditOutcome};

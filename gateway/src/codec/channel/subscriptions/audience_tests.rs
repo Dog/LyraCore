@@ -7,7 +7,6 @@ use std::sync::mpsc::Receiver;
 
 const SPEAKER: u64 = 10;
 
-/// Every raw packet queued for one viewer, jobs run in order, as `(opcode, body)`.
 fn received_raw(rx: &Receiver<Outbound>) -> Vec<(u16, Vec<u8>)> {
     let mut packets = Vec::new();
     while let Ok(outbound) = rx.try_recv() {
@@ -24,7 +23,6 @@ fn received_raw(rx: &Receiver<Outbound>) -> Vec<(u16, Vec<u8>)> {
     packets
 }
 
-/// JOINED naming `SPEAKER` in "Tx": notice 0x00, the name, then the guid (cm:Channel.cpp:760-764).
 #[test]
 fn a_channel_notice_reaches_each_recipient_on_any_shard_and_nobody_else() {
     let view = WorldView::new(true);

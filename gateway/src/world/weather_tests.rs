@@ -1,8 +1,5 @@
-//! Zone weather: the world-entry packet from a Store, and the live relay across World Sessions.
-
 use super::*;
 
-/// A Store with one zone's sky, or one that cannot answer.
 struct WeatherFake {
     rows: Vec<(u32, codec::ZoneWeatherView)>,
     error: Option<&'static str>,
@@ -21,7 +18,6 @@ impl WeatherStore for WeatherFake {
     }
 }
 
-/// The weather packet a client entering `zone_id` receives.
 fn run(store: &WeatherFake, zone_id: u32) -> SMSG_WEATHER {
     match zone_weather_message(store, zone_id, WeatherChangeType::Instant) {
         ServerOpcodeMessage::SMSG_WEATHER(weather) => *weather,
@@ -29,8 +25,6 @@ fn run(store: &WeatherFake, zone_id: u32) -> SMSG_WEATHER {
     }
 }
 
-/// Story 10: a zone the Module has no weather row for is fine weather. World entry still sends the
-/// packet, because a client told nothing keeps rendering whatever sky it arrived with.
 #[test]
 fn a_zone_with_no_weather_row_is_fine_weather() {
     let weather = run(
@@ -46,7 +40,6 @@ fn a_zone_with_no_weather_row_is_fine_weather() {
     assert_eq!(weather.change, WeatherChangeType::Instant);
 }
 
-/// A Store that cannot answer the weather question is a degraded sky, never a failed login.
 #[test]
 fn a_weather_read_failure_is_fine_weather() {
     let weather = run(
@@ -78,8 +71,6 @@ fn a_zone_with_a_weather_row_gets_that_sky_and_no_other_zone_does() {
     assert_eq!(run(&store, 40).weather_type, WeatherType::Fine);
 }
 
-/// Drive one World Session through the handshake and world entry, and hand back the client end
-/// parked on the first packet that comes AFTER world entry.
 fn world_session_in_world(
     store: std::sync::Arc<WorldFake>,
     character_guid: u64,
@@ -98,7 +89,6 @@ fn world_session_in_world(
     (client, c_dec, server)
 }
 
-/// One `game_zone_weather` row, as the Module writes it and the relay reads it.
 fn zone_weather_row(
     zone_id: u32,
     weather_type: u8,
@@ -112,18 +102,6 @@ fn zone_weather_row(
     }
 }
 
-/// Stories 5 and 6 end to end, over the real cipher: two World Sessions on real socket pairs share
-/// one shard's relay, one standing in Elwynn Forest and one in Westfall. Forced Elwynn rain must
-/// decode as valid rain on the Elwynn client and must not reach the Westfall client at all.
-///
-/// Both characters stand on the SAME position, so nothing but the zone can separate them — the
-/// spatial index has no say in weather.
-///
-/// Westfall's own snow is a sentinel rather than a bare timeout. A session's writer is FIFO, so an
-/// Elwynn row that leaked into Westfall's routing would arrive on that socket BEFORE the snow; the
-/// assertion therefore fails deterministically if the zone filter goes away, instead of resting on
-/// a socket that happened to stay quiet. The bounded silence afterwards closes the mirror case:
-/// Westfall's snow must not reach Elwynn either.
 #[test]
 fn forced_elwynn_rain_reaches_only_the_client_standing_in_elwynn() {
     const ELWYNN: u32 = 12;
@@ -152,7 +130,6 @@ fn forced_elwynn_rain_reaches_only_the_client_standing_in_elwynn() {
     let (mut westfall_client, mut westfall_dec, westfall_server) =
         world_session_in_world(session_store(westfall_entity), 2);
 
-    // Elwynn is forced to heavy rain; Westfall drifts into light snow of its own.
     crate::codec::weather::subscriptions::relay_zone_weather(
         &view,
         0,
@@ -187,8 +164,6 @@ fn forced_elwynn_rain_reaches_only_the_client_standing_in_elwynn() {
         other => panic!("the Westfall client must receive Westfall's snow, got {other}"),
     }
 
-    // Neither zone's sky is echoed to the other. A short deadline is enough: both sockets have
-    // already delivered a packet enqueued after the one being tested for.
     let quiet = std::time::Duration::from_millis(250);
     for (name, client, dec) in [
         ("Elwynn", &mut elwynn_client, &mut elwynn_dec),

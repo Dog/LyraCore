@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# import-world-sql-test.sh — OFFLINE behavioural test for import-world.sh's SQL chokepoint (#440).
-#
-# Run it from the checkout root, any time, with nothing set up:
-#   bash importer/scripts/import-world-sql-test.sh     # prints "[test] OK" when it passes
-#
-# In the style of scripts/install-script-test.sh: everything runs against STUBBED tools on PATH in a
-# scratch directory. `spacetime` and `cargo` are shell shims; `target/debug/lyracore-importer` (the
-# importer binary import-world.sh execs directly by relative path) is a shim too. No real ETL runs,
-# no network, no live node — see that script's own header for why a full import can't be exercised
-# here (tens of minutes, needs a real dump/client/node).
-#
-# WHAT THIS PINS: #440 was three defects that together turned a SUCCESSFUL import into ~50 false
-# "table is empty" FAILs — (a) every `spacetime sql`/`spacetime call` queried the CLI's ambient
-# default server instead of the node the import actually targets, (b) a FAILED query and a
-# LEGITIMATE zero-row result both read as a count of 0, so one dead connection produced a wall of
-# fake FAILs instead of one honest error, and (c) an undeclared `python3` dependency crashed the
-# service-coverage audit mid-output on a minimal host. This test stubs `spacetime` to fail (proving a
-# single "cannot reach" abort, not a FAIL wall), stubs it to succeed with canned counts (proving the
-# assertions actually read them, not always 0), checks every logged invocation carries --server, and
-# exercises the python3-missing degrade path.
 set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -26,7 +6,7 @@ passed=0
 failed=0
 ok() { passed=$((passed + 1)); printf '  ok    %s\n' "$1"; }
 no() { failed=$((failed + 1)); printf '  FAIL  %s\n' "$1"; }
-check() { # check <description> <command...>
+check() {
     local desc="$1"
     shift
     if "$@"; then ok "$desc"; else
@@ -36,7 +16,7 @@ check() { # check <description> <command...>
 }
 contains() { grep -Fq -- "$2" "$1"; }
 not_contains() { ! grep -Fq -- "$2" "$1"; }
-count_matches() { grep -c -- "$2" "$1" 2>/dev/null || true; } # never fails the -e-less caller on "0 matches"
+count_matches() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 
 sandbox="$(mktemp -d "${TMPDIR:-/tmp}/lyracore-import-world-sql-test.XXXXXX")"
 trap 'rm -rf "$sandbox"' EXIT
@@ -46,7 +26,6 @@ mkdir -p "$stubs"
 stub_log="$sandbox/stub.log"
 : >"$stub_log"
 
-# --- the scratch checkout: import-world.sh's own `cd "$(dirname "$0")/../.."` lands here -----------
 checkout="$sandbox/checkout"
 mkdir -p "$checkout/importer/scripts" "$checkout/target/debug"
 cp "$repo_root/importer/scripts/import-world.sh" "$checkout/importer/scripts/import-world.sh"
@@ -56,9 +35,6 @@ cp "$repo_root/importer/scripts/import-class-spells.sh" "$checkout/importer/scri
 chmod +x "$checkout/importer/scripts/import-world.sh" "$checkout/importer/scripts/import-class-spells.sh"
 under_test="$checkout/importer/scripts/import-world.sh"
 
-# --- stubs ----------------------------------------------------------------------------------------
-# The importer binary import-world.sh execs directly by relative path (`./target/debug/lyracore-importer`,
-# never resolved through PATH) — no real ETL, no dump, no client data; every family "imports" instantly.
 cat >"$checkout/target/debug/lyracore-importer" <<'STUB'
 #!/bin/sh
 echo "lyracore-importer $*" >>"$STUB_LOG"
@@ -74,13 +50,6 @@ exit 0
 STUB
 chmod +x "$stubs/cargo"
 
-# `spacetime`, driven by two env knobs the test sets per scenario:
-#   STUB_MODE=fail     — every `sql`/`call` fails (a dead/unreachable/wrong server)
-#   STUB_MODE=succeed  — `sql` returns STUB_ROW_COUNT canned numeric rows (mimics a real table dump);
-#                         a query that is plainly the one-continent map_id/COUNT(*) probe answers with
-#                         a single map-0 row instead, so the preflight/re-assert guards don't misread
-#                         the filler as foreign-continent contamination and abort somewhere this test
-#                         isn't exercising.
 cat >"$stubs/spacetime" <<'STUB'
 #!/bin/sh
 echo "spacetime $*" >>"$STUB_LOG"
@@ -124,7 +93,7 @@ chmod +x "$stubs/spacetime"
 
 out="$sandbox/out.txt"
 
-run_import() { # run_import [extra env assignments already exported by the caller]
+run_import() {
     (
         cd "$sandbox" || exit 99
         env -i \
@@ -142,10 +111,6 @@ run_import() { # run_import [extra env assignments already exported by the calle
     code=$?
 }
 
-# =====================================================================================================
-# 1. spacetime UNREACHABLE — the exact #440 repro: a query that FAILS must produce ONE clear abort,
-#    never a wall of per-table FAILs that blame the data.
-# =====================================================================================================
 echo "import-world.sh — spacetime unreachable (#440 repro)"
 : >"$stub_log"
 STUB_MODE=fail run_import
@@ -159,10 +124,6 @@ check "the abort names the server it tried" contains "$out" "http://127.0.0.1:30
 check "the abort explains a failure is not a zero-row result" contains "$out" "not the same as zero rows"
 [ "$code" -ne 0 ] || cat "$out"
 
-# =====================================================================================================
-# 2. spacetime REACHABLE, canned counts — the assertions must actually READ what the query returned,
-#    not silently collapse a real answer to 0.
-# =====================================================================================================
 echo
 echo "import-world.sh — spacetime reachable, canned row counts"
 : >"$stub_log"
@@ -174,9 +135,6 @@ check "  ...and floors it clears print ok, not FAIL" \
     contains "$out" "ok    gather-node GO spawns: 150"
 check "the run reaches its own final verdict line" contains "$out" '[world]'
 
-# =====================================================================================================
-# 3. every spacetime sql/call invocation carries --server (defect a) --------------------------------
-# =====================================================================================================
 echo
 echo "import-world.sh — every spacetime invocation is server-pinned"
 unserved="$(grep -E '^spacetime (sql|call) ' "$stub_log" | grep -vc -- '--server' || true)"
@@ -191,9 +149,6 @@ STUB_MODE=succeed SPACETIME_SERVER="http://example.invalid:9000" run_import
 check "an overridden SPACETIME_SERVER reaches spacetime verbatim" \
     grep -q -- '--server http://example.invalid:9000' "$stub_log"
 
-# =====================================================================================================
-# 4. canonical profiles stay one importer argument, never a copied rectangle -------------------------
-# =====================================================================================================
 echo
 echo "import-world.sh — canonical profile argument"
 : >"$stub_log"
@@ -223,7 +178,6 @@ check "the Kalimdor profile runs its Teldrassil named check" \
 check "the Kalimdor profile runs its Darkshore named check" \
     contains "$out" 'Darkshore follow-on correct-map quest-giver spawn'
 
-# Full profiles keep map ownership and load client catalogues in the dump pass.
 echo
 echo "import-world.sh: full profile ownership and catalogue passes"
 for profile in full-world full-eastern full-kalimdor full-instances; do
@@ -273,9 +227,6 @@ for profile in full-eastern full-kalimdor full-instances; do
     check "$profile does not call the importer after an ownership failure" not_contains "$stub_log" 'lyracore-importer '
 done
 
-# =====================================================================================================
-# 5. python3 absent — the coverage audit must degrade explicitly, never crash mid-output (defect c) --
-# =====================================================================================================
 echo
 echo "import-world.sh — python3 absent from PATH"
 no_python="$sandbox/no-python-path"

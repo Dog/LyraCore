@@ -1,22 +1,4 @@
-//! The spellmeta Import Family's half of a Package Delta apply: the setters for `game_spell_chain`,
-//! `game_spell_learn` and `game_spell_proc_event`, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of spell metadata.
-//!
-//! `game_spell_learn` follows the loot shape: its `id` is a free surrogate with its own Package
-//! band (`is_package_spellmeta_id`). The other two key on a spell identifier, so the band that
-//! decides what a Package may invent there is the Package SPELL band (`is_package_spell_id`) — a
-//! metadata row cannot outlive the `game_spell` row it describes, and giving it a band of its own
-//! would let a Package write metadata for a spell that cannot exist.
-//!
-//! That also fixes an order: every spell a claim here names has to be on the shard already, which
-//! for a Package spell means the SPELL family's own apply ran first. A `--dump` realm runs the
-//! spell pass before the dump pass, so this is the order an import already has.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
+//! Package spells must be applied before their metadata references are checked.
 
 use spacetimedb::{ReducerContext, Table};
 
@@ -32,17 +14,11 @@ use crate::{
 
 use super::{as_f32, as_u32, as_u64, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a spell metadata claim whose final row would describe a spell this Shard does not hold.
-///
-/// The key itself is checked as well as the columns: a rank link or a proc overlay for a missing
-/// spell is a row nothing will ever read.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         match row.table() {
             ClaimTable::SpellChain => {
                 check_spell(ctx, row, "spell_id", row.row_id() as u32)?;
-                // `prev_spell` is 0 on a family's first rank and `req_spell` is 0 on most rows, so
-                // both are checked only when set.
                 for field in ["prev_spell", "req_spell"] {
                     let spell_id = final_u32(ctx, row, field)?;
                     if spell_id != 0 {
@@ -81,8 +57,6 @@ fn check_spell(
     Ok(())
 }
 
-/// The value `field` will hold once this row's claim lands: the claimed value if the claim sets it,
-/// otherwise what the Shard already holds.
 fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row.fields().get(field).map(|claimed| &claimed.value) {
         return Ok(*value);
@@ -125,7 +99,6 @@ fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, 
     })
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -157,15 +130,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The band differs per table, because two of the three key on a spell identifier. Both ranges are
-/// cleared on every apply, so such a row is gone by the time the write pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_row(row.table(), row.row_id())
 }
 
-/// True when this identifier is one a Package invented on this table.
 fn is_package_row(table: ClaimTable, id: u64) -> bool {
     match table {
         ClaimTable::SpellLearn => is_package_spellmeta_id(id),
@@ -173,8 +141,6 @@ fn is_package_row(table: ClaimTable, id: u64) -> bool {
     }
 }
 
-/// Removes every row a Package invented. `game_spell_learn` clears its own band; the two
-/// spell-keyed tables clear the Package spell band.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let chains = ctx.db.game_spell_chain();
     let stale: Vec<u32> = chains
@@ -283,7 +249,6 @@ fn gone(row: &TracedRow) -> String {
     format!("`{}` row {} vanished mid-apply", row.table(), row.key())
 }
 
-/// An insert has to carry every column, so it is checked before the setters run.
 fn build(
     row: &TracedRow,
     set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -301,10 +266,6 @@ fn apply_claimed(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn blank_spell_chain(spell_id: u32) -> SpellChain {
     SpellChain {
@@ -389,10 +350,6 @@ fn no_such_column(table: &str, column: &str) -> String {
     format!("`{table}` has no claimable column `{column}`")
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -405,8 +362,6 @@ mod tests {
     const A_RANK: &str = r#"{"rank":{"type":"u8","value":3}}"#;
     const A_LEARN: &str = r#"{"learn_spell":{"type":"u32","value":168}}"#;
 
-    /// The Package spell range is cleared on every apply, so tuning a rank link for a Package spell
-    /// nobody enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_spells_rank_link_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -429,8 +384,6 @@ mod tests {
         assert!(!updates_an_uninvented_package_row(&plan.rows[0]));
     }
 
-    /// `game_spell_learn` has a band of its own, so a Package spell identifier on it is a real
-    /// imported row rather than a Package one.
     #[test]
     fn the_dependent_table_reconciles_against_its_own_band_not_the_spell_band() {
         assert!(is_package_row(ClaimTable::SpellLearn, PACKAGE_SPELL_LEARN));
@@ -474,8 +427,6 @@ mod tests {
         assert_eq!(chain.rank, 2);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_spell_metadata_column_has_a_setter() {
         let mut chain = blank_spell_chain(PACKAGE_SPELL);

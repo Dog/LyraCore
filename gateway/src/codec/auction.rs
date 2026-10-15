@@ -91,9 +91,7 @@ pub fn build_auction_bidder_list_result(
     }
 }
 
-/// Outbid or Won, to the bidder (`cm:AuctionHouseHandler.cpp:93-107,157-158`,
-/// `cm:AuctionHouseMgr.cpp:146-147`). `won` is the displaced bid on Outbid, 0 on Won: the client
-/// reads a nonzero value as "you were outbid" and zero as "you won".
+/// The client reads nonzero `won` as outbid and zero as won.
 pub fn build_auction_bidder_notification(
     auction_house: AuctionHouse,
     auction_id: u32,
@@ -114,9 +112,6 @@ pub fn build_auction_bidder_notification(
     }
 }
 
-/// Sold, Expired or New bid, to the owner (`cm:AuctionHouseMgr.cpp:195-199,231-232,802-806`,
-/// `cm:AuctionHouseHandler.cpp:110-128`). `bidder` is 0 on Sold and Expired, and the new bidder on
-/// New bid, which the client answers only by refreshing its list.
 pub fn build_auction_owner_notification(
     auction_id: u32,
     bid: u32,
@@ -135,9 +130,7 @@ pub fn build_auction_owner_notification(
     }
 }
 
-/// Removed, to the bidder a Cancellation displaced (`cm:AuctionHouseHandler.cpp:131-139`). The
-/// client prints `ERR_AUCTION_REMOVED_S` with the item's name. The wire's first field is the
-/// auction id, which `wow_world_messages` names `item`.
+/// The binding's `item` field carries the auction id.
 pub fn build_auction_removed_notification(
     auction_id: u32,
     item_entry: u32,
@@ -154,8 +147,6 @@ pub fn build_auction_removed_notification(
 mod tests {
     use super::*;
 
-    /// `cm:AuctionHouseHandler.cpp:131-139`: auction id, item entry, random property id, 12 bytes,
-    /// written out by hand.
     #[test]
     fn the_removed_notification_encodes_to_the_exact_cmangos_wire_layout() {
         use wow_world_messages::Message;
@@ -277,8 +268,6 @@ mod tests {
         assert_eq!(packet.bidder.guid(), 9);
     }
 
-    /// `cm:AuctionHouseHandler.cpp:93-107`: house, auction id, bidder guid (full 8 bytes, not
-    /// packed), won, out_bid, item entry, random property id — 32 bytes, written out by hand.
     #[test]
     fn the_bidder_notification_encodes_to_the_exact_cmangos_wire_layout() {
         use wow_world_messages::Message;
@@ -288,7 +277,7 @@ mod tests {
         packet.write_into_vec(&mut bytes).unwrap();
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(&1u32.to_le_bytes()); // AuctionHouse::Stormwind == 0x1
+        expected.extend_from_slice(&1u32.to_le_bytes());
         expected.extend_from_slice(&41u32.to_le_bytes());
         expected.extend_from_slice(&9u64.to_le_bytes());
         expected.extend_from_slice(&201u32.to_le_bytes());
@@ -299,8 +288,6 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// `cm:AuctionHouseHandler.cpp:110-128`: auction id, bid, auction_out_bid, bidder guid (full 8
-    /// bytes), item entry, random property id — 28 bytes, written out by hand.
     #[test]
     fn the_owner_notification_encodes_to_the_exact_cmangos_wire_layout() {
         use wow_world_messages::Message;

@@ -1,29 +1,3 @@
-//! The globals Import Family's half of a Package Delta apply: the setters for the seven world-wide
-//! reference tables, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of globals.
-//!
-//! Three tables follow the loot shape: `game_graveyard_zone`, `game_createinfo_spell` and
-//! `game_createinfo_action` key on a free surrogate, so one Package band
-//! (`is_package_globals_id`) covers them. The other four are update-only
-//! ([`lyracore_package_delta::DeltaError::InsertNotSupported`]): the two stat curves and
-//! `game_start_position` key on a race, class and level the client fixes, and
-//! `game_areatrigger_teleport` keys on an `AreaTrigger.dbc` trigger id. None of the four carries a
-//! band, so [`clear_package_range`] never touches them.
-//!
-//! Two references are checked, and only two. `game_graveyard_zone.safe_loc_id` names a
-//! `game_graveyard` row and `game_createinfo_spell.spell_id` names a `game_spell` row, so both
-//! resolve against a catalogue this shard holds. `game_areatrigger_teleport.trigger_id` is NOT
-//! checked against `game_area_trigger`: that table comes from the importer's `--dbc` pass, which a
-//! `--dump`-only shard has never run, so the check would refuse every legitimate claim there.
-//! `game_createinfo_action.action` is not checked either — it is polymorphic on `action_type`
-//! (spell, item, macro), so no single catalogue answers it.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -39,7 +13,6 @@ use crate::{
 
 use super::{as_f32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a globals claim whose final row would point at data this Shard does not hold.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         match row.table() {
@@ -66,8 +39,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// The value `field` will hold once this row's claim lands: the claimed value if the claim sets it,
-/// otherwise what the Shard already holds.
 fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row.fields().get(field).map(|claimed| &claimed.value) {
         return Ok(*value);
@@ -107,7 +78,6 @@ fn missing_reference(row: &TracedRow, field: &str, value: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if has_package_band(row.table()) && updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -119,8 +89,6 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True for the three tables whose key is a free surrogate. The other four permit no insert, so no
-/// row of them is ever "Package-invented, but no enabled Package inserts it".
 const fn has_package_band(table: ClaimTable) -> bool {
     matches!(
         table,
@@ -165,15 +133,10 @@ fn row_is_present(ctx: &ReducerContext, row: &TracedRow) -> bool {
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package globals range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_globals_id(row.row_id())
 }
 
-/// Removes every row a Package invented, from each of the three banded tables.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let zones = ctx.db.game_graveyard_zone();
     let stale: Vec<u64> = zones
@@ -326,7 +289,6 @@ fn update_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one table's setter over every claimed column. Seven tables share the loop.
 fn apply_fields(
     row: &TracedRow,
     mut set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -336,10 +298,6 @@ fn apply_fields(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn apply_class_level_stats_field(
     stats: &mut ClassLevelStats,
@@ -482,10 +440,6 @@ fn no_such_column(table: &str, column: &str) -> String {
     format!("`{table}` has no claimable column `{column}`")
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -495,8 +449,6 @@ mod tests {
     use super::*;
     use lyracore_package_delta::Table as ClaimTable;
 
-    /// The Package globals range is cleared on every apply, so tuning a Package graveyard link
-    /// nobody enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_graveyard_zone_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -527,8 +479,6 @@ mod tests {
         assert!(!updates_an_uninvented_package_row(&plan.rows[0]));
     }
 
-    /// A stat curve carries no band, so a Package-range identifier on it is not "uninvented" — it
-    /// is simply a class and a level no client has.
     #[test]
     fn a_stat_curve_row_is_never_an_uninvented_package_row() {
         let plan = plan(&[artifact(
@@ -564,8 +514,6 @@ mod tests {
         assert_eq!(zone.zone_id, 12);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_globals_column_has_a_setter() {
         let mut class_stats = ClassLevelStats {

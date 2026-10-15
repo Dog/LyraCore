@@ -1,6 +1,3 @@
-# Blank issues stay enabled on purpose: the maintainers file most of the queue themselves, in the
-# expected/actual/how it shows/fix direction shape CONTRIBUTING.md describes, and the forms are
-# aimed at people reporting from the outside.
 blank_issues_enabled: true
 contact_links:
   - name: Troubleshooting guide

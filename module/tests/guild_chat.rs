@@ -1,8 +1,3 @@
-//! Guild and officer chat through the Realm Chat path (`cm:Guild.cpp:554-594`), on a private
-//! Standalone. Guild chat needs GCHATSPEAK to speak and GCHATLISTEN to hear; officer chat needs
-//! OFFCHATSPEAK and OFFCHATLISTEN. The audience is read live in the line's own transaction, so a
-//! rank edit takes effect on the very next line.
-
 mod support;
 
 use serde_json::json;
@@ -39,10 +34,6 @@ fn insert_member(realm: &Standalone, guild_id: &str, guid: u64, rank_id: u32, na
     ));
 }
 
-/// Found one Guild led by `LEADER` (rank 0) and add `OFFICER` (rank 1) and `VETERAN` (rank 2) at their
-/// default rights, plus `MUTED` at a rank edited down to nothing. `STRANGER` never joins. Every
-/// default rank keeps GCHATLISTEN|GCHATSPEAK; only rank 0 and 1 also keep OFFCHATLISTEN|OFFCHATSPEAK
-/// (`lyracore_shared::guild::DEFAULT_RANKS`).
 fn seeded_guild(realm: &Standalone) -> String {
     realm.assert_call(
         "realm_guild_op",
@@ -64,7 +55,6 @@ fn seeded_guild(realm: &Standalone) -> String {
     guild_id
 }
 
-/// A request of `kind` from a Human (race 1) speaking Universal, tagged NONE.
 fn request(kind: u8, message: &str) -> String {
     json!({
         "kind": kind,
@@ -77,9 +67,6 @@ fn request(kind: u8, message: &str) -> String {
     .to_string()
 }
 
-/// One accepted `realm_chat` call's recipients (sorted) and `ignorable`. Waits for the event GC to
-/// reap the row before returning, so the next capture never races a stray delete transaction — the
-/// same discipline `realm_chat.rs`'s durable test follows.
 fn line_of(realm: &Standalone, actor_guid: u64, kind: u8, message: &str) -> (Vec<u64>, bool) {
     let req = request(kind, message);
     let updates = realm.capture_updates(REALM_CHAT_ROWS, 1, || {
@@ -109,7 +96,6 @@ fn line_of(realm: &Standalone, actor_guid: u64, kind: u8, message: &str) -> (Vec
     (recipients, ignorable)
 }
 
-/// The whole error text of a refused `realm_chat` call, which carries the Refusal tag.
 fn refused(realm: &Standalone, actor_guid: u64, kind: u8, tag: &str) {
     let req = request(kind, "anyone?");
     let output = realm.call("realm_chat", &[&actor(&actor_guid.to_string()), &req]);
@@ -128,8 +114,6 @@ fn refused(realm: &Standalone, actor_guid: u64, kind: u8, tag: &str) {
     );
 }
 
-/// **AC 1**: Guild chat reaches every member with GCHATLISTEN, the speaker included; Muted (edited
-/// to no rights) is excluded, and the line is ignorable (`cm:Guild.cpp:570`).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn guild_chat_reaches_every_member_with_gchatlisten() {
@@ -143,8 +127,6 @@ fn guild_chat_reaches_every_member_with_gchatlisten() {
     assert!(ignorable);
 }
 
-/// **AC 2**: Officer chat reaches only the ranks that keep OFFCHATLISTEN by default: the leader
-/// and the Officer rank. Veteran and Muted lack it (`cm:Guild.cpp:591`).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn officer_chat_reaches_only_officer_ranked_members() {
@@ -158,9 +140,6 @@ fn officer_chat_reaches_only_officer_ranked_members() {
     assert!(ignorable);
 }
 
-/// **AC 3**: a member whose rank lacks the speak right sends nothing, for both Chat Kinds, and a
-/// Character outside any Guild sends nothing either (`cm:ChatHandler.cpp:367-369`,
-/// `cm:Guild.cpp:559-561,580-582`).
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_rank_without_the_speak_right_and_a_non_member_are_refused() {
@@ -175,8 +154,6 @@ fn a_rank_without_the_speak_right_and_a_non_member_are_refused() {
     refused(&realm, STRANGER, KIND_OFFICER, "chat:not_in_guild");
 }
 
-/// **AC 5**: a rank edit takes effect on the very next line, because the audience is read fresh in
-/// the line's own transaction rather than cached from an earlier read.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_rank_edit_changes_the_very_next_line() {
@@ -188,7 +165,6 @@ fn a_rank_edit_changes_the_very_next_line() {
     let (recipients, _) = line_of(&realm, VETERAN, KIND_GUILD, "before");
     assert_eq!(recipients, [LEADER, OFFICER, VETERAN]);
 
-    // Strip GCHATSPEAK from the Veteran rank, keeping GCHATLISTEN.
     realm.assert_call(
         "realm_guild_op",
         &[
@@ -198,7 +174,6 @@ fn a_rank_edit_changes_the_very_next_line() {
     );
     refused(&realm, VETERAN, KIND_GUILD, "chat:no_guild_chat_right");
 
-    // Restore it; the very next line succeeds again, Veteran included in its own audience.
     realm.assert_call(
         "realm_guild_op",
         &[

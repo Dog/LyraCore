@@ -1,19 +1,3 @@
-//! The gossip Import Family's half of a Package Delta apply: the setters for the six gossip
-//! tables, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of gossip.
-//!
-//! Five of the six tables follow the loot shape: their key is a free identifier space, so one
-//! Package band (`is_package_gossip_id`) covers them all. `game_gossip_menu` is the sixth and is
-//! update-only ([`lyracore_package_delta::DeltaError::InsertNotSupported`]): its key is a creature
-//! template entry, which no Package may invent. It carries no band, so [`clear_package_range`]
-//! never touches it.
-//!
-//! The Claim schema and the setters below are one contract; the tests at the bottom fail if a
-//! claimable column has no setter.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -29,10 +13,6 @@ use crate::{
 
 use super::{as_f32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a gossip claim whose final row would point at no row after this family lands.
-///
-/// Every reference stays inside the family except `game_gossip_option.entry`, which names a
-/// creature template the creatures family owns.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         match row.table() {
@@ -68,10 +48,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// True when `text_id` will name a `game_npc_text` row once this plan lands.
-///
-/// A Package-band greeting is satisfied by an insert in the same plan; anything else has to be on
-/// the shard already. The `quest_exists_after_apply` shape.
 fn npc_text_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], text_id: u32) -> bool {
     if text_id == 0 {
         return false;
@@ -86,7 +62,6 @@ fn npc_text_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], text_id
     ctx.db.game_npc_text().text_id().find(text_id).is_some()
 }
 
-/// True when `menu_id` will name a `game_gossip_menu_profile` row once this plan lands.
 fn menu_profile_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], menu_id: u32) -> bool {
     if menu_id == 0 {
         return false;
@@ -105,9 +80,6 @@ fn menu_profile_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], men
         .is_some()
 }
 
-/// The value `field` will hold once this row's claim lands: the claimed value if the claim sets it,
-/// otherwise what the Shard already holds. An update that changes only one column is judged on what
-/// the row will hold after the apply, not on the column alone.
 fn final_u32(ctx: &ReducerContext, row: &TracedRow, field: &str) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row.fields().get(field).map(|claimed| &claimed.value) {
         return Ok(*value);
@@ -165,10 +137,7 @@ fn missing_reference(row: &TracedRow, field: &str, value: u32) -> String {
     )
 }
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
-    // `game_gossip_menu` permits no insert at all, so no row of it is ever "Package-invented, but
-    // no enabled Package inserts it".
     if row.table() != ClaimTable::GossipMenu && updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
     }
@@ -210,16 +179,10 @@ fn row_is_present(ctx: &ReducerContext, row: &TracedRow) -> bool {
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package gossip range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_gossip_id(row.row_id())
 }
 
-/// Removes every row a Package invented, from each of the five banded tables. `game_gossip_menu`
-/// has no band — nothing to clear there.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let profiles = ctx.db.game_gossip_menu_profile();
     for menu_id in package_keys(profiles.iter().map(|row| u64::from(row.menu_id))) {
@@ -241,16 +204,13 @@ pub(super) fn clear_package_range(ctx: &ReducerContext) {
         slots.id().delete(id);
     }
 
-    // The greeting bodies go LAST: the slots above point at them, so clearing a body first would
-    // leave a slot naming a row that is already gone for the rest of this transaction.
+    // Clear greeting slots before the bodies they reference.
     let texts = ctx.db.game_npc_text();
     for text_id in package_keys(texts.iter().map(|row| u64::from(row.text_id))) {
         texts.text_id().delete(text_id as u32);
     }
 }
 
-/// The Package-band keys of one table, collected before any delete so the iteration does not run
-/// against a table it is mutating.
 fn package_keys(keys: impl Iterator<Item = u64>) -> Vec<u64> {
     keys.filter(|key| is_package_gossip_id(*key)).collect()
 }
@@ -391,8 +351,6 @@ fn update_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one table's setter over every claimed column. Six tables share the loop, so it lives here
-/// rather than six times over.
 fn apply_fields(
     row: &TracedRow,
     mut set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -402,10 +360,6 @@ fn apply_fields(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn apply_gossip_menu_field(
     menu: &mut crate::GossipMenu,
@@ -554,10 +508,6 @@ fn no_such_column(table: &str, column: &str) -> String {
     format!("`{table}` has no claimable column `{column}`")
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -567,8 +517,6 @@ mod tests {
     use super::*;
     use lyracore_package_delta::Table as ClaimTable;
 
-    /// The Package gossip range is cleared on every apply, so tuning a Package greeting nobody
-    /// enables is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_npc_text_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -636,8 +584,6 @@ mod tests {
         assert_eq!(text.text, "The forge is cold, friend.");
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_gossip_column_has_a_setter() {
         let mut menu = crate::GossipMenu {

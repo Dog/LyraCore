@@ -1,27 +1,3 @@
-//! The creature-ai Import Family's half of a Package Delta apply: the setters for the EventAI
-//! catalogue, and how to find one row of it.
-//!
-//! The shared shell in the parent module decides everything a family does not. What is here is only
-//! what is true of EventAI.
-//!
-//! Three tables, all the loot shape: `game_creature_ai_broadcast_text`, `game_creature_ai_summon`
-//! and `game_quest_event_requirement` each key on a plain surrogate identifier with its own
-//! Package band (`is_package_creature_ai_id`). None of them names a map, so every claim here is
-//! global.
-//!
-//! The family's scripted definitions are not claimable, for the reasons
-//! `lyracore_package_delta`'s `CREATURE_AI_FAMILY` gives. That is what keeps this module small: a
-//! Package tunes what a creature SAYS, where its summons land, and which quests need their source
-//! event, but never the rules themselves.
-//!
-//! # Encounter ownership
-//!
-//! An Encounter Binding is the map-scoped link from an imported EventAI action to the Package that
-//! owns the encounter, and a loaded definition carrying a `NotifyEncounter` instruction is where
-//! that link lives durably. A claim that retunes a line such a definition speaks, or a placement it
-//! summons at, would change an encounter's fight without its owning Package's say.
-//! [`check_references`] refuses that and names both sides.
-
 use std::collections::BTreeMap;
 
 use spacetimedb::{ReducerContext, Table};
@@ -40,16 +16,11 @@ use crate::{
 
 use super::{as_f32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Refuses a creature-ai claim that names data this Shard will not hold, or that reaches into an
-/// encounter another Package owns.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     check_quests_exist(ctx, rows)?;
     check_encounter_ownership(ctx, rows)
 }
 
-/// A quest event requirement names a quest, and `game_quest_template` belongs to another family.
-/// The quest has to be on this Shard already, the same rule `trainers::check_references` applies
-/// to the creature template and spell a trainer offering names.
 fn check_quests_exist(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     for row in rows {
         if row.table() != ClaimTable::QuestEventRequirement {
@@ -74,8 +45,6 @@ fn check_quests_exist(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), St
     Ok(())
 }
 
-/// The value `quest_entry` will hold once this row's claim lands: the claimed value if the claim
-/// sets it, otherwise what the Shard already holds.
 fn final_quest_entry(ctx: &ReducerContext, row: &TracedRow) -> Result<u32, String> {
     if let Some(FieldValue::U32(value)) = row
         .fields()
@@ -99,8 +68,6 @@ fn final_quest_entry(ctx: &ReducerContext, row: &TracedRow) -> Result<u32, Strin
         })
 }
 
-/// Refuses a claim on a broadcast text or a summon placement an encounter-owned creature's
-/// definition depends on.
 fn check_encounter_ownership(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     let claims_catalogue_row = rows.iter().any(|row| {
         matches!(
@@ -137,24 +104,18 @@ fn check_encounter_ownership(ctx: &ReducerContext, rows: &[TracedRow]) -> Result
     Ok(())
 }
 
-/// One catalogue row a loaded definition names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OwnedRow {
     BroadcastText(u32),
     Summon(u32),
 }
 
-/// Which encounter owns one catalogue row, and the creature whose definition names it.
 #[derive(Debug, Clone)]
 struct EncounterOwner {
     creature: String,
     binding: EncounterBinding,
 }
 
-/// Every broadcast text and summon placement an encounter-owned definition depends on.
-///
-/// A definition is encounter-owned when one of its rules notifies an Encounter Binding. Walked
-/// once per apply, and only when the plan claims a catalogue row at all.
 fn encounter_owned_rows(ctx: &ReducerContext) -> BTreeMap<OwnedRow, EncounterOwner> {
     let mut owned = BTreeMap::new();
     for definition in ctx.db.game_creature_ai_definition().iter() {
@@ -182,7 +143,6 @@ fn encounter_owned_rows(ctx: &ReducerContext) -> BTreeMap<OwnedRow, EncounterOwn
     owned
 }
 
-/// The first Encounter Binding this definition notifies, or `None` when no Package owns its fight.
 fn notified_binding(definition: &CreatureAiDefinition) -> Option<EncounterBinding> {
     definition
         .rules
@@ -194,8 +154,6 @@ fn notified_binding(definition: &CreatureAiDefinition) -> Option<EncounterBindin
         })
 }
 
-/// How a refusal names the creature a definition belongs to. A definition names its subject by
-/// template entry or by one remapped spawn guid, never both.
 fn subject_of(definition: &CreatureAiDefinition) -> String {
     if definition.creature_entry == 0 {
         format!("creature guid {}", definition.creature_guid)
@@ -204,7 +162,6 @@ fn subject_of(definition: &CreatureAiDefinition) -> String {
     }
 }
 
-/// What this Shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if row.operation() == Operation::Update && is_package_creature_ai_id(row.row_id()) {
         return UpdateTarget::Uninvented;
@@ -243,8 +200,6 @@ fn row_is_present(ctx: &ReducerContext, row: &TracedRow) -> bool {
     }
 }
 
-/// Removes every row a Package invented, so a Package that left the enabled set takes its EventAI
-/// rows with it.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let texts = ctx.db.game_creature_ai_broadcast_text();
     let stale: Vec<u32> = texts
@@ -361,7 +316,6 @@ fn gone(row: &TracedRow) -> String {
     format!("`{}` row {} vanished mid-apply", row.table(), row.key())
 }
 
-/// Runs one table's setter over every claimed column.
 fn apply_fields(
     row: &TracedRow,
     mut set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -371,10 +325,6 @@ fn apply_fields(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn blank_broadcast_text(id: u32) -> CreatureAiBroadcastText {
     CreatureAiBroadcastText {
@@ -468,10 +418,6 @@ fn apply_quest_event_requirement_field(
     Ok(())
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way to
-//  build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -483,8 +429,6 @@ mod tests {
     use super::*;
     use lyracore_package_delta::Table as ClaimTable;
 
-    /// The Package EventAI range is cleared on every apply, so tuning a Package row nobody enables
-    /// is a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_broadcast_text_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -572,8 +516,6 @@ mod tests {
         assert_eq!(requirement.quest_entry, 8_000_001);
     }
 
-    /// The Claim schema and the setters above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_creature_ai_column_has_a_setter() {
         let mut text = blank_broadcast_text(PACKAGE_BROADCAST_TEXT);

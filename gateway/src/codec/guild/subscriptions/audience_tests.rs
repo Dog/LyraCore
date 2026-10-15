@@ -30,15 +30,10 @@ fn membership(rows: &[(u64, u32, u32)]) -> GuildMembershipRead {
     })
 }
 
-/// The broadcast (`0..=13`) and addressed-membership (`0x40..`) kinds these audience tests use
-/// never read a Guild snapshot, so a closure that panics if called proves it.
 fn unreachable_snapshot_read() -> GuildRosterSnapshotRead {
     Arc::new(|_guild_id, _kind| panic!("this Guild Event kind must not read a snapshot"))
 }
 
-/// A snapshot read that always answers `snapshot` and counts its own calls, so a test can
-/// assert a settings-change event reads the Realm-core cache once and shares the result with
-/// every recipient.
 fn counting_snapshot_read(
     snapshot: GuildEventSnapshot,
 ) -> (GuildRosterSnapshotRead, Arc<AtomicU32>) {
@@ -51,8 +46,6 @@ fn counting_snapshot_read(
     (read, reads)
 }
 
-/// SMSG_GUILD_ROSTER for one member whose officer note is `officer_note`, so two calls with
-/// different notes give two packets a test can tell apart by content.
 fn roster_variant(officer_note: &str) -> ServerOpcodeMessage {
     let guild = crate::codec::GuildView {
         guild_id: 7,
@@ -139,7 +132,6 @@ fn a_broadcast_guild_event_reaches_online_members_and_nobody_else() {
     let mut receivers = Vec::new();
     for (session, guid) in [(1, 9001), (2, 9002), (3, 9003), (4, 9004)] {
         let (tx, rx) = SessionTx::with_depth(0);
-        // Members stand on different Shards: the audience is the Guild, not the Shard.
         view.add_viewer_on_shard(
             viewer_with_tx(session, guid, identity(session as u8), tx),
             anchor,
@@ -191,8 +183,6 @@ fn an_addressed_guild_event_reaches_only_its_recipient() {
     );
     view.add_viewer_on_shard(viewer_with_tx(2, 9001, identity(2), member_tx), anchor, 0);
 
-    // DISBANDED (0x08) is addressed per former member, so it exercises the generic addressed
-    // path through the raw SMSG_GUILD_EVENT builder.
     guild_event_appeared(
         &view,
         &membership(&[(9001, 7, 0)]),
@@ -258,9 +248,6 @@ fn tabard_changed_reaches_every_online_member_with_the_new_emblem() {
     );
 }
 
-/// `0x50` (`event_kind::ROSTER_TO_ACTOR`) is addressed, so it takes the same recipient-only
-/// path SIGNED_ON's twin above already proves. This test pins that the actor's job reads the
-/// shared snapshot and picks the roster its own Guild Rank sees.
 #[test]
 fn roster_to_actor_reaches_only_the_actor_with_the_roster_its_rank_sees() {
     use lyracore_shared::guild::event_kind;
@@ -315,10 +302,6 @@ fn roster_to_actor_with_no_membership_row_sends_nothing() {
     assert!(queued_job(&actor_rx).is_empty());
 }
 
-/// The same guard also has to check which Guild the membership row names: `map_or(0, ...)`
-/// ignored the returned guild_id, so a member who moved to another Guild between this job's
-/// enqueue and its run would still get a roster, rendered under its new Guild's own Rank
-/// Rights.
 #[test]
 fn roster_to_actor_with_membership_in_another_guild_sends_nothing() {
     use lyracore_shared::guild::event_kind;
@@ -337,10 +320,6 @@ fn roster_to_actor_with_membership_in_another_guild_sends_nothing() {
     assert!(queued_job(&actor_rx).is_empty());
 }
 
-/// `0x80` (`event_kind::ROSTER_REFRESH`) is a broadcast kind, so it takes the same audience
-/// path the SIGNED_OFF broadcast test above already proves. This test pins that every online
-/// member's own job reads one shared snapshot and picks the roster its own rank sees, so a
-/// large Guild costs one Realm-core read for the whole broadcast, not one per member.
 #[test]
 fn roster_refresh_gives_each_online_member_the_roster_its_own_rank_sees() {
     use lyracore_shared::guild::event_kind;
@@ -456,7 +435,6 @@ fn night_watch() -> crate::codec::PetitionView {
     }
 }
 
-/// A Petition read that answers `petition` for the Charter and counts its calls.
 fn counting_petition_read(
     petition: Option<crate::codec::PetitionView>,
 ) -> (PetitionRead, Arc<AtomicU32>) {
@@ -484,7 +462,6 @@ fn petition_event(recipient_guid: u64, kind: u8, subject_guid: u64) -> GuildEven
     }
 }
 
-/// Registers the recipient 9003 and a bystander 9004 on one shard.
 fn recipient_and_bystander(view: &WorldView) -> (Receiver<Outbound>, Receiver<Outbound>) {
     let anchor = CellKey::at(0, 0, 0, 0);
     let (recipient_tx, recipient_rx) = SessionTx::with_depth(0);
@@ -690,9 +667,6 @@ fn a_disband_reaches_each_former_member_exactly_once() {
         receivers.push(rx);
     }
     let [alice_rx, bob_rx] = <[_; 2]>::try_from(receivers).unwrap();
-    // A disbanded Guild's members are already gone by the time the relay job runs, so
-    // `membership` answers `None` for both. DISBANDED is addressed, not read from current
-    // membership.
     let no_members = membership(&[]);
 
     guild_event_appeared(
@@ -724,11 +698,8 @@ fn a_removed_event_does_not_reach_the_removed_member() {
         anchor,
         0,
     );
-    // The removed Character's viewer is still on this Gateway (mid-logout, or simply still
-    // connected); its membership is already gone, so `online_audience` no longer includes it.
     view.add_viewer_on_shard(viewer_with_tx(2, 9002, identity(2), removed_tx), anchor, 0);
 
-    // Only 9001 remains a member of guild 7; 9002 was just removed.
     let members = membership(&[(9001, 7, 0)]);
     guild_event_appeared(
         &view,

@@ -38,7 +38,7 @@ and Actor operations from version 3.
 ### Marker macros
 
 The sanctioned extension points. Each is a text-scanned marker `module/build.rs` turns into a
-registry entry; the macro documentation in `module/src/lib.rs` is authoritative for the exact shape,
+registry entry; the macro patterns in `module/src/lib.rs` are authoritative for the exact shape,
 which must be written literally.
 
 | marker | registers |
@@ -56,8 +56,8 @@ them a despawned character leaves rows behind, and a character that crosses a sh
 ### Hook catalogue
 
 Handlers are notify-only: they observe the payload and may act through the operations below. There is
-no veto and no fold. Payload fields are documented at the struct in `module/src/hooks.rs`, which is
-authoritative; this list is the set of event names and their payload types.
+no veto and no fold. The structs in `module/src/hooks.rs` define the payload fields and their types.
+This list pairs each event name with its payload type.
 
 | event | payload |
 |---|---|

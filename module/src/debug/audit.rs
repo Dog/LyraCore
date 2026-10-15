@@ -1,25 +1,13 @@
-//! Content audits: the 1-20 class-kit audit (which learnable abilities actually DO something) and
-//! the 1-20 quest-chain integrity audit (which quests would stall a leveling playthrough). Both are
-//! pure reads that log a report; neither mutates state.
-
 use spacetimedb::{log, reducer, ReducerContext, Table};
 
 use crate::{
     game_creature_template, game_item_template, game_quest_template, game_spell, game_spell_effect,
 };
 
-/// 1-20 leveling audit (2026-07-17): for each of the 6 human-class trainers, resolve EVERY offering
-/// through the server's own `resolve_learn_target` (wrapper → rank) and classify the rank spell's
-/// effects — LIVE (has a real handler), HOLLOW (all effects are unmapped E_SCRIPTED no-ops, script_id
-/// 0 — the spell "exists" but does nothing), or NO-EFFECT (learn-only/passive, no effect rows). Logs a
-/// per-class band summary (L1-9 / L10-19 / L20) + the concrete HOLLOW list (class · req_level · id ·
-/// name) — the actionable "which class abilities don't work through 1-20" wall list. Read the module
-/// log after calling. Pure read, no state change.
 #[reducer]
 pub fn debug_audit_class_kits(ctx: &ReducerContext) {
     use crate::game_trainer_spell;
     use crate::spell::{A_FLAG, E_SCRIPTED};
-    // (class label, trainer creature entry): the Goldshire class trainers.
     const TRAINERS: &[(&str, u32)] = &[
         ("Warrior", 913),
         ("Paladin", 927),
@@ -28,10 +16,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
         ("Mage", 328),
         ("Warlock", 906),
     ];
-    // PASSIVE combat skills whose mechanic lives in the COMBAT ENGINE, not as a spell effect
-    // (verified 2026-07-17: combat/tables.rs parry/block in the attack table, combat/mod.rs off-hand
-    // swings). Their spell has no live effect but the ability WORKS — so they are NOT hollow. Matched
-    // by name (rank-suffix stripped by the resolver). Keeps the HOLLOW list actionable.
     const ENGINE_PASSIVES: &[&str] = &[
         "Parry",
         "Dodge",
@@ -44,8 +28,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
         "Slow Fall",
         "Unending Breath",
     ];
-    // Classify a resolved rank spell: Some(true)=LIVE, Some(false)=HOLLOW (unmapped no-op), None=no
-    // effects, or the passive-engine bucket via the returned name check at the call site.
     let classify = |rank: u32| -> Option<bool> {
         let effects: Vec<_> = ctx
             .db
@@ -56,8 +38,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
         if effects.is_empty() {
             return None;
         }
-        // A_FLAG passive markers don't count as "does something"; an E_SCRIPTED with script_id 0 is
-        // the unmapped no-op. Any other effect kind (or a scripted handler with a real id) is live.
         let live = effects
             .iter()
             .any(|e| e.kind != A_FLAG && !(e.kind == E_SCRIPTED && e.script_id == 0));
@@ -74,7 +54,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
     };
     log::info!("=== CLASS-KIT AUDIT (1-20 leveling) — LIVE / HOLLOW / NO-EFFECT per band ===");
     for (label, trainer) in TRAINERS {
-        // [band][0]=live [1]=hollow [2]=no-effect
         let mut counts = [[0u32; 3]; 3];
         let mut hollow: Vec<(u8, u32, String)> = Vec::new();
         for off in ctx
@@ -97,7 +76,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
                 .unwrap_or_default();
             match classify(rank) {
                 Some(true) => counts[b][0] += 1,
-                // An engine-implemented passive counts as LIVE (the mechanic works), not hollow.
                 _ if ENGINE_PASSIVES.contains(&name.as_str()) => counts[b][0] += 1,
                 Some(false) => {
                     counts[b][1] += 1;
@@ -126,12 +104,6 @@ pub fn debug_audit_class_kits(ctx: &ReducerContext) {
     log::info!("=== END CLASS-KIT AUDIT ===");
 }
 
-/// 1-20 quest-chain integrity audit (2026-07-17): for every quest with `quest_level` in 1..=20,
-/// check the four things a leveling player needs to actually COMPLETE it, and log the broken ones —
-/// the "which quests would stall a 1-20 playthrough" wall list. Checks: (1) a START giver exists (a
-/// creature or GO offers it — else the quest is unreachable), (2) an END giver exists (else it can't
-/// be turned in), (3) `prev_quest_id`, if set, resolves to a real quest (else a dangling chain), (4)
-/// every KILL/COLLECT objective target + every reward item references an existing template. Pure read.
 #[reducer]
 pub fn debug_audit_quest_chains(ctx: &ReducerContext) {
     use crate::quest::quest_role;
@@ -154,7 +126,7 @@ pub fn debug_audit_quest_chains(ctx: &ReducerContext) {
         }
     };
     let mut ok = [0u32; 3];
-    let mut broken: Vec<(u32, u32, String, String)> = Vec::new(); // (level, entry, title, reasons)
+    let mut broken: Vec<(u32, u32, String, String)> = Vec::new();
     log::info!("=== QUEST-CHAIN AUDIT (1-20) — completability per band ===");
     for q in ctx.db.game_quest_template().iter() {
         if q.quest_level == 0 || q.quest_level > 20 {
@@ -192,7 +164,7 @@ pub fn debug_audit_quest_chains(ctx: &ReducerContext) {
                     .entry()
                     .find(o.target_entry)
                     .is_none(),
-                _ => false, // USE_GAMEOBJECT / EXPLORE: target validated elsewhere
+                _ => false,
             };
             if missing {
                 reasons.push("bad objective target");

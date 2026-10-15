@@ -118,7 +118,6 @@ fn melee_swing_relays_damage_then_stops_on_a_killing_blow() {
 
 const HEROIC_STRIKE_CASTER: u64 = 7;
 
-/// The module's `CAST_FAIL_NO_POWER`.
 const NO_POWER_CODE: u8 = 1;
 
 fn spell_cast_event(kind: u8) -> SpellCastEvent {
@@ -151,9 +150,6 @@ fn spell_cast_event(kind: u8) -> SpellCastEvent {
     }
 }
 
-/// An interruption signal row for `spell_id` cast by `HEROIC_STRIKE_CASTER`, carrying
-/// `failure_reason`. Every other field stays at the module baseline's zero, which is what such a
-/// row really looks like on the wire.
 fn interrupted_cast(spell_id: u32, failure_reason: u8) -> SpellCastEvent {
     SpellCastEvent {
         spell_id,
@@ -296,9 +292,6 @@ fn unknown_spell_cast_event_kind_emits_no_packet() {
     assert!(cast_event_outbound(HEROIC_STRIKE_CASTER, &row).is_empty());
 }
 
-/// A queued strike that could not pay its cost at the swing: the caster gets the cast-bar
-/// teardown and then the failed cast result naming the queued spell with the vanilla Not Enough
-/// Power reason (0x4D). No SMSG_SPELL_GO — the strike never fired.
 #[test]
 fn a_deferred_power_failure_relays_the_teardown_then_the_failed_cast_result() {
     let out = cast_event_outbound(HEROIC_STRIKE_CASTER, &interrupted_cast(78, NO_POWER_CODE));
@@ -314,14 +307,12 @@ fn a_deferred_power_failure_relays_the_teardown_then_the_failed_cast_result() {
     match &out[1] {
         Outbound::Raw { opcode, body } => {
             assert_eq!(*opcode, 0x0130);
-            // spell(u32 LE) + CAST_FAILED(0x02) + SPELL_FAILED_NO_POWER(0x4D).
             assert_eq!(body, &vec![78, 0, 0, 0, 0x02, 0x4D]);
         }
         _ => panic!("expected the raw failed cast result second"),
     }
 }
 
-/// The failed cast result is caster-private: a bystander watching the same row gets nothing.
 #[test]
 fn a_bystander_sees_neither_half_of_a_deferred_power_failure() {
     let out = cast_event_outbound(
@@ -331,8 +322,6 @@ fn a_bystander_sees_neither_half_of_a_deferred_power_failure() {
     assert!(out.is_empty(), "both messages are caster-private");
 }
 
-/// An interruption with no concrete reason (a damaged mid-cast timed spell) still sends the
-/// teardown alone — the cast result belongs to a failure the server can name.
 #[test]
 fn an_ordinary_interruption_still_sends_the_teardown_alone() {
     let out = cast_event_outbound(HEROIC_STRIKE_CASTER, &interrupted_cast(133, 0));
@@ -345,31 +334,20 @@ fn an_ordinary_interruption_still_sends_the_teardown_alone() {
 
 #[test]
 fn stealth_both_inserts_hide_both_deletes_reveal_created_dedupes() {
-    // A Stealth cast applies TWO A_STEALTH auras and the SDK fires both inserts AFTER applying the
-    // delta, so both see post-count 2 -> both HIDE (the per-viewer `created` set makes the 2nd a
-    // no-op at the call site). A break removes both -> two deletes seeing post-count 0 -> both REVEAL
-    // (created-deduped to one). The decision is purely "stealthed -> Hide, not stealthed -> Reveal".
     assert_eq!(stealth_action(true, 1), StealthAction::Hide);
     assert_eq!(stealth_action(true, 2), StealthAction::Hide);
     assert_eq!(stealth_action(true, 3), StealthAction::Hide);
-    assert_eq!(stealth_action(false, 1), StealthAction::None); // still stealthed after one of two deletes
+    assert_eq!(stealth_action(false, 1), StealthAction::None);
     assert_eq!(stealth_action(false, 0), StealthAction::Reveal);
-    assert_eq!(stealth_action(false, 2), StealthAction::None); // over-count delete does not reveal
-                                                               // An insert can never leave count 0 (it adds one) -> defensively a no-op.
+    assert_eq!(stealth_action(false, 2), StealthAction::None);
     assert_eq!(stealth_action(true, 0), StealthAction::None);
 }
 
 #[test]
 fn stealth_dedup_composes_with_a_real_hashset_exactly_once() {
-    // `stealth_visibility` pairs `stealth_action`'s Hide/Reveal decision with `created`'s
-    // remove()/insert() return value (only act if the set's membership actually changed) — this
-    // composes that SAME discipline over a real `std::collections::HashSet<u64>` (not a mock) to
-    // pin the "exactly once" guarantee a Stealth cast's two A_STEALTH inserts/deletes rely on.
     let target = 99u64;
-    let mut created: HashSet<u64> = HashSet::from([target]); // starts visible
+    let mut created: HashSet<u64> = HashSet::from([target]);
     let mut destroys = 0;
-    // A Stealth cast applies TWO A_STEALTH auras; the SDK fires both inserts AFTER applying the
-    // whole delta, so both see post-count 2 -> both decide Hide.
     for count in [2, 2] {
         if stealth_action(true, count) == StealthAction::Hide && created.remove(&target) {
             destroys += 1;
@@ -377,7 +355,6 @@ fn stealth_dedup_composes_with_a_real_hashset_exactly_once() {
     }
     assert_eq!(destroys, 1, "two HIDE decisions must destroy exactly once");
     assert!(!created.contains(&target));
-    // A break removes both auras; both deletes see post-count 0 -> both decide Reveal.
     let mut creates = 0;
     for count in [0, 0] {
         if stealth_action(false, count) == StealthAction::Reveal && created.insert(target) {

@@ -1,28 +1,12 @@
-//! Money + item loot from a creature corpse. The lootable copper is rolled onto the corpse's
-//! `WorldEntity` (with `UNIT_DYNFLAG_LOOTABLE`) on the killing blow in `combat/`; `loot_money` moves
-//! it into the looter's purse and clears the flag. Item drops are rolled into `game_corpse_loot` rows
-//! on the same killing blow; the gateway reads them to populate the loot window, and taking one
-//! (`CMSG_AUTOSTORE_LOOT_ITEM`) is `crate::items::take_loot` → `apply_take_loot`. [server]/[entity]
-//!
-//! Split into three files that stay one Rust module (`crate::loot::*` paths are
-//! unaffected — everything below re-exports through): this file (the roll core, the money split,
-//! and the loot-family DATA tables — creature/pickpocket/gameobject/skinning/fishing), `rolls.rs`
-//! (the NEED/GREED/round-robin/master group-loot machinery), and the sibling top-level
-//! `crate::professions` (skinning/fishing/enchanting — feature reducers over that data, not loot-table
-//! machinery themselves).
-//!
-//! Loot-family completeness, two design decisions recorded here because they shape
-//! every table/reducer below:
-
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::actor::{ActionRefusal, ActionRefusalKind};
 use crate::character::game_character;
-use crate::game_group_member; // clone_quest_loot_for_group's GameObject roster read
+use crate::game_group_member;
 use crate::game_world_entity;
-use crate::{game_character_quest, game_quest_objective}; // killer_needs_item (fishing's zone resolve now lives in terrain::zone_id_at)
+use crate::{game_character_quest, game_quest_objective};
 use lyracore_shared::loot::LootRefusal;
-use lyracore_shared::loot_roll::event_kind as roll_event_kind; // apply_loot_money's MONEY_SHARE push
+use lyracore_shared::loot_roll::event_kind as roll_event_kind;
 
 mod rolls;
 pub use rolls::{
@@ -45,80 +29,37 @@ pub use tag::{
     CreatureLootTagGroup, CreatureQuestTap, CreatureQuestTapMember,
 };
 
-// The profession reducers (skinning/fishing/enchanting) live in the sibling top-level
-// `crate::professions` module — re-exported here so every existing
-// `crate::loot::skin_corpse`/`apply_fish`/`apply_disenchant`/`apply_enchant_item`/`entry_is_beast`
-// call site (debug.rs's twins) keeps compiling unchanged even though nothing in THIS file uses
-// them directly.
 #[allow(unused_imports)]
 pub(crate) use crate::professions::{
     apply_disenchant, apply_enchant_item, apply_fish, entry_is_beast, skin_corpse,
 };
 
-/// One item available to loot on a creature corpse. Born on the killing blow (combat/),
-/// read by the gateway for `SMSG_LOOT_RESPONSE`, reaped when the corpse decays (creatures/). Public
-/// + no RLS: loot is shown to whoever opens the corpse (the take is gated by the loot reducer, like
-/// money). `item_entry` → `game_item_template` (the gateway joins it for the display id). [entity]
 #[table(accessor = game_corpse_loot, public, index(accessor = by_corpse, btree(columns = [corpse_guid])))]
 pub struct CorpseLoot {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
     pub corpse_guid: u64,
-    pub slot: u8,        // loot-window slot index (0-based)
-    pub item_entry: u32, // -> game_item_template.entry
+    pub slot: u8,
+    pub item_entry: u32,
     pub count: u32,
-    // END-APPENDED (see the module doc):
-    // does this row carry a QUEST-only item (rolled from a `quest_only` creature/pickpocket/
-    // gameobject-loot row)? Quest rows now roll UNCONDITIONALLY (the drop-chance still applies; only
-    // the pre-roll killer gate is gone) — visibility (gateway) and takability (`apply_take_loot`) are
-    // decided per-viewer/per-taker instead. `#[default(false)]` so every existing row (and every
-    // non-quest drop) keeps behaving exactly as before — additive auto-migration.
     #[default(false)]
     pub quest_only: bool,
-    // END-APPENDED: `0` = the SHARED, not-yet-split row, any currently-needing
-    // character may claim it, which triggers the per-member clone (`clone_quest_loot_for_group`);
-    // nonzero = a character guid, this specific row is a per-member CLONE reserved for exactly that
-    // character (minted the moment the shared row is first taken). Meaningless when `quest_only` is
-    // false UNLESS it's a group-loot WINNER-LOCKED row (below): nonzero then also marks
-    // "this row belongs EXCLUSIVELY to this guid" for a NEED/GREED roll winner whose bag was full at grant time (`resolve_roll`'s inventory-full fallback — the item
-    // sits here until they free space and re-loot). Same predicate on both the gateway's visibility
-    // read and `apply_take_loot`'s gate either way: nonzero `reserved_for` always means "only this
-    // guid, unconditionally". `#[default(0)]` — additive.
+    // Nonzero reserves the row for one Character, including a Loot Roll winner with full bags.
     #[default(0u64)]
     pub reserved_for: u64,
-    // END-APPENDED (group loot methods): three columns the module stamps
-    // at KILL TIME (`apply_group_loot_rules`, called from `combat::kill_creature` — never at
-    // loot-open; see the module doc below for why). All three are meaningless (stay at their
-    // defaults) for an ungrouped kill, an FFA-method group, or any `quest_only` row (the two systems
-    // are kept ORTHOGONAL — `apply_group_loot_rules` never touches a `quest_only` row). `#[default]`
-    // on all three — additive, byte-identical for every existing row.
-    /// `0` = no round-robin/master restriction (FFA, or a solo/ungrouped kill); nonzero = ONLY this
-    /// character guid may see/take the row via the plain loot path (ROUND_ROBIN/GROUP-below-
-    /// threshold: the corpse's picked-once designee; MASTER-above-threshold: the master looter).
     #[default(0u64)]
     pub designated_looter_guid: u64,
-    /// Above-threshold under the MASTER method: takable ONLY via `loot_master_give` (never the plain
-    /// autostore path, not even by the master themselves — matches vanilla's explicit-assign model).
+    // Even the master must use the explicit assignment path.
     #[default(false)]
     pub master_only: bool,
-    /// A live NEED/GREED/NBG roll is in progress on this row — WITHHELD from EVERY viewer's loot
-    /// window (including the eventual winner) until `resolve_roll` clears it (by deleting the row on
-    /// a successful grant, or flipping `reserved_for` to the winner on an inventory-full fallback).
+    // Withheld rows may belong to a Loot Roll promoted to Realm-core.
     #[default(false)]
     pub withheld: bool,
     #[default(0)]
     pub random_property_id: u32,
 }
 
-/// A creature's loot-table entry: when an `creature_entry` creature dies, its rows roll for drops.
-/// `chance_bp` is BASIS POINTS (0..=10000; 10000 = always, 0 = never) so sub-1% odds are representable
-/// (real loot tables are full of fractional chances). `group_id` gives vanilla "pick-one" pools:
-/// `0` = an independent roll (this row drops on its own chance), `>0` = a group where AT MOST ONE
-/// member drops per kill (the members' `chance_bp` are weights walked as a cumulative band — so a
-/// shared loot pool of N items drops one of them, not N independent items). Multiple rows per
-/// `creature_entry` form the full table. Loaded by the importer (cmangos `*_loot_template`) or seeded;
-/// public + read-only, no Timestamp → SQL-loadable. A creature with NO rows drops no items. [static]
 #[table(accessor = game_creature_loot, public, index(accessor = by_creature, btree(columns = [creature_entry])))]
 pub struct CreatureLoot {
     #[primary_key]
@@ -126,28 +67,17 @@ pub struct CreatureLoot {
     pub id: u64,
     pub creature_entry: u32,
     pub item_entry: u32,
-    pub chance_bp: u32, // drop chance in basis points (0..=10000); a group member's weight if group_id>0
+    pub chance_bp: u32, // Basis points; group_id > 0 uses this as a weight.
     pub count: u32,
-    pub group_id: u32, // 0 = independent roll; >0 = pick-one group (≤1 member drops per kill)
-    // END-APPENDED: cmangos `ChanceOrQuestChance < 0`, the item is a QUEST-drop, only
-    // ever visible to a player who currently needs it (an active matching COLLECT_ITEM objective — see
-    // `killer_needs_item`). Gated at ROLL TIME against the CREDITED KILLER (see the module doc),
-    // never re-evaluated later. `#[default(false)]` so existing rows keep
-    // rolling exactly as before (never quest-gated) — additive auto-migration.
+    pub group_id: u32, // Zero is independent; nonzero selects a pool with at most one drop.
     #[default(false)]
     pub quest_only: bool,
 }
 
-/// Independent drop test (`group_id == 0`): does an item with `chance_bp` (0..=10000) drop on a
-/// `roll` in 0..10000? Half-open (`roll < chance`) so 10000 always drops and 0 never does. Pure/testable.
 pub(crate) fn loot_drops(chance_bp: u32, roll_0_9999: u32) -> bool {
     roll_0_9999 < chance_bp
 }
 
-/// Pick-one group roll: given member weights in basis points and a `roll` in 0..10000, return the index
-/// of the member that drops, or `None` if the roll lands past the members' cumulative weight (the
-/// group's "nothing" band — only reachable when the weights sum below 10000). This is the vanilla
-/// group-loot semantics: at most one item from a shared pool, weighted by chance. Pure/testable.
 pub(crate) fn group_pick(member_bp: &[u32], roll_0_9999: u32) -> Option<usize> {
     let mut cum = 0u32;
     for (i, &bp) in member_bp.iter().enumerate() {
@@ -159,27 +89,17 @@ pub(crate) fn group_pick(member_bp: &[u32], roll_0_9999: u32) -> Option<usize> {
     None
 }
 
-/// Per-1000 copper-loot multiplier for a creature's classification `rank` — an elite/rare/boss is
-/// worth more money than a normal mob of the same level. cmangos `creature_template.rank`: `0`=normal,
-/// `1`=elite, `2`=rare-elite, `3`=boss, `4`=rare. Bumps: normal 1.0×, elite 1.5×, rare-elite 2.0×,
-/// boss 3.0×, rare 2.0×. PERMILLE (×1000) for exact integer math; rank 0 (`1000`) is the identity so a
-/// normal kill's purse is BYTE-IDENTICAL to before. Unknown rank → normal (never amplify). Pure —
-/// unit-tested. (HP/damage rank scaling live in `creatures/`/`combat/`; this is the loot twin.)
 pub(crate) fn rank_money_multiplier_permille(rank: u8) -> u32 {
     match rank {
-        0 => 1000, // normal — identity (baseline)
-        1 => 1500, // elite
-        2 => 2000, // rare-elite
-        3 => 3000, // boss
-        4 => 2000, // rare
-        _ => 1000, // unknown rank → treat as normal
+        0 => 1000, // Normal.
+        1 => 1500, // Elite.
+        2 => 2000, // Rare elite.
+        3 => 3000, // Boss.
+        4 => 2000, // Rare.
+        _ => 1000,
     }
 }
 
-/// Apply the rank money multiplier to a rolled copper amount (integer permille math, saturating so a
-/// large roll × a high multiplier can't wrap a `u32`). Shared by the killing-blow money roll
-/// (combat/) and the unit test so the live scaling and the asserted numbers never drift. Rank 0 →
-/// the amount unchanged. Pure.
 pub(crate) fn scale_money_for_rank(money: u32, rank: u8) -> u32 {
     let permille = rank_money_multiplier_permille(rank);
     ((money as u64 * permille as u64) / 1000) as u32
@@ -215,17 +135,6 @@ pub(crate) fn roll_loot_rows_quest_aware(
     winners
 }
 
-/// Roll ONE generic loot table (the shape shared by every family — creature/pickpocket/gameobject/
-/// skinning/fishing): independent rows (`group_id == 0`) each test their own `chance_bp`; grouped rows
-/// (`group_id > 0`) are collected and rolled ONCE per group (pick-one, weighted by `chance_bp`).
-/// Returns the winners as `(item_entry, count)`, in table order for independents then group order —
-/// callers decide what a winner MEANS (a `game_corpse_loot` row, a direct `grant_item`, …).
-///
-/// A thin adapter over [`roll_loot_rows_quest_aware`] (the "one roll core"): tag every row
-/// `quest_only = false`, delegate, then drop the flag off each winner. The RNG draw sequence is
-/// IDENTICAL to the old standalone body this replaces (the same `ctx.random` calls in the same
-/// order), so `professions::skin_corpse`/`professions::apply_fish` — the two callers with no
-/// `quest_only` column to carry — stay byte-identical.
 pub(crate) fn roll_loot_rows(
     ctx: &ReducerContext,
     rows: Vec<(u32, u32, u32, u32)>,
@@ -242,7 +151,6 @@ pub(crate) fn roll_loot_rows(
         .collect()
 }
 
-/// A quest reservation grants its owner the item even when current need has ended.
 pub(crate) fn quest_take_allowed(
     reserved_for: u64,
     taker_guid: u64,
@@ -267,11 +175,6 @@ pub(crate) fn group_loot_take_allowed(
     )
 }
 
-/// Pure: given `(character_guid, currently_needs_item)` pairs for every OTHER
-/// group member (the taker already excluded by the caller), which should receive a fresh per-member
-/// clone when the shared `quest_only` row is first taken? Only the still-needing ones — a member who's
-/// already capped on the item (or no longer holds the quest) gets nothing, matching vanilla (the item
-/// simply isn't offered to them). Pure.
 pub(crate) fn clone_targets(other_members: &[(u64, bool)]) -> Vec<u64> {
     other_members
         .iter()
@@ -280,11 +183,6 @@ pub(crate) fn clone_targets(other_members: &[(u64, bool)]) -> Vec<u64> {
         .collect()
 }
 
-/// Pure: `count` fresh, ascending loot-window slot indices past whatever is
-/// already used on a corpse (`used_slots`), so per-member quest clones never collide with the
-/// just-deleted shared row's slot or any sibling drop. Saturating (a corpse loot window is
-/// realistically far under 255 rows — the gateway's RAW `SMSG_LOOT_RESPONSE` builder already caps the
-/// wire count at `u8::MAX`). Pure.
 pub(crate) fn next_free_slots(used_slots: &[u8], count: usize) -> Vec<u8> {
     let mut next = used_slots
         .iter()
@@ -300,7 +198,6 @@ pub(crate) fn next_free_slots(used_slots: &[u8], count: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Read quest and inventory facts for the shared quest-item need rule.
 pub(crate) fn killer_needs_item(ctx: &ReducerContext, killer: Option<u64>, item: u32) -> bool {
     let Some(killer_guid) = killer else {
         return false;
@@ -337,19 +234,7 @@ pub(crate) fn killer_needs_item(ctx: &ReducerContext, killer: Option<u64>, item:
     )
 }
 
-/// Purge every `game_corpse_loot` / `game_corpse_loot_eligible` row still parked on `guid`, BEFORE a
-/// fresh roll ever writes to it. Two residue sources land here: (a) corpse-guid REUSE
-/// (a harness SQL teardown or `debug_spawn_at_feet` skipping the decay reaper leaves a departed kill's
-/// `game_corpse_loot_eligible` snapshot behind for the next creature minted at that guid), and (b)
-/// the pickpocket/kill collision — `roll_pickpocket_loot` inserts `game_corpse_loot` rows at
-/// slots 0.. keyed on the LIVE creature's guid (vanilla lets a rogue crack a pocket before the kill);
-/// if the mob dies before every row is taken, `roll_creature_loot` re-inserts kill drops starting at
-/// slot 0 on the SAME guid, producing duplicate `(corpse_guid, slot)` pairs that every first-match
-/// consumer (`items::apply_take_loot`, `unlock_row_ffa`, `settle_roll_grant`, `loot_master_give`)
-/// addresses ambiguously. Vanilla-correct either way: the pickpocket window dies with the mob, so any
-/// leftover pickpocket rows are stale the instant it does. Called from the ONE spot every creature
-/// death routes through (`combat::kill_creature`), before the fresh loot roll / group snapshot — a
-/// no-op for a guid with no residue (the common path). [server]
+// Purge pickpocket residue before death loot reuses the same guid and slot numbers.
 pub(crate) fn purge_corpse_residue(ctx: &ReducerContext, guid: u64) {
     let loot = ctx.db.game_corpse_loot();
     let stale_loot: Vec<u64> = loot.by_corpse().filter(&guid).map(|l| l.id).collect();
@@ -363,24 +248,7 @@ pub(crate) fn purge_corpse_residue(ctx: &ReducerContext, guid: u64) {
     }
 }
 
-/// Reap every loot-family row keyed on `corpse_guid` (creature corpse OR chest-GO guid): item rows,
-/// the group-loot eligibility snapshot, rolls + votes. This is the CANONICAL teardown sweep — the one
-/// every despawn path routes through ([`crate::creatures::despawn_creature_entity`] for creatures, the
-/// GO-copy loop in `instance::teardown_instance_inner` for chests) — so a new loot-family table is
-/// added HERE, once, and every teardown picks it up.
-///
-/// Distinct from [`purge_corpse_residue`], which sits next door and looks similar: that one runs
-/// BEFORE a fresh kill roll and deliberately purges unconditionally (nothing on a live mob's guid can
-/// be owned by a roll that matters). This one runs when the corpse itself goes away, and must respect
-/// the withheld gate below.
-///
-/// Fix: a `game_corpse_loot` row still `withheld` is locked by a live NEED/GREED roll —
-/// which, in a sharded deployment, may be authoritative on realm-core and invisible to this
-/// database's own `game_loot_roll` table (promoted away within ~200ms of kill-time; see
-/// `creatures::tick::pass_decay`'s matching fix). Reaping it here would delete the item out from
-/// under a roll that has not resolved yet, so `settle_loot_roll`'s eventual grant finds nothing and
-/// silently no-ops. Leave a withheld row behind — orphaned-but-safe, the same posture the
-/// inventory-full fallback already uses for a row exclusively reserved for a winner. [server]
+// Preserve withheld rows: their live Loot Roll may exist only on Realm-core.
 pub(crate) fn reap_corpse_loot_family(ctx: &ReducerContext, corpse_guid: u64) {
     let loot = ctx.db.game_corpse_loot();
     let stale: Vec<u64> = loot
@@ -417,8 +285,6 @@ pub(crate) fn reap_corpse_loot_family(ctx: &ReducerContext, corpse_guid: u64) {
     }
 }
 
-/// Insert valid drops at consecutive slots. Invalid property catalogues omit the affected item.
-/// Each row starts unclaimed and FFA; creature group rules are applied by the caller.
 pub(crate) fn insert_corpse_rows(
     ctx: &ReducerContext,
     corpse_guid: u64,
@@ -441,8 +307,6 @@ pub(crate) fn insert_corpse_rows(
             count,
             quest_only,
             reserved_for: 0,
-            // Group-loot stamping happens AFTER this fn returns, in
-            // `apply_group_loot_rules` (combat::kill_creature) — this insert always starts FFA.
             designated_looter_guid: 0,
             master_only: false,
             withheld: false,
@@ -453,15 +317,6 @@ pub(crate) fn insert_corpse_rows(
     inserted != 0
 }
 
-/// Roll a creature's loot table into `game_corpse_loot` rows on its corpse; returns whether anything
-/// dropped (so the caller sets `UNIT_DYNFLAG_LOOTABLE`). Data-driven: reads `game_creature_loot` for
-/// `creature_entry`, then rolls independent rows + one weighted pick per group with the
-/// `roll_loot_rows_quest_aware` core (`quest_only` rows roll UNCONDITIONALLY, with
-/// no killer gate; the flag just rides along onto the inserted row for the gateway/take-path to
-/// gate per-viewer/per-taker instead), inserting the winners at sequential loot slots with a fresh
-/// `reserved_for = 0` (unclaimed). No table rows → nothing drops (no universal placeholder). Shared by
-/// the real killing blow (combat/) and the debug kill (debug.rs) so both produce identical loot.
-/// [server]
 pub(crate) fn roll_creature_loot(
     ctx: &ReducerContext,
     creature_entry: u32,
@@ -478,20 +333,7 @@ pub(crate) fn roll_creature_loot(
     insert_corpse_rows(ctx, corpse_guid, winners)
 }
 
-// ===========================================================================================
-//  LOOT-FAMILY COMPLETENESS, the four families `game_creature_loot` never covered:
-//  pickpocket / gameobject-chest / skinning / fishing. All four share the SAME row shape as
-//  `CreatureLoot` (item/chance_bp/count/group_id, some also carrying `quest_only`); the importer maps
-//  cmangos's `*_loot_template` family onto them (see importer's `parse_loot_family`). Public + no
-//  Timestamp → SQL-loadable, exactly like `CreatureLoot`. [static]
-// ===========================================================================================
-
-/// `pickpocketing_loot_template` — a creature's PICKPOCKET table, keyed directly on
-/// `creature_entry` (the importer collapses cmangos's `PickpocketLootId` indirection the same way it
-/// already does for `CreatureLoot`'s `LootId`). Rolled by `roll_pickpocket_loot` (E_PICKPOCKET,
-/// spell/cast.rs) into `game_corpse_loot` keyed on the LIVE creature's guid — pickpocketing doesn't
-/// kill it, so the shared corpse-loot table just serves as "this guid has a loot window" (like the
-/// GO-chest reuse below). [static]
+// The importer resolves PickpocketLootId to creature_entry before storage.
 #[table(accessor = game_pickpocket_loot, public, index(accessor = by_creature, btree(columns = [creature_entry])))]
 pub struct GamePickpocketLoot {
     #[primary_key]
@@ -505,12 +347,6 @@ pub struct GamePickpocketLoot {
     pub quest_only: bool,
 }
 
-/// `gameobject_loot_template` — a lootable gameobject's (CHEST) table, keyed on `loot_id`
-/// (`GameObjectTemplate.data1` — the REAL cmangos `gameobject_template.Data1`, read verbatim by the
-/// importer). Rolled by `apply_use_gameobject`'s CHEST arm (gameobject.rs) into `game_corpse_loot`
-/// keyed on the GO's guid, multi-slot (unlike the old single-`data0`-item shortcut it replaces). A
-/// `loot_id` of 0 (unimported / the seed/demo chest) has no rows here — the module falls back to the
-/// legacy single-item `data0` drop, so existing seed/demo data + tests stay byte-identical. [static]
 #[table(accessor = game_gameobject_loot, public, index(accessor = by_loot, btree(columns = [loot_id])))]
 pub struct GameObjectLoot {
     #[primary_key]
@@ -524,12 +360,6 @@ pub struct GameObjectLoot {
     pub quest_only: bool,
 }
 
-/// `skinning_loot_template` — a level-banded leather table, keyed on `skin_loot_id`
-/// (`CreatureTemplate.skin_loot_id` — cmangos's `SkinLootId`; several creatures of the same level band
-/// share ONE `skin_loot_id`, so this is NOT collapsed onto `creature_entry` the way pickpocket is).
-/// Rolled by `professions::skin_corpse` in place of the flat `LEATHER_ENTRY` shortcut; a `skin_loot_id`
-/// of 0 (unimported, or a seeded/test beast) falls back to the flat leather, byte-identical to before.
-/// No `quest_only` — no cmangos skinning row is ever quest-gated. [static]
 #[table(accessor = game_skinning_loot, public, index(accessor = by_skin, btree(columns = [skin_loot_id])))]
 pub struct GameSkinningLoot {
     #[primary_key]
@@ -554,14 +384,6 @@ pub struct GameFishingLoot {
     pub group_id: u32,
 }
 
-/// Roll a creature's PICKPOCKET table into `game_corpse_loot` rows keyed on the LIVE target's guid, then
-/// refresh `UNIT_DYNFLAG_LOOTABLE` (`refresh_lootable`) so a still-alive-but-pickpocketed
-/// creature shows the loot cursor if anything rolled. Quest-only rows roll UNCONDITIONALLY
-/// (no rogue gate; the flag rides onto the row for per-viewer/per-taker gating
-/// downstream). A no-row table (or an all-miss roll) inserts nothing and never touches the flag — the
-/// existing money-only path (spell/cast.rs) is unaffected either way. Called from `E_PICKPOCKET`
-/// (spell/cast.rs), inside the SAME `!target.pickpocketed` once-gate the copper roll already uses, so
-/// items can never be drained twice per life either. [server]
 pub(crate) fn roll_pickpocket_loot(ctx: &ReducerContext, creature_entry: u32, target_guid: u64) {
     let raw: Vec<(u32, u32, u32, u32, bool)> = ctx
         .db
@@ -578,14 +400,6 @@ pub(crate) fn roll_pickpocket_loot(ctx: &ReducerContext, creature_entry: u32, ta
     refresh_lootable(ctx, target_guid);
 }
 
-/// On the FIRST take of a shared `quest_only` row (`apply_take_loot`'s caller):
-/// mint one independent, per-member `reserved_for` clone for every OTHER member of `taker_guid`'s group
-/// who currently still needs `item_entry` — so a grouped quest-holder's copy doesn't vanish the instant
-/// a fellow member loots theirs. A solo `taker_guid` (`group_of` returns `None`) touches nothing —
-/// solo behavior is unchanged (design requirement). Clones land at FRESH slots past whatever is
-/// already on the corpse (`next_free_slots`), never colliding with the just-deleted original's slot or
-/// any sibling drop. Reads `by_group`, an indexed group-scoped lookup, so it costs one clone per
-/// OTHER member whatever the group's size, up to 39 in a full Raid. [server]
 pub(crate) fn clone_quest_loot_for_group(
     ctx: &ReducerContext,
     taker_guid: u64,
@@ -639,9 +453,7 @@ pub(crate) fn clone_quest_loot_for_group(
     }
 }
 
-/// Clone a quest-only creature-loot row for the other corpse-eligible Characters who still need
-/// it. The resolved eligibility set is the whole recipient ceiling: a current group lookup would
-/// let a later joiner receive a clone.
+// Use death-time eligibility; a current roster would admit later joiners.
 pub(crate) fn clone_quest_loot_for_eligible(
     ctx: &ReducerContext,
     taker_guid: u64,
@@ -689,11 +501,9 @@ pub(crate) fn clone_quest_loot_for_eligible(
     }
 }
 
-/// Max distance to loot a corpse: (10 yd)². Generous — the vanilla client walks into interaction
-/// range itself before sending `CMSG_LOOT_MONEY`, so this only rejects clearly-out-of-range abuse.
+// Squared yards.
 pub(crate) const LOOT_RANGE_SQ: f32 = 100.0;
 
-/// A corpse is ready for skinning once no item row or money remains.
 pub(crate) fn corpse_is_looted(ctx: &ReducerContext, corpse_guid: u64, money: u32) -> bool {
     money == 0
         && ctx
@@ -705,16 +515,12 @@ pub(crate) fn corpse_is_looted(ctx: &ReducerContext, corpse_guid: u64, money: u3
             .is_none()
 }
 
-/// The reducer edge for every loot Refusal. Only the tag crosses the tier boundary, so the Gateway
-/// never reads Module prose; the operator detail stays in the Module log.
 pub(crate) fn refused(refusal: LootRefusal, detail: &str) -> String {
     let tag = refusal.as_tag();
     spacetimedb::log::info!("loot refused {tag}: {detail}");
     tag.to_string()
 }
 
-/// Open a creature corpse for the read that follows. This reducer core only authorizes the read;
-/// it does not create durable loot-window state.
 pub(crate) fn request_open_creature_corpse(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -795,8 +601,6 @@ pub(crate) fn open_creature_corpse(
     request_open_creature_corpse(ctx, actor_guid, corpse_guid).map_err(Into::into)
 }
 
-/// Shared core: take corpse money by explicit looter guid, behind the `loot_money` reducer and
-/// `actor::loot_money`. The Loot Tag Gate runs before the corpse purse changes.
 pub(crate) fn apply_loot_money(
     ctx: &ReducerContext,
     looter_guid: u64,
@@ -807,8 +611,6 @@ pub(crate) fn apply_loot_money(
         .guid()
         .find(looter_guid)
         .ok_or_else(|| refused(LootRefusal::LooterUnavailable, "looter not in world"))?;
-    // A dead looter (killed with a loot window still open) can't loot — gate on the same `dead` flag
-    // every other action checks, so death stays server-authoritative.
     if looter.dead {
         return Err(refused(
             LootRefusal::LooterUnavailable,
@@ -820,9 +622,6 @@ pub(crate) fn apply_loot_money(
         .find(target_guid)
         .ok_or_else(|| refused(LootRefusal::NoLootSource, "no such corpse"))?;
 
-    // Only CREATURE corpses are lootable. A dead/ghost PLAYER is also `dead` with a non-zero purse
-    // (loaded from character.money), so without this guard a second player in range could drain the
-    // victim's coinage (PvP purse theft). Money loot is creature-only until real player-loot rules.
     if corpse.is_player() {
         return Err(refused(LootRefusal::NoLootSource, "cannot loot a player"));
     }
@@ -832,8 +631,6 @@ pub(crate) fn apply_loot_money(
             "Loot Source is not a corpse",
         ));
     }
-    // Map + instance gated: a creature corpse is a `game_world_entity` row, so its
-    // `instance_id` is already on it, so a looter can never reach across an instance wall.
     if corpse.map_id != looter.map_id {
         return Err(refused(LootRefusal::OutOfRange, "corpse on another map"));
     }
@@ -861,19 +658,11 @@ pub(crate) fn apply_loot_money(
     corpse.money = 0;
     entities.guid().update(corpse);
 
-    // Split across the resolved corpse-eligibility set, never a current party lookup. The access
-    // Gate above makes an empty set a Refusal. A one-recipient set is solo and sends no
-    // `MONEY_SHARE` event.
     let recipients = corpse_eligible_recipients(ctx, target_guid);
     let grouped = money_is_grouped(&recipients);
     let shares = split_money(amount, &recipients, looter_guid);
 
-    // Credit the looter's own share in-place (avoid a stale-copy clobber: `looter` is updated ONCE,
-    // after the loop, never re-fetched mid-function) and every other recipient's purse via
-    // `credit_purse` (live entity if online, else the durable Character row — TRAP: a member who was
-    // online at KILL time (the snapshot only ever contains callers of `kill_reward_recipients` who
-    // were online then) may have logged off by LOOT time; vanilla still pays their share [V], so this
-    // never silently drops their copper).
+    // Credit the looter in this local copy to avoid overwriting a separately updated purse.
     for &(recipient_guid, share) in &shares {
         if share == 0 {
             continue;
@@ -886,9 +675,6 @@ pub(crate) fn apply_loot_money(
     }
     entities.guid().update(looter);
 
-    // Only a real GROUPED split pushes `MONEY_SHARE` — a solo credit above never reaches here with
-    // `grouped == true`. Every recipient gets its own notify, including the looter (vanilla shows the
-    // looter the same "Your share of the loot is X" line as the rest of the party when grouped).
     if grouped {
         for &(recipient_guid, share) in &shares {
             if share == 0 {
@@ -904,25 +690,11 @@ pub(crate) fn apply_loot_money(
         }
     }
 
-    // Money may not be the last thing on the corpse — the flag follows the RULE, not this path.
     refresh_lootable(ctx, target_guid);
     Ok(())
 }
 
-/// Credit `share` copper to `recipient_guid`'s purse: the live `WorldEntity.money` if currently
-/// online (relayed to their own connection as `PLAYER_FIELD_COINAGE`), else the durable
-/// `Character.money` row directly (an OFFLINE grouped recipient still gets paid;
-/// `build_player_entity` loads `character.money` back into the entity at their next login). Saturating,
-/// mirroring the looter's own transfer in [`apply_loot_money`]. No-op if the guid resolves to neither
-/// (a deleted character mid-flight) — never panics on a stale snapshot row.
-///
-/// DEFER verdict for the in-transit case. This is the one audited by-guid path a REFUSAL
-/// gets wrong: the recipient is a PARTY MEMBER collecting their share of someone else's kill, so
-/// dropping the write would silently short a third party who is not transferring and cannot know
-/// why. `transfer::defer_money_delta` folds the copper into the escrowed export blob instead, so it
-/// travels with the character. `begin_transfer` deleted the live entity, so the entity branch above
-/// has already missed — the fold happens before the durable-row write, which stays as the
-/// same-database payer of record (both partitions share the one `game_character` row).
+// During Transfer, defer shares into Escrow so an in-flight recipient still gets paid.
 fn credit_purse(ctx: &ReducerContext, recipient_guid: u64, share: u32) {
     let entities = ctx.db.game_world_entity();
     if let Some(mut e) = entities.guid().find(recipient_guid) {
@@ -938,9 +710,6 @@ fn credit_purse(ctx: &ReducerContext, recipient_guid: u64, share: u32) {
     }
 }
 
-/// Split `total` copper evenly across the resolved corpse-eligibility set, with the remainder to
-/// `looter_guid`. The access Gate ensures a real caller is in a non-empty set. The empty case stays
-/// defined for this pure helper's callers and tests, but never authorizes money loot. Pure.
 pub(crate) fn split_money(total: u32, recipients: &[u64], looter_guid: u64) -> Vec<(u64, u32)> {
     if recipients.is_empty() {
         return vec![(looter_guid, total)];
@@ -966,16 +735,10 @@ pub(crate) fn split_money(total: u32, recipients: &[u64], looter_guid: u64) -> V
     shares
 }
 
-/// Money shares are a party action only when the corpse has more than one eligible Character.
 pub(crate) fn money_is_grouped(recipients: &[u64]) -> bool {
     recipients.len() > 1
 }
 
-/// Re-derive `UNIT_DYNFLAG_LOOTABLE` for a corpse from what is actually left on it:
-/// lootable ⇔ any `game_corpse_loot` row remains OR `money > 0`. The ONE clear/set point both
-/// loot paths call after consuming — item-only corpses go dark when the last row is taken, and
-/// taking the money early no longer strips the cursor while items remain. Writes only on a real
-/// change (no spurious on_update relay); a despawned/non-corpse guid is a no-op.
 pub(crate) fn refresh_lootable(ctx: &ReducerContext, corpse_guid: u64) {
     let entities = ctx.db.game_world_entity();
     let Some(mut corpse) = entities.guid().find(corpse_guid) else {
@@ -1006,33 +769,28 @@ mod tests {
 
     #[test]
     fn loot_chance_is_half_open() {
-        // 10000 bp (100%) always drops (every 0..9999 roll is < 10000); 0 never drops.
         assert!(loot_drops(10000, 0));
         assert!(loot_drops(10000, 9999));
         assert!(!loot_drops(0, 0));
-        // A 50% item (5000 bp) drops on the low half, not the high half.
         assert!(loot_drops(5000, 0));
         assert!(loot_drops(5000, 4999));
         assert!(!loot_drops(5000, 5000));
         assert!(!loot_drops(5000, 9999));
-        // Basis points represent sub-1% odds the old integer percent couldn't: 39 bp = 0.39%.
         assert!(loot_drops(39, 38));
         assert!(!loot_drops(39, 39));
     }
 
     #[test]
     fn group_pick_is_one_weighted_band() {
-        // A 3-item pool: bands [0,2000) [2000,5000) [5000,6000), total 6000 bp (60% to drop something).
         let w = [2000u32, 3000, 1000];
-        assert_eq!(group_pick(&w, 0), Some(0)); // first band
+        assert_eq!(group_pick(&w, 0), Some(0));
         assert_eq!(group_pick(&w, 1999), Some(0));
-        assert_eq!(group_pick(&w, 2000), Some(1)); // second band
+        assert_eq!(group_pick(&w, 2000), Some(1));
         assert_eq!(group_pick(&w, 4999), Some(1));
-        assert_eq!(group_pick(&w, 5000), Some(2)); // third band
+        assert_eq!(group_pick(&w, 5000), Some(2));
         assert_eq!(group_pick(&w, 5999), Some(2));
-        assert_eq!(group_pick(&w, 6000), None); // past the cumulative weight → nothing drops
+        assert_eq!(group_pick(&w, 6000), None);
         assert_eq!(group_pick(&w, 9999), None);
-        // An equal-chance pool that sums to 10000 always yields exactly one member.
         let eq = [2500u32, 2500, 2500, 2500];
         assert!(group_pick(&eq, 9999).is_some());
         assert_eq!(group_pick(&eq, 2500), Some(1));
@@ -1040,7 +798,6 @@ mod tests {
 
     #[test]
     fn rank_money_scales_and_rank0_is_identity() {
-        // Rank 0 (normal) is the IDENTITY — a normal kill's purse is unchanged for any rolled amount.
         for money in [0u32, 1, 17, 1000, 1_000_000, u32::MAX] {
             assert_eq!(
                 scale_money_for_rank(money, 0),
@@ -1048,35 +805,25 @@ mod tests {
                 "rank-0 money must be identity for {money}"
             );
         }
-        // Elite/rare/boss money bumps (permille): a 100-copper roll scales by the documented factors.
-        assert_eq!(scale_money_for_rank(100, 1), 150); // elite ×1.5
-        assert_eq!(scale_money_for_rank(100, 2), 200); // rare-elite ×2.0
-        assert_eq!(scale_money_for_rank(100, 3), 300); // boss ×3.0
-        assert_eq!(scale_money_for_rank(100, 4), 200); // rare ×2.0
-                                                       // Unknown rank → normal (never amplify an unrecognized value).
+        assert_eq!(scale_money_for_rank(100, 1), 150);
+        assert_eq!(scale_money_for_rank(100, 2), 200);
+        assert_eq!(scale_money_for_rank(100, 3), 300);
+        assert_eq!(scale_money_for_rank(100, 4), 200);
         assert_eq!(scale_money_for_rank(100, 9), 100);
-        // An empty roll (0 copper) stays 0 at any rank — a no-money creature drops nothing regardless.
         assert_eq!(scale_money_for_rank(0, 3), 0);
-        // The permille table: rank 0 is the identity divisor; elite/boss exceed normal.
         assert_eq!(rank_money_multiplier_permille(0), 1000);
         assert!(rank_money_multiplier_permille(1) > rank_money_multiplier_permille(0));
         assert!(rank_money_multiplier_permille(3) > rank_money_multiplier_permille(1));
-        // Saturating: a near-max roll × a >1 multiplier must not wrap.
         assert!(scale_money_for_rank(u32::MAX, 3) >= u32::MAX / 2);
     }
 
-    // ---- LOOT-FAMILY COMPLETENESS ----
-
     #[test]
     fn quest_take_allowed_admits_the_reservee_unconditionally_and_needing_takers_on_shared_rows() {
-        // Unreserved (shared) row: any needing taker is admitted; a non-needing one is rejected.
         assert!(quest_take_allowed(0, 7, true));
         assert!(
             !quest_take_allowed(0, 7, false),
             "no need → no take on the unreserved shared row"
         );
-        // Reserved for guid 7: guid 7 admitted regardless of current need; guid 8 rejected even if
-        // THEY also need it — the reservation is exclusive.
         assert!(quest_take_allowed(7, 7, true));
         assert!(
             !quest_take_allowed(7, 8, true),
@@ -1090,10 +837,6 @@ mod tests {
         );
     }
 
-    /// `group_loot_take_allowed` — the take-time gate for NON-quest rows: a nonzero `reserved_for`
-    /// (winner-locked fallback) is exclusive and unconditional; a `master_only` row is NEVER takable
-    /// via the plain path (even by the stamped master — they must use `loot_master_give`); a
-    /// `designated_looter_guid` restricts to that guid; the zero/false baseline is plain FFA.
     #[test]
     fn group_loot_take_allowed_gates_withheld_reserved_master_and_designated_rows() {
         assert!(
@@ -1104,9 +847,7 @@ mod tests {
             !group_loot_take_allowed(true, 7, false, 0, 7),
             "even the future reservee waits for resolution"
         );
-        // Baseline: no restriction at all → anyone may take.
         assert!(group_loot_take_allowed(false, 0, false, 0, 7));
-        // Reserved (winner-locked): only the reservee, regardless of the other flags.
         assert!(group_loot_take_allowed(false, 7, false, 0, 7));
         assert!(
             !group_loot_take_allowed(false, 7, false, 0, 8),
@@ -1116,13 +857,11 @@ mod tests {
             !group_loot_take_allowed(false, 7, true, 99, 8),
             "reserved wins over master_only/designated too"
         );
-        // Master-only: nobody takes it via the plain path, not even the stamped master.
         assert!(
             !group_loot_take_allowed(false, 0, true, 42, 42),
             "master_only blocks even the master's OWN take"
         );
         assert!(!group_loot_take_allowed(false, 0, true, 42, 8));
-        // Designated (round-robin/below-threshold): only that guid.
         assert!(group_loot_take_allowed(false, 0, false, 42, 42));
         assert!(
             !group_loot_take_allowed(false, 0, false, 42, 8),
@@ -1130,9 +869,6 @@ mod tests {
         );
     }
 
-    /// `clone_targets` — only the STILL-NEEDING other members get a clone; a member who capped out or
-    /// dropped the quest between roll and take gets nothing (mirrors vanilla: the item simply isn't
-    /// offered). Order-preserving (deterministic slot assignment downstream).
     #[test]
     fn clone_targets_admits_only_the_still_needing_members() {
         let others = [(10u64, true), (20u64, false), (30u64, true)];
@@ -1151,9 +887,6 @@ mod tests {
         );
     }
 
-    /// `next_free_slots` — fresh ascending slots strictly past the corpse's current max, so a clone
-    /// never collides with the just-deleted original's slot or a sibling drop. An empty corpse (no
-    /// rows left) starts at slot 0, never panics.
     #[test]
     fn next_free_slots_never_collides_with_whats_already_on_the_corpse() {
         assert_eq!(next_free_slots(&[0, 1, 2], 2), vec![3, 4]);
@@ -1163,15 +896,9 @@ mod tests {
             "an emptied corpse starts back at slot 0"
         );
         assert_eq!(next_free_slots(&[5], 1), vec![6]);
-        // Saturating at the u8 ceiling — never panics/wraps even from an already-maxed corpse.
         assert_eq!(next_free_slots(&[255], 2), vec![255, 255]);
     }
 
-    // ---- Money-loot split ----
-
-    /// SOLO passthrough: an empty `recipients` slice (no `game_corpse_loot_eligible` snapshot) always
-    /// credits the WHOLE amount to the looter in a single entry — byte-identical to the
-    /// unconditional-credit path, regardless of amount.
     #[test]
     fn split_money_solo_passthrough_credits_the_whole_amount_to_the_looter() {
         assert_eq!(split_money(137, &[], 7), vec![(7, 137)]);
@@ -1179,8 +906,6 @@ mod tests {
         assert_eq!(split_money(u32::MAX, &[], 7), vec![(7, u32::MAX)]);
     }
 
-    /// GROUPED even split: divides evenly with NO remainder when it divides cleanly, in the exact
-    /// recipient order given.
     #[test]
     fn split_money_even_split_with_no_remainder() {
         assert_eq!(
@@ -1193,49 +918,35 @@ mod tests {
         );
     }
 
-    /// GROUPED split with a remainder: the remainder (cmangos convention [V]) goes to whichever
-    /// recipient IS the looter, wherever it sits in the list — never to the first/last member
-    /// positionally.
     #[test]
     fn split_money_remainder_goes_to_the_looter() {
-        // 100 / 3 = 33 each, remainder 1 → the looter (guid 2, the middle entry) gets 34.
         assert_eq!(
             split_money(100, &[1, 2, 3], 2),
             vec![(1, 33), (2, 34), (3, 33)]
         );
-        // Looter is the FIRST entry.
         assert_eq!(
             split_money(100, &[1, 2, 3], 1),
             vec![(1, 34), (2, 33), (3, 33)]
         );
-        // Looter is the LAST entry.
         assert_eq!(
             split_money(100, &[1, 2, 3], 3),
             vec![(1, 33), (2, 33), (3, 34)]
         );
-        // 7 copper across 2 recipients: 3 each, remainder 1 to the looter.
         assert_eq!(split_money(7, &[5, 9], 9), vec![(5, 3), (9, 4)]);
     }
 
-    /// If the looter is not itself in the snapshot (edge case — e.g. joined the group after the kill
-    /// was snapshotted), the remainder is folded into an EXTRA entry for the looter instead of being
-    /// silently dropped — every recipient still gets its even share.
     #[test]
     fn split_money_looter_outside_recipients_gets_an_extra_remainder_entry() {
         assert_eq!(
             split_money(100, &[10, 20, 30], 99),
             vec![(10, 33), (20, 33), (30, 33), (99, 1)]
         );
-        // No remainder → no extra entry needed (nothing to fold in).
         assert_eq!(
             split_money(90, &[10, 20, 30], 99),
             vec![(10, 30), (20, 30), (30, 30)]
         );
     }
 
-    /// A single-recipient "group" (shouldn't happen — `apply_group_loot_rules` never snapshots below
-    /// 2 recipients — but the pure fn degrades sanely if it ever did): the whole amount to that one
-    /// recipient, remainder folded in if they're the looter.
     #[test]
     fn split_money_single_recipient_degrades_to_whole_amount() {
         assert_eq!(split_money(50, &[7], 7), vec![(7, 50)]);

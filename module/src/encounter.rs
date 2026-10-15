@@ -1,34 +1,3 @@
-//! Encounter kernel, the mangos `InstanceScript` analogue as a PACKAGE-SUPPORT
-//! layer. Ships ZERO encounter content: dungeons' choreography lives in drop-in packages
-//! (`packages/dungeons/`, first consumer: 227 Deadmines), which consume three things from here:
-//!
-//! 1. **State** — `game_encounter_state`, one row per `(instance_id, encounter_id)` (the playbook's
-//!    PK-pair pattern: synthetic `#[auto_inc]` PK + a btree on the pair, like
-//!    `game_player_reputation`'s `(character_guid, faction_id)`). `state` is the mangos 4-state
-//!    machine (NotStarted/InProgress/Done/Failed), `payload` the `SetData`/`GetData` u32. NOT
-//!    gateway-subscribed — packages and core read it server-side only (verified absent from
-//!    `gateway/src/stdb/connection.rs`'s subscription list; nothing client-side needs it).
-//! 2. **Hooks** — three new notify-hook events on the EXISTING build.rs marker-scan substrate
-//!    (`game_hook!` + `HOOK_EVENTS` row + payload struct in hooks.rs — NOT a second mechanism):
-//!    `on_creature_death` (entry-carrying, instance-stamped; fired from `combat::kill_creature`),
-//!    `on_go_used` (fired from `gameobject::apply_use_gameobject`'s success exit), and
-//!    `on_hp_threshold` (fired from THIS module's `encounter_hp_probe`, itself a `game_hook!` on
-//!    the existing `on_damage_taken` event — the damage chokepoint needed no new dispatch line).
-//!    `on_hp_threshold` fires ONCE per watched threshold per instance (heal-and-re-cross never
-//!    re-fires until reset), deduped via a RESERVED `game_encounter_state` row (see
-//!    [`hp_fired_key`]). ZERO-COST when unused: the probe's first instruction bails on the
-//!    compile-time-const `GAME_HOOKS_ON_HP_THRESHOLD.is_empty()`, so a tree with no registered
-//!    consumer pays one predictable branch per damage event and nothing else.
-//! 3. **Primitives** — thin package-callable choreography verbs: [`open_door`], [`spawn_wave`]
-//!    (with despawn-on-reset bookkeeping via `game_encounter_spawn`), [`equip_swap`] (durable
-//!    virtual-item display projection), [`move_to_point`] (one
-//!    leg through `creatures::tick::emit_move_spline`; the creature tick advances the stored
-//!    position), and [`encounter_reset`].
-//!
-//! Reset/sweep: the instance reap deletes per-instance kernel state via
-//! [`sweep_encounter_state`], called from `instance::teardown_instance_inner` right before the
-//! `game_instance` row itself goes (the splice point is documented on the fn). [server]
-
 use spacetimedb::{table, ReducerContext, Table};
 
 use lyracore_shared::constants;
@@ -40,7 +9,6 @@ use crate::{
     game_instance, game_world_entity,
 };
 
-/// Package-owned encounter selected by the EventAI import boundary.
 #[derive(spacetimedb::SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncounterBinding {
     BlackfathomDeepsKelris,
@@ -100,7 +68,6 @@ impl EncounterBinding {
     }
 }
 
-/// Named notification delivered to the encounter package that owns [`EncounterBinding`].
 #[derive(spacetimedb::SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncounterSignal {
     Begin,
@@ -111,8 +78,6 @@ pub enum EncounterSignal {
     SendMandokirDownstairs,
 }
 
-/// Route one EventAI notification through encounter authority. The binding checks both package
-/// ownership and map scope before any state is changed.
 pub(crate) fn notify_from_eventai(
     ctx: &ReducerContext,
     source_guid: u64,
@@ -155,8 +120,6 @@ pub(crate) fn notify_from_eventai(
         ));
     }
     let Some(handler) = package_handler_for(binding, crate::GAME_ENCOUNTER_PACKAGES)? else {
-        // The mangos SetData-without-instance-script semantic: the DATA names an encounter
-        // boundary, but no installed Package claims it — the notification has no consumer.
         spacetimedb::log::warn!(
             "encounter binding {binding:?} has no installed package authority — {signal:?} not consumed"
         );
@@ -196,10 +159,6 @@ fn encounter_state_for_signal(signal: EncounterSignal) -> Option<u8> {
     }
 }
 
-// ===========================================================================================
-//  Encounter state machine values (mangos EncounterState analogue)
-// ===========================================================================================
-
 pub const ENCOUNTER_NOT_STARTED: u8 = 0;
 #[allow(dead_code, reason = "Packages select the encounter states they need")]
 pub const ENCOUNTER_IN_PROGRESS: u8 = 1;
@@ -208,25 +167,11 @@ pub const ENCOUNTER_DONE: u8 = 2;
 #[allow(dead_code, reason = "Packages select the encounter states they need")]
 pub const ENCOUNTER_FAILED: u8 = 3;
 
-/// Encounter ids with this bit set are RESERVED for kernel bookkeeping (today: the per-entry
-/// HP-threshold fired-marks, [`hp_fired_key`]). Packages must key their encounters below it —
-/// vanilla creature entries are < 2^24, so the namespaces can never collide.
+// Encounter ids with this bit set belong to kernel bookkeeping.
 pub const RESERVED_ENCOUNTER_ID_BIT: u32 = 0x8000_0000;
 
-/// Sentinel for "no HP threshold has fired yet" in a reserved dedup row's `payload` — one past the
-/// highest possible percentage, so every watch `pct` (0..=100) compares strictly below it.
 pub const HP_FIRED_NONE: u32 = 101;
 
-// ===========================================================================================
-//  Tables (all server-side only — none is gateway-subscribed)
-// ===========================================================================================
-
-/// Per-(instance, encounter) state + scratch data — the `InstanceScript::SetData/GetData` store.
-/// Logical key `(instance_id, encounter_id)` via an `#[auto_inc]` PK + the `by_pair` btree (the
-/// PK-pair pattern; see `game_player_reputation`). A missing row reads as
-/// (`ENCOUNTER_NOT_STARTED`, payload 0). `encounter_id`s with [`RESERVED_ENCOUNTER_ID_BIT`] set
-/// are kernel bookkeeping rows (HP dedup), not package encounters. Swept per instance by
-/// [`sweep_encounter_state`]. [server]
 #[table(accessor = game_encounter_state, index(accessor = by_pair, btree(columns = [instance_id, encounter_id])))]
 pub struct EncounterState {
     #[primary_key]
@@ -238,10 +183,6 @@ pub struct EncounterState {
     pub payload: u32,
 }
 
-/// A registered HP-threshold watch: "fire `on_hp_threshold` when a creature of `entry` drops to
-/// `pct`% or below". GLOBAL (template-scoped, not per-instance — the per-instance once-only dedup
-/// lives in the reserved `game_encounter_state` rows), registered idempotently by packages via
-/// [`watch_hp_threshold`]. Never swept with an instance. [server]
 #[table(accessor = game_encounter_hp_watch, index(accessor = by_entry, btree(columns = [entry])))]
 pub struct EncounterHpWatch {
     #[primary_key]
@@ -251,12 +192,6 @@ pub struct EncounterHpWatch {
     pub pct: u8,
 }
 
-/// Despawn-on-reset bookkeeping for [`spawn_wave`]: one row per wave-spawned creature, so
-/// [`encounter_reset`] / [`sweep_encounter_state`] can tear the adds (entity + spawn row + legs +
-/// loot) back down. CRITICAL: wave adds get real `game_creature_spawn` rows (so corpse decay works)
-/// which are NOT instance-tagged — an untracked leftover spawn row would eventually respawn into
-/// instance 0 (`pass_respawn` builds at instance 0), so every reset path MUST delete via this
-/// table. [server]
 #[table(accessor = game_encounter_spawn, index(accessor = by_instance, btree(columns = [instance_id])))]
 pub struct EncounterSpawn {
     #[primary_key]
@@ -277,23 +212,14 @@ pub struct EncounterEquip {
     pub ranged: u32,
 }
 
-// ===========================================================================================
-//  Pure decisions (unit-tested below)
-// ===========================================================================================
-
-/// The reserved `encounter_id` carrying the per-instance HP-threshold fired-mark for creature
-/// `entry` (its `payload` = lowest pct fired so far, [`HP_FIRED_NONE`] when virgin). Pure.
 pub(crate) fn hp_fired_key(entry: u32) -> u32 {
     RESERVED_ENCOUNTER_ID_BIT | entry
 }
 
-/// Is `encounter_id` in the kernel-reserved namespace? Pure.
 pub(crate) fn is_reserved_encounter_id(encounter_id: u32) -> bool {
     encounter_id & RESERVED_ENCOUNTER_ID_BIT != 0
 }
 
-/// Current HP as an integer percentage (floor), u64 math so `health * 100` can never wrap.
-/// `max == 0` (malformed row) reads as 100% — nothing fires. Pure.
 pub(crate) fn hp_pct(health: u32, max_health: u32) -> u32 {
     if max_health == 0 {
         return 100;
@@ -301,13 +227,6 @@ pub(crate) fn hp_pct(health: u32, max_health: u32) -> u32 {
     ((health as u64 * 100) / max_health as u64) as u32
 }
 
-/// THE crossing-dedup decision: which watched thresholds fire now that the creature sits at
-/// `new_pct`%, given `lowest_fired` (the lowest pct already fired this instance, or
-/// [`HP_FIRED_NONE`]). A watch `w` fires iff `new_pct <= w` (crossed) AND `w < lowest_fired`
-/// (never fired — this is the once-per-instance memory: a heal back above `w` and a re-drop
-/// changes nothing, because `lowest_fired` only ratchets DOWN). A single huge hit crossing several
-/// watches fires them all, ordered high→low (66 before 33 — phase order). Duplicate watch rows
-/// collapse to one firing. Returns the fired pcts (desc). Pure — unit-tested.
 pub(crate) fn crossed_thresholds(watches: &[u8], lowest_fired: u32, new_pct: u32) -> Vec<u8> {
     let mut fired: Vec<u8> = watches
         .iter()
@@ -319,32 +238,18 @@ pub(crate) fn crossed_thresholds(watches: &[u8], lowest_fired: u32, new_pct: u32
     fired
 }
 
-/// Wave-spawn guid: `HIGHGUID_UNIT` high bits + `entry` in 24..47 + a unique low 24 — the same
-/// namespace layout the importer/seed/debug spawns use, so the 5875 client classifies the add as a
-/// Unit and the low part can't collide with an existing spawn of the same entry. Pure.
 pub(crate) fn wave_guid(entry: u32, next_low: u64) -> u64 {
     const HIGHGUID_UNIT: u64 = 0xF130;
     (HIGHGUID_UNIT << 48) | ((entry as u64) << 24) | (next_low & 0x00FF_FFFF)
 }
 
-/// Deterministic per-add spread around the wave anchor so a multi-add wave doesn't stack on one
-/// point: a compact 3-wide grid, 2 yd pitch, row-major. Pure.
 #[allow(dead_code, reason = "retained Package API encounter choreography")]
 pub(crate) fn wave_offset(index: usize) -> (f32, f32) {
     (2.0 * ((index % 3) as f32 - 1.0), 2.0 * ((index / 3) as f32))
 }
 
-/// `[V]` The `game_gameobject.state` value that renders a DOOR/BUTTON as OPEN on the 5875 client.
-/// The in-repo convention (gameobject.rs `toggle_state`'s test labels) is
-/// 0 = closed/ready, 1 = open/used, and the gateway relays the raw value
-/// (`set_gameobject_state(go.state)`); no live client in this sandbox to confirm the rendering —
-/// if a live check shows doors inverted, flip THIS const (one place).
 #[allow(dead_code, reason = "retained Package API encounter state")]
 pub const DOOR_OPEN_STATE: u8 = 1;
-
-// ===========================================================================================
-//  State accessors (SetData / GetData)
-// ===========================================================================================
 
 fn state_row(ctx: &ReducerContext, instance_id: u64, encounter_id: u32) -> Option<EncounterState> {
     ctx.db
@@ -354,7 +259,6 @@ fn state_row(ctx: &ReducerContext, instance_id: u64, encounter_id: u32) -> Optio
         .next()
 }
 
-/// Upsert the full row (internal — the public accessors preserve the other column).
 fn upsert_state_row(
     ctx: &ReducerContext,
     instance_id: u64,
@@ -381,7 +285,6 @@ fn upsert_state_row(
     }
 }
 
-/// Current state of `(instance_id, encounter_id)` — `ENCOUNTER_NOT_STARTED` when no row exists.
 #[allow(dead_code, reason = "retained Package API operation")]
 pub(crate) fn get_encounter_state(ctx: &ReducerContext, instance_id: u64, encounter_id: u32) -> u8 {
     state_row(ctx, instance_id, encounter_id)
@@ -406,7 +309,6 @@ pub(crate) fn set_encounter_state(
     Ok(())
 }
 
-/// `GetData`: the row's scratch u32 — 0 when no row exists.
 #[allow(dead_code, reason = "retained Package API encounter choreography")]
 pub(crate) fn get_encounter_data(ctx: &ReducerContext, instance_id: u64, encounter_id: u32) -> u32 {
     state_row(ctx, instance_id, encounter_id)
@@ -414,8 +316,6 @@ pub(crate) fn get_encounter_data(ctx: &ReducerContext, instance_id: u64, encount
         .unwrap_or(0)
 }
 
-/// `SetData`: set the scratch u32, preserving `state`. Upserts. Same reserved-namespace refusal
-/// as [`set_encounter_state`].
 #[allow(dead_code, reason = "retained Package API operation")]
 pub(crate) fn set_encounter_data(
     ctx: &ReducerContext,
@@ -433,15 +333,6 @@ pub(crate) fn set_encounter_data(
     Ok(())
 }
 
-// ===========================================================================================
-//  HP-threshold watch + probe
-// ===========================================================================================
-
-/// Register "fire `on_hp_threshold` when a creature of `entry` reaches `pct`% or below" — the
-/// package-side half of the hook (the `game_hook!(on_hp_threshold, ...)` handler is the other).
-/// Idempotent (check-before-insert, the `learn_spell` grant idiom): packages typically call this
-/// from their seed/fixture reducer or an `on_creature_spawn` handler, either of which may run
-/// repeatedly. `pct` must be 1..=99 (0 is the death hook's job; 100 would fire on any scratch).
 #[allow(dead_code, reason = "retained Package API encounter choreography")]
 pub(crate) fn watch_hp_threshold(ctx: &ReducerContext, entry: u32, pct: u8) -> Result<(), String> {
     if !(1..=99).contains(&pct) {
@@ -454,16 +345,12 @@ pub(crate) fn watch_hp_threshold(ctx: &ReducerContext, entry: u32, pct: u8) -> R
     }
     let t = ctx.db.game_encounter_hp_watch();
     if t.by_entry().filter(&entry).any(|w| w.pct == pct) {
-        return Ok(()); // already registered
+        return Ok(());
     }
     t.insert(EncounterHpWatch { id: 0, entry, pct });
     Ok(())
 }
 
-/// Forget the per-instance fired-marks for `entry` so its thresholds can fire again — a package
-/// calls this from its wipe/evade reset alongside [`encounter_reset`] (the boss healed to full;
-/// the next attempt's crossings must re-fire). Instance-scoped: other instances' marks are
-/// untouched. The instance reap sweeps these rows wholesale ([`sweep_encounter_state`]).
 #[allow(dead_code, reason = "retained Package API operation")]
 pub(crate) fn reset_hp_fired(ctx: &ReducerContext, instance_id: u64, entry: u32) {
     let t = ctx.db.game_encounter_state();
@@ -472,30 +359,18 @@ pub(crate) fn reset_hp_fired(ctx: &ReducerContext, instance_id: u64, entry: u32)
     }
 }
 
-// The kernel's own damage-side probe, registered on the EXISTING `on_damage_taken` event via the
-// same marker-scan substrate packages use — so the damage chokepoint (`spell::break_auras_on_damage`,
-// where the target's post-damage health is already committed: every caller updates the row first,
-// and same-transaction read-your-writes holds) needed NO new dispatch line. ZERO-COST GUARD: the
-// first instruction bails on the compile-time-const registry — a tree where no package registered
-// an `on_hp_threshold` handler pays one predictable branch per damage event, no table reads.
 crate::game_hook!(on_damage_taken, fn encounter_hp_probe(ctx, payload) {
     if crate::GAME_HOOKS_ON_HP_THRESHOLD.is_empty() {
-        return; // no consumer anywhere in the build — free.
+        return;
     }
     probe_hp_thresholds(ctx, payload.target_guid);
 });
 
-/// The ctx half of the HP-threshold hook: read the (already-committed) post-damage health, join it
-/// against the entry's registered watches, dedup via the reserved state row, and fire
-/// `on_hp_threshold` once per newly-crossed watch (high→low). The fired-mark is written BEFORE the
-/// handlers run (mark-before-roll, playbook §2): a handler that itself deals damage re-enters this
-/// probe with the ratchet already advanced, so it can never double-fire.
+// Save fired thresholds before callbacks so reentrant damage cannot fire them twice.
 fn probe_hp_thresholds(ctx: &ReducerContext, target_guid: u64) {
     let Some(e) = ctx.db.game_world_entity().guid().find(target_guid) else {
         return;
     };
-    // Creatures only (players/pets are never encounter bosses); `on_damage_taken` already implies
-    // the target survived, but a dead row is re-checked for safety.
     if e.is_player() || e.owner_guid != 0 || e.dead || e.max_health == 0 {
         return;
     }
@@ -507,7 +382,7 @@ fn probe_hp_thresholds(ctx: &ReducerContext, target_guid: u64) {
         .map(|w| w.pct)
         .collect();
     if watches.is_empty() {
-        return; // registered consumers exist, but not for this entry — one btree probe spent.
+        return;
     }
     let key = hp_fired_key(e.entry);
     let lowest_fired = state_row(ctx, e.instance_id, key)
@@ -515,9 +390,8 @@ fn probe_hp_thresholds(ctx: &ReducerContext, target_guid: u64) {
         .unwrap_or(HP_FIRED_NONE);
     let fired = crossed_thresholds(&watches, lowest_fired, hp_pct(e.health, e.max_health));
     let Some(&new_lowest) = fired.last() else {
-        return; // nothing newly crossed
+        return;
     };
-    // Ratchet FIRST (see fn doc), then notify.
     upsert_state_row(
         ctx,
         e.instance_id,
@@ -585,7 +459,6 @@ pub(crate) fn open_door(
     Ok(opened)
 }
 
-// A wave's full placement (entries, count, anchor position, instance, encounter id).
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code, reason = "retained Package API encounter choreography")]
 pub(crate) fn spawn_wave(
@@ -605,8 +478,6 @@ pub(crate) fn spawn_wave(
             spacetimedb::log::warn!("spawn_wave: no creature template {entry} — skipped");
             continue;
         };
-        // Unique low 24 bits: one past the current max for this entry (the debug_spawn_at_feet
-        // scheme). Recomputed per add — a wave of N identical entries gets consecutive lows.
         let next_low = ctx
             .db
             .game_creature_spawn()
@@ -634,9 +505,9 @@ pub(crate) fn spawn_wave(
                     u32::MAX as i64 * 1_000_000,
                 ))
                 .unwrap_or(ctx.timestamp),
-            despawn_at: crate::creatures::timer_never(ctx), // not armed until this add actually dies
-            movement_type: crate::creatures::MOVEMENT_IDLE, // holds its post until aggro
-            respawn_secs: u32::MAX,                         // "never" — see the fn doc
+            despawn_at: crate::creatures::timer_never(ctx),
+            movement_type: crate::creatures::MOVEMENT_IDLE,
+            respawn_secs: u32::MAX,
             life_seq: 0,
             source_guid: 0,
             instance_id,
@@ -656,10 +527,6 @@ pub(crate) fn spawn_wave(
     guids
 }
 
-/// Write a creature's virtual-item slots (Mr. Smite: sword+board → two-hander → dual maces).
-/// Authored values are item entries; the durable row carries the corresponding display ids expected
-/// by `UNIT_VIRTUAL_ITEM_SLOT_DISPLAY`. Zero unequips a slot. Upserts; errs for a missing creature
-/// or item template so a relay never reports success without an observable projection.
 pub(crate) fn equip_swap(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -706,12 +573,6 @@ pub(crate) fn equip_swap(
     Ok(())
 }
 
-/// Send a creature on one movement leg to `(x, y, z)`, the Smite rack-run motion. The leg starts
-/// where the client draws the mover now, and the creature tick advances the stored position along
-/// it as along any other leg, so a reader mid-leg never sees the destination. The duration comes
-/// from the snare-aware `combat::effective_move_speed` over the 2D distance. Errs for a missing,
-/// player or dead mover. An immobilized mover is a no-op Ok. A mover the client already draws on
-/// the point stops there and takes no new leg.
 pub(crate) fn move_to_point(
     ctx: &ReducerContext,
     creature_guid: u64,
@@ -743,7 +604,6 @@ pub(crate) fn move_to_point(
     let (dx, dy) = (x - e.x, y - e.y);
     let dist = (dx * dx + dy * dy).sqrt();
     if dist <= f32::EPSILON {
-        // End the old leg here, so a relay arrival sees a leg of its own land on the point.
         crate::creatures::tick::stop_where_rendered(ctx, &mut e);
         entities.guid().update(e);
         return Ok(());
@@ -765,11 +625,6 @@ pub(crate) fn move_to_point(
     Ok(())
 }
 
-/// Reset one encounter: state → `ENCOUNTER_NOT_STARTED` (payload zeroed — the `SetData` scratch is
-/// per-attempt), and despawn this encounter's tracked wave spawns (entity + spawn row + legs +
-/// corpse loot + equip + tracking row). Does NOT touch the HP fired-marks — those are keyed by
-/// creature ENTRY, not encounter id, so the package's reset handler calls [`reset_hp_fired`] for
-/// its boss entries alongside this (documented on that fn).
 #[allow(dead_code, reason = "retained Package API operation")]
 pub(crate) fn encounter_reset(ctx: &ReducerContext, instance_id: u64, encounter_id: u32) {
     upsert_state_row(ctx, instance_id, encounter_id, ENCOUNTER_NOT_STARTED, 0);
@@ -799,12 +654,6 @@ pub(crate) fn encounter_reset_full(
     }
 }
 
-/// Tear down tracked wave spawns: the canonical creature-despawn checklist
-/// ([`crate::creatures::despawn_creature_entity`] — engagement/threat/taunt lock, spline + motion
-/// rows, the whole loot family, then the live entity, whose delete relays `SMSG_DESTROY_OBJECT`;
-/// it may already be decay-deleted, which is fine), plus this path's OWN extras: the spawn row (the
-/// row that would otherwise respawn into instance 0 — see [`EncounterSpawn`]), any equip row, and the
-/// tracking row itself.
 fn despawn_tracked(ctx: &ReducerContext, tracked: &[EncounterSpawn]) {
     for t in tracked {
         crate::creatures::despawn_creature_entity(ctx, t.guid);
@@ -814,15 +663,7 @@ fn despawn_tracked(ctx: &ReducerContext, tracked: &[EncounterSpawn]) {
     }
 }
 
-/// Sweep EVERY kernel row for a dying instance: tracked wave spawns (full teardown — this is what
-/// keeps their untagged `game_creature_spawn` rows from ever respawning into instance 0), all
-/// `game_encounter_state` rows (package encounters AND the reserved HP fired-marks), and all
-/// equip rows. HP WATCHES are global template config and deliberately survive.
-///
-/// SPLICE POINT: the instance reap's population sweep calls
-/// `crate::encounter::sweep_encounter_state(ctx, instance_id)` right next to its entity/corpse/GO-copy
-/// deletes, before the `game_instance` row itself goes (`instance::teardown_instance_inner`). Also
-/// exercised directly by the debug-feature lever `debug_sweep_encounter_state`.
+// Delete tracked spawn rows too so Instance teardown cannot respawn them in the open world.
 pub(crate) fn sweep_encounter_state(ctx: &ReducerContext, instance_id: u64) {
     let tracked: Vec<EncounterSpawn> = ctx
         .db
@@ -852,17 +693,9 @@ pub(crate) fn sweep_encounter_state(ctx: &ReducerContext, instance_id: u64) {
     }
 }
 
-// ===========================================================================================
-//  Tests — every pure decision above
-// ===========================================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The binding catalog is data-derived (dump-verified `ACTION_T_SET_INSTANCE_DATA` rows), so
-    // it ships with the engine even when no installed Package claims a binding — an unclaimed
-    // notification is a logged no-op, verified below.
 
     #[test]
     fn package_lookup_skips_unclaimed_and_refuses_duplicate_authority() {
@@ -875,8 +708,6 @@ mod tests {
         }
 
         let binding = EncounterBinding::BlackfathomDeepsKelris;
-        // Unclaimed is a valid install state (the data names the boundary, no Package consumes
-        // it), so the lookup yields nothing rather than an error — notify no-ops on it.
         assert!(matches!(package_handler_for(binding, &[]), Ok(None)));
 
         let claimed = [(binding, handler as EncounterPackageHandler)];
@@ -893,20 +724,15 @@ mod tests {
 
     #[test]
     fn crossing_fires_each_watch_once_high_to_low_and_never_refires_after_heal_redrop() {
-        // Smite's 66/33 pattern. First hit to 60%: 66 fires, 33 doesn't.
         let watches = [66u8, 33u8];
         assert_eq!(crossed_thresholds(&watches, HP_FIRED_NONE, 60), vec![66]);
-        // Ratchet now 66. Heal to 90%, re-drop to 60%: NOTHING re-fires (once per instance).
         assert_eq!(crossed_thresholds(&watches, 66, 60), Vec::<u8>::new());
-        // Drop on to 30%: only 33 fires.
         assert_eq!(crossed_thresholds(&watches, 66, 30), vec![33]);
-        // Ratchet 33: nothing left.
         assert_eq!(crossed_thresholds(&watches, 33, 5), Vec::<u8>::new());
     }
 
     #[test]
     fn one_giant_hit_crossing_several_watches_fires_all_desc_and_dedups_duplicates() {
-        // 100% → 10% in one hit, with a duplicate 66 row registered twice.
         let watches = [33u8, 66u8, 66u8, 90u8];
         assert_eq!(
             crossed_thresholds(&watches, HP_FIRED_NONE, 10),
@@ -917,36 +743,31 @@ mod tests {
     #[test]
     fn crossing_boundary_is_at_or_below_and_higher_watch_never_fires_after_lower_ratchet() {
         let watches = [66u8];
-        // Exactly 66% counts as crossed (mangos HealthBelowPct-with-equal semantics).
         assert_eq!(crossed_thresholds(&watches, HP_FIRED_NONE, 66), vec![66]);
-        // 67% does not.
         assert_eq!(
             crossed_thresholds(&watches, HP_FIRED_NONE, 67),
             Vec::<u8>::new()
         );
-        // A 66 watch with the ratchet already at 33 (fired during a burst) can never fire late.
         assert_eq!(crossed_thresholds(&[66u8, 33u8], 33, 20), Vec::<u8>::new());
     }
 
     #[test]
     fn hp_pct_floors_uses_u64_math_and_treats_zero_max_as_full() {
-        assert_eq!(hp_pct(664, 1000), 66); // floor, not round
+        assert_eq!(hp_pct(664, 1000), 66);
         assert_eq!(hp_pct(0, 1000), 0);
         assert_eq!(hp_pct(1000, 1000), 100);
-        assert_eq!(hp_pct(u32::MAX, u32::MAX), 100); // health*100 would wrap u32
-        assert_eq!(hp_pct(5, 0), 100); // malformed row → nothing fires
+        assert_eq!(hp_pct(u32::MAX, u32::MAX), 100);
+        assert_eq!(hp_pct(5, 0), 100);
     }
 
     #[test]
     fn reserved_hp_key_namespace_is_disjoint_from_package_encounter_ids() {
-        // Every vanilla creature entry (< 2^24) maps into the reserved namespace...
         assert!(is_reserved_encounter_id(hp_fired_key(1)));
-        assert!(is_reserved_encounter_id(hp_fired_key(646))); // Mr. Smite
+        assert!(is_reserved_encounter_id(hp_fired_key(646)));
         assert_eq!(hp_fired_key(646), 0x8000_0000 | 646);
         assert!(!is_reserved_encounter_id(0));
         assert!(!is_reserved_encounter_id(1));
         assert!(!is_reserved_encounter_id(0x7FFF_FFFF));
-        // Distinct entries map to distinct keys (bit-or, no folding).
         assert_ne!(hp_fired_key(639), hp_fired_key(646));
     }
 
@@ -956,8 +777,6 @@ mod tests {
         assert_eq!(ENCOUNTER_IN_PROGRESS, 1);
         assert_eq!(ENCOUNTER_DONE, 2);
         assert_eq!(ENCOUNTER_FAILED, 3);
-        // The virgin sentinel strictly exceeds any pct a watch may hold (1..=99) AND 100,
-        // so `w < HP_FIRED_NONE` is true for every legal watch — the first crossing always fires.
         const { assert!(HP_FIRED_NONE > 100) };
     }
 
@@ -972,7 +791,7 @@ mod tests {
 
     #[test]
     fn wave_guid_carries_highguid_unit_entry_bits_and_a_bounded_low() {
-        let g = wave_guid(636, 7); // a Defias Miner add, low 7
+        let g = wave_guid(636, 7);
         assert_eq!(
             g >> 48,
             0xF130,
@@ -980,7 +799,6 @@ mod tests {
         );
         assert_eq!((g >> 24) & 0xFF_FFFF, 636);
         assert_eq!(g & 0xFF_FFFF, 7);
-        // A low that would overflow 24 bits is masked, never corrupting the entry bits.
         assert_eq!((wave_guid(636, 0x0100_0000 + 5) >> 24) & 0xFF_FFFF, 636);
         assert_eq!(wave_guid(636, 0x0100_0000 + 5) & 0xFF_FFFF, 5);
     }
@@ -990,8 +808,7 @@ mod tests {
         assert_eq!(wave_offset(0), (-2.0, 0.0));
         assert_eq!(wave_offset(1), (0.0, 0.0));
         assert_eq!(wave_offset(2), (2.0, 0.0));
-        assert_eq!(wave_offset(3), (-2.0, 2.0)); // second row
-                                                 // No two of the first 9 collide.
+        assert_eq!(wave_offset(3), (-2.0, 2.0));
         let pts: Vec<(i32, i32)> = (0..9)
             .map(|i| {
                 let (x, y) = wave_offset(i);

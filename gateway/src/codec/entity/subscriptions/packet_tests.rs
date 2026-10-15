@@ -117,7 +117,6 @@ fn created_player(out: &[Outbound]) -> wow_world_messages::vanilla::UpdatePlayer
     player.clone()
 }
 
-/// A Human Warrior: the CREATE encoder refuses race 0.
 fn human_warrior() -> WorldEntity {
     WorldEntity {
         unit_bytes_0: 1 | (1 << 8) | (1 << 24),
@@ -165,7 +164,6 @@ fn single_health_change_emits_one() {
     let mut new = old.clone();
     new.health = 50;
     let out = entity_update_to_outbound(&old, &new);
-    // Decode + pin: guid and the exact health value ride the health-only VALUES packet.
     assert_eq!(
         out,
         vec![ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(
@@ -174,15 +172,11 @@ fn single_health_change_emits_one() {
     );
 }
 
-/// a sheath change must relay, or drawing a weapon is invisible to everyone but the player
-/// who did it. The state lives in BYTE 0 of `unit_bytes_2` — pin the decoded packet, and pin that
-/// an unchanged row stays silent (the client re-sends its current state on every weapon swap, and
-/// a relay per no-op is a broadcast amplifier on a busy cell).
 #[test]
 fn sheath_change_relays_and_a_no_op_stays_silent() {
     let old = player_entity();
     let mut new = old.clone();
-    new.unit_bytes_2 = 1; // SHEATH_STATE_MELEE — weapons drawn
+    new.unit_bytes_2 = 1;
     assert_eq!(
         entity_update_to_outbound(&old, &new),
         vec![ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(
@@ -197,8 +191,6 @@ fn sheath_change_relays_and_a_no_op_stays_silent() {
 
 #[test]
 fn independent_field_changes_each_emit() {
-    // health (any unit) + dynamic_flags (any unit) + power (player) = three separate packets,
-    // in the relay's fixed emission order — decoded and pinned by guid + value, not just count.
     let old = player_entity();
     let mut new = old.clone();
     new.health = 50;
@@ -240,8 +232,6 @@ fn dynamic_flag_values_uses_the_viewer_projection() {
 
 #[test]
 fn levelup_is_exclusive_with_field_diffs() {
-    // A ding collapses level + vitals + xp into ONE combined VALUES block, NOT separate health/xp
-    // packets — even though health and xp also changed this tick.
     let old = player_entity();
     let mut new = old.clone();
     new.level = 2;
@@ -251,8 +241,6 @@ fn levelup_is_exclusive_with_field_diffs() {
     assert_eq!(entity_update_to_outbound(&old, &new).len(), 1);
 }
 
-/// `/afk` sets PLAYER_FLAGS_AFK (0x02, descriptor index 190). Self and every observer run this
-/// same diff, so each client holding the object gets one VALUES update carrying the new word.
 #[test]
 fn an_afk_toggle_relays_player_flags_to_every_viewer() {
     let old = player_entity();
@@ -290,17 +278,15 @@ fn an_afk_toggle_relays_player_flags_to_every_viewer() {
 
 #[test]
 fn player_only_fields_are_gated_for_creatures() {
-    // A creature (no PLAYER bit) relays health + dynamic_flags but NOT xp/coinage/ghost/power —
-    // decoded and pinned as exactly those two packets, not just a count of two.
     let mut old = player_entity();
     old.type_mask = 0;
     let mut new = old.clone();
-    new.health = 50; // emits (any unit)
-    new.dynamic_flags = 1; // emits (any unit)
-    new.xp = 10; // gated out (player-only)
-    new.money = 10; // gated out
-    new.power = 30; // gated out
-    new.player_flags = 0x10; // gated out
+    new.health = 50;
+    new.dynamic_flags = 1;
+    new.xp = 10;
+    new.money = 10;
+    new.power = 30;
+    new.player_flags = 0x10;
     let out = entity_update_to_outbound(&old, &new);
     assert_eq!(
         out,
@@ -317,11 +303,6 @@ fn player_only_fields_are_gated_for_creatures() {
 
 #[test]
 fn creature_levelup_does_not_take_the_exclusive_branch() {
-    // The level-up branch is player-only; a creature whose level changed still diffs health
-    // normally. A bare length check can't tell the two branches apart here — the player-only
-    // ding ALSO emits exactly one packet — so decode the one packet and pin it as the plain
-    // Unit-mask health update (build_health_values), not the Player-mask combined ding
-    // (build_levelup_values) a regressed player-gate would otherwise produce with the same count.
     let mut old = player_entity();
     old.type_mask = 0;
     let mut new = old.clone();
@@ -338,7 +319,6 @@ fn creature_levelup_does_not_take_the_exclusive_branch() {
 
 #[test]
 fn target_change_emits_one() {
-    // UNIT_FIELD_TARGET relay — any unit, one packet, guid + target value pinned.
     let old = player_entity();
     let mut new = old.clone();
     new.target_guid = 0xDEAD_BEEF;
@@ -353,11 +333,9 @@ fn target_change_emits_one() {
 
 #[test]
 fn bank_bag_slot_purchase_relays_and_the_rest_byte_survives() {
-    // A bought bank bag slot lands in byte 2 of PLAYER_BYTES_2; the relay must carry the FULL
-    // field (a partial VALUES overwrites the whole u32) so byte 0 (facial hair) and byte 3 (rest
-    // state — HAZARD: a zero byte 3 crashes the 5875 client's XP bar) ride along unchanged.
+    // Preserve all PLAYER_BYTES_2 bytes; a zero rest-state byte crashes build 5875's XP bar.
     let mut old = player_entity();
-    old.player_bytes_2 = lyracore_shared::packing::player_bytes_2_with_rest(7, 0, false); // facial hair 7, 0 slots, NORMAL
+    old.player_bytes_2 = lyracore_shared::packing::player_bytes_2_with_rest(7, 0, false);
     let mut new = old.clone();
     new.player_bytes_2 = lyracore_shared::packing::with_bank_bag_slots(old.player_bytes_2, 1);
     let out = entity_update_to_outbound(&old, &new);
@@ -382,18 +360,14 @@ fn bank_bag_slot_purchase_relays_and_the_rest_byte_survives() {
 
 #[test]
 fn a_rest_state_flip_alone_does_not_relay_the_bank_slot_packet() {
-    // Byte 3 changing (rest flip) must NOT trip the byte-2-scoped bank slot relay — that byte
-    // already relays through its own dedicated `game_rest_state_event` path.
     let old = player_entity();
     let mut new = old.clone();
-    new.player_bytes_2 = lyracore_shared::packing::player_bytes_2_with_rest(0, 0, true); // RESTED
+    new.player_bytes_2 = lyracore_shared::packing::player_bytes_2_with_rest(0, 0, true);
     assert!(entity_update_to_outbound(&old, &new).is_empty());
 }
 
 #[test]
 fn max_vitals_change_emits_one() {
-    // A non-level-up max_health change (gear/aura) — any unit, one packet, guid + max_health/
-    // power values pinned (max_power carries through unchanged from `player_entity()`).
     let old = player_entity();
     let mut new = old.clone();
     new.max_health = 150;
@@ -409,23 +383,17 @@ fn max_vitals_change_emits_one() {
 
 #[test]
 fn ghost_transition_edge_detects_the_spirit_healer_reveal() {
-    const GHOST: u32 = lyracore_shared::constants::player_flags::GHOST; // 0x10
-                                                                        // alive→ghost (Release Spirit): REVEAL the in-scope spirit healers (Some(true)).
+    const GHOST: u32 = lyracore_shared::constants::player_flags::GHOST;
     assert_eq!(ghost_transition(0, GHOST, GHOST), Some(true));
-    // ghost→alive (reclaim corpse / spirit-healer res): DESTROY them (Some(false)).
     assert_eq!(ghost_transition(GHOST, 0, GHOST), Some(false));
-    // No GHOST-bit change → no reveal work, even when OTHER player-flags toggle this update
-    // (the common heartbeat / unrelated flag write must NOT re-fire the reveal).
     assert_eq!(ghost_transition(0, 0, GHOST), None);
     assert_eq!(ghost_transition(GHOST, GHOST, GHOST), None);
-    assert_eq!(ghost_transition(0x4 | GHOST, 0x8 | GHOST, GHOST), None); // ghost stays set, others flip
-    assert_eq!(ghost_transition(0x4, 0x8, GHOST), None); // ghost stays clear, others flip
+    assert_eq!(ghost_transition(0x4 | GHOST, 0x8 | GHOST, GHOST), None);
+    assert_eq!(ghost_transition(0x4, 0x8, GHOST), None);
 }
 
 #[test]
 fn in_combat_flag_change_emits_one() {
-    // UNIT_FLAG_IN_COMBAT toggling on unit_flags — any unit, one VALUES packet, guid + the
-    // exact post-toggle flags word pinned.
     let old = player_entity();
     let mut new = old.clone();
     new.unit_flags |= lyracore_shared::constants::unit_flags::IN_COMBAT;
@@ -470,8 +438,6 @@ fn taxi_landing_emits_one_atomic_presentation_update_not_a_land_mount_duplicate(
 
 #[test]
 fn land_mount_display_change_emits_the_standalone_builder_not_taxi_presentation() {
-    // A land mount changes ONLY `mount_display_id` — TAXI_FLIGHT is untouched — so it must relay
-    // through the decoupled single-field builder, not the taxi-coupled one.
     let old = player_entity();
     let mut new = old.clone();
     new.mount_display_id = 1147;
@@ -488,7 +454,7 @@ fn land_dismount_display_change_emits_the_standalone_builder_with_zero() {
     let mut old = player_entity();
     old.mount_display_id = 1147;
     let mut new = old.clone();
-    new.mount_display_id = 0; // dismount — TAXI_FLIGHT was never set for a land mount
+    new.mount_display_id = 0;
     assert_eq!(
         entity_update_to_outbound(&old, &new),
         vec![ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(
@@ -499,8 +465,6 @@ fn land_dismount_display_change_emits_the_standalone_builder_with_zero() {
 
 #[test]
 fn a_land_mount_display_change_alongside_an_unrelated_flag_change_emits_both_packets() {
-    // The flag change is real but NOT the taxi flight bit — both relay, separately, neither
-    // coupled through the taxi builder.
     let old = player_entity();
     let mut new = old.clone();
     new.mount_display_id = 1147;
@@ -522,12 +486,9 @@ fn a_land_mount_display_change_alongside_an_unrelated_flag_change_emits_both_pac
 
 #[test]
 fn run_speed_mult_bp_change_emits_force_run_speed_change_with_the_derived_speed() {
-    // GM playtest `.speed`: a run_speed_mult_bp change relays
-    // SMSG_FORCE_RUN_SPEED_CHANGE with speed = BASE_RUN_SPEED (7.0) * bp/10000 — pin the derived
-    // value end-to-end (this is the "codec pin for the speed message" this feature calls for).
     let old = player_entity();
     let mut new = old.clone();
-    new.run_speed_mult_bp = 30_000; // .speed 3 -> 3x
+    new.run_speed_mult_bp = 30_000;
     let out = entity_update_to_outbound(&old, &new);
     assert_eq!(
         out,
@@ -557,7 +518,7 @@ fn appearance_change_relays_the_wisp_and_the_restored_native_display() {
 fn run_speed_mult_bp_unchanged_emits_nothing_extra() {
     let old = player_entity();
     let mut new = old.clone();
-    new.health = 50; // an unrelated change must not spuriously trigger the speed relay
+    new.health = 50;
     let out = entity_update_to_outbound(&old, &new);
     assert!(!out
         .iter()
@@ -566,8 +527,6 @@ fn run_speed_mult_bp_unchanged_emits_nothing_extra() {
 
 #[test]
 fn creature_relays_target_and_max_vitals() {
-    // The target + max-vitals arms are NOT player-gated: a creature relays both, decoded and
-    // pinned in emission order (target before max-vitals) with their exact values.
     let mut old = player_entity();
     old.type_mask = 0;
     let mut new = old.clone();
@@ -848,31 +807,15 @@ fn peer_create_applies_always_and_not_stack_run_bonuses() {
     }
 }
 
-// ---- AOI re-entry, initial-apply, instance isolation --------------
-//
-// `offer_peer_create`/`is_update_reentry` themselves need a live SDK connection (`RemoteTables`
-// is only constructible off a real subscription) to exercise end-to-end, so — per this repo's
-// established convention (`ghost_transition`, `stealth_action`, `entity_update_to_outbound`) —
-// the DECISION logic they're built from is extracted pure (`peer_create_gate`,
-// `is_update_reentry`) and tested directly here; both are the ACTUAL functions
-// `offer_peer_create`/the `on_update` callback call, not a parallel re-implementation.
-
 #[test]
 fn peer_create_gate_excludes_self_regardless_of_other_fields() {
-    // Self is never offered a CREATE of its own row (the dedup set is pre-seeded with
-    // self_guid instead) — true even if every other gate would otherwise pass.
     assert!(!peer_create_gate(1, 1, 0, 0, 0, true, false));
 }
 
 #[test]
 fn peer_create_gate_excludes_a_different_instance_work_item_190() {
-    // Same instance (both open-world 0, or both some future dungeon instance N) -> visible.
     assert!(peer_create_gate(2, 1, 0, 0, 0, false, false));
     assert!(peer_create_gate(2, 1, 7, 7, 0, false, false));
-    // Different instance (e.g. a dungeon party's row vs. an open-world viewer, or two
-    // different parties' instances of the same dungeon) -> excluded. This is the gate the
-    // The login sweep and the re-entry path BOTH sit behind — a cross-instance row must
-    // never be marked `created`, even transiently, by either path.
     assert!(!peer_create_gate(2, 1, 7, 0, 0, false, false));
     assert!(!peer_create_gate(2, 1, 3, 7, 0, false, false));
 }
@@ -880,62 +823,41 @@ fn peer_create_gate_excludes_a_different_instance_work_item_190() {
 #[test]
 fn peer_create_gate_spirithealer_and_stealth_gates_unaffected_by_the_refactor() {
     const SPIRITHEALER: u32 = lyracore_shared::constants::npc_flags::SPIRITHEALER;
-    // A spirit healer is invisible to a living viewer...
     assert!(!peer_create_gate(2, 1, 0, 0, SPIRITHEALER, false, false));
     assert!(peer_create_gate(2, 1, 0, 0, SPIRITHEALER, true, false));
-    // A non-spirit-healer entity is unaffected by the viewer's ghost state.
     assert!(peer_create_gate(2, 1, 0, 0, 0, false, false));
-    // A currently-stealthed peer is excluded regardless of everything else.
     assert!(!peer_create_gate(2, 1, 0, 0, 0, false, true));
 }
 
 #[test]
 fn reentry_after_leaving_aoi_recreates_exactly_once_work_item_144() {
-    // The exact re-entry scenario: observer sees peer (CREATE) -> peer leaves the AOI box
-    // (on_delete evicts it from `created`, sends DESTROY) -> peer returns, delivered as an
-    // UPDATE of the SDK's still-cached row (not a fresh on_insert) -> the observer must
-    // re-CREATE it, not silently drop it forever.
     let self_guid = 1u64;
     let peer = 42u64;
-    let mut created: HashSet<u64> = HashSet::from([self_guid, peer]); // currently visible
+    let mut created: HashSet<u64> = HashSet::from([self_guid, peer]);
 
-    // Leave: on_delete's `if del_created.lock().unwrap().remove(&row.guid)` — must actually
-    // evict, or the later re-entry check below sees a false "already shown".
     assert!(
         created.remove(&peer),
         "on_delete must evict the leaving peer from `created`"
     );
     assert!(!created.contains(&peer));
 
-    // Re-entry arrives as an on_update, not on_insert (the SDK's refcounted cache still holds
-    // the row). The callback's actual dispatch predicate must say "treat as re-entry".
     assert!(is_update_reentry(peer, self_guid, created.contains(&peer)));
 
-    // `offer_peer_create`'s gate passes (same instance, not stealthed, not a spirit healer) ->
-    // the dedup insert succeeds -> exactly one CREATE goes out.
     assert!(peer_create_gate(peer, self_guid, 0, 0, 0, false, false));
     assert!(
         created.insert(peer),
         "the re-entry offer must (re)insert into `created`"
     );
 
-    // A THIRD sighting of the same still-visible peer (an ordinary field update, e.g. a
-    // heartbeat) must NOT be treated as another re-entry — it's already shown, so it diffs
-    // normally instead of re-CREATEing (which would desync the client).
     assert!(!is_update_reentry(peer, self_guid, created.contains(&peer)));
 
-    // Self never triggers the re-entry branch, even if (hypothetically) it were ever evicted.
     assert!(!is_update_reentry(self_guid, self_guid, false));
 }
 
 #[test]
 fn login_resident_sweep_creates_every_pre_existing_peer_exactly_once_work_item_145() {
-    // The login-sweep scenario: a fresh login's AOI box already contains peers/creatures (rows
-    // resident in the connection's cache from the just-applied subscription) whose
-    // `on_insert` may or may not have fired. The sweep in `subscribe_player_events` offers
-    // every resident row through this SAME gate + dedup — model it directly.
     let self_guid = 1u64;
-    let residents = [2u64, 3, 4]; // pre-existing peers already in the login AOI box
+    let residents = [2u64, 3, 4];
     let mut created: HashSet<u64> = HashSet::from([self_guid]);
 
     let mut creates_sent = 0;
@@ -951,8 +873,6 @@ fn login_resident_sweep_creates_every_pre_existing_peer_exactly_once_work_item_1
     );
     assert!(residents.iter().all(|g| created.contains(g)));
 
-    // Idempotency (the sweep's own correctness claim): if the SDK ALSO fired an apply-time
-    // on_insert for one resident before the sweep runs, the sweep must not double-create it.
     creates_sent = 0;
     for guid in residents {
         if peer_create_gate(guid, self_guid, 0, 0, 0, false, false) && created.insert(guid) {
@@ -967,9 +887,6 @@ fn login_resident_sweep_creates_every_pre_existing_peer_exactly_once_work_item_1
 
 #[test]
 fn login_resident_sweep_excludes_cross_instance_residents_work_item_190() {
-    // A row resident in the connection's cache from a DIFFERENT instance than the viewer
-    // (always a no-op today since every entity is instance 0, but the
-    // gate must already hold the line) must never be swept into `created`.
     let self_guid = 1u64;
     let viewer_instance_id = 0u64;
     let same_instance_peer = 2u64;
@@ -998,9 +915,7 @@ fn login_resident_sweep_excludes_cross_instance_residents_work_item_190() {
 
 #[test]
 fn corpse_and_gameobject_creates_relay_only_within_the_viewers_instance_work_item_190_slice_2() {
-    // Open-world rows to an open-world viewer: byte-identical to the previous behavior (always relayed).
     assert!(instance_relay_gate(0, Some(0)));
-    // A per-instance GO copy / in-instance corpse reaches ONLY viewers inside that instance…
     assert!(instance_relay_gate(7, Some(7)));
     assert!(
         !instance_relay_gate(7, Some(0)),
@@ -1010,11 +925,7 @@ fn corpse_and_gameobject_creates_relay_only_within_the_viewers_instance_work_ite
         !instance_relay_gate(7, Some(9)),
         "another party's instance must not see them either"
     );
-    // …and an instanced viewer no longer receives the static instance-0 originals (they are the
-    // COPY SOURCES on the dungeon map — the copies are what render inside the run).
     assert!(!instance_relay_gate(0, Some(7)));
-    // Unknown viewer instance (entity not resident — the AOI-on login window) relays NOTHING,
-    // not even instance 0: suppress-then-sweep, never guess.
     assert!(!instance_relay_gate(0, None));
     assert!(!instance_relay_gate(7, None));
 }

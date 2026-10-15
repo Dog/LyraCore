@@ -18,8 +18,7 @@ const ROOT_B: u32 = 5_090_902;
 const SHADOWMELD: u32 = 5_090_903;
 const STEALTH: u32 = 5_090_904;
 
-/// A Character with a self-cast spell for each fixture aura. `aura_interrupt` bit 1 is
-/// break-on-move, as the importer maps the vanilla movement interrupt flag.
+// aura_interrupt bit 1 is break-on-move, mapped from the vanilla movement interrupt flag.
 fn fixture(name: &str) -> (Standalone, [f32; 3]) {
     let mut shard = Standalone::start(name);
     shard.publish_module();
@@ -107,7 +106,6 @@ fn a_rooted_character_turns_but_moves_only_after_the_last_root_ends() {
         "a steering heartbeat must not translate"
     );
 
-    // The root receipt arrives as a stop at the spot where the client halted.
     send_move(&shard, STOP, STILL, [x + 1.0, y, z], 1.5, 20);
     assert_eq!(position(&shard), (x + 1.0, 1.5));
     send_move(&shard, SET_FACING, STILL, [x + 1.0, y, z], 2.5, 30);
@@ -117,7 +115,6 @@ fn a_rooted_character_turns_but_moves_only_after_the_last_root_ends() {
         "a rooted Character still turns"
     );
 
-    // A jump that lands after the root still lands where the client came down.
     send_move(&shard, FALL_LAND, FORWARD, [x + 2.0, y, z], 2.5, 35);
     assert_eq!(position(&shard).0, x + 2.0, "a landing is never dropped");
 

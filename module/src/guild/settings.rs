@@ -1,7 +1,3 @@
-//! MOTD, guild info text, public and officer notes, and Guild Rank edit, add and delete
-//! (`cm:GuildHandler.cpp:488-680`). Every op first requires membership; a Refusal leaves every
-//! guild row unchanged.
-
 use super::{
     game_guild, game_guild_member, game_guild_rank, member, push_event, rank_rights, GuildMember,
     GuildNoteEdit, GuildRank, GuildRankEdit,
@@ -12,8 +8,6 @@ use lyracore_shared::guild::{
 };
 use spacetimedb::{ReducerContext, Table};
 
-/// CMSG_GUILD_MOTD: the actor's Guild Rank needs SETMOTD. An empty MOTD is allowed
-/// (`cm:GuildHandler.cpp:494-497`). Broadcasts MOTD `[text]` (`:511-513`).
 pub(super) fn set_motd(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -49,8 +43,6 @@ pub(super) fn set_motd(
     Ok(())
 }
 
-/// CMSG_GUILD_INFO_TEXT: the actor's Guild Rank needs MODIFY_GUILD_INFO. No event, no reply
-/// (`cm:GuildHandler.cpp:693-713`).
 pub(super) fn set_info(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -77,7 +69,6 @@ pub(super) fn set_info(
     Ok(())
 }
 
-/// Which note field an edit targets, and the Rank Right that gates it.
 enum NoteKind {
     Public,
     Officer,
@@ -99,10 +90,6 @@ impl NoteKind {
     }
 }
 
-/// CMSG_GUILD_SET_PUBLIC_NOTE / SET_OFFICER_NOTE, shared: check the editor's right, check the
-/// target is a member of the same Guild, check the note length, write the note, then address a
-/// fresh roster back to the editor (event `0x50`) so it renders after the commit
-/// (`cm:GuildHandler.cpp:526-588`).
 fn set_note(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -153,7 +140,6 @@ pub(super) fn set_officer_note(
     set_note(ctx, actor_guid, edit, NoteKind::Officer)
 }
 
-/// The acting Character's Guild, when it is the Guild Leader.
 fn require_leader(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -171,9 +157,6 @@ fn require_leader(
     Ok(())
 }
 
-/// CMSG_GUILD_RANK: the Guild Leader renames a Guild Rank and sets its rights. An unknown
-/// `rank_id` changes nothing and answers success, matching `cm:Guild.cpp:668-688`; rank 0 keeps
-/// every right whatever the client sends (`:621-622`). Broadcasts `ROSTER_REFRESH`.
 pub(super) fn edit_rank(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -212,9 +195,6 @@ pub(super) fn edit_rank(
     Ok(())
 }
 
-/// CMSG_GUILD_ADD_RANK: the Guild Leader appends a new lowest Guild Rank with
-/// GCHATLISTEN|GCHATSPEAK, up to [`MAX_RANKS`] (`cm:GuildHandler.cpp:650-657`). Broadcasts
-/// `ROSTER_REFRESH`.
 pub(super) fn add_rank(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -249,11 +229,6 @@ pub(super) fn add_rank(
     Ok(())
 }
 
-/// CMSG_GUILD_DEL_RANK: the Guild Leader deletes the lowest Guild Rank, down to [`MIN_RANKS`]
-/// (`cm:Guild.cpp:639-650`). Its members move to the new lowest rank in the same transaction, so
-/// the Guild Projection relay on `game_guild_member` picks up their new PLAYER_GUILDRANK as an
-/// ordinary update; mangos instead leaves them out of range until the client reloads. Broadcasts
-/// `ROSTER_REFRESH`.
 pub(super) fn delete_rank(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GuildRefusal> {
     let actor = member(ctx, actor_guid).ok_or(GuildRefusal::NotInGuild)?;
     require_leader(ctx, actor_guid, actor.guild_id)?;
@@ -290,8 +265,3 @@ pub(super) fn delete_rank(ctx: &ReducerContext, actor_guid: u64) -> Result<(), G
     );
     Ok(())
 }
-
-// Behavior tests for these reducers (rank add and delete bounds, members moved on delete, rank 0
-// rights forced) live in `module/tests/guild_settings.rs`, which runs them as real reducer calls
-// against real rows. A pure unit test here could only restate the same constants or expressions
-// the reducer already uses, proving nothing about the reducer itself.

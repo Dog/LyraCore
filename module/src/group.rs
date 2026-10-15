@@ -1,39 +1,3 @@
-//! Party/group system: invite → accept/decline handshake, membership, leave/kick/
-//! disband, and the group-scoped kill rewards (XP split + shared quest credit).
-//!
-//! Shape mirrors the friend/ignore system: the GATEWAY resolves typed names to guids
-//! (`character_guid_by_name`, the `/who` lookup) and the reducers re-validate server-side off
-//! `ctx.sender()`'s in-world character. Cross-player notifications ride a `game_group_event` row
-//! (RLS-scoped to the recipient, the `game_whisper_event` pattern) that the gateway relays as
-//! `SMSG_GROUP_INVITE` / `SMSG_GROUP_LIST` / `SMSG_GROUP_DECLINE` / `SMSG_GROUP_DESTROYED`; LIST
-//! events carry the roster snapshot in their payload, built in the SAME transaction as the
-//! membership change (a relay-time coordinator read would race the event across connections).
-//!
-//! **Where this state LIVES (group slice).** `game_group` / `game_group_member` /
-//! `game_group_invite` are authoritative on **realm-core** — none of the three is coupled to space,
-//! and all three broke the moment a second database existed (a player inside Deadmines could not
-//! invite one in Elwynn: `invite_core` resolved the target inside the CALLING database and a
-//! character on another shard has no row there). The gateway drives them there through the
-//! operator-gated [`realm_group_op`], and each world shard's copy is a write-through cache it
-//! refreshes with [`sync_group_mirror`] — the `game_account`/`game_session` relationship.
-//! A single-database deployment has no realm-core to route to and keeps calling the player-facing
-//! reducers below exactly as before; the whole split is a gateway routing decision, not a schema one.
-//!
-//! **Server-driven invites.** A session-less Character's invite has no client and no
-//! `ctx.sender()` to resolve — it is a decision a Package makes inside the Module. It cannot write
-//! group rows for the same reason a player's cross-shard invite cannot: only the gateway can reach
-//! realm-core. [`BotInviteIntent`] is the module's half of that split — a DECISION, not a write —
-//! picked up by `gateway/src/world/party.rs`'s `run_bot_invite`. The same row carries a bot's
-//! decision to LEAVE its party, which meets the identical authority wall.
-//!
-//! Vanilla-parity notes: a Party caps at 5 members. Its leader may convert it to a Raid of up to 40
-//! in 8 Subgroups, and it never converts back. A Raid leader promotes Assistants, who may also
-//! invite and remove members, and the first Assistant leads when the leader leaves. Kill XP splits
-//! EVENLY among in-range living members (each member's grey-clamp applies to their OWN level, so
-//! a too-high member naturally gets 0). Vanilla's sum-of-levels weighting, the 3/4/5-member bonus
-//! multipliers and the raid XP rate are a documented follow-up. Kill quest-credit goes to every
-//! in-range member (vanilla).
-
 mod mirror;
 #[cfg_attr(not(feature = "debug_reducers"), allow(unused_imports))]
 pub use mirror::sync_group_mirror;
@@ -48,8 +12,6 @@ use lyracore_shared::group::{
     TARGET_ICON_COUNT, TARGET_ICON_LIST_REQUEST,
 };
 
-/// Group kill-reward radius² — members farther than this from the slain creature get neither XP
-/// nor quest credit. Vanilla's `sWorld.getConfig(CONFIG_FLOAT_GROUP_XP_DISTANCE)` = 74.0 yd.
 pub const GROUP_XP_RANGE_SQ: f32 = 74.0 * 74.0;
 
 pub mod loot_method {
@@ -60,12 +22,6 @@ pub mod loot_method {
     pub const NEED_BEFORE_GREED: u8 = 4;
 }
 
-/// A Group: a Party, or a Raid its leader converted. `leader_guid` is a member's character guid;
-/// leadership transfers on leader-leave and the group disbands below 2 members. Public + no RLS
-/// (membership is world-visible state, like `game_world_entity`). `SMSG_GROUP_LIST` is driven by
-/// the module's LIST event rows (`roster_payload`), not by a read of this table. The Gateway
-/// coordinator caches it to read Realm-core's roster and push each World Shard's mirror.
-/// [entity]
 #[table(accessor = game_group, public)]
 pub struct Group {
     #[primary_key]
@@ -73,21 +29,18 @@ pub struct Group {
     pub group_id: u64,
     pub leader_guid: u64,
 
-    #[default(3)] // loot_method::GROUP
+    #[default(3)]
     pub loot_method: u8,
-    #[default(2)] // ItemQuality::Uncommon
+    #[default(2)]
     pub loot_threshold: u8,
     #[default(0)]
     pub rr_cursor: u32,
     #[default(0u64)]
     pub master_looter_guid: u64,
-    /// [`GroupKind`] as its wire byte. END-appended, so every earlier row reads as a Party.
     #[default(0u8)]
     pub group_type: u8,
 }
 
-/// One member row per character in a group. `character_guid` is unique across the table — a
-/// character is in at most one group. [entity]
 #[table(
     accessor = game_group_member,
     public,
@@ -101,15 +54,11 @@ pub struct GroupMember {
     pub group_id: u64,
     pub character_guid: u64,
     pub owner_identity: Identity,
-    /// [`RaidSlot`] as its wire byte. END-appended, so every earlier member reads as Subgroup 0
-    /// without the Assistant flag, which every Party member is.
     #[default(0u8)]
     pub raid_slot: u8,
 }
 
-/// Realm-core's order for one complete party roster and each World Shard mirror's last accepted
-/// value. The row survives disband so a delayed pre-disband snapshot cannot recreate the party.
-/// Realm-core owns increments; World Shards only copy the supplied value in [`sync_group_mirror`].
+// Keep this revision after disband so a delayed roster cannot recreate the party.
 #[table(accessor = game_group_roster_revision, public)]
 pub struct GroupRosterRevision {
     #[primary_key]
@@ -118,10 +67,6 @@ pub struct GroupRosterRevision {
     pub active: bool,
 }
 
-/// Realm-core-certified partition state for one mirrored party member. This local projection
-/// carries no position and names no Shard. The Realm membership row and locator revisions order
-/// delayed Gateway fanout without relying on clocks from different databases.
-/// [entity]
 #[table(
     accessor = game_group_member_partition,
     public,
@@ -131,13 +76,11 @@ pub struct GroupMemberPartition {
     #[primary_key]
     pub character_guid: u64,
     pub group_id: u64,
-    /// The authoritative Realm-core `game_group_member.id`, never a World Shard mirror row id.
     pub membership_revision: u64,
-    /// False is a retained removal fence. A later join must carry a newer membership revision.
+    // A removed member remains fenced until a newer membership revision arrives.
     pub member_active: bool,
     pub map_id: u32,
     pub instance_id: u64,
-    /// Realm-core `game_character_shard.revision`.
     pub locator_revision: u64,
     pub state: PartyPartitionState,
 }
@@ -157,9 +100,6 @@ crate::character_owned!(delete, fn sweep_delete_game_group_member_partition(ctx,
 });
 crate::character_owned!(not_transported, fn sweep_transfer_game_group_member_partition());
 
-// Character-owned sweeps: a deleted character leaves its group through the same
-// leader-transfer/disband logic a voluntary leave uses — never a bare row delete, which would
-// orphan leadership or leave a 1-member group alive.
 crate::character_owned!(delete, fn sweep_delete_game_group_member(ctx, character_guid) {
     remove_member(ctx, character_guid, Departure::Left);
 });
@@ -173,34 +113,10 @@ crate::character_owned!(restamp, fn sweep_restamp_game_group_member(ctx, charact
     }
 });
 
-// CROSS-DATABASE transport (group slice): membership does NOT ride the export blob.
-//
-// Shipped an interim MIRROR here — the member row travelled in the manifest carrying its
-// original `group_id`, and an `ensure_group` helper re-created the parent `game_group` row at the
-// destination. Its own AC called for that mirror to be deleted once membership had one
-// authoritative home, and the group slice gives it one: `game_group` / `game_group_member` / `game_group_invite`
-// are authoritative on REALM-CORE, and each world shard's copy is a gateway-maintained write-through
-// cache (`sync_group_mirror`) — the same relationship `game_account` / `game_session` have.
-//
-// So the blob must not carry membership: it would race the authority. The gateway re-pushes the
-// realm-core roster onto the destination at world entry (`world::party::on_world_entry`), which is
-// strictly better than the snapshot — a party SPLIT across the boundary re-syncs both sides, where
-// the snapshot could only carry what the character had when it stepped into the portal.
-//
-// This also settles the three OPEN entries on the in-transit exception list (`transfer/mod.rs`):
-// a third party's accept/kick/leave for an in-transit character is now a REALM-CORE write, so
-// there is no source-copy write left to lose.
+// Membership snapshots must not travel because they can overwrite a newer Realm-core roster.
 crate::character_owned!(not_transported, fn sweep_transfer_game_group_member());
 
-/// Drop a character's MIRROR row on the shard it is leaving, without the leave/disband semantics
-/// (re-scoped).
-///
-/// `transfer::do_finish` calls this immediately before `cascade_delete_character` tears the source
-/// copy down. A shard hop is not a departure: running `remove_member` would fire DESTROYED at the
-/// remaining members and DISBAND a two-person party the moment its first member stepped through the
-/// portal. On realm-core that would be worse than wrong — it would be a MIRROR inventing a membership
-/// change and notifying clients about it, when the authority (realm-core) recorded nothing at all.
-/// Deleting the row and nothing else is exactly what a departing cache entry should do.
+// Transfer removes the local mirror without leave or disband semantics.
 pub(crate) fn detach_for_transfer(ctx: &ReducerContext, character_guid: u64) {
     let members = ctx.db.game_group_member();
     for m in members
@@ -212,10 +128,6 @@ pub(crate) fn detach_for_transfer(ctx: &ReducerContext, character_guid: u64) {
     }
 }
 
-/// A pending invite: at most one per target (a newer invite replaces it). Consumed by
-/// accept/decline; a never-answered invite is reaped by the event GC on its own 2-minute TTL
-/// (long enough to answer the dialog, short enough not to leak — see `gc.rs`). Private —
-/// only the module reads it. [entity]
 #[table(accessor = game_group_invite, index(accessor = by_target, btree(columns = [target_guid])))]
 pub struct GroupInvite {
     #[primary_key]
@@ -224,18 +136,10 @@ pub struct GroupInvite {
     pub target_guid: u64,
     pub inviter_guid: u64,
     pub created_at: Timestamp,
-    /// The Group the invite joins, or 0 when the inviter had none. As in cmangos, an accept joins
-    /// this Group whatever the inviter did since, and fails once the Group is gone. The first
-    /// accept of a 0 invite forms the inviter's Group and stamps it onto the inviter's other
-    /// pending invites. A row from before this column reads 0.
     #[default(0u64)]
     pub group_id: u64,
 }
 
-// Character-owned sweep: a deleted character's pending invites go with it — rows where it
-// is the TARGET (indexed) and rows where it is the INVITER (scan; the table only ever holds
-// currently-pending invites, so it stays tiny). Delete-only: GroupInvite carries no
-// owner_identity, so there is nothing to restamp.
 crate::character_owned!(delete, fn sweep_delete_game_group_invite(ctx, character_guid) {
     let invites = ctx.db.game_group_invite();
     for inv in invites.by_target().filter(&character_guid).collect::<Vec<_>>() {
@@ -250,34 +154,8 @@ crate::character_owned!(delete, fn sweep_delete_game_group_invite(ctx, character
         invites.id().delete(id);
     }
 });
-// CROSS-DATABASE transport: a pending invite is a 2-minute dialog with a GC TTL, and
-// the inviter is by definition NOT transferring with the target (they are still standing in the
-// open world). Carrying it would pop an invite dialog for a party the arriving character cannot see.
-// Not transported, by decision — the invite dies with the source copy, exactly as a decline would.
 crate::character_owned!(not_transported, fn sweep_transfer_game_group_invite());
 
-/// A bot-initiated invite the MODULE has DECIDED but cannot execute (closing the gap
-/// the group slice opened): `game_group`/`game_group_member` are authoritative on realm-core, and
-/// only the gateway can reach it — the module never has. Before this table existed, a Package's
-/// server-driven invite called [`invite_core`] directly, writing this shard's LOCAL
-/// `game_group`/`game_group_member` rows, which realm-core had never heard of; the next
-/// `sync_group_mirror` push then wiped the party the mirror did not recognise.
-///
-/// The fix splits the decision from the execution, the same way `world::party` already splits a
-/// player's own invite: the module picks the fellow quester (it already owns the spatial + quest
-/// data that decision needs) and writes it HERE instead of writing group rows; the gateway's
-/// `world::party::run_bot_invite` picks the row up and runs the SAME `realm_group_op` a player's own
-/// CMSG_GROUP_INVITE would, so a bot party is created through the authority a `sync_group_mirror`
-/// push never contradicts.
-///
-/// The row carries a LEAVE as well as an INVITE now (see [`op`](Self::op)) — a bot leaving a party
-/// hits the same authority wall the invite did. The table keeps its name because renaming one is a
-/// migration and this is not.
-///
-/// Private — no client ever needs to see this, only the gateway's owner-token coordinator connection
-/// (the `game_account`/`game_session` pattern). Short-lived: reaped by
-/// the shared 1s event TTL (`gc.rs`), which is generous — the gateway's subscription callback fires
-/// on the insert, not on a poll. [entity]
 #[table(accessor = game_bot_invite_intent, index(accessor = by_actor, btree(columns = [inviter_guid])))]
 pub struct BotInviteIntent {
     #[primary_key]
@@ -286,42 +164,20 @@ pub struct BotInviteIntent {
     pub inviter_guid: u64,
     pub target_guid: u64,
     pub created_at: Timestamp,
-    /// Which group op the gateway should run: [`lyracore_shared::group::bot_op`]. END-appended with
-    /// a `0` default, so every row written before this column existed reads as the INVITE it was.
-    ///
-    /// A leave needs the same relay for the same reason an invite does — membership is
-    /// authoritative on realm-core and the module cannot reach it — so it rides this row rather
-    /// than a second table with an identical shape and an identical reaper.
     #[default(0u8)]
     pub op: u8,
 }
 
-/// Record a bot's serendipity invite DECISION for the gateway to execute. No gating here
-/// beyond existence-of-nothing: every real gate (leader or Assistant only, party cap,
-/// already-grouped, pending-invite-replaces-older) lives in `invite_core_on`/`realm_group_op`,
-/// which the gateway calls against the correct authority; this is a pure write, mirroring how a
-/// player's own CMSG_GROUP_INVITE is a pure gateway-side resolve-then-call with no module-side
-/// pre-check either.
-///
-/// Only Packages call this operation. A Core checkout without an installed Rust Package has no caller.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn emit_bot_invite_intent(ctx: &ReducerContext, inviter_guid: u64, target_guid: u64) {
     emit_bot_group_intent(ctx, bot_op::INVITE, inviter_guid, target_guid);
 }
 
-/// Record a session-less Character's decision to LEAVE its party, for the gateway to execute.
-///
-/// The same split, and the same reason: a bot that ran `leave_group_for` itself would write this
-/// shard's local member rows, and the next `sync_group_mirror` push would put the party back.
-///
-/// Nothing here checks that the Character is in a party. `leave_group_for` refuses a non-member, so
-/// a decision that has already been executed costs one refused op rather than a wrong one.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn emit_bot_leave_intent(ctx: &ReducerContext, leaver_guid: u64) {
     emit_bot_group_intent(ctx, bot_op::LEAVE, leaver_guid, 0);
 }
 
-/// The one writer of [`BotInviteIntent`]. `target_guid` is unused by a LEAVE.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 fn emit_bot_group_intent(ctx: &ReducerContext, op: u8, actor_guid: u64, target_guid: u64) {
     ctx.db.game_bot_invite_intent().insert(BotInviteIntent {
@@ -344,9 +200,6 @@ pub(crate) fn clear_unclaimed_group_intents(ctx: &ReducerContext, character_guid
     }
 }
 
-/// Admit and consume one Group Intent in a serialized World Shard transaction.
-/// Consent and live Session ownership are checked before deletion. A selection after this claim
-/// cannot recall the action that the winning Gateway will send to Realm-core.
 #[reducer]
 pub fn claim_bot_invite_intent(ctx: &ReducerContext, intent_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -362,7 +215,6 @@ pub fn claim_bot_invite_intent(ctx: &ReducerContext, intent_id: u64) -> Result<(
     Ok(())
 }
 
-/// Reducer edge: only the tag crosses to the gateway; the detail stays in module logs.
 pub(crate) fn refused(refusal: GroupRefusal, detail: &str) -> String {
     let tag = refusal.as_tag();
     spacetimedb::log::info!("group refused {tag}: {detail}");
@@ -381,8 +233,6 @@ impl From<GroupRefusal> for GroupOpError {
     }
 }
 
-/// Serialize a gameplay Refusal as its stable tag, while leaving broken durable relationships
-/// untagged so the Gateway treats them as session failures.
 fn group_op_error(error: GroupOpError, detail: &str) -> String {
     match error {
         GroupOpError::Refused(refusal) => refused(refusal, detail),
@@ -393,55 +243,20 @@ fn group_op_error(error: GroupOpError, detail: &str) -> String {
     }
 }
 
-// Event kinds, roster grammar, and classified error strings are the SHARED wire contract:
-// lyracore_shared::group is the one definition both crates import — a renumber,
-// reword, or delimiter change is a cross-crate compile-visible edit, never a runtime drift.
 use lyracore_shared::group::{bot_op, event_kind as group_event_kind, leave_cause, GroupRefusal};
 
-/// A per-recipient group notification (the `game_whisper_event` pattern): public + RLS-scoped so
-/// only the recipient's connection sees it; reaped by the shared event GC. LIST events carry the
-/// FULL roster snapshot in `payload` ([`RosterPayload`]), built in the SAME transaction as the
-/// membership change, so the gateway relay never races a cross-connection coordinator read (the
-/// module is the one place the roster is guaranteed consistent). [event]
 #[table(accessor = game_group_event, public, index(accessor = by_recipient, btree(columns = [recipient_identity])))]
 pub struct GroupEvent {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
     pub recipient_identity: Identity,
-    pub kind: u8, // group_event_kind::*
+    pub kind: u8,
     pub other_guid: u64,
-    /// Unused by the gateway relay. Kept as an empty column rather than removed, because dropping
-    /// it is a schema change this fix does not need.
-    ///
-    /// A name written here would only be correct when [`push_event`] runs on the same database
-    /// that holds `other_guid`'s character row. That holds for `gw_group_invite`/`gw_group_decline`
-    /// on an unsharded Realm. It fails for `realm_group_op` on a sharded Realm, which is exactly
-    /// the case a cross-shard invite needs: `other_guid`'s Character lives on a different World
-    /// Shard than the write. This reducer cannot tell the two cases apart, so it leaves the column
-    /// blank and lets the gateway resolve the name from the World Shard caches at render time, the
-    /// same way it already resolves a blank LIST roster name
-    /// (`gateway/src/stdb/subscriptions.rs::other_character_name`).
     pub other_name: String,
     pub created_at: Timestamp,
-    // LIST roster snapshot (`RosterPayload::encode`); empty for the other kinds. A plain
-    // column (String cannot be #[default]-ed — the macro's typecheck is const): fine because this
-    // whole table has no pre-payload row to migrate anywhere real.
     pub payload: String,
-    /// The recipient's CHARACTER GUID (group slice). END-appended + `#[default(0)]`, so
-    /// this is an additive auto-migration and every earlier row reads as 0.
-    ///
-    /// `recipient_identity` cannot address a recipient on REALM-CORE: an identity is minted per
-    /// (account, database) by the node, so the identity a player holds on a world shard names
-    /// nobody on the directory database — and realm-core has no `game_character` rows to resolve one
-    /// from in the first place. A guid is the one realm-wide name a character has. The identity
-    /// column stays exactly as it was and still drives the per-player RLS on a world shard; this
-    /// column is what the gateway's realm-core relay filters on (it reads through the owner token,
-    /// which bypasses RLS, and self-filters per session — the coordinator-relay law).
-    // The u64 default MUST be typed: a bare `0` encodes as 4 bytes and `publish` rejects the
-    // migration with "data too short for u64: Expected 8, given 4" (world.rs:127 records the same
-    // rule). Nothing in `cargo test`/`cargo check` validates default-value encoding — only a real
-    // migration does — so this shipped green and blocked the first publish that tried to apply it.
+    // Identities are Shard-local; Realm-core addresses recipients by Character guid.
     #[default(0u64)]
     pub recipient_guid: u64,
 }
@@ -453,10 +268,6 @@ pub(crate) fn push_event(
     other_guid: u64,
     payload: String,
 ) {
-    // A missing character row is not an early return. A world shard has the row. REALM-CORE has no
-    // character rows at all, so an early return there would stop the directory database from
-    // notifying anybody, and every invite popup and roster refresh for a cross-shard party would be
-    // dropped at the source.
     let bound = ctx
         .db
         .game_character()
@@ -468,8 +279,6 @@ pub(crate) fn push_event(
         recipient_identity: crate::helpers::event_recipient_identity(bound),
         kind,
         other_guid,
-        // Left empty: see the field comment. This reducer cannot tell here whether `ctx.db` holds
-        // `other_guid`'s character row, so it does not guess.
         other_name: String::new(),
         created_at: ctx.timestamp,
         payload,
@@ -477,15 +286,6 @@ pub(crate) fn push_event(
     });
 }
 
-/// The LIST payload, encoded by the SHARED grammar ([`RosterPayload`], delimiter defense
-/// included). Carries the group's CURRENT loot rules, kind and every Raid Slot alongside the
-/// roster, so any of those changing re-renders the party frame through this same relay. A Party's
-/// payload also carries its Target Icons. Presence is the Gateway's to add: this database may be
-/// Realm-core, which has no live entities.
-///
-/// `None` means the `game_group` row is MISSING — every caller treats that as a hard invariant
-/// violation (they've either just inserted the row or already `.ok_or("group row missing")?`'d
-/// their own read of it), so there is no plausible roster to fabricate here.
 fn roster_payload(ctx: &ReducerContext, group_id: u64) -> Option<String> {
     let group = ctx.db.game_group().group_id().find(group_id)?;
     let members = members_of(ctx, group_id)
@@ -511,7 +311,7 @@ fn roster_payload(ctx: &ReducerContext, group_id: u64) -> Option<String> {
             master_looter_guid: group.master_looter_guid,
             kind,
             members,
-            // The Party client clears its marks on every list, so the list carries them back.
+            // The Party client clears marks on each roster list, so send them back with it.
             target_icons: match kind {
                 GroupKind::Party => target_icons_of(ctx, group_id),
                 GroupKind::Raid => Vec::new(),
@@ -529,21 +329,16 @@ pub(crate) fn raid_slot_of(member: &GroupMember) -> RaidSlot {
     RaidSlot::from_wire_or_default(member.raid_slot)
 }
 
-/// Whether `character_guid` is in a Raid, read from this database's own rows: the authority on
-/// Realm-core, the mirror on a World Shard.
 pub(crate) fn in_raid(ctx: &ReducerContext, character_guid: u64) -> bool {
     group_of(ctx, character_guid)
         .and_then(|member| ctx.db.game_group().group_id().find(member.group_id))
         .is_some_and(|group| group_kind_of(&group) == GroupKind::Raid)
 }
 
-/// Whether `member` may manage `group`'s Raid: its leader, or an Assistant. Only a Raid member
-/// holds the Assistant flag, so in a Party this is the leader alone. Invites and kicks read it.
 pub(crate) fn manages_raid(group: &Group, member: &GroupMember) -> bool {
     group.leader_guid == member.character_guid || raid_slot_of(member).is_assistant()
 }
 
-/// Who receives one Group Broadcast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GroupAudience {
     Everyone,
@@ -563,8 +358,6 @@ impl GroupAudience {
     }
 }
 
-/// Push one `game_group_event` row per member of `group_id` in `audience`. Every Gateway relays
-/// the rows addressed to its own sessions. A missing group reaches nobody.
 pub(crate) fn group_broadcast(
     ctx: &ReducerContext,
     group_id: u64,
@@ -589,12 +382,10 @@ pub(crate) fn group_broadcast(
     }
 }
 
-/// Whether a Group of `kind` with `member_count` members can take one more.
 fn has_room(kind: GroupKind, member_count: usize) -> bool {
     member_count < kind.member_cap()
 }
 
-/// The group a character belongs to, if any.
 pub(crate) fn group_of(ctx: &ReducerContext, character_guid: u64) -> Option<GroupMember> {
     ctx.db
         .game_group_member()
@@ -613,8 +404,6 @@ pub struct PartyUnitFacts {
     pub health: u32,
     pub max_health: u32,
     pub dead: bool,
-    /// The unit's client selection. Selection identifies the designated target but does not start a
-    /// fight by itself.
     pub target_guid: u64,
 }
 
@@ -637,7 +426,6 @@ pub struct PartyFacts {
     pub group_id: u64,
     pub leader_guid: u64,
     pub members: Vec<PartyMemberFacts>,
-    /// Living hostile units with current evidence that this party is already fighting them.
     pub enemies: Vec<PartyEnemyFacts>,
 }
 
@@ -672,8 +460,6 @@ pub struct CompanionTargetFacts {
     pub max_health: u32,
 }
 
-/// Resolve only the named hostile creature. This exact read permits a designated pull without
-/// widening the party fight scan or choosing a substitute target.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn companion_target_facts(
     ctx: &ReducerContext,
@@ -719,10 +505,6 @@ pub(crate) fn companion_target_facts(
     })
 }
 
-/// Recheck the Gateway-certified authority projection and the bot Gate in the target transaction.
-/// `None` means Package application may proceed; `Some` is a terminal typed Refusal. Companion
-/// Orders cover the whole Raid: the bound is the member cap of the Group's kind, and a longer list
-/// is a damaged mirror.
 pub(crate) fn admit_party_command(
     ctx: &ReducerContext,
     admitted: &crate::bridge::AdmittedClientCommand,
@@ -786,10 +568,6 @@ pub struct PartyFactsUnavailable {
     pub reason: PartyFactsUnavailableReason,
 }
 
-/// Whether another current party member is certified in `partition`. This portal Gate reads only
-/// the bounded roster and exact member projections; combat facts cannot make location unavailable.
-/// The bound stays at the Party cap on purpose: a Raid of more than five members reads as
-/// unavailable here, as the 5-player dungeon cap in `instance.rs` also refuses it.
 pub(crate) fn has_known_party_member_in_partition(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -851,17 +629,6 @@ fn known_party_partition(
         })
 }
 
-/// Read one Character's local durable party mirror, member facts, and enemies with current party
-/// melee, cast, threat, or control evidence. Membership remains useful when a member has no live
-/// entity on this Shard, so those facts are nullable.
-///
-/// Facts cover every member of the Group, Raid included, whatever the Subgroup. Reads stop with
-/// `FightLimit` above the member cap of the Group's kind (only a damaged mirror holds more), 24
-/// incoming melee or threat-source rows for one member, one pending cast for one member, or 24
-/// aggregate enemy GUIDs.
-/// Each retained enemy permits 80 threat sources (a full Raid and one pet each), 64 control auras,
-/// and three effects on a pending spell. A missing parent Group stops with `MissingGroup`; neither
-/// failure returns facts selected from an arbitrary prefix.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn party_facts(
     ctx: &ReducerContext,
@@ -1047,8 +814,6 @@ pub(crate) fn party_facts(
     }))
 }
 
-/// Resolve a membership and its required parent for mutation cores. `Ok(None)` means the
-/// Character has no membership; a membership without its Group is a durable invariant failure.
 pub(crate) fn checked_group_membership(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -1070,7 +835,6 @@ pub(crate) fn checked_group_membership(
     Ok(Some((member, group)))
 }
 
-/// `character_guid`'s Group and its members, through [`checked_group_membership`].
 pub(crate) fn group_with_members(
     ctx: &ReducerContext,
     character_guid: u64,
@@ -1083,10 +847,6 @@ pub(crate) fn group_with_members(
     )
 }
 
-/// The leader-authorization sequence of the ops only the leader may run (loot rules, convert, set
-/// leader, set Assistant): resolve `guid`'s group membership, its `Group` row, and confirm `guid`
-/// actually IS that group's leader. [`GroupRefusal::NotInGroup`] if `guid` has no group at all;
-/// [`GroupRefusal::NotLeader`] if it does but isn't the leader.
 fn led_group_of(ctx: &ReducerContext, guid: u64) -> Result<(GroupMember, Group), GroupOpError> {
     let (m, group) = checked_group_membership(ctx, guid)?.ok_or(GroupRefusal::NotInGroup)?;
     if group.leader_guid != guid {
@@ -1095,8 +855,6 @@ fn led_group_of(ctx: &ReducerContext, guid: u64) -> Result<(GroupMember, Group),
     Ok((m, group))
 }
 
-/// `pub(crate)` because the kill-time loot stamping (`combat/mod.rs` →
-/// `loot::apply_group_loot_rules`) needs the CURRENT roster to pick a round-robin/master designee.
 pub(crate) fn members_of(ctx: &ReducerContext, group_id: u64) -> Vec<GroupMember> {
     ctx.db
         .game_group_member()
@@ -1105,9 +863,6 @@ pub(crate) fn members_of(ctx: &ReducerContext, group_id: u64) -> Vec<GroupMember
         .collect()
 }
 
-/// The roster of `group_id`, read no further than the Group kind's member cap. `None` means the
-/// mirror holds more rows than that kind allows, so the roster is damaged and no caller may act
-/// on a prefix of it.
 pub(crate) fn bounded_roster(
     ctx: &ReducerContext,
     group_id: u64,
@@ -1124,10 +879,6 @@ pub(crate) fn bounded_roster(
     (roster.len() <= cap).then_some(roster)
 }
 
-/// Who hears a party line: every member of the speaker's Group, the speaker included, in a Party.
-/// In a Raid it narrows to the speaker's own Subgroup (cm:ChatHandler.cpp:302-332,
-/// cm:Group.cpp:777-788). Nobody's ignore list filters it. Read from this database's membership,
-/// which is the party authority wherever the Gateway sends Realm Chat.
 pub(crate) fn party_chat_audience(
     ctx: &ReducerContext,
     speaker_guid: u64,
@@ -1156,8 +907,6 @@ pub(crate) fn party_chat_audience(
     })
 }
 
-/// The three raid Chat Kinds, typed so their audience rule is an exhaustive match instead of a
-/// wire byte with a caller-defect fallback arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RaidChatKind {
     Raid,
@@ -1165,11 +914,6 @@ pub(crate) enum RaidChatKind {
     RaidWarning,
 }
 
-/// Who hears one raid Chat Kind: every Raid member, the speaker included, gated by who may send
-/// it (cm:ChatHandler.cpp:413-446, 461-490, 506-534). Refused outside a Raid, whether ungrouped or
-/// in a Party. `RaidWarning` gates behind leader-or-Assistant, matching cmangos's
-/// `Chat.RestrictedRaidWarnings` default of 1 (cm:mangosd.conf.dist.in:1161); LyraCore ships that
-/// default with no config toggle.
 pub(crate) fn raid_chat_audience(
     ctx: &ReducerContext,
     speaker_guid: u64,
@@ -1201,12 +945,6 @@ pub(crate) fn raid_chat_audience(
     })
 }
 
-/// The audience Refusal for one raid Chat Kind against an already-resolved Group kind and the
-/// speaker's own privilege, or `None` when it may speak. `manages` is [`manages_raid`]'s answer:
-/// the speaker leads the Raid or assists. Pure, with no `ReducerContext`, so cm:ChatHandler.cpp:
-/// 413-446, 461-490 and 506-534 are each a unit test over this one table instead of a durable
-/// fixture. Assumes the speaker is already in a Group; a groupless speaker never reaches this far
-/// (`raid_chat_audience` answers `NotInGroup` first).
 fn raid_chat_refusal(
     kind: RaidChatKind,
     group_kind: GroupKind,
@@ -1241,19 +979,6 @@ fn push_list_to_all(ctx: &ReducerContext, group_id: u64) {
     );
 }
 
-// ===========================================================================================
-//  Reducers (sender-identity, gateway-resolved guids — the add_friend convention)
-// ===========================================================================================
-
-/// `CMSG_GROUP_INVITE` (name gateway-resolved to `target_guid`): validate, record the pending
-/// invite (replacing any older one on the target), notify the target, and fire the
-/// `on_group_invite` package hook (a bot target auto-accepts through it — but only on the plane where
-/// the bot's own rows live: see [`invite_core_on`]'s note on the hook). Reached via
-/// `gw::gw_group_invite`.
-///
-/// The identity-free invite core (the `accept_invite_for` pattern): shared by `gw::gw_group_invite`
-/// and any server-driven inviter, which passes the bot's guid. Same gates in the same order for
-/// every caller.
 pub(crate) fn invite_core(
     ctx: &ReducerContext,
     inviter_guid: u64,
@@ -1281,8 +1006,6 @@ fn invite_core_on(
         if ctx.db.game_character().guid().find(target_guid).is_none() {
             return Err(GroupRefusal::NoSuchPlayer.into());
         }
-        // Vanilla requires the target online; a session-less Character's live entity counts (its
-        // auto-accept rides the hook below, not a client).
         if ctx
             .db
             .game_world_entity()
@@ -1298,9 +1021,6 @@ fn invite_core_on(
     {
         return Err(GroupRefusal::AlreadyInGroup.into());
     }
-    // An inviter with NO group yet leads the one the first accept forms. An inviter in a group must
-    // lead it or be an Assistant in it (cm:GroupHandler.cpp:128-139), and the group must have room
-    // for its kind.
     let inviter_group_id = match checked_group_membership(ctx, inviter_guid)? {
         Some((m, group)) => {
             if !manages_raid(&group, &m) {
@@ -1331,16 +1051,6 @@ fn invite_core_on(
         inviter_guid,
         String::new(),
     );
-    // The hook is PLANE-LOCAL, and this is what that costs: package tables live on the world
-    // shards, so on a TRUE multi-database realm-core a Package's bot table is empty and its
-    // auto-accept handler returns immediately — a player's invite to a bot was created correctly and
-    // then nobody answered it (observed live 2026-07-26). Fired here regardless: a single-database
-    // gateway's realm-core IS the world shard, so the bot table is populated and the hook
-    // still answers in this transaction there — including every bot-to-bot serendipity invite
-    // which since that fix runs through `realm_group_op`/Plane::RealmCore like every
-    // other invite, never through `invite_core`/Plane::Shard directly. On a real multi-database
-    // deployment the gateway answers instead, where it can see both databases
-    // (`gateway/src/world/party.rs`, `answer_for_session_less`).
     crate::hooks::fire_on_group_invite(
         ctx,
         &crate::hooks::GroupInvitePayload {
@@ -1351,12 +1061,6 @@ fn invite_core_on(
     Ok(())
 }
 
-/// `CMSG_GROUP_ACCEPT`: consume the caller's pending invite; create the inviter's group if this
-/// is its first acceptance, join it otherwise, and push a roster refresh to every member. Reached
-/// via `gw::gw_accept_group_invite`.
-///
-/// The identity-free accept core: shared by `gw::gw_accept_group_invite` and any server-driven
-/// acceptor (a Package auto-accept hook calls this with the bot's guid).
 pub(crate) fn accept_invite_for(ctx: &ReducerContext, acceptor_guid: u64) -> Result<(), String> {
     let acceptor = crate::helpers::character_by_guid(ctx, acceptor_guid);
     if acceptor.as_ref().is_some_and(|character| !character.online) {
@@ -1372,9 +1076,6 @@ pub(crate) fn accept_invite_for(ctx: &ReducerContext, acceptor_guid: u64) -> Res
     })
 }
 
-/// Whether `character_guid` has invited someone while it has no Group, so the first accept will
-/// form its Group. cmangos refuses to invite such a Character, which already holds the leader
-/// invite of the Group it is forming (cm:GroupHandler.cpp:105-114).
 fn has_pending_leader_invite(ctx: &ReducerContext, character_guid: u64) -> bool {
     ctx.db
         .game_group_invite()
@@ -1382,8 +1083,6 @@ fn has_pending_leader_invite(ctx: &ReducerContext, character_guid: u64) -> bool 
         .any(|invite| invite.inviter_guid == character_guid && invite.group_id == 0)
 }
 
-/// Consume `acceptor_guid`'s pending invite and join its Group through [`plan_join`]. `class` is
-/// the acceptor's, for the Seeker row a queued Party gains; 0 when unknown.
 fn accept_invite_on(
     ctx: &ReducerContext,
     plane: Plane,
@@ -1397,8 +1096,6 @@ fn accept_invite_on(
         .next()
         .ok_or(GroupRefusal::NoPendingInvite)?;
     invites.id().delete(invite.id);
-    // cmangos joins the invite's Group whatever the inviter did since: left, removed or demoted
-    // (cm:GroupHandler.cpp:185-227). An invite without a Group forms the inviter's.
     let target = match invite.group_id {
         0 => JoinTarget::NewParty {
             leader_guid: invite.inviter_guid,
@@ -1406,8 +1103,6 @@ fn accept_invite_on(
         group_id => JoinTarget::Group(group_id),
     };
     let plan = plan_join(ctx, acceptor_guid, target)?;
-    // A World Shard holds every Character it groups, so a missing row is a Character that is gone
-    // or in transit. Realm-core holds none and takes the Gateway's word.
     if plane == Plane::Shard {
         if let JoinTarget::NewParty { leader_guid } = target {
             crate::helpers::character_by_guid(ctx, leader_guid)
@@ -1424,26 +1119,19 @@ fn accept_invite_on(
         .map_err(GroupOpError::Invariant)
 }
 
-/// Which Group [`plan_join`] adds a Character to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinTarget {
-    /// An existing Group.
     Group(u64),
-    /// A Party this join forms. The leader joins it first.
     NewParty { leader_guid: u64 },
 }
 
-/// The Group [`JoinPlan::apply`] added a Character to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JoinedGroup {
     pub(crate) group_id: u64,
-    /// The join formed this Party.
     pub(crate) formed: bool,
 }
 
-/// A join that passed every check and has written nothing yet. [`JoinPlan::apply`] cannot fail, so
-/// a caller may write its own rows between the two and never leave half a join behind. The plan
-/// holds while nothing between the two changes group membership.
+// A checked JoinPlan remains valid only while intervening writes leave membership unchanged.
 #[derive(Debug)]
 pub(crate) struct JoinPlan {
     joiner_guid: u64,
@@ -1451,10 +1139,6 @@ pub(crate) struct JoinPlan {
     slot: RaidSlot,
 }
 
-/// The one way a Character joins a Group: an accepted invite and a Stone Add both come here.
-///
-/// The joiner must be in no Group. An existing Group must exist and have room for its kind; a Raid
-/// joiner takes a free Raid Slot. A new Party's leader must be in no Group either. Writes nothing.
 pub(crate) fn plan_join(
     ctx: &ReducerContext,
     joiner_guid: u64,
@@ -1467,8 +1151,6 @@ pub(crate) fn plan_join(
         JoinTarget::Group(group_id) => {
             let current = members_of(ctx, group_id);
             let Some(group) = ctx.db.game_group().group_id().find(group_id) else {
-                // A Group that is gone ends the invite. Member rows that still name a missing
-                // Group are broken state, not a lapsed invite.
                 if current.is_empty() {
                     return Err(GroupRefusal::NoPendingInvite.into());
                 }
@@ -1487,7 +1169,6 @@ pub(crate) fn plan_join(
             }
         }
         JoinTarget::NewParty { leader_guid } => {
-            // A leader that has joined a Group since speaks for nobody.
             if checked_group_membership(ctx, leader_guid)?.is_some() {
                 return Err(GroupRefusal::InviterUnavailable.into());
             }
@@ -1502,14 +1183,6 @@ pub(crate) fn plan_join(
 }
 
 impl JoinPlan {
-    /// Add the joiner. A new Party starts with Vanilla's defaults, group loot at Uncommon, and its
-    /// leader's other pending invites now join it. Every member gets the roster list. The joiner,
-    /// and a new Party's leader, get their Instance Removal reconciled, so joining the Group that
-    /// owns the instance cancels the countdown (cm:Group.cpp:880-885).
-    ///
-    /// A member row's `owner_identity` is the local Character row's identity when this database
-    /// holds one, else zero: Realm-core holds no Character rows, and each World Shard mirror
-    /// re-derives it.
     pub(crate) fn apply(self, ctx: &ReducerContext) -> JoinedGroup {
         let Self {
             joiner_guid,
@@ -1572,8 +1245,6 @@ impl JoinPlan {
     }
 }
 
-/// A member row's `owner_identity`: this database's binding for the Character, or zero where it
-/// holds no Character row.
 fn member_identity(ctx: &ReducerContext, character_guid: u64) -> Identity {
     crate::helpers::event_recipient_identity(
         crate::helpers::character_by_guid(ctx, character_guid)
@@ -1613,8 +1284,6 @@ pub(crate) fn leave_group_for(ctx: &ReducerContext, leaver_guid: u64) -> Result<
         .map_err(|error| group_op_error(error, &format!("{leaver_guid} could not leave its party")))
 }
 
-/// A deleted Character also loses every Target Icon on it. Its World Shard's delete sweep cannot
-/// reach the icon rows when the party authority is Realm-core.
 fn leave_group_on(ctx: &ReducerContext, leaver_guid: u64, cause: u8) -> Result<(), GroupOpError> {
     if checked_group_membership(ctx, leaver_guid)?.is_none() {
         return Err(GroupRefusal::NotInGroup.into());
@@ -1636,9 +1305,6 @@ pub(crate) fn uninvite_from_group(
     })
 }
 
-/// The leader or an Assistant removes another member (cm:Player.cpp:19051-19063). Nobody removes
-/// the leader: an Assistant who tries is refused with [`GroupRefusal::NotLeader`], the answer
-/// cmangos sends (cm:GroupHandler.cpp:274-276). An Assistant may remove another Assistant.
 fn uninvite_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -1699,7 +1365,7 @@ fn set_loot_method_on(
         }
         master_guid
     } else {
-        0 // meaningless for a non-MASTER method — never leave a stale master guid set
+        0
     };
     group.loot_method = loot_setting;
     group.loot_threshold = loot_threshold;
@@ -1709,8 +1375,6 @@ fn set_loot_method_on(
     Ok(())
 }
 
-/// Is `method` one of the five known `loot_method::*` values? Pure. [`group_loot_method`]'s gate,
-/// split out so it's unit-testable without a live `ReducerContext`.
 pub(crate) fn valid_loot_method(method: u8) -> bool {
     matches!(
         method,
@@ -1722,15 +1386,10 @@ pub(crate) fn valid_loot_method(method: u8) -> bool {
     )
 }
 
-/// Is `threshold` a real vanilla `ItemQuality` (0 Poor..=6 Artifact)? Pure.
 pub(crate) fn valid_loot_threshold(threshold: u8) -> bool {
     threshold <= 6
 }
 
-/// `CMSG_GROUP_RAID_CONVERT`: the leader converts its Party to a Raid (cm:GroupHandler.cpp:473-490).
-/// Every member keeps the Subgroup 0 slot a Party member holds (cm:Group.cpp:208-222), and every
-/// member receives the raid list. Converting a Raid again succeeds and changes nothing, so it
-/// writes no row and sends no list; cmangos does not check it either.
 fn raid_convert_on(ctx: &ReducerContext, actor_guid: u64) -> Result<RosterChange, GroupOpError> {
     let (member, mut group) = led_group_of(ctx, actor_guid)?;
     if group_kind_of(&group) == GroupKind::Raid {
@@ -1738,8 +1397,6 @@ fn raid_convert_on(ctx: &ReducerContext, actor_guid: u64) -> Result<RosterChange
     }
     group.group_type = GroupKind::Raid.wire();
     ctx.db.game_group().group_id().update(group);
-    // A queued raid would keep taking Stone Adds past the Party's roles, and JOIN refuses a raid,
-    // so the Party leaves the Meeting Stone Queue. Both cores keep it queued.
     crate::meeting_stone::dequeue_party(
         ctx,
         member.group_id,
@@ -1749,10 +1406,6 @@ fn raid_convert_on(ctx: &ReducerContext, actor_guid: u64) -> Result<RosterChange
     Ok(RosterChange::Changed)
 }
 
-/// `CMSG_GROUP_SET_LEADER`: the leader passes the lead to another member (cm:GroupHandler.cpp:
-/// 344-362). Every member hears the new leader's name, then gets the list (cm:Group.cpp:490-502).
-/// The new leader keeps its Raid Slot. The target must be online in vanilla; Realm-core cannot see
-/// presence, so the Gateway refuses an offline target before it calls this.
 fn set_leader_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -1774,9 +1427,6 @@ fn set_leader_on(
     Ok(RosterChange::Changed)
 }
 
-/// `CMSG_GROUP_ASSISTANT_LEADER`: the Raid leader promotes a member to Assistant or demotes one
-/// (cm:GroupHandler.cpp:527-545, cm:Group.h:222-230). Promoting an Assistant again, or demoting a
-/// plain member, succeeds and changes nothing, so it writes no row and sends no list.
 fn set_assistant_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -1806,9 +1456,6 @@ fn set_assistant_on(
     Ok(RosterChange::Changed)
 }
 
-/// `target_guid`'s membership in `group_id`, or [`GroupRefusal::TargetNotInGroup`] when it belongs
-/// to no Group or a different one. Shared by [`change_subgroup_on`] and [`swap_subgroup_on`], which
-/// both need it for every member they move.
 fn member_of_group(
     ctx: &ReducerContext,
     target_guid: u64,
@@ -1819,10 +1466,6 @@ fn member_of_group(
         .ok_or_else(|| GroupOpError::from(GroupRefusal::TargetNotInGroup))
 }
 
-/// `CMSG_GROUP_CHANGE_SUB_GROUP`: the leader or an Assistant moves `target_guid` to `subgroup`
-/// (cm:GroupHandler.cpp:492-525, cm:Group.cpp:1203-1251). The same Subgroup succeeds and changes
-/// nothing (cm:Group.cpp:1234); a full destination refuses, and the Assistant bit survives the
-/// move.
 fn change_subgroup_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -1837,8 +1480,6 @@ fn change_subgroup_on(
     if !manages_raid(&group, &actor_member) {
         return Err(GroupRefusal::NotLeader.into());
     }
-    // Bounds-checked before the target is resolved, matching cmangos's own gate order: an
-    // out-of-range wire byte refuses before the server looks anybody up (cm:GroupHandler.cpp:500-501).
     if subgroup >= RAID_SUBGROUPS {
         return Err(GroupRefusal::InvalidSubgroup.into());
     }
@@ -1860,11 +1501,6 @@ fn change_subgroup_on(
     Ok(RosterChange::Changed)
 }
 
-/// `CMSG_GROUP_SWAP_SUB_GROUP`: the leader or an Assistant exchanges the Subgroups of `first_guid`
-/// and `second_guid` (cm:GroupHandler.cpp:901-944). Both members already in one Subgroup succeed
-/// and change nothing (cm:GroupHandler.cpp:939). cmangos applies two moves and sends two lists; one
-/// atomic swap can never overfill a Subgroup, so it needs no capacity Gate, and this writes both
-/// slots in one transaction and pushes one list.
 fn swap_subgroup_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -1896,30 +1532,18 @@ fn swap_subgroup_on(
     Ok(RosterChange::Changed)
 }
 
-/// Whether a successful op changed what the Roster Revision orders: the member list, leader, loot
-/// rules, Group kind or a Raid Slot. Only a change advances the revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RosterChange {
     Changed,
     Unchanged,
 }
 
-/// How a member left its Group. The Meeting Stone Queue answers a kick differently from a leave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Departure {
-    /// The member left, or its Character was deleted.
     Left,
-    /// The leader or an Assistant removed the member.
     Kicked,
 }
 
-/// The single membership-removal core (voluntary leave, kick, character delete): drops the member
-/// row, notifies the leaver, transfers leadership if the leader left, and DISBANDS below 2 members
-/// (vanilla: a party of one is no party), which also deletes the Group's Target Icons. A new leader
-/// is announced to the remaining members before their list (cm:Group.cpp:464-470). Every Character
-/// that lost its Group here gets its Instance Removal reconciled (cm:Group.cpp:461). A queued
-/// Party's Meeting Stone Queue state follows the departure before the list
-/// ([`crate::meeting_stone::party_left`]). Idempotent for a guid not in any group.
 pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure: Departure) {
     let Some(m) = group_of(ctx, character_guid) else {
         return;
@@ -1937,8 +1561,6 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
 
     let remaining = members_of(ctx, group_id);
     let group = ctx.db.game_group().group_id().find(group_id);
-    // The incumbent-leader arg only matters for the survive branch; a missing group row (shouldn't
-    // happen while members exist) falls back to 0 — no update runs without a row to update anyway.
     let rematch = match leader_after_removal(
         group.as_ref().map_or(GroupKind::Party, group_kind_of),
         &remaining,
@@ -1946,11 +1568,7 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
         group.as_ref().map_or(0, |g| g.leader_guid),
     ) {
         None => {
-            // trap: a group disbanding mid-roll must resolve any of its live rolls
-            // to the sole remaining member (vanilla behavior) rather than leaving them to time out.
-            // The FULL former membership (the leaver, already removed above, PLUS whoever's left) is
-            // what `force_resolve_rolls_for_disband` needs to recognize "every voter on this roll
-            // belonged to the group that just disbanded" — `remaining` alone would miss the leaver.
+            // Include the leaver in the former roster when resolving rolls after disband.
             let survivors: Vec<u64> = remaining.iter().map(|r| r.character_guid).collect();
             let mut all_guids = survivors.clone();
             all_guids.push(character_guid);
@@ -1973,8 +1591,6 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
             crate::meeting_stone::party_disbanded(ctx, group_id, &all_guids);
             clear_target_icons(ctx, group_id);
             ctx.db.game_group().group_id().delete(group_id);
-            // A disband starts the countdown for every former member in the instance, the last
-            // one included (cm:Group.cpp:554).
             for guid in all_guids {
                 crate::instance::reconcile_instance_removal(ctx, guid);
             }
@@ -2003,8 +1619,6 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
     };
     push_list_to_all(ctx, group_id);
     crate::instance::reconcile_instance_removal(ctx, character_guid);
-    // `remove_member` has no failure path: a delete sweep runs it. A broken relationship stops
-    // the pass and is logged; the removal itself stands.
     if let Some(bucket) = rematch {
         if let Err(reason) = crate::meeting_stone::match_bucket(ctx, bucket) {
             spacetimedb::log::error!("meeting stone pass after {character_guid} left: {reason}");
@@ -2012,8 +1626,6 @@ pub(crate) fn remove_member(ctx: &ReducerContext, character_guid: u64, departure
     }
 }
 
-/// Tell every member who leads now. `SMSG_GROUP_SET_LEADER` carries only a name, which the Gateway
-/// resolves from `leader_guid`, because Realm-core holds no names.
 fn announce_leader(ctx: &ReducerContext, group_id: u64, leader_guid: u64) {
     group_broadcast(
         ctx,
@@ -2025,13 +1637,6 @@ fn announce_leader(ctx: &ReducerContext, group_id: u64, leader_guid: u64) {
     );
 }
 
-/// The post-removal survival/leadership decision for [`remove_member`]: `None` → the group DISBANDS
-/// (fewer than 2 members remain — vanilla: a party of one is no party); `Some(leader)` → the group
-/// survives under `leader`, the incumbent unless the leaver WAS the leader. Then the lead passes in
-/// join order (lowest member-row id): in a Raid to the first Assistant, else to the first member
-/// (cm:Group.cpp:954-997). cmangos also prefers online members; Realm-core cannot see presence, so
-/// that preference is not reproduced. `remaining` is the member rows left AFTER the leaver's row is
-/// deleted. Pure and unit-tested.
 pub(crate) fn leader_after_removal(
     kind: GroupKind,
     remaining: &[GroupMember],
@@ -2054,30 +1659,12 @@ pub(crate) fn leader_after_removal(
         .map(|heir| heir.character_guid)
 }
 
-// ===========================================================================================
-//  REALM-CORE plane (group slice)
-// ===========================================================================================
-
-/// Which DEPLOYMENT of this one module a group call is running on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plane {
-    /// A world shard: characters and live entities are local.
     Shard,
-    /// The realm-wide directory database: neither is.
     RealmCore,
 }
 
-/// The realm-wide party ops, as ONE operator-gated reducer keyed by [`lyracore_shared::group::realm_op`].
-///
-/// **Operator-gated, and it has to be**: it takes the acting character's guid as an argument instead
-/// of deriving it from `ctx.sender()`, because on realm-core there is no live entity to derive it
-/// from. A client that could call it could accept invites, kick members and change loot rules as
-/// anybody in the realm. The gateway is the only caller, it holds the coordinator (operator) token,
-/// and it passes the guid it already authenticated for that socket (`InWorld::self_guid`) — the same
-/// trust boundary `set_character_shard` and `establish_session` sit on.
-///
-/// One reducer rather than one per op: see [`lyracore_shared::group::realm_op`] for that trade and
-/// for the argument slots each op reads.
 #[reducer]
 pub fn realm_group_op(
     ctx: &ReducerContext,
@@ -2091,22 +1678,18 @@ pub fn realm_group_op(
     crate::helpers::require_operator(ctx)?;
     let actor_guid = crate::account_ownership::require_actor(ctx, request_actor)?;
     use lyracore_shared::group::realm_op;
-    // An op byte this module does not know is a gateway newer than the module — a deployment fault,
-    // not a party outcome, so it stays an untagged error the gateway treats as a failure.
     let before_groups = realm_op_groups(ctx, op, actor_guid, target_guid);
     use RosterChange::{Changed, Unchanged};
     let ran = match op {
         realm_op::INVITE => {
             invite_core_on(ctx, Plane::RealmCore, actor_guid, target_guid).map(|()| Unchanged)
         }
-        // Realm-core holds no Character rows, so the Gateway conveys the acceptor's class.
         realm_op::ACCEPT => {
             accept_invite_on(ctx, Plane::RealmCore, actor_guid, arg_a).map(|()| Changed)
         }
         realm_op::DECLINE => decline_invite_on(ctx, actor_guid).map(|()| Unchanged),
         realm_op::LEAVE => leave_group_on(ctx, actor_guid, arg_a).map(|()| Changed),
         realm_op::UNINVITE => uninvite_on(ctx, actor_guid, target_guid).map(|()| Changed),
-        // `CMSG_LOOT_METHOD`'s own field order: setting, master, threshold.
         realm_op::LOOT_METHOD => {
             set_loot_method_on(ctx, actor_guid, arg_a, target_guid, arg_b).map(|()| Changed)
         }
@@ -2115,7 +1698,6 @@ pub fn realm_group_op(
         realm_op::SET_ASSISTANT => set_assistant_on(ctx, actor_guid, target_guid, arg_a != 0),
         realm_op::CHANGE_SUBGROUP => change_subgroup_on(ctx, actor_guid, target_guid, arg_a),
         realm_op::SWAP_SUBGROUP => swap_subgroup_on(ctx, actor_guid, target_guid, arg_c),
-        // Group Broadcasts change no roster.
         realm_op::READY_CHECK_START => ready_check_start_on(ctx, actor_guid).map(|()| Unchanged),
         realm_op::READY_CHECK_ANSWER => {
             ready_check_answer_on(ctx, actor_guid, arg_a).map(|()| Unchanged)
@@ -2164,7 +1746,6 @@ fn realm_op_groups(
         guids.push(target_guid);
     }
     if op == realm_op::ACCEPT {
-        // An invite with a Group joins that Group, which the acceptor's own row names afterwards.
         if let Some(invite) = ctx
             .db
             .game_group_invite()
@@ -2190,8 +1771,6 @@ fn realm_op_groups(
         .collect()
 }
 
-/// Advance `group_id`'s Roster Revision. `was_active` says whether the Group existed before this
-/// transaction, which sets the first revision of a Group that has no row yet.
 pub(crate) fn advance_group_revision(
     ctx: &ReducerContext,
     group_id: u64,
@@ -2220,9 +1799,6 @@ fn next_group_revision(current: Option<u64>, was_active: bool) -> u64 {
         .expect("party roster revision exhausted")
 }
 
-/// Acknowledged Realm-core party authority read for one companion command attempt. Companion
-/// Orders cover the whole Raid: both lists are bounded at the member cap of the Group's kind, and a
-/// longer list is a damaged mirror.
 #[reducer]
 pub fn admit_party_command_authority(
     ctx: &ReducerContext,
@@ -2278,16 +1854,6 @@ pub fn admit_party_command_authority(
     Ok(())
 }
 
-// ===========================================================================================
-//  Kill rewards: XP split + shared quest credit
-// ===========================================================================================
-
-/// Everyone a kill by `killer_guid` at `(x, y)` on `map_id`/`instance_id` (the kill site) rewards:
-/// the killer alone when ungrouped, else every group member whose LIVE entity is alive, on the
-/// same map + instance, and within [`GROUP_XP_RANGE_SQ`] of the corpse (the killer qualifies
-/// through the same filter — it is always in range of its own kill). Each recipient gets `1/n` of
-/// its OWN level-based kill XP ([`crate::xp::award_xp`]'s `share_count`) and full quest
-/// kill-credit.
 pub(crate) fn kill_reward_recipients(
     ctx: &ReducerContext,
     killer_guid: u64,
@@ -2325,16 +1891,6 @@ pub(crate) fn eligible_for_kill_reward(
     !dead && same_map && same_instance && dist_sq <= GROUP_XP_RANGE_SQ
 }
 
-// ===========================================================================================
-//  Group Broadcasts: Ready Check, Target Icons, minimap ping, /roll
-// ===========================================================================================
-//
-// Each op pushes one `game_group_event` row per recipient and changes no roster, so none of them
-// advances the Roster Revision or needs a mirror push.
-
-/// One Target Icon a Group holds. A Group holds each icon once and a unit carries one icon at
-/// most, so a Group has 8 rows at most. Private: LIST and TARGET_ICON_LIST events carry the icons
-/// to clients. The rows go when the Group disbands. [entity]
 #[table(
     accessor = game_group_target_icon,
     index(accessor = by_group, btree(columns = [group_id])),
@@ -2349,22 +1905,18 @@ pub struct GroupTargetIcon {
     pub target_guid: u64,
 }
 
-// A deleted Character loses the icon it carries. No client needs an update: the unit is gone.
 crate::character_owned!(delete, fn sweep_delete_game_group_target_icon(ctx, character_guid) {
     delete_target_icons_on(ctx, character_guid);
 });
 
-/// Drop every Target Icon on `target_guid`, in every Group, without an update: the unit is gone.
 fn delete_target_icons_on(ctx: &ReducerContext, target_guid: u64) {
     let icons = ctx.db.game_group_target_icon();
     for row in icons.by_target().filter(&target_guid).collect::<Vec<_>>() {
         icons.id().delete(row.id);
     }
 }
-// Group state on the party authority. The icon stays on its unit across a Transfer.
 crate::character_owned!(not_transported, fn sweep_transfer_game_group_target_icon());
 
-/// Every Target Icon `group_id` holds, in icon order.
 fn target_icons_of(ctx: &ReducerContext, group_id: u64) -> Vec<TargetIcon> {
     let mut icons: Vec<TargetIcon> = ctx
         .db
@@ -2380,10 +1932,6 @@ fn target_icons_of(ctx: &ReducerContext, group_id: u64) -> Vec<TargetIcon> {
     icons
 }
 
-/// The partial updates one Target Icon request makes, in send order (cm:Group.cpp:583-601). A
-/// unit that already holds an icon loses it first, with its own clearing update. Then `icon` goes
-/// to `target_guid`, and a unit that held `icon` before loses it through that same update. Target
-/// 0 clears `icon`. Pure.
 fn target_icon_updates(
     held: &[TargetIcon],
     icon: u8,
@@ -2404,7 +1952,6 @@ fn target_icon_updates(
     Ok(updates)
 }
 
-/// Store one partial update. Target 0 deletes the icon's row.
 fn write_target_icon(ctx: &ReducerContext, group_id: u64, update: TargetIcon) {
     let icons = ctx.db.game_group_target_icon();
     let row = icons
@@ -2438,8 +1985,6 @@ fn clear_target_icons(ctx: &ReducerContext, group_id: u64) {
     }
 }
 
-/// `actor_guid`'s membership and Group, when it leads the Group or is one of its Assistants
-/// (cm:GroupHandler.cpp:463-467, 556-558). In a Party only the leader qualifies.
 fn managed_group_of(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -2452,16 +1997,11 @@ fn managed_group_of(
     Ok((member, group))
 }
 
-/// A `realm_group_op` slot that carries a 32-bit value. A wider value means the Gateway broke the
-/// argument contract, which is not a gameplay answer.
 fn wire_u32(value: u64, slot: &str) -> Result<u32, GroupOpError> {
     u32::try_from(value)
         .map_err(|_| GroupOpError::Invariant(format!("{slot} {value} does not fit 32 bits")))
 }
 
-/// `MSG_RAID_READY_CHECK` without a body. The leader or an Assistant asks every member, the asker
-/// included (cm:GroupHandler.cpp:549-564). A Party may run one too. The Module keeps no Ready
-/// Check state and no timeout: the leader's client counts the answers.
 fn ready_check_start_on(ctx: &ReducerContext, actor_guid: u64) -> Result<(), GroupOpError> {
     let (member, _group) = managed_group_of(ctx, actor_guid)?;
     group_broadcast(
@@ -2475,8 +2015,6 @@ fn ready_check_start_on(ctx: &ReducerContext, actor_guid: u64) -> Result<(), Gro
     Ok(())
 }
 
-/// `MSG_RAID_READY_CHECK` with the answer's state byte. Only the leader receives it, with the
-/// answerer's guid (cm:GroupHandler.cpp:566-581).
 fn ready_check_answer_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -2495,9 +2033,6 @@ fn ready_check_answer_on(
     Ok(())
 }
 
-/// `MSG_RAID_TARGET_UPDATE` (cm:GroupHandler.cpp:444-471). [`TARGET_ICON_LIST_REQUEST`] sends
-/// every icon to the actor alone, and any member may ask. Setting an icon needs the leader or an
-/// Assistant, and every member receives each partial update.
 fn target_icon_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -2532,8 +2067,6 @@ fn target_icon_on(
     Ok(())
 }
 
-/// `MSG_MINIMAP_PING`: every member but the sender sees the ping (cm:GroupHandler.cpp:395-415).
-/// `x_bits` and `y_bits` are the client's `f32` bit patterns.
 fn minimap_ping_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -2555,10 +2088,6 @@ fn minimap_ping_on(
     Ok(())
 }
 
-/// `MSG_RANDOM_ROLL`: every member sees a grouped roll, the roller included, wherever they are.
-/// An ungrouped roll reaches the roller alone (cm:GroupHandler.cpp:417-442; patch 1.7.0,
-/// vm:GroupHandler.cpp:419-431). The result comes from `ctx.random`, so two rolls in one
-/// microsecond are unrelated.
 fn random_roll_on(
     ctx: &ReducerContext,
     actor_guid: u64,
@@ -2624,8 +2153,6 @@ mod tests {
         );
     }
 
-    /// The share filter's range gate is the vanilla 74yd group-XP distance, squared for the
-    /// comparison `kill_reward_recipients` runs — pin it so a tuning edit is a conscious act.
     #[test]
     fn group_xp_range_is_74_yards() {
         assert_eq!(GROUP_XP_RANGE_SQ, 5476.0);
@@ -2634,16 +2161,13 @@ mod tests {
 
     #[test]
     fn kill_reward_needs_an_alive_member_on_the_same_map_within_range() {
-        // The all-pass baseline: alive, same map, same instance, at the corpse.
         assert!(eligible_for_kill_reward(false, true, true, 0.0));
-        // Exactly at the 74yd² boundary is still IN (inclusive comparison).
         assert!(eligible_for_kill_reward(
             false,
             true,
             true,
             GROUP_XP_RANGE_SQ
         ));
-        // Each gate rejects on its own: a dead member, another map, another instance, out of range.
         assert!(!eligible_for_kill_reward(true, true, true, 0.0));
         assert!(!eligible_for_kill_reward(false, false, true, 0.0));
         assert!(!eligible_for_kill_reward(false, true, false, 0.0));
@@ -2655,7 +2179,6 @@ mod tests {
         ));
     }
 
-    /// A remaining member row: `id` is its join order.
     fn member_row(id: u64, character_guid: u64, assistant: bool) -> GroupMember {
         GroupMember {
             id,
@@ -2670,7 +2193,6 @@ mod tests {
     fn leadership_passes_to_the_longest_standing_member_or_the_group_disbands() {
         let party = GroupKind::Party;
         let row = |id, guid| member_row(id, guid, false);
-        // Fewer than 2 remaining → disband (None), whoever led and whoever left.
         assert_eq!(leader_after_removal(party, &[], 7, 7), None);
         assert_eq!(leader_after_removal(party, &[row(3, 30)], 7, 7), None);
         assert_eq!(
@@ -2683,8 +2205,6 @@ mod tests {
             Some(10),
             "a member who does not lead leaves the incumbent in place"
         );
-        // The LEADER leaving passes to the lowest member-ROW id (longest-standing), not the lowest
-        // guid, whatever order the rows arrive in.
         assert_eq!(
             leader_after_removal(party, &[row(5, 90), row(9, 20)], 10, 10),
             Some(90)
@@ -2695,8 +2215,6 @@ mod tests {
         );
     }
 
-    /// cm:Group.cpp:972-977, 993: a Raid passes the lead to its first Assistant in join order, and
-    /// to its first member when it has no Assistant.
     #[test]
     fn a_raid_leader_leaving_passes_the_lead_to_the_first_assistant_in_join_order() {
         let raid = GroupKind::Raid;
@@ -2726,7 +2244,6 @@ mod tests {
         );
     }
 
-    /// Only a Raid prefers an Assistant (cm:Group.cpp:972). A Party passes the lead in join order.
     #[test]
     fn a_party_passes_the_lead_in_join_order_whatever_a_slot_says() {
         let remaining = [member_row(2, 20, false), member_row(5, 50, true)];
@@ -2735,8 +2252,6 @@ mod tests {
             Some(20)
         );
     }
-
-    // ---- Raids ----
 
     fn raid_member(character_guid: u64, subgroup: u8, assistant: bool) -> GroupMember {
         GroupMember {
@@ -2791,7 +2306,6 @@ mod tests {
         assert_eq!(selected(GroupAudience::Subgroup(1)), [3]);
     }
 
-    /// Invites and kicks read this over the actor's current Group row and Raid Slot.
     #[test]
     fn the_leader_and_assistants_manage_a_raid() {
         let group = raid_led_by(1);
@@ -2810,9 +2324,6 @@ mod tests {
         );
     }
 
-    /// The raid chat audience table (cm:ChatHandler.cpp:413-446, 461-490, 506-534), every row: a
-    /// Party refuses all three kinds regardless of privilege; a Raid answers each kind by its own
-    /// rule.
     #[test]
     fn the_raid_chat_gate_follows_the_audience_table() {
         use lyracore_shared::chat::ChatRefusal;
@@ -2831,7 +2342,6 @@ mod tests {
             }
         }
 
-        // Raid: any Raid member, leader or not.
         assert_eq!(
             raid_chat_refusal(RaidChatKind::Raid, GroupKind::Raid, false, false),
             None
@@ -2845,7 +2355,6 @@ mod tests {
             None
         );
 
-        // RaidLeader: the leader alone. An Assistant who does not lead is still refused.
         assert_eq!(
             raid_chat_refusal(RaidChatKind::RaidLeader, GroupKind::Raid, true, true),
             None
@@ -2860,7 +2369,6 @@ mod tests {
             Some(ChatRefusal::NotRaidLeader)
         );
 
-        // RaidWarning: the leader or an Assistant.
         assert_eq!(
             raid_chat_refusal(RaidChatKind::RaidWarning, GroupKind::Raid, true, true),
             None
@@ -2876,8 +2384,6 @@ mod tests {
         );
     }
 
-    // ---- Target Icons (cm:Group.cpp:583-601) ----
-
     fn held(icon: u8, target_guid: u64) -> TargetIcon {
         TargetIcon { icon, target_guid }
     }
@@ -2887,7 +2393,6 @@ mod tests {
         assert_eq!(target_icon_updates(&[], 7, 100), Ok(vec![held(7, 100)]));
     }
 
-    /// A unit carries one icon, so moving it sends the clear before the new icon.
     #[test]
     fn a_marked_unit_loses_its_old_icon_before_it_takes_the_new_one() {
         assert_eq!(
@@ -2896,7 +2401,6 @@ mod tests {
         );
     }
 
-    /// The icon's previous unit loses it through the one update that gives it to the new unit.
     #[test]
     fn an_icon_given_to_another_unit_replaces_the_old_holder_in_one_update() {
         assert_eq!(
@@ -2905,7 +2409,6 @@ mod tests {
         );
     }
 
-    /// cmangos clears and sets again when a unit takes the icon it already holds.
     #[test]
     fn marking_a_unit_with_its_own_icon_clears_it_and_sets_it_again() {
         assert_eq!(
@@ -2922,7 +2425,6 @@ mod tests {
         );
     }
 
-    /// cm:Group.cpp:585-586: an index of 8 or more is not an icon.
     #[test]
     fn an_icon_index_of_eight_or_more_is_refused() {
         for icon in [8, 9, 0xFE] {
@@ -2933,12 +2435,8 @@ mod tests {
         }
     }
 
-    // ---- Group loot methods ----
-
     #[test]
     fn loot_method_encoding_matches_the_real_wire_grouplootsetting_order() {
-        // wow_world_base::GroupLootSetting: FreeForAll=0, RoundRobin=1, MasterLoot=2, GroupLoot=3,
-        // NeedBeforeGreed=4 — a mismatch here would silently misrender the party frame's loot icon.
         assert_eq!(loot_method::FFA, 0);
         assert_eq!(loot_method::ROUND_ROBIN, 1);
         assert_eq!(loot_method::MASTER, 2);

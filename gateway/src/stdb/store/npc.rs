@@ -1,5 +1,3 @@
-//! `Coordinator`'s [`NpcStore`] adapter.
-
 use anyhow::Result;
 use spacetimedb_sdk::Table;
 
@@ -13,7 +11,6 @@ use crate::world::{Actor, InteractionOutcome, NpcStore};
 use super::interaction_outcome;
 
 impl NpcStore for Coordinator {
-    /// Standing-derived reaction gate. The inherent read has other callers (vendor, guild, quest).
     fn npc_refuses_interaction(&self, npc_guid: u64, player_guid: u64) -> Result<bool> {
         Coordinator::npc_refuses_interaction(self, npc_guid, player_guid)
     }
@@ -22,8 +19,6 @@ impl NpcStore for Coordinator {
         Coordinator::gameobject_template(self, entry)
     }
 
-    /// Resolve the active title text for one NPC, with a per-creature menu override before the
-    /// entry-owned default menu.
     fn npc_gossip_text_id(&self, npc_guid: u64) -> u32 {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -42,18 +37,6 @@ impl NpcStore for Coordinator {
         }
     }
 
-    /// Look up the full weighted greeting for a `text_id`: `game_npc_text` (slot 0
-    /// male, back-compat) + any `game_npc_text_slot` rows for the same id. Returns `None` when the
-    /// text_id has no `game_npc_text` row at all (the gateway falls back to the generic greeting).
-    ///
-    /// Back-compat normalization: a `text_id` with NO `game_npc_text_slot` rows (never imported by the
-    /// weighted-greeting importer — either a pre-existing row, or the legacy `npc_text[entry]`
-    /// fallback path, which only ever populates `game_npc_text`) is read as slot 0 = `(text, text,
-    /// 1.0)` and every other slot silent, matching the old single-slot behavior byte-for-byte. When
-    /// slot rows DO exist, they
-    /// are used verbatim (real per-slot probabilities from the dump) and slot 0's base-row `text` is
-    /// NOT separately re-applied (the slot-0 row, always emitted by the importer alongside the others,
-    /// is the source of truth once any slot row exists).
     fn npc_text_for_id(&self, text_id: u32) -> Option<crate::codec::NpcTextView> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -68,7 +51,7 @@ impl NpcStore for Coordinator {
             view.slots[0] = (base.text.clone(), base.text, 1.0);
             return Some(view);
         }
-        slot_rows.sort_by_key(|s| s.slot_index); // stable slot order (SQL has no ORDER BY in 2.5)
+        slot_rows.sort_by_key(|s| s.slot_index);
         let mut view = crate::codec::NpcTextView::default();
         for row in slot_rows {
             if (row.slot_index as usize) < 8 {
@@ -79,8 +62,6 @@ impl NpcStore for Coordinator {
         Some(view)
     }
 
-    /// Return the active imported options for one NPC. A live per-creature override replaces the
-    /// entry-owned default options. The dispatcher applies conditions at both HELLO and SELECT.
     fn gossip_options(&self, npc_guid: u64) -> Result<Vec<crate::codec::GossipOptionView>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -136,8 +117,6 @@ impl NpcStore for Coordinator {
             .collect())
     }
 
-    /// Does the NPC at `guid` carry the innkeeper flag? Shows its gossip option. Reads `npc_flags`
-    /// off the entity (privileged cache); absent → false.
     fn npc_is_innkeeper(&self, guid: u64) -> Result<bool> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -148,9 +127,6 @@ impl NpcStore for Coordinator {
             .is_some_and(|e| e.npc_flags & lyracore_shared::constants::npc_flags::INNKEEPER != 0))
     }
 
-    /// Resolve a live pet visible to the world. Pet names are public unit presentation: Hunter
-    /// names come from the bounded durable projection, while summoned-pet names remain authored
-    /// creature-template data. The requester must be in world, but need not own the observed pet.
     fn pet_name(
         &self,
         _requester: Actor,
@@ -188,7 +164,6 @@ impl NpcStore for Coordinator {
         Ok(resolve_pet_name(pet_number, pet_guid, None, summoned))
     }
 
-    /// Read a creature template by entry for a `CMSG_CREATURE_QUERY` reply (Tier 2 / NPCs).
     fn creature_template(&self, entry: u32) -> Result<Option<crate::codec::CreatureView>> {
         Ok(self
             .0
@@ -210,12 +185,6 @@ impl NpcStore for Coordinator {
             }))
     }
 
-    /// The `type_id` of a SPAWNED gameobject, by its live guid (join `game_gameobject` →
-    /// `game_gameobject_template`). Feeds the `CMSG_GAMEOBJ_USE` dispatch: a
-    /// `lyracore_shared::constants::go_type::QUESTGIVER` GO (the Wanted Poster, the Lost Guards corpses)
-    /// opens the quest window instead of rolling loot / toggling state — that is what a questgiver
-    /// gameobject does in vanilla. `None` for an unspawned/unknown guid (the caller falls back to the
-    /// ordinary use-reducer path, which itself no-ops on an unknown guid).
     fn gameobject_type(&self, go_guid: u64) -> Result<Option<u8>> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -231,9 +200,6 @@ impl NpcStore for Coordinator {
             .map(|t| t.type_id))
     }
 
-    /// Validate a `CMSG_INSPECT` request (target is a real in-world player, on the caller's map, in
-    /// range, friendly) over the coordinator connection so the module resolves the caller from
-    /// `ctx.sender`. `Err` (out of range / hostile / no such target) → the caller ignores it.
     fn inspect(&self, actor: Actor, target_guid: u64) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(
@@ -243,7 +209,6 @@ impl NpcStore for Coordinator {
         )
     }
 
-    /// Enter an area trigger (`CMSG_AREATRIGGER`) — credit any active explore quest tied to `trigger_id`.
     fn enter_areatrigger(&self, actor: Actor, trigger_id: u32) -> Result<()> {
         let coord = self.0.call_pipe();
         call_reducer!(
@@ -253,8 +218,6 @@ impl NpcStore for Coordinator {
         )
     }
 
-    /// `CMSG_GOSSIP_SELECT_OPTION` — the NOTIFY-ONLY module chokepoint. Fired
-    /// best-effort BEFORE the gateway's own gossip behavior; a failure never blocks the reply.
     fn gossip_select(
         &self,
         actor: Actor,
@@ -275,7 +238,6 @@ impl NpcStore for Coordinator {
         )
     }
 
-    /// Bind the Character's home after the Module checks the selected innkeeper.
     fn bind_home(&self, actor: Actor, innkeeper_guid: u64) -> Result<InteractionOutcome> {
         let coord = self.0.call_pipe();
         interaction_outcome(call_reducer!(

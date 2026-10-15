@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::reads::view_of_item_row;
@@ -13,20 +11,11 @@ use spacetimedb_sdk::Table;
 use std::sync::{Arc, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// Trade-status relay: `game_trade_event.kind` → the `SMSG_TRADE_STATUS` variant, to the
-/// row's recipient and nobody else (audience resolved by the caller, the `auction_notice_outbound`
-/// shape). The kind byte is `lyracore_shared::trade::event_kind` — NOT the vanilla discriminant;
-/// this match IS the wire mapping. An unknown kind (a newer module mid-rollout) drops with a warn
-/// rather than desyncing the window.
 pub(crate) fn trade_event_outbound(row: &TradeEvent) -> Vec<Outbound> {
     use lyracore_shared::trade::event_kind as kind;
     use wow_world_messages::vanilla::SMSG_TRADE_STATUS;
-    // The OFFER_* kinds carry a whole-side snapshot and decode to the fixed-444-byte extended
-    // status instead of a plain status ; `self_player` is the kind, not an inference.
     if row.kind == kind::OFFER_SELF || row.kind == kind::OFFER_PARTNER {
-        // WIRE POLARITY (mangoszero `SendUpdateTrade`): the byte is `1 means traders data,
-        // 0 means own` — so the field is SET when the packet describes the PARTNER's side,
-        // despite the binding's `self_player` name. The protocol's polarity controls this value.
+        // The misnamed self_player byte is 1 for the partner's data and 0 for one's own.
         return match trade_offer_extended(row.kind == kind::OFFER_PARTNER, &row.payload) {
             Some(msg) => vec![Outbound::One(
                 ServerOpcodeMessage::SMSG_TRADE_STATUS_EXTENDED(Box::new(msg)),
@@ -57,8 +46,6 @@ pub(crate) fn trade_event_outbound(row: &TradeEvent) -> Vec<Outbound> {
         kind::TRADE_ACCEPT => Some(SMSG_TRADE_STATUS::TradeAccept),
         kind::BACK_TO_TRADE => Some(SMSG_TRADE_STATUS::BackToTrade),
         kind::TRADE_COMPLETE => Some(SMSG_TRADE_STATUS::TradeComplete),
-        // Commit refused on bag space: the window closes with the inventory error;
-        // `target_error` says WHOSE bags — false = yours, true = the partner's.
         kind::INV_FULL_SELF => Some(SMSG_TRADE_STATUS::CloseWindow {
             inventory_result: wow_world_messages::vanilla::InventoryResult::InventoryFull,
             item_limit_category_id: 0,
@@ -92,11 +79,6 @@ pub(crate) fn trade_event_outbound(row: &TradeEvent) -> Vec<Outbound> {
     }
 }
 
-/// Decode an `OFFER_*` payload into the fixed-444-byte `SMSG_TRADE_STATUS_EXTENDED`:
-/// counts are 7/7 (the cmangos constant), unused slots stay zeroed (`TradeSlot::default`), and
-/// every filled slot carries the module-resolved stack/durability/enchant fields. Fails closed
-/// with the payload decoder. `describes_partner` sets the wire's misnamed `self_player` byte —
-/// mangoszero: "1 means traders data, 0 means own".
 pub(crate) fn trade_offer_extended(
     describes_partner: bool,
     payload: &str,
@@ -119,7 +101,6 @@ pub(crate) fn trade_offer_extended(
         };
     }
     Some(SMSG_TRADE_STATUS_EXTENDED {
-        // `1 means traders data` — see the call-site polarity note.
         self_player: describes_partner,
         trade_slot_count1: 7,
         trade_slot_count2: 7,
@@ -173,7 +154,6 @@ pub(crate) fn item_gain_feedback(
     out
 }
 
-/// Build the complete live-inventory insert result for one owner.
 pub(crate) fn item_instance_insert_outbound(
     db: &RemoteTables,
     self_guid: u64,
@@ -224,9 +204,7 @@ pub(crate) fn item_instance_insert_outbound(
             out.push(Outbound::Raw { opcode, body });
         }
     }
-    // The item object and the descriptor that makes it reachable must precede gain feedback. The
-    // shared owner-view enqueues this complete vector as one writer job, so another producer cannot
-    // splice quest completion between CREATE and its inventory/container pointer.
+    // Queue CREATE and inventory pointers together before gain or quest-completion feedback.
     out.extend(item_gain_feedback(
         db,
         self_guid,
@@ -242,7 +220,6 @@ pub(crate) fn item_instance_insert_outbound(
     out
 }
 
-/// Build the complete live-inventory delete result for one owner.
 pub(crate) fn item_instance_delete_outbound(
     db: &RemoteTables,
     self_guid: u64,
@@ -280,7 +257,6 @@ pub(crate) fn item_instance_delete_outbound(
     out
 }
 
-/// Build the complete live-inventory update result for one owner.
 pub(crate) fn item_instance_update_outbound(
     db: &RemoteTables,
     self_guid: u64,
@@ -335,9 +311,6 @@ pub(crate) fn item_instance_update_outbound(
     out
 }
 
-/// An in-place permanent enchant change: the item's enchantment word and, for worn gear that did
-/// not change slot, its visible item. The slot projection covers a change of slot. Empty when the
-/// enchant did not change, and for a Guild Charter, whose word holds its Petition id.
 pub(crate) fn enchant_change_outbound(
     self_guid: u64,
     old: &ItemInstance,
@@ -419,8 +392,6 @@ pub(crate) fn append_item_armor_and_sheet(
     }
 }
 
-/// Select one item owner registered on the firing shard; cache reads and packet work run on its
-/// writer queue.
 pub(crate) fn item_owner_job(
     view: &WorldView,
     shard: ShardId,
@@ -453,10 +424,7 @@ pub(crate) fn item_inserted(
     });
 }
 
-/// The value of ITEM_FIELD_ENCHANTMENT for a newly inserted item. A Guild Charter shows its Petition
-/// id, read from the Realm-core cache before the Home Shard's cache guard is taken; it shows 0 when
-/// its Petition is not open yet, and the Petition insert relay sends it later. Every other item
-/// shows the enchantment ID the client resolves for its permanent enchant.
+/// Read the Guild Charter's Petition before taking the Home Shard cache lock.
 pub(crate) fn item_enchantment_word(coord: &Coordinator, row: &ItemInstance) -> u32 {
     if row.entry != lyracore_shared::guild::GUILD_CHARTER_ENTRY {
         return client_enchantment_id(row.enchant_id);
@@ -524,8 +492,6 @@ pub(crate) fn item_slot_read(coord: &Coordinator) -> ItemSlotRead {
     })
 }
 
-/// Peers see worn gear only. The first eligible writer reads the current slot occupant;
-/// all recipients share it so the item table is scanned once per changed slot.
 pub(crate) fn item_visible_changed(
     view: &WorldView,
     shard: ShardId,
@@ -580,8 +546,6 @@ pub(crate) fn item_visible_changed(
     }
 }
 
-/// A trade status landed → the `SMSG_TRADE_STATUS` packet to the row's RECIPIENT and nobody
-/// else (same shape as [`resurrect_offered`]).
 pub(crate) fn trade_event_appeared(view: &WorldView, shard: ShardId, row: &TradeEvent) {
     let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.recipient_guid)) else {
         return;

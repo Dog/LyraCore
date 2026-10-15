@@ -1,9 +1,3 @@
-//! Mail Timer fixtures for `module/tests/mail_expiry.rs` and `module/tests/mail_delivery.rs`.
-//! Each stage reducer writes its letters
-//! through `mail::insert_letter` and then backdates them, so the timers they arm fire at once.
-//! The checks compare armed instants with the vanilla lifetimes written out below, not with the
-//! Module's own expiry function.
-
 use lyracore_shared::mail::{
     MailSender, CHECK_MASK_COD_PAYMENT, CHECK_MASK_COPIED, CHECK_MASK_RETURNED,
 };
@@ -17,7 +11,6 @@ const SENDER: u64 = 509_0070;
 const RECIPIENT: u64 = 509_0071;
 const DELAYED_RECIPIENT: u64 = 509_0072;
 const LEGACY_RECIPIENT: u64 = 509_0073;
-/// The seeded Tester. The take and COD fixtures pay out into its live purse and bags.
 const TAKER: u64 = 1;
 const ITEM: ItemSnapshot = ItemSnapshot {
     entry: 509_0070,
@@ -28,7 +21,6 @@ const ITEM: ItemSnapshot = ItemSnapshot {
     random_property_id: 0,
     item_text_id: 0,
 };
-/// A real template, so a payout can grant it.
 const BLADE: ItemSnapshot = ItemSnapshot {
     entry: crate::seed::FIXTURE_BLADE,
     stack_count: 1,
@@ -41,11 +33,8 @@ const BLADE: ItemSnapshot = ItemSnapshot {
 const SECOND_MICROS: i64 = 1_000_000;
 const MINUTE_MICROS: i64 = 60 * SECOND_MICROS;
 const DAY_MICROS: i64 = 86_400 * SECOND_MICROS;
-/// A Mail lives 30 days after it arrives, 3 with a COD price (cmangos `Mail.cpp:309-313`), and a
-/// Mail returned at expiry lives 30 days from the return (cmangos `ObjectMgr.cpp:6214-6215`).
 const LIFE_MICROS: i64 = 30 * DAY_MICROS;
 const COD_LIFE_MICROS: i64 = 3 * DAY_MICROS;
-/// The delayed letter arrives this long after staging.
 const DELAY_MICROS: i64 = 2 * SECOND_MICROS;
 
 const RETURNS: &str = "timer: returns";
@@ -63,7 +52,6 @@ const TAKE_MONEY: &str = "timer: take money";
 const TAKE_ITEM: &str = "timer: take item";
 const COD_RACE: &str = "timer: cod race";
 
-/// One fixture letter and how old it is when staged.
 struct Staged {
     subject: &'static str,
     recipient_guid: u64,
@@ -90,8 +78,6 @@ impl Staged {
     }
 }
 
-/// Insert `staged` as a new letter, then move its creation back by its age and arm its timer
-/// again. Returns the backdated row.
 fn stage(ctx: &ReducerContext, staged: Staged, deliver_micros: i64) -> Mail {
     let id = crate::mail::insert_letter(
         ctx,
@@ -117,7 +103,6 @@ fn stage(ctx: &ReducerContext, staged: Staged, deliver_micros: i64) -> Mail {
     age(ctx, row, staged.age_micros)
 }
 
-/// Make `mail` `age_micros` old and arm its timer again.
 fn age(ctx: &ReducerContext, mail: Mail, age_micros: i64) -> Mail {
     let aged = ctx.db.game_mail().id().update(Mail {
         created_at: Timestamp::from_micros_since_unix_epoch(
@@ -129,7 +114,6 @@ fn age(ctx: &ReducerContext, mail: Mail, age_micros: i64) -> Mail {
     aged
 }
 
-/// Delete every Mail `recipient_guid` holds under one of `subjects`, with its timer.
 fn clear(ctx: &ReducerContext, recipient_guid: u64, subjects: &[&str]) {
     let stale: Vec<u64> = ctx
         .db
@@ -173,7 +157,6 @@ fn armed_micros(ctx: &ReducerContext, mail_id: u64) -> Option<i64> {
     }
 }
 
-/// `mail`'s timer fires `life_micros` after `arrived_micros`, to the second.
 fn check_armed(
     ctx: &ReducerContext,
     mail: &Mail,
@@ -190,8 +173,6 @@ fn check_armed(
     }
 }
 
-/// `subject` came back to SENDER as a Returned Mail with its item, no price and 30 days from the
-/// return.
 fn check_returned(ctx: &ReducerContext, subject: &str) -> Result<(), String> {
     let back = find(ctx, SENDER, subject).ok_or_else(|| format!("{subject} did not return"))?;
     if back.sender() != MailSender::Character(RECIPIENT)
@@ -206,9 +187,6 @@ fn check_returned(ctx: &ReducerContext, subject: &str) -> Result<(), String> {
     check_armed(ctx, &back, back.deliver_micros, LIFE_MICROS)
 }
 
-/// Stage one letter for each Mail Expiry outcome, two letters inside their life, and one letter
-/// delivered in about 2 s. Refuses unless every visible letter sent exactly one Mail Arrival and
-/// the delayed one sent none.
 #[reducer]
 pub fn debug_stage_mail_expiry_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -286,8 +264,6 @@ pub fn debug_stage_mail_expiry_fixture(ctx: &ReducerContext) -> Result<(), Strin
     Ok(())
 }
 
-/// Refuses until every staged letter has met its Mail Expiry outcome and the delayed letter has
-/// been delivered.
 #[reducer]
 pub fn debug_verify_mail_expiry_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -341,13 +317,9 @@ pub fn debug_verify_mail_expiry_fixture(ctx: &ReducerContext) -> Result<(), Stri
     Ok(())
 }
 
-/// Run the timer body again for every Mail id the expiry fixture used, with a row that is no
-/// longer armed. Refuses if that changes a Mail, a timer or the Mail Arrivals.
 #[reducer]
 pub fn debug_replay_mail_timer_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
-    // The stage inserts RETURNS first and DELAYED last in one transaction, so the ids between
-    // them are exactly the fixture's, deleted ones included.
     let first = find(ctx, SENDER, RETURNS).ok_or("stage and settle the fixture first")?;
     let last = find(ctx, DELAYED_RECIPIENT, DELAYED).ok_or("stage the fixture first")?;
     let state = |ctx: &ReducerContext, id: u64| -> Result<Vec<u8>, String> {
@@ -380,8 +352,6 @@ pub fn debug_replay_mail_timer_fixture(ctx: &ReducerContext) -> Result<(), Strin
     Ok(())
 }
 
-/// Stage two letters as they were before the Mail Timer existed: one past its life and one inside
-/// it, neither with a timer.
 #[reducer]
 pub fn debug_stage_mail_legacy_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -405,7 +375,6 @@ pub fn debug_stage_mail_legacy_fixture(ctx: &ReducerContext) -> Result<(), Strin
     Ok(())
 }
 
-/// Refuses until the repair pass has armed both legacy letters and the expired one has returned.
 #[reducer]
 pub fn debug_verify_mail_legacy_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -424,8 +393,6 @@ pub fn debug_verify_mail_legacy_fixture(ctx: &ReducerContext) -> Result<(), Stri
     )
 }
 
-/// Stage three letters for the Tester: 77 copper, a blade, and a blade for a 250-copper COD price.
-/// The tests fence a take or a payment first and age the letter past its life after.
 #[reducer]
 pub fn debug_stage_mail_take_fixture(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -459,8 +426,6 @@ pub fn debug_stage_mail_take_fixture(ctx: &ReducerContext) -> Result<(), String>
     Ok(())
 }
 
-/// Make the fixture letter `subject` for `recipient_guid` `age_secs` old, so a timer past its life
-/// fires at once.
 #[reducer]
 pub fn debug_age_mail_fixture(
     ctx: &ReducerContext,
@@ -480,9 +445,6 @@ pub fn debug_age_mail_fixture(
     Ok(())
 }
 
-/// Bring the delayed letter `subject` for `recipient_guid` forward to arrive 1 µs from now, so its
-/// Mail Timer fires at once and sends the Mail Arrival. Only for a "delivery: " letter that
-/// `module/tests/mail_delivery.rs` committed with a Delivery Delay, and that has not arrived.
 #[reducer]
 pub fn debug_deliver_mail_fixture(
     ctx: &ReducerContext,
@@ -494,8 +456,7 @@ pub fn debug_deliver_mail_fixture(
         .filter(|mail| mail.subject.starts_with("delivery: "))
         .filter(|mail| !mail.is_delivered(ctx.timestamp))
         .ok_or_else(|| format!("no delayed fixture letter {subject} for {recipient_guid}"))?;
-    // A timer delivers only when it fires at exactly `deliver_micros`, so the instant must stay
-    // ahead of this transaction.
+    // Delivery requires the timer to fire at deliver_micros, so keep it after this transaction.
     let arrives = ctx.db.game_mail().id().update(Mail {
         deliver_micros: ctx.timestamp.to_micros_since_unix_epoch() + 1,
         ..mail
@@ -504,7 +465,6 @@ pub fn debug_deliver_mail_fixture(
     Ok(())
 }
 
-/// Refuses unless `recipient_guid` holds the fixture letter `subject` as `held` says.
 #[reducer]
 pub fn debug_verify_mail_fixture_held(
     ctx: &ReducerContext,

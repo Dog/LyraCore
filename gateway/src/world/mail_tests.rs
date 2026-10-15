@@ -1,5 +1,3 @@
-//! Mail routing tests through the shared WorldFake topology.
-
 use super::handlers::Mail;
 use super::party_tests::{character, DORMANT, GINGER, TRIN, VIM};
 use super::*;
@@ -528,7 +526,6 @@ fn returning_a_mail_carries_its_attachment_and_copper_unchanged() {
             ..Default::default()
         },
     )];
-    // Vim is Ginger's alt here, so the item comes back at once.
     *world.mail.realm_accounts.lock().unwrap() = alts(&[GINGER, VIM]);
 
     mail::return_to_sender(world.as_ref(), Actor::new(GINGER), MAILBOX, 1)
@@ -908,12 +905,10 @@ fn orc(guid: u64, name: &str) -> codec::CharacterView {
     }
 }
 
-const GRUG: u64 = 20; // Horde, standing next to Ginger — the faction refusal
-const ECHO_WORLD: u64 = 30; // "Echo" on the open world …
-const ECHO_INSTANCES: u64 = 31; // … and "Echo" again on the instances shard: the homonym
+const GRUG: u64 = 20;
+const ECHO_WORLD: u64 = 30;
+const ECHO_INSTANCES: u64 = 31;
 const PURSE: u32 = 500;
-/// Ginger, Trin and Dormant are one player's alts, so an item between them arrives at once, as the
-/// take and cash on delivery tests need. Vim plays on another Realm Account.
 const ALTS: &str = "GINGER";
 const VIMS_ACCOUNT: &str = "VIM";
 fn alts(guids: &[u64]) -> Vec<(u64, String)> {
@@ -1426,9 +1421,6 @@ fn a_letter_sent_over_the_wire_is_acked_ok_and_lands_in_the_recipients_mailbox()
     assert_eq!(store.mail.purses.lock().unwrap()[0].1, PURSE - 30);
 }
 
-/// `seated_sender`'s sharded twin: the sender's own handle plus a realm-core handle, so
-/// `CMSG_SEND_MAIL` drives the fence → commit → confirm → settle escrow instead of the
-/// single-database fallback.
 fn sharded_seated_sender() -> std::sync::Arc<WorldFake> {
     let realm = std::sync::Arc::new(WorldFake {
         topology: TopologyState {
@@ -1730,12 +1722,6 @@ fn a_sharded_send_drives_fence_then_commit_then_confirm_then_settle() {
     );
 }
 
-/// The coordinator's subscribed cache lags the call pipe that carries `mail_fence`: the fence can
-/// commit on the sender's own shard before its escrow row is readable back through that same
-/// shard's cache. Observed live on a sharded realm: `realm_mail_fence` logged a successful fence,
-/// but the read-back that follows it came up empty on 2 of 4 sends, and each stayed HELD until the
-/// sender's next mailbox visit re-drove it. `held_fence` must wait the lag out, not refuse a fence
-/// that already landed.
 #[test]
 fn a_sharded_send_waits_out_a_lagging_escrow_cache_and_still_settles() {
     let (_realm, world, _instances, calls) = sharded_send();
@@ -2243,8 +2229,6 @@ fn taking_an_item_puts_it_in_the_takers_bags_with_its_state_unchanged() {
     );
 }
 
-/// A Letter Copy mailed on and taken again keeps its text id, so the taker can still read it. The
-/// sharded take reads the item from its fence, not from the Mail row.
 #[test]
 fn a_taken_letter_keeps_its_text_id() {
     let letter = mail::AttachedItem {
@@ -2298,9 +2282,6 @@ fn a_sharded_item_take_probes_for_room_before_it_fences_anything() {
     );
 }
 
-/// The same coordinator cache lag as a send's fence, on the take side: `mail_take_item_fence`
-/// commits on realm-core (the plane that owns the mail row), and the read-back that follows it can
-/// still miss there before the subscription catches up.
 #[test]
 fn a_sharded_item_take_waits_out_a_lagging_escrow_cache_and_still_settles() {
     let (realm, world, _calls, mail_id) = delivered_item();
@@ -3045,8 +3026,6 @@ fn a_refused_priced_take_reaches_the_client_as_not_enough_money() {
     );
 }
 
-/// The same mail rows on both planes, as `(the session's store, the store that holds the rows)`:
-/// a sharded world handle whose rows live on realm-core, and a single-database store.
 fn both_planes(
     mails: Vec<(u64, codec::MailView)>,
 ) -> [(std::sync::Arc<WorldFake>, std::sync::Arc<WorldFake>); 2] {
@@ -3299,7 +3278,6 @@ fn a_returned_mail_lists_as_returned_and_unread_with_no_price_and_a_fresh_countd
         },
     );
     for (store, _) in both_planes(vec![priced]) {
-        // Vim is Ginger's alt here, so the item comes back at once.
         *store.mail.realm_accounts.lock().unwrap() = alts(&[GINGER, VIM]);
         mail::return_to_sender(store.as_ref(), Actor::new(GINGER), MAILBOX, 1).expect("declined");
 
@@ -3375,7 +3353,6 @@ fn deleting_a_priced_mail_answers_the_internal_error_and_keeps_the_mail() {
     );
 }
 
-/// Every row `recipient` holds on `plane`, delivered or not.
 fn held_for(plane: &WorldFake, recipient: u64) -> Vec<codec::MailView> {
     plane
         .mail
@@ -3387,7 +3364,6 @@ fn held_for(plane: &WorldFake, recipient: u64) -> Vec<codec::MailView> {
         .map(|(_, m)| m.clone())
         .collect()
 }
-/// The `same_account` answer each mail send, fence and return on `store` carried.
 fn same_account_seen(store: &WorldFake) -> Vec<(&'static str, bool)> {
     store.mail.same_account_seen.lock().unwrap().clone()
 }
@@ -3430,7 +3406,6 @@ fn copper_to_another_account_arrives_at_once() {
 #[test]
 fn an_item_to_an_alt_on_another_shard_arrives_at_once() {
     let (_realm, world, instances, _calls) = sharded_send();
-    // Vim is Ginger's alt. Only the instances Shard, where Vim lives, names his Realm Account.
     *instances.mail.realm_accounts.lock().unwrap() = alts(&[VIM]);
     give_item(&world, GINGER, SWORD_GUID, sword());
 
@@ -3448,8 +3423,6 @@ fn an_item_to_an_alt_on_another_shard_arrives_at_once() {
 #[test]
 fn a_shard_that_holds_a_character_on_a_shadow_account_defers_to_another_shard() {
     let (_realm, world, instances, _calls) = sharded_send();
-    // Ginger came over from the instances Shard. The world Shard holds her on a shadow Account and
-    // cannot name her Realm Account, and the instances Shard kept her Account Character Owner.
     *world.mail.realm_accounts.lock().unwrap() = alts(&[TRIN]);
     *instances.mail.realm_accounts.lock().unwrap() = alts(&[GINGER]);
     give_item(&world, GINGER, SWORD_GUID, sword());
@@ -3579,7 +3552,6 @@ fn a_cod_letter_to_another_account_waits_and_its_payment_arrives_at_once() {
         .expect_err("nothing to buy yet");
     assert_eq!(purse_of(&instances, VIM), PURSE, "and nothing is charged");
 
-    // An hour later.
     for (_, m) in realm.mail.mails.lock().unwrap().iter_mut() {
         m.deliver_secs = mail::now_secs();
     }
@@ -3594,12 +3566,6 @@ fn a_cod_letter_to_another_account_waits_and_its_payment_arrives_at_once() {
     );
 }
 
-// -------------------------------------------------------------------------------------
-// Letter Copy (`CMSG_MAIL_CREATE_TEXT_ITEM`)
-// -------------------------------------------------------------------------------------
-
-/// GINGER's seeded mail (id 1, body "left it at the inn") is the copy fixture throughout: a
-/// delivered Character mail with a body, so its text id is its own id (`item_text_id_for`).
 const GINGERS_LETTER_TEXT_ID: u32 = 1;
 
 #[test]
@@ -3701,15 +3667,12 @@ fn a_letter_already_granted_refuses_a_second_copy_and_grants_no_second_letter() 
     );
 }
 
-/// The held-item check in `mail_grant_letter` only guards the crash window before GRANTED is
-/// recorded — it is not the durable answer. Once GRANTED lands, destroying, mailing away, or
-/// trading the letter must not reopen the grant: the record lives on the mail, not the item.
 #[test]
 fn destroying_the_granted_item_does_not_reopen_a_second_grant() {
     let (_realm, world, _calls) = sharded_mailbox();
     mail::copy_letter(world.as_ref(), Actor::new(GINGER), MAILBOX, 1)
         .expect("the first copy completes");
-    world.mail.granted_letters.lock().unwrap().clear(); // the Plain Letter is gone from the bags
+    world.mail.granted_letters.lock().unwrap().clear();
 
     let refusal = mail::copy_letter(world.as_ref(), Actor::new(GINGER), MAILBOX, 1)
         .expect_err("GRANTED survives the item's destruction")
@@ -3722,9 +3685,6 @@ fn destroying_the_granted_item_does_not_reopen_a_second_grant() {
     );
 }
 
-/// A grant lost between the room check and the Home Shard call (bags filled, logout, timeout, a
-/// Gateway crash) leaves the mail COPIED with its text filed but no letter granted. Clicking again
-/// must reach the Home Shard, not bounce off "already copied".
 #[test]
 fn retrying_after_an_interrupted_grant_still_grants_the_letter() {
     let (realm, world, _calls) = sharded_mailbox();
@@ -3866,9 +3826,6 @@ fn a_letter_copy_into_a_full_bag_over_the_wire_answers_equip_error() {
     );
 }
 
-/// `game_item_text` ids are a mail's own id — small and sequential. A caller who neither holds the
-/// granted item nor owns the mail must not read it by guessing the id, even after the letter's
-/// mail row is long gone.
 #[test]
 fn item_text_query_refuses_a_caller_who_neither_owns_the_item_nor_the_mail() {
     let (realm, world, _calls) = sharded_mailbox();
@@ -3907,9 +3864,6 @@ fn item_text_query_answers_for_an_owner_who_still_holds_the_granted_item() {
 fn item_text_query_falls_back_to_the_callers_own_undeleted_mail() {
     let (_realm, world, _calls) = sharded_mailbox();
 
-    // No copy has happened, so `game_item_text` holds nothing — the query still resolves through
-    // the caller's own delivered mail under the same id, matching what a letter still sitting in
-    // the mailbox has always done.
     assert_eq!(
         mail::item_text(
             world.as_ref(),
@@ -3927,9 +3881,6 @@ fn item_text_query_falls_back_to_the_callers_own_undeleted_mail() {
     );
 }
 
-/// A Reward Letter as the Module files it at turn-in: quest 3645, Membership Card Renewal, from
-/// its quest ender with template 99 and item 11423 after 86,400 s (`cdb:` quest_template,
-/// mail_loot_template). The quest ender here is creature 7802.
 const REWARD_ESCROW: u64 = 0x5EED_0009;
 fn card_renewal_letter(recipient: u64, delivery_delay_secs: u32) -> mail::HeldEscrow {
     mail::HeldEscrow {
@@ -3954,7 +3905,6 @@ fn card_renewal_letter(recipient: u64, delivery_delay_secs: u32) -> mail::HeldEs
         }),
     }
 }
-/// File `letter` on `shard` for `owner`, as the turn-in's transaction leaves it: unattested.
 fn hold_reward_letter(shard: &WorldFake, owner: u64, letter: mail::HeldEscrow) {
     shard
         .mail
@@ -3982,8 +3932,6 @@ fn reward_letters(plane: &WorldFake, recipient: u64) -> Vec<codec::MailView> {
         .map(|(_, m)| m.clone())
         .collect()
 }
-/// The mail row the Module writes for the card renewal letter: from creature 7802 and no guid,
-/// naming template 99, with HAS_BODY (0x10).
 fn assert_card_renewal(letter: &codec::MailView) {
     assert_eq!(
         (
@@ -4244,8 +4192,6 @@ fn a_reward_letter_a_turn_in_files_is_delivered_on_either_plane() {
     }
 }
 
-/// A mail Refusal answers the client and the World Session continues; a Transport Loss mid-drive
-/// leaves the letter's outcome unknown and ends the session.
 #[test]
 fn a_send_refusal_is_answered_and_a_transport_loss_ends_the_session() {
     let send = |receiver: &str| {

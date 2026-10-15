@@ -1,6 +1,3 @@
-//! A creature killed on a leg stops where the client renders it at the kill, not at the position
-//! the last advance firing stored. The kill lands between firings, which only a real shard shows.
-
 mod support;
 
 use std::time::Duration;
@@ -8,7 +5,6 @@ use std::time::Duration;
 use spacetimedb::Timestamp;
 use support::{leg, leg_destination, lone_wolf, number, Row, Standalone, LEG_YD};
 
-/// `combat::death::CORPSE_DECAY_MICROS`: the kill arms the corpse decay this long after itself.
 const CORPSE_DECAY_MICROS: i64 = 60_000_000;
 
 fn timestamp_micros(value: &str) -> i64 {
@@ -50,7 +46,6 @@ fn a_creature_killed_mid_leg_stops_where_the_client_renders_it() {
     let dur_ms: u32 = number(&leg, "dur_ms");
     assert!(dur_ms >= 4_000, "{LEG_YD} yd walked in only {dur_ms} ms");
 
-    // Kill part way along the leg, at no particular phase of the 0.5 s firing.
     std::thread::sleep(Duration::from_millis(1_730));
     shard.assert_call("debug_kill_creature", &["1", &guid]);
 
@@ -73,7 +68,6 @@ fn a_creature_killed_mid_leg_stops_where_the_client_renders_it() {
     let corpse = shard.query_rows(&row_query).remove(0);
     assert_eq!(corpse["dead"], "true", "{corpse:?}");
     assert_stored_at(&corpse, rendered, "at the kill");
-    // The next firings play the stop leg. A stop packet anywhere else would move the corpse there.
     std::thread::sleep(Duration::from_millis(1_200));
     assert_stored_at(
         &shard.query_rows(&row_query).remove(0),

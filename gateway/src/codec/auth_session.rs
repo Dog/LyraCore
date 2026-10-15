@@ -1,13 +1,5 @@
-//! The plaintext `CMSG_AUTH_SESSION` frame, decoded by hand.
-//!
-//! `wow_world_messages` sizes a buffer from the client's `addon_info_decompressed_size` and unwraps
-//! the zlib decode, so an unauthenticated peer could abort the process or unwind the session with
-//! one packet. The gateway never reads the addon list, so this decoder stops before the zlib blob.
-//! Layout (gtker cmsg_auth_session.wowm): `u16 BE size` (opcode + body), `u32 LE opcode`,
-//! `build: u32`, `server_id: u32`, `username: CString`, `client_seed: u32`, `client_proof: u8[20]`,
-//! then the compressed addon list.
+//! The typed decoder trusts the addon size and unwraps zlib; skip the unused blob here.
 
-// Untrusted input arrives here: a malformed packet or env var must return an error, never unwind.
 #![cfg_attr(
     not(test),
     deny(
@@ -22,10 +14,8 @@
 
 use std::io::{self, Read};
 
-/// The opcode of the one plaintext client frame in the world handshake.
 pub const CMSG_AUTH_SESSION_OPCODE: u32 = 0x01ED;
 
-/// What the world handshake proves against: the fields before the addon blob.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AuthSessionClaim {
     pub username: String,
@@ -33,8 +23,6 @@ pub struct AuthSessionClaim {
     pub client_proof: [u8; 20],
 }
 
-/// Read one plaintext frame and decode it as `CMSG_AUTH_SESSION`. A wrong opcode or a short body
-/// is `InvalidData`; a closed or silent socket surfaces as the read's own error kind.
 pub fn read_auth_session<R: Read>(r: &mut R) -> io::Result<AuthSessionClaim> {
     let mut header = [0u8; 6];
     r.read_exact(&mut header)?;
@@ -45,14 +33,13 @@ pub fn read_auth_session<R: Read>(r: &mut R) -> io::Result<AuthSessionClaim> {
             "expected CMSG_AUTH_SESSION, got opcode {opcode:#06x}"
         )));
     }
-    // `size` counts the u32 opcode. The u16 header bounds the body; no client field sizes it.
+    // `size` includes the u32 opcode; the u16 header bounds the body.
     let mut body = vec![0u8; size.saturating_sub(4)];
     r.read_exact(&mut body)?;
     parse_auth_session_body(&body)
 }
 
 fn parse_auth_session_body(body: &[u8]) -> io::Result<AuthSessionClaim> {
-    // build + server_id: the gateway reads neither.
     let rest = body.get(8..).ok_or_else(short)?;
     let nul = rest.iter().position(|b| *b == 0).ok_or_else(short)?;
     let username = String::from_utf8(rest[..nul].to_vec())
@@ -117,11 +104,9 @@ mod tests {
         );
     }
 
-    /// The whole point of the hand decoder: the addon blob is never sized or inflated.
     #[test]
     fn an_absurd_addon_size_with_garbage_zlib_is_ignored() {
         let mut bytes = frame(&tester());
-        // Replace the decompressed-size field and everything after it.
         let fixed = 6 + 4 + 4 + "TESTER".len() + 1 + 4 + 20;
         bytes.truncate(fixed);
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -136,7 +121,7 @@ mod tests {
     #[test]
     fn a_frame_with_another_opcode_is_invalid_data() {
         let mut bytes = frame(&tester());
-        bytes[2..6].copy_from_slice(&0x0037u32.to_le_bytes()); // CMSG_CHAR_ENUM
+        bytes[2..6].copy_from_slice(&0x0037u32.to_le_bytes());
         let err = read_auth_session(&mut bytes.as_slice()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("0x0037"), "{err}");

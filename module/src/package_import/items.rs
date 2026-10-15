@@ -1,17 +1,3 @@
-//! The items Import Family's half of a Package Delta apply: the setters for `game_item_template`,
-//! where a Package item lives, and how to find one row.
-//!
-//! The shared shell in the parent module decides everything a family does not: what the plan is,
-//! what refuses it, the order of the durable pass, and the provenance. What is here is only what is
-//! true of items.
-//!
-//! The Claim schema and the setter below are one contract; the test at the bottom fails if a
-//! claimable column has no setter.
-//!
-//! Unlike the spell family, items own exactly one table, so `row.key()` reaching this module is
-//! always `PrimaryKey::Item` — `check_claims_belong_to` refuses anything else before the family
-//! dispatch in the parent module ever calls here.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{is_package_item_id, FieldValue, Operation, PrimaryKey, TracedRow};
@@ -20,7 +6,6 @@ use crate::items::{game_item_template, ItemTemplate};
 
 use super::{as_bool, as_f32, as_i32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// What this shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -38,17 +23,10 @@ pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarg
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
-///
-/// The Package item range is cleared on every apply, so such a row is gone by the time the write
-/// pass runs: the Package that owns it is not enabled, and the one tuning it is claiming a row that
-/// does not exist. A base item is different — the base import puts it there.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     row.operation() == Operation::Update && is_package_item_id(entry_of(row))
 }
 
-/// Removes every row a Package invented. A whole-table pass over `game_item_template`, once per
-/// import, right after the base import rewrote it anyway.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let items = ctx.db.game_item_template();
     let stale: Vec<u32> = items
@@ -85,13 +63,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-// ===========================================================================================
-//  Row building — pure.
-// ===========================================================================================
-
-/// The `entry` an items-family row names. Total, not a `Result`: `check_claims_belong_to` has
-/// already refused a foreign-family row before this module's dispatch runs, so `row.key()` is
-/// always `PrimaryKey::Item` here.
 fn entry_of(row: &TracedRow) -> u32 {
     let PrimaryKey::Item { entry } = row.key() else {
         unreachable!("`check_claims_belong_to` refuses a non-item row before the items family's dispatch runs")
@@ -99,9 +70,6 @@ fn entry_of(row: &TracedRow) -> u32 {
     entry
 }
 
-/// A Package item before any claim has been applied to it. Every claimable column is overwritten by
-/// the insert that follows, so these values never survive; they exist because the row's shape has no
-/// `Default`.
 fn blank_item(entry: u32) -> ItemTemplate {
     ItemTemplate {
         entry,
@@ -247,10 +215,6 @@ fn built_item(row: &TracedRow) -> Result<ItemTemplate, String> {
     Ok(item)
 }
 
-// ===========================================================================================
-//  Tests — the pure half. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -259,8 +223,6 @@ mod tests {
     use super::*;
     use lyracore_package_delta::Table as ClaimTable;
 
-    /// The Package item range is cleared on every apply, so tuning a Package item nobody enables is
-    /// a plan that names a row which will not exist.
     #[test]
     fn tuning_a_package_item_no_enabled_package_inserts_is_refused() {
         let plan = plan(&[artifact(
@@ -308,8 +270,6 @@ mod tests {
         assert!((item.damage_max - 9.0).abs() < f32::EPSILON);
     }
 
-    /// The Claim schema and the setter above are one contract. A column the schema declares but no
-    /// setter names would fail an apply against a live shard and nowhere else.
     #[test]
     fn every_claimable_item_column_has_a_setter() {
         let mut item = blank_item(PACKAGE_ITEM);

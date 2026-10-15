@@ -1,17 +1,9 @@
-//! The table catalogue and the Import Family each table belongs to.
-//!
-//! An applier is called for one family at a time, so `Table::family` decides which claims that call
-//! may touch. These cases hold the catalogue, the parser and the family map together.
-
 use lyracore_package_delta::{
     Table, CAST_FAMILY, CREATURE_AI_FAMILY, CREATURE_FAMILY, GAMEOBJECT_FAMILY, GLOBALS_FAMILY,
     GOSSIP_FAMILY, ITEM_FAMILY, LOOT_FAMILY, QUEST_FAMILY, SPELLMETA_FAMILY, SPELL_FAMILY,
     TRAINER_FAMILY,
 };
 
-/// `Table::ALL`, `Table::as_str` and `Table::parse` are three hand-maintained lists of one
-/// catalogue. The match below carries no wildcard, so a table added to the enum stops this case
-/// compiling until all three learn it.
 #[test]
 fn every_table_in_the_catalogue_parses_back_to_itself() {
     for table in Table::ALL {
@@ -155,9 +147,6 @@ fn the_globals_tables_belong_to_the_globals_import_family() {
     assert_eq!(GLOBALS_FAMILY, "globals");
 }
 
-/// The spell metadata tables belong to `spellmeta`, NOT to `spell`, even though two of the three
-/// key on a spell identifier. A base import reloads them in their own family's block, so an apply
-/// that ran them under `spell` would be reverted by the block that owns them.
 #[test]
 fn the_spell_metadata_tables_belong_to_the_spellmeta_import_family() {
     for table in [Table::SpellChain, Table::SpellLearn, Table::SpellProcEvent] {
@@ -187,8 +176,6 @@ fn the_gameobject_tables_belong_to_the_gameobjects_import_family() {
     assert_eq!(GAMEOBJECT_FAMILY, "gameobjects");
 }
 
-/// `game_gameobject_loot` names a gameobject but reloads under the loot family's own block, so an
-/// apply that ran it under `gameobjects` would be reverted by the block that owns it.
 #[test]
 fn the_gameobject_loot_table_stays_with_the_loot_family() {
     assert_eq!(Table::GameobjectLoot.family(), LOOT_FAMILY);
@@ -207,17 +194,12 @@ fn the_eventai_catalogue_tables_belong_to_the_creature_ai_import_family() {
     assert_eq!(CREATURE_AI_FAMILY, "creature-ai");
 }
 
-/// `game_quest_event_requirement` names a quest, but the `creature-ai` block loads it. An apply
-/// that ran it under `quests` would be reverted by the block that owns it.
 #[test]
 fn the_quest_event_requirement_table_stays_with_the_creature_ai_family() {
     assert_eq!(Table::QuestEventRequirement.family(), CREATURE_AI_FAMILY);
     assert_ne!(Table::QuestEventRequirement.family(), QUEST_FAMILY);
 }
 
-/// The `creature-ai` family loads its scripted definitions through a reducer, as a nested rule
-/// payload. There is no scalar column shape for it, so no claim may name one — the catalogue
-/// carries the family's row-typed tables and nothing else.
 #[test]
 fn no_eventai_definition_table_is_claimable() {
     for name in [
@@ -232,8 +214,6 @@ fn no_eventai_definition_table_is_claimable() {
     }
 }
 
-/// A family name travels as a reducer argument and as `game_import_meta.family`, where the importer
-/// writes it in lowercase. A name that did not match would route an apply at nothing.
 #[test]
 fn every_family_name_is_a_lowercase_import_family_name() {
     for table in Table::ALL {
@@ -247,7 +227,6 @@ fn every_family_name_is_a_lowercase_import_family_name() {
     }
 }
 
-/// A table with no claimable columns would accept an `insert` that carries nothing.
 #[test]
 fn every_table_has_claimable_columns() {
     for table in Table::ALL {

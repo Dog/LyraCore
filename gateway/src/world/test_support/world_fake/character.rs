@@ -2,27 +2,14 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct CharacterState {
-    /// When set, `character_by_guid` cannot answer from this Shard.
     pub(crate) character_read_error: Option<String>,
-    /// Recorded `delete_character` calls: (account_id, character_guid).
     pub(crate) deleted: std::sync::Mutex<Vec<(u64, u64)>>,
-    /// When set, `delete_character` returns this outcome instead of `Success`.
     pub(crate) delete_outcome: Option<codec::CharDeleteOutcome>,
     pub(crate) created_characters: std::sync::Mutex<Vec<codec::CharacterView>>,
-    /// The Nth guid `create_character` assigns, offset well above every hand-seeded fixture
-    /// guid in this file (the highest is 100, in the transfer tests) so it can never collide.
     pub(crate) next_created_guid: std::sync::atomic::AtomicU64,
-    /// Reputation standings `player_reputations` returns — `(reputation_index, standing)` pairs folded
-    /// into the login SMSG_INITIALIZE_FACTIONS (restoring persisted standings instead of the
-    /// all-neutral stub).
     pub(crate) reputations: Vec<(i32, i32, bool)>,
-    /// Imported action-bar rows `player_actions` returns — `(button, action, action_type)` triples.
-    /// Empty by default (the pre-import fallback path).
     pub(crate) player_actions: Vec<(u8, u32, u8)>,
-    /// The character's spellbook, as `player_learned_spells` reports it. Empty by default; a
-    /// proficiency test seeds the passive the trainer buy is meant to have granted.
     pub(crate) learned_spells: Vec<u32>,
-    /// How many times a caller asked for the two-snapshot durable absence check.
     pub(crate) durable_absence_checks: std::sync::atomic::AtomicUsize,
 }
 
@@ -127,7 +114,6 @@ impl CharacterStore for WorldFake {
     }
 
     fn effective_armor(&self, _guid: u64) -> u32 {
-        // No gear/auras in the test store → effective == the login entity's armor.
         self.session
             .login_entity
             .as_ref()
@@ -140,7 +126,7 @@ impl CharacterStore for WorldFake {
     }
 
     fn spell_modifiers(&self, _character_guid: u64) -> Vec<(u32, u8, i32, bool)> {
-        Vec::new() // no modifier packets in the harness (login stays byte-identical)
+        Vec::new()
     }
 
     fn player_learned_spells(&self, _player_guid: u64) -> Result<Vec<u32>> {

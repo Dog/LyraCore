@@ -1,15 +1,3 @@
-//! The gameobjects Import Family's half of a Package Delta apply: the setters for the gameobject
-//! catalogue, its trap metadata and its spawns, and how to find one row of each.
-//!
-//! The shared shell in the parent module decides everything a family does not. What is here is only
-//! what is true of gameobjects.
-//!
-//! Three tables, one band. `game_gameobject_template` and `game_gameobject_trap` share one
-//! identifier space on purpose: a trap row describes the template of the same entry, so a Package
-//! trap is exactly as Package-owned as its template. `game_gameobject` is SPATIAL, and unlike a
-//! creature its row IS the live prop — nothing rebuilds it from a spawn record, so a write here
-//! also derives the AOI grid cell the row is addressed through.
-
 use spacetimedb::{ReducerContext, Table};
 
 use lyracore_package_delta::{
@@ -23,14 +11,8 @@ use crate::{
 
 use super::{as_f32, as_str, as_u32, as_u8, check_insert_is_whole, UpdateTarget};
 
-/// Bits 0..47 of a gameobject guid: the spawn identifier the importer packs there.
 const GAMEOBJECT_GUID_SPAWN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 
-/// Refuses a gameobjects claim whose final row would point at no row after this family lands.
-///
-/// A spawn and a trap both name a template: the row each describes has to exist once the plan
-/// lands. And two spawn claims may derive ONE durable guid, because the map routes a claim but
-/// never reaches the guid — the same invalid map-ownership statement the creatures family refuses.
 pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Result<(), String> {
     check_one_guid_per_spawn(rows)?;
     for row in rows {
@@ -51,7 +33,6 @@ pub(super) fn check_references(ctx: &ReducerContext, rows: &[TracedRow]) -> Resu
     Ok(())
 }
 
-/// Refuses a plan whose spawn claims collide on one derived guid.
 fn check_one_guid_per_spawn(rows: &[TracedRow]) -> Result<(), String> {
     let claimed: Vec<&TracedRow> = rows
         .iter()
@@ -73,8 +54,6 @@ fn check_one_guid_per_spawn(rows: &[TracedRow]) -> Result<(), String> {
     Ok(())
 }
 
-/// The template a spawn will name once its claim lands: the claimed value if the claim sets it,
-/// otherwise what the Shard already holds.
 fn final_template_entry(ctx: &ReducerContext, row: &TracedRow) -> Result<u32, String> {
     if let Some(FieldValue::U32(entry)) = row
         .fields()
@@ -97,7 +76,6 @@ fn final_template_entry(ctx: &ReducerContext, row: &TracedRow) -> Result<u32, St
         })
 }
 
-/// True when `entry` will name a `game_gameobject_template` row once this plan lands.
 fn template_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], entry: u32) -> bool {
     if entry == 0 {
         return false;
@@ -116,7 +94,6 @@ fn template_exists_after_apply(ctx: &ReducerContext, rows: &[TracedRow], entry: 
         .is_some()
 }
 
-/// What this Shard holds for the row an `update` claim names.
 pub(super) fn update_target(ctx: &ReducerContext, row: &TracedRow) -> UpdateTarget {
     if row.operation() == Operation::Update && updates_an_uninvented_package_row(row) {
         return UpdateTarget::Uninvented;
@@ -150,7 +127,6 @@ fn row_is_present(ctx: &ReducerContext, row: &TracedRow) -> bool {
     }
 }
 
-/// True when a traced update would land on a Package-range row that no enabled Package invents.
 fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     match row.key() {
         PrimaryKey::GameobjectTemplate { entry } | PrimaryKey::GameobjectTrap { entry } => {
@@ -161,8 +137,6 @@ fn updates_an_uninvented_package_row(row: &TracedRow) -> bool {
     }
 }
 
-/// Removes every row a Package invented: the spawns and the trap metadata first, then the
-/// templates they name.
 pub(super) fn clear_package_range(ctx: &ReducerContext) {
     let spawns = ctx.db.game_gameobject();
     let package_guids: Vec<u64> = spawns
@@ -195,7 +169,6 @@ pub(super) fn clear_package_range(ctx: &ReducerContext) {
     }
 }
 
-/// True when a durable gameobject guid carries a Package-invented spawn identifier.
 fn is_package_spawn_guid(guid: u64) -> bool {
     u32::try_from(guid & GAMEOBJECT_GUID_SPAWN_MASK).is_ok_and(is_package_gameobject_id)
 }
@@ -275,9 +248,6 @@ pub(super) fn write_row(ctx: &ReducerContext, row: &TracedRow) -> Result<(), Str
     Ok(())
 }
 
-/// Re-derives the AOI grid columns from the coordinates in the same write that set them. They are
-/// not claimable, and a stale value here does not slow a query down — it shows players the wrong
-/// world (`module/src/tripwires.rs`'s grid-cell tripwire).
 fn stamp_cell(spawn: &mut GameObject) {
     let (grid_x, grid_y) = lyracore_shared::spatial::grid_cell(spawn.x, spawn.y);
     spawn.grid_x = grid_x;
@@ -293,7 +263,6 @@ fn gone(row: &TracedRow) -> String {
     format!("`{}` row {} vanished mid-apply", row.table(), row.key())
 }
 
-/// Runs one table's setter over every claimed column.
 fn apply_fields(
     row: &TracedRow,
     mut set: impl FnMut(&str, &FieldValue) -> Result<(), String>,
@@ -303,10 +272,6 @@ fn apply_fields(
     }
     Ok(())
 }
-
-// ===========================================================================================
-//  Pure row building.
-// ===========================================================================================
 
 fn blank_template(entry: u32) -> GameObjectTemplate {
     GameObjectTemplate {
@@ -366,9 +331,6 @@ fn apply_trap_field(
     Ok(())
 }
 
-/// A spawn row with everything the key already decided, and the live state a fresh import stamps: a
-/// ready prop, no pending respawn, open world. The grid columns are re-derived by [`stamp_cell`]
-/// once the claimed coordinates are on the row.
 fn blank_spawn(ctx: &ReducerContext, key: PrimaryKey) -> GameObject {
     let map_id = match key {
         PrimaryKey::GameobjectSpawn { map_id, .. } => map_id,
@@ -423,10 +385,6 @@ fn no_such_column(table: &str, column: &str) -> String {
     format!("`{table}` has no claimable column `{column}`")
 }
 
-// ===========================================================================================
-//  Pure tests. Row WRITING needs a live ReducerContext, which a native test has no way
-//  to build (same limit `import_meta`'s tests note); the wire suite covers that rung.
-// ===========================================================================================
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{
@@ -493,8 +451,6 @@ mod tests {
         assert_eq!(template.data0, 25);
     }
 
-    /// The grid columns address the row for every viewer's AOI box, and they are derived rather
-    /// than claimed, so a written position has to re-derive them.
     #[test]
     fn a_written_position_restamps_the_grid_cell() {
         let mut spawn = blank_spawn_for_test();
@@ -512,7 +468,6 @@ mod tests {
         assert_ne!(spawn.cell, 0, "a real position is not cell (0, 0)");
     }
 
-    /// The Claim schema and the setters above are one contract.
     #[test]
     fn every_claimable_gameobject_column_has_a_setter() {
         let mut template = blank_template(PACKAGE_GAMEOBJECT);
@@ -540,8 +495,6 @@ mod tests {
         assert!(!is_package_spawn_guid(imported));
     }
 
-    /// `blank_spawn` needs a live `ReducerContext` for its timestamp, which a native test cannot
-    /// build, so the pure cases construct the row directly.
     fn blank_spawn_for_test() -> GameObject {
         GameObject {
             guid: lyracore_package_delta::packed_gameobject_spawn_guid(PACKAGE_GAMEOBJECT),

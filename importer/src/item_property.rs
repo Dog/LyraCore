@@ -1,5 +1,3 @@
-//! Derive Random Property catalogues from the Operator's client and ClassicDB dump.
-
 use crate::spell_dbc::{read_spells, Spell};
 use crate::{dbc, field, parse_table, push_insert, sql_text};
 use anyhow::{bail, Context, Result};
@@ -28,7 +26,6 @@ fn resistance_kind(school: u32) -> Option<u8> {
     }
 }
 
-/// Flat equip auras only. Conditional, scaling and percentage modifiers retain kind 0.
 fn aura_kinds(aura: u32, misc: u32) -> Vec<(u8, u32)> {
     match (aura, misc) {
         (29, u32::MAX) => (kind::STRENGTH..=kind::SPIRIT)
@@ -284,7 +281,6 @@ fn insert_effect(rows: &mut BTreeMap<u64, String>, enchant_id: u32, effect: Effe
     Ok(())
 }
 
-/// ClassicDB chance has at most two decimal places. Keep hundredths exactly; reject extra precision.
 fn decimal_weight(value: &str) -> Result<u32> {
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     if whole.is_empty()
@@ -388,7 +384,6 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes.resize(713, 0);
-        // Build 5875 columns, including the inventory mask immediately before Effect[0].
         for (column, value) in [
             (0, 509_0003),
             (58, u32::MAX),
@@ -445,7 +440,6 @@ mod tests {
         assert!(read_spells(&bytes).is_err());
     }
 
-    // Authored zero records let tests exercise the real DBC parser without client bytes.
     fn synthetic_table<T: DbcTable>(fields: u32) -> T {
         let mut bytes = b"WDBC".to_vec();
         for value in [1, fields, fields * 4, 1] {

@@ -14,7 +14,6 @@ const FRANK: u64 = 5_091_006;
 const GRACE: u64 = 5_091_007;
 const HORDE_TARGET: u64 = 5_091_008;
 
-/// A tokenless actor: Realm-core holds no Account Claim for the reserved guids.
 fn actor(guid: u64) -> String {
     format!(r#"{{"guid":{guid},"ownership":null}}"#)
 }
@@ -83,9 +82,6 @@ fn guild_id_of(realm: &Standalone, name: &str) -> String {
         .clone()
 }
 
-/// Invite: a member on one side offers a live Character a place in its Guild. Covers the
-/// Refusals that never insert a member row: a repeated invite, an opposite-team target, an
-/// ignored target (silent success), and inviting someone already in the Guild.
 fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
     realm.assert_call(
         "realm_guild_op",
@@ -101,7 +97,6 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
     assert_eq!(invites[0]["guild_id"], guild_id);
     assert_eq!(invites[0]["inviter_guid"], LEADER.to_string());
 
-    // A repeated invite to the same target is refused before a second row appears.
     refused(
         realm,
         &[
@@ -111,7 +106,6 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
         "guild:already_invited",
     );
 
-    // An opposite-team invite is refused and writes no row.
     refused(
         realm,
         &[
@@ -126,7 +120,6 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
         ))
         .is_empty());
 
-    // An ignored invite is a silent success: no row, no error.
     realm.assert_call(
         "realm_guild_op",
         &[
@@ -140,7 +133,6 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
         ))
         .is_empty());
 
-    // Accept: Bob joins at the lowest rank; the invite is consumed.
     realm.assert_call(
         "realm_guild_op",
         &[&actor(BOB), &accept("Bob", TEAM_ALLIANCE)],
@@ -155,14 +147,12 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
         ))
         .is_empty());
 
-    // Accepting a stale (already-consumed) invite a second time is silent.
     refused(
         realm,
         &[&actor(BOB), &accept("Bob", TEAM_ALLIANCE)],
         "guild:no_pending_invite",
     );
 
-    // Inviting an existing member answers AlreadyInGuild.
     refused(
         realm,
         &[
@@ -173,8 +163,6 @@ fn invite_and_accept_phase(realm: &Standalone, guild_id: &str) {
     );
 }
 
-/// Decline: Dave refuses a fresh invite, and the inviter hears about it through an addressed
-/// Guild Event. A second invite then succeeds, so Dave is a member for the rank-change phase.
 fn decline_then_join_phase(realm: &Standalone) {
     realm.assert_call(
         "realm_guild_op",
@@ -196,7 +184,6 @@ fn decline_then_join_phase(realm: &Standalone) {
     assert_eq!(decline_events.len(), 1, "0x41 == 65");
     assert!(decline_events[0]["strings"].contains("Dave"));
 
-    // A second invite to Dave succeeds this time.
     realm.assert_call(
         "realm_guild_op",
         &[
@@ -211,9 +198,7 @@ fn decline_then_join_phase(realm: &Standalone) {
     assert!(member_row(realm, DAVE).is_some());
 }
 
-/// Promote and demote move a member's Guild Rank by one and refuse past the actor's own reach.
 fn promote_and_demote_phase(realm: &Standalone) {
-    // Promote: Bob rises one rank (4 -> 3), broadcasting the new rank's name.
     realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(BOB)]);
     assert_eq!(member_row(realm, BOB).unwrap()["rank_id"], "3");
     let promotion_events =
@@ -222,24 +207,19 @@ fn promote_and_demote_phase(realm: &Standalone) {
         .iter()
         .any(|row| row["strings"].contains("Member")));
 
-    // Promoting past the actor's own reach is refused. Only ranks 0 and 1 hold PROMOTE, so the
-    // Leader raises Bob to Officer (rank 1) first; Dave rises to rank 2, one step past Bob's
-    // reach (`actor_rank + 1 >= target_rank`).
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(BOB)]); // 3 -> 2
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(BOB)]); // 2 -> 1
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(DAVE)]); // 4 -> 3
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(DAVE)]); // 3 -> 2
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(BOB)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(BOB)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(DAVE)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &promote(DAVE)]);
     refused(realm, &[&actor(BOB), &promote(DAVE)], "guild:rank_too_high");
 
-    // Demote: Bob and Dave return to the lowest rank.
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]); // 1 -> 2
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]); // 2 -> 3
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]); // 3 -> 4
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(BOB)]);
     assert_eq!(member_row(realm, BOB).unwrap()["rank_id"], "4");
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(DAVE)]); // 2 -> 3
-    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(DAVE)]); // 3 -> 4
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(DAVE)]);
+    realm.assert_call("realm_guild_op", &[&actor(LEADER), &demote(DAVE)]);
 
-    // Demoting the Guild's already-lowest rank is refused.
     refused(
         realm,
         &[&actor(LEADER), &demote(DAVE)],
@@ -247,24 +227,18 @@ fn promote_and_demote_phase(realm: &Standalone) {
     );
 }
 
-/// Remove expels a member; the Guild Leader cannot be removed. SetLeader then passes leadership
-/// to Bob, and the old leader becomes an Officer.
 fn remove_and_set_leader_phase(realm: &Standalone, guild_id: &str) {
-    // A member without REMOVE cannot remove anyone.
     refused(realm, &[&actor(BOB), &remove(DAVE)], "guild:no_permission");
 
-    // Remove: the leader expels Dave.
     realm.assert_call("realm_guild_op", &[&actor(LEADER), &remove(DAVE)]);
     assert!(member_row(realm, DAVE).is_none());
 
-    // The Guild Leader cannot be removed.
     refused(
         realm,
         &[&actor(LEADER), &remove(LEADER)],
         "guild:leader_cannot_leave",
     );
 
-    // SetLeader: leadership passes to Bob; the old leader becomes an Officer.
     realm.assert_call("realm_guild_op", &[&actor(LEADER), &set_leader(BOB)]);
     assert_eq!(member_row(realm, BOB).unwrap()["rank_id"], "0");
     assert_eq!(member_row(realm, LEADER).unwrap()["rank_id"], "1");
@@ -276,14 +250,9 @@ fn remove_and_set_leader_phase(realm: &Standalone, guild_id: &str) {
     );
 }
 
-/// Disband: only the Guild Leader may disband. It clears the Guild, its Ranks and members, and
-/// any pending invite, and addresses one DISBANDED row to each member still in the Guild.
 fn disband_phase(realm: &Standalone, guild_id: &str) {
-    // A non-leader cannot disband.
     refused(realm, &[&actor(LEADER), DISBAND], "guild:not_leader");
 
-    // A pending invite outstanding at disband time, so the assertions below prove disband
-    // actually clears it rather than merely finding no invite left over from an earlier step.
     realm.assert_call(
         "realm_guild_op",
         &[
@@ -300,8 +269,6 @@ fn disband_phase(realm: &Standalone, guild_id: &str) {
         1
     );
 
-    // Disband: Bob, the new leader, dissolves the Guild. Every table forgets it, and every
-    // member still in the Guild gets one addressed DISBANDED row.
     realm.assert_call("realm_guild_op", &[&actor(BOB), DISBAND]);
     assert!(realm
         .query_rows(&format!(
@@ -335,9 +302,6 @@ fn disband_phase(realm: &Standalone, guild_id: &str) {
     }
 }
 
-/// Runs only when requested because it builds and publishes the Wasm module to its own standalone.
-/// Found with GmCreate, then every membership op as a tokenless actor, phase by phase: invite,
-/// accept, decline, promote, demote, remove, pass leadership, disband.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn membership_moves_through_every_op_as_tokenless_actors() {
@@ -358,8 +322,6 @@ fn membership_moves_through_every_op_as_tokenless_actors() {
     disband_phase(&realm, &guild_id);
 }
 
-/// A lone Guild Leader's Leave disbands the Guild; a Guild Leader with company must pass
-/// leadership first. Separate Guilds so the two cases cannot interact.
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn leave_disbands_a_lone_leader_and_refuses_a_leader_with_company() {
@@ -396,7 +358,6 @@ fn leave_disbands_a_lone_leader_and_refuses_a_leader_with_company() {
         .query_rows("SELECT * FROM game_guild WHERE name = 'Company Guild'")
         .is_empty());
 
-    // An ordinary member's leave removes only that member.
     realm.assert_call("realm_guild_op", &[&actor(GRACE), LEAVE]);
     assert!(member_row(&realm, GRACE).is_none());
     assert!(!realm

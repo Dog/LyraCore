@@ -1,9 +1,3 @@
-//! The `apply_*` mutation cores that don't belong to the vendor economy (`economy.rs`) or the
-//! move/split/equip slot machinery (`inventory.rs`, split): grant / use items, take corpse loot,
-//! the starter-loadout grant, and the equipped-stat sum. Each is the shared core behind a thin player
-//! reducer and its debug twin (see `reducers.rs`). All effects are additive: they touch only the item
-//! rows + the actor's health/money.
-
 use crate::actor::{ActionRefusal, ActionRefusalKind};
 use spacetimedb::{Identity, ReducerContext, Table};
 
@@ -11,12 +5,12 @@ use lyracore_shared::constants::starter_item;
 use lyracore_shared::item::ItemRefusal;
 
 use super::{next_item_guid, refuse, select_property};
-use crate::game_character; // the durable char holds `class` (the live WorldEntity does not)
+use crate::game_character;
 use crate::game_corpse_loot;
 use crate::game_gameobject;
-use crate::game_spell_effect; // Gate A reads the on-use spell's effect kinds (by_spell) to mana-gate energize consumables
-use crate::game_start_item; // per-class starter loadout (CharStartOutfit via importer --dbc)
-use crate::game_world_entity; // gameobject (chest) loot source — apply_take_loot resolves it too
+use crate::game_spell_effect;
+use crate::game_start_item;
+use crate::game_world_entity;
 
 use super::inventory::{first_free_backpack_slot, first_free_bag_slot, is_carried_slot};
 use super::rules::{
@@ -26,22 +20,12 @@ use super::tables::{
     game_item_instance, game_item_template, item_in_slot, ItemInstance, ItemTemplate,
 };
 
-/// Grant the starter loadout to a character the first time it logs in, idempotently. Called from
-/// `player_login` once the live entity exists (so `owner_identity` is bound). A no-op if the
-/// character already owns any item (so a relog never duplicates). The single ownership guard at the
-/// top covers every grant below, so a relog never duplicates any of them. Each individual grant is
-/// skipped if its template isn't seeded (so login never depends on item data being loaded). The
-/// loadout is the EQUIPPED main-hand weapon plus a couple of loose backpack items, proving the
-/// inventory renders multiple distinct items at distinct slots. Additive: it only ever inserts into
-/// the two new item tables. [entity]
 pub(crate) fn grant_starter_item(
     ctx: &ReducerContext,
     owner_guid: u64,
     owner_identity: Identity,
 ) -> Result<(), String> {
     let instances = ctx.db.game_item_instance();
-    // Already has items → nothing to do (idempotent across relogs). This one guard gates every grant
-    // below, so the whole loadout is granted at most once per character.
     if instances
         .by_owner_guid()
         .filter(&owner_guid)
@@ -50,8 +34,6 @@ pub(crate) fn grant_starter_item(
     {
         return Ok(());
     }
-    // Grant one owned item at `slot`, only if its template is seeded (a missing template is skipped,
-    // never fatal to login). Allocation still refuses an exhausted GUID Range.
     let grant_one = |entry: u32, slot: u8, stack: u32| -> Result<(), String> {
         let Some(tmpl) = ctx.db.game_item_template().entry().find(entry) else {
             return Ok(());
@@ -68,18 +50,13 @@ pub(crate) fn grant_starter_item(
             stack_count: stack,
             durability: tmpl.max_durability,
             created_at: ctx.timestamp,
-            enchant_id: 0, // freshly minted loadout item — unenchanted
-            // BoP (bonding::BIND_ON_PICKUP) binds the instant it's granted — the starter kit is a
-            // grant source like any other.
+            enchant_id: 0,
             soulbound: binds_on_grant(tmpl.bonding),
             random_property_id,
-            item_text_id: 0, // no starter item carries readable text
+            item_text_id: 0,
         });
         Ok(())
     };
-    // Every character starts with a Hearthstone in the backpack (use it to recall to the bound home).
-    // Granted BEFORE the outfit/fallback branches so both paths get it; HEARTHSTONE_SLOT (38, last
-    // backpack) sits clear of the outfit's stow slots (from BACKPACK_SLOT_0 up). Skipped if unseeded.
     grant_one(
         starter_item::HEARTHSTONE_ENTRY,
         starter_item::HEARTHSTONE_SLOT,
@@ -104,23 +81,14 @@ pub(crate) fn grant_starter_item(
         let mut occupied: std::collections::HashSet<u8> = std::collections::HashSet::new();
         let mut backpack = starter_item::BACKPACK_SLOT_0;
         for entry in outfit {
-            // Skip the Hearthstone — it was already granted explicitly into HEARTHSTONE_SLOT above.
-            // CharStartOutfit lists 6948 for every race/class, so without this guard every new
-            // character would receive two Hearthstone rows (one equipped slot + one backpack copy).
+            // CharStartOutfit includes the Hearthstone already granted above.
             if entry == starter_item::HEARTHSTONE_ENTRY {
                 continue;
             }
             let Some(tmpl) = ctx.db.game_item_template().entry().find(entry) else {
                 continue;
             };
-            // Equippable (its inventory_type maps to a slot) → that slot; otherwise the next free backpack
-            // slot. `occupied` tracks slots filled this pass so a paired ring/trinket takes the free finger.
-            // `false` (Dual Wield) is correct here — a brand-new character has learned no spells yet,
-            // so the second-one-hander-to-offhand redirect never applies at grant time.
-            // Ammo (Projectile, class 6) starts as a FULL STACK. CharStartOutfit lists only the item id,
-            // not a count, so a flat grant of 1 gave hunters/rogues a single round — the first Auto Shot
-            // consumes it, then the ranged swing tick finds no ammo and cancels the auto-repeat (the shot
-            // never lands). Vanilla starts a hunter with 200. Non-ammo items grant 1 as before.
+            // CharStartOutfit omits counts; vanilla starting ammunition is 200 rounds.
             const CLASS_AMMO: u8 = 6;
             let count = if tmpl.class == CLASS_AMMO { 200 } else { 1 };
             match resolve_equip_slot(tmpl.inventory_type, false, |s| occupied.contains(&s)) {
@@ -137,20 +105,12 @@ pub(crate) fn grant_starter_item(
         return Ok(());
     }
 
-    // FALLBACK (pre-import / unseeded race_class): the hand-authored Warrior loadout — a weapon EQUIPPED in
-    // the main hand (slot 15) so the client renders it on the model, plus a couple of backpack items.
     grant_one(starter_item::ENTRY, starter_item::MAINHAND_SLOT, 1)?;
     grant_one(51, starter_item::BACKPACK_SLOT_0, 1)?;
     grant_one(52, starter_item::BACKPACK_SLOT_0 + 1, 5)?;
     Ok(())
 }
 
-/// Grant `count`× `item_entry` to `player_guid` — the canonical "mint an owned item" core, used by
-/// quest turn-in rewards ([`crate::quest`]) and available to any other give-an-item path. Looks up the
-/// player (for the RLS `owner_identity`) and the item template (for durability), then delegates to
-/// `store_item`, which tops up an existing partial stack first and spills the remainder across as many
-/// backpack/bag slots as it takes. A Refusal leaves inventory unchanged. Quest turn-in uses
-/// `exchange_items` to plan all consumption and rewards together. `count` is floored at 1.
 pub(crate) fn grant_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -205,9 +165,6 @@ pub(crate) fn request_grant_item(
     )
 }
 
-/// Top a profile-owned resource up to a fixed target. The target is capped at the largest
-/// supported ammunition stack so a malformed profile cannot turn periodic repair into an unlimited
-/// grant. Storage still owns capacity, uniqueness, and Random Property Gates.
 #[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn request_profile_item(
     ctx: &ReducerContext,
@@ -246,9 +203,7 @@ fn profile_item_target_admitted(target_count: u32) -> Result<(), ActionRefusal> 
     ))
 }
 
-/// Add items to matching carried stacks, then free backpack or bag slots.
-/// Capacity, uniqueness and every Random Property are resolved before changing any item, so callers may
-/// handle an inventory-full Refusal without keeping a partial grant.
+// Callers may catch a Refusal, so failed storage must leave inventory unchanged.
 pub(crate) fn store_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -287,20 +242,12 @@ fn store_item_typed(
     plan.commit(ctx)
 }
 
-/// The next slot an incoming item can land in: backpack first (23..=38), then the content slots of
-/// equipped bags in bag-equip order. `Err` is the full-bag refusal, and it is the ONE the whole
-/// server answers with — [`store_item`] and [`store_instance_state`] both come here, so a mail take
-/// and a vendor buy cannot disagree about whether there is room.
 pub(crate) fn free_slot(ctx: &ReducerContext, player_guid: u64) -> Result<u8, String> {
     first_free_backpack_slot(ctx, player_guid)
         .or_else(|| first_free_bag_slot(ctx, player_guid))
         .ok_or_else(|| lyracore_shared::mail::INVENTORY_FULL.to_string())
 }
 
-/// Is there anywhere for one more item to land? [`free_slot`]'s boolean twin, for a caller that
-/// wants the answer BEFORE it starts moving value it cannot put back — the sharded mail take probes
-/// the recipient's shard with this so a full bag refuses the click instead of stranding the item in
-/// an escrow.
 pub(crate) fn has_free_slot(ctx: &ReducerContext, player_guid: u64) -> bool {
     free_slot(ctx, player_guid).is_ok()
 }
@@ -313,7 +260,7 @@ pub(crate) struct ItemSnapshot {
     pub enchant_id: u32,
     pub soulbound: bool,
     pub random_property_id: u32,
-    /// `ITEM_FIELD_ITEM_TEXT_ID` of a Plain Letter from a Letter Copy. 0 for every other item.
+    // ITEM_FIELD_ITEM_TEXT_ID; zero except on a Letter Copy.
     pub item_text_id: u32,
 }
 
@@ -337,7 +284,6 @@ impl From<&ItemInstance> for ItemSnapshot {
     }
 }
 
-/// Recreates an exact item snapshot, applying only template grant-time constraints.
 pub(crate) fn store_instance_state(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -347,9 +293,6 @@ pub(crate) fn store_instance_state(
     snapshot: &ItemSnapshot,
 ) -> Result<(), String> {
     let slot = free_slot(ctx, player_guid)?;
-    // Trade allocates before deleting either side's outgoing rows: otherwise an emptied inventory
-    // can re-mint a guid deleted earlier in the same transaction and the item relay sees UPDATE
-    // instead of CREATE. Mail can safely allocate at insertion time.
     let guid = match preallocated_guid {
         Some(guid) => guid,
         None => next_item_guid(ctx)?,
@@ -360,14 +303,11 @@ pub(crate) fn store_instance_state(
         owner_identity,
         owner_guid: player_guid,
         slot,
-        // Clamped to the template's own stack cap: the snapshot is durable data that outlives a
-        // template edit, and a row above the cap would render as an impossible stack.
+        // Snapshots can outlive template edits, including a lower stack cap.
         stack_count: snapshot.stack_count.max(1).min(tmpl.max_stack.max(1)),
         durability: snapshot.durability,
         created_at: ctx.timestamp,
         enchant_id: snapshot.enchant_id,
-        // The recorded bind state, ORed with the template's grant-time rule — `store_item`'s
-        // expression exactly, so an arriving item cannot end up less bound than a granted one.
         soulbound: snapshot.soulbound || binds_on_grant(tmpl.bonding),
         random_property_id: snapshot.random_property_id,
         item_text_id: snapshot.item_text_id,
@@ -375,15 +315,7 @@ pub(crate) fn store_instance_state(
     Ok(())
 }
 
-/// Store one letter granted by a Letter Copy: a fresh `item_entry` instance carrying
-/// `item_text_id` in `ITEM_FIELD_ITEM_TEXT_ID`. `free_slot` is both the capacity Gate and the slot
-/// choice — the same one every other item grant uses, so a letter and a mail take can never
-/// disagree about whether there is room. `Err(INVENTORY_FULL)` on a full bag, unchanged.
-///
-/// Idempotent by text id: a retry reaching this after an earlier call already granted the same
-/// `item_text_id` (a resent packet, or a Gateway that never learned its own driven call landed) is
-/// a no-op success, not a second letter. The owner-guid index keeps the check O(the player's own
-/// items), never a whole-table scan.
+// Retry identity is item_text_id, so a lost reply cannot duplicate a Letter Copy.
 pub(crate) fn grant_letter_item(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -418,7 +350,7 @@ pub(crate) fn grant_letter_item(
         stack_count: 1,
         durability: tmpl.max_durability,
         created_at: ctx.timestamp,
-        enchant_id: 0, // a freshly minted letter — unenchanted
+        enchant_id: 0,
         soulbound: binds_on_grant(tmpl.bonding),
         random_property_id: 0,
         item_text_id,
@@ -426,7 +358,6 @@ pub(crate) fn grant_letter_item(
     Ok(())
 }
 
-/// Carried quantity of `item_entry` for collect-quest completion and turn-in.
 pub(crate) fn item_count(ctx: &ReducerContext, owner_guid: u64, item_entry: u32) -> u32 {
     lyracore_shared::item::carried_quantity(
         item_entry,
@@ -438,8 +369,7 @@ pub(crate) fn item_count(ctx: &ReducerContext, owner_guid: u64, item_entry: u32)
     )
 }
 
-/// Remove exactly `count` carried units, lowest slot first. Missing quantity leaves every item
-/// unchanged, even when the caller retains the Refusal and continues its reducer.
+// A caught Refusal must leave every stack unchanged.
 pub(crate) fn remove_items(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -450,7 +380,6 @@ pub(crate) fn remove_items(
     let mut stacks: Vec<ItemInstance> = instances
         .by_owner_guid()
         .filter(&owner_guid)
-        // A turn-in consumes carried stacks only; the bank is never silently emptied.
         .filter(|i| is_carried_slot(i.slot) && i.entry == item_entry)
         .collect();
     let original_counts: Vec<u32> = stacks.iter().map(|item| item.stack_count).collect();
@@ -487,8 +416,7 @@ pub(crate) fn carried_items(ctx: &ReducerContext, owner_guid: u64) -> Vec<ItemIn
         .collect()
 }
 
-/// Restore a failed craft before its item changes become visible to the Gateway. This also
-/// removes products from earlier effects in the same craft, without minting refund identities.
+// Restore original identities and remove prior craft products before the transaction commits.
 pub(crate) fn restore_carried_items(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -504,18 +432,12 @@ pub(crate) fn restore_carried_items(
     crate::trade::refresh_offer(ctx, owner_guid);
 }
 
-/// "Recently Bandaged" debuff spell id (vanilla 11196) — already seeded (a 60s `A_FLAG` marker aura, no
-/// tick). The bandage's eff1 `E_TRIGGER` applies it, and `apply_item_use` gates on `has_aura(.., this)`
-/// BEFORE consuming/casting so a player can't re-bandage while it is live (vanilla's anti-spam window).
-/// Reusing the existing 11196 row avoids seeding a new cooldown spell entirely.
 pub(crate) const RECENTLY_BANDAGED_SPELL: u32 = 11196;
 
 fn use_spell_for(tmpl: &ItemTemplate) -> Option<u32> {
     (tmpl.spellid_1 != 0 && tmpl.spelltrigger_1 == 0).then_some(tmpl.spellid_1)
 }
 
-/// Recall items, mounts and hostile summon quest items remain in the bag after use.
-/// The effect kind is the authority; the quest item is also needed for retries.
 fn spell_keeps_item(ctx: &ReducerContext, spell_id: u32) -> bool {
     let reusable_effect = ctx
         .db
@@ -531,22 +453,10 @@ fn spell_keeps_item(ctx: &ReducerContext, spell_id: u32) -> bool {
     reusable_effect || crate::mount::spell_is_mount(ctx, spell_id)
 }
 
-/// Is `entry` a BANDAGE AND is its cooldown debuff (`RECENTLY_BANDAGED_SPELL`) currently live on the
-/// user? The pure half of the re-bandage gate (the `has_aura` presence is the ctx half) — split out so
-/// the "a bandage is cooldown-gated, other consumables are not" decision is unit-testable without a ctx.
-/// BOTH bandage entries (real items 1251 Linen + 2581 Heavy Linen) are gated — in vanilla ALL bandages
-/// share the single "Recently Bandaged" lockout (Gate B), so a player can't alternate 1251/2581 to bypass
-/// the window. Every other consumable returns false (no cooldown), so the gate is a no-op for the
-/// potion/food/water (baseline-safe).
 fn bandage_cooldown_blocks(entry: u32, has_cooldown_debuff: bool) -> bool {
     matches!(entry, 1251 | 2581) && has_cooldown_debuff
 }
 
-/// Is `player_guid`'s class a MANA class? (class lives on `game_character`, not the live entity). Gates
-/// every POWER-restoring consumable — the legacy drink branch (water without an on-use spell) AND Gate A
-/// for the new mapped energize consumables (mana potion / drink). A non-mana class (Warrior/Rogue) using a
-/// power consumable would otherwise preload rage/energy out of combat (the reducer-validation-sweep
-/// exploit). A missing character row fails closed (treated as non-mana). [entity]
 fn is_mana_class(ctx: &ReducerContext, player_guid: u64) -> bool {
     ctx.db
         .game_character()
@@ -559,10 +469,6 @@ fn is_mana_class(ctx: &ReducerContext, player_guid: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Does the on-use `spell_id` RESTORE POWER (an `E_ENERGIZE` instant or an `A_PERIODIC_ENERGIZE` drink)?
-/// The pure-data half of Gate A: a power-restoring consumable is gated to mana classes (`is_mana_class`).
-/// Reads `game_spell_effect` by the `by_spell` index — `true` if ANY effect is an energize kind. A heal /
-/// HoT / food / buff has no energize effect → `false` → ungated (class-agnostic). [entity]
 fn spell_restores_power(ctx: &ReducerContext, spell_id: u32) -> bool {
     ctx.db
         .game_spell_effect()
@@ -571,14 +477,6 @@ fn spell_restores_power(ctx: &ReducerContext, spell_id: u32) -> bool {
         .any(|e| e.kind == crate::spell::E_ENERGIZE || e.kind == crate::spell::A_PERIODIC_ENERGIZE)
 }
 
-/// Shared use-an-item logic for the player + debug paths: resolve the item -> run its gates -> consume
-/// one unit (unless it's a non-consuming recall item) -> `begin_cast` its `spellid_1`. `spellid_1`
-/// (trigger 0) is the SINGLE on-use authority — this retired the old three-mechanism `apply_item_use`
-/// (a hardcoded Hearthstone special case, the `USE_EFFECTS` shadow-map, and a legacy vital-restore
-/// fallback with its own duplicated mana gate): every usable item, consumable or not (a potion, a
-/// bandage, the Engineering bomb, the Hearthstone), now resolves through ONE lookup and ONE cast path.
-/// Errors if the user is dead, the slot is empty, the template is missing, or the item carries no on-use
-/// spell. Additive — touches only the item row(s) + whatever `begin_cast`'s effect list touches. [entity]
 pub(crate) fn apply_item_use(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -601,7 +499,6 @@ pub(crate) fn apply_item_use(
     if crate::trade::item_is_offered(ctx, player_guid, inst.guid) {
         return Err(ItemRefusal::NotRightNow);
     }
-    // A banked item must be taken out before it can be used — the bank is not a second action bar.
     if !is_carried_slot(inst.slot) {
         return Err(refuse(
             ItemRefusal::ItemNotUsable,
@@ -619,48 +516,33 @@ pub(crate) fn apply_item_use(
                 format!("no template for item entry {}", inst.entry),
             )
         })?;
-    // spellid_1 (trigger 0) is the item's on-use spell — the single authority now. No mapped
-    // spell means nothing to "use" (a plain reagent, a piece of gear, an un-migrated item).
     let spell_id = use_spell_for(&tmpl).ok_or_else(|| {
         refuse(
             ItemRefusal::ItemNotUsable,
             format!("item {} is not consumable", inst.entry),
         )
     })?;
-    // Required-level gate: a too-high item can sit in the bag, but can't be USED. Seeded items are
-    // required_level 1, so this never trips for the loadout.
-    // Vanilla's level result carries the required level in the packet, and a Refusal tag has no
-    // payload, so a level Gate reads as the generic "can never use that item".
+    // The level-specific packet needs a level payload, which ItemRefusal cannot carry.
     if !meets_required_level(player.level, tmpl.required_level) {
         return Err(refuse(
             ItemRefusal::ItemNotUsable,
             format!("requires level {}", tmpl.required_level),
         ));
     }
-    // RE-BANDAGE GATE (vanilla "Recently Bandaged"): refuse the BANDAGE while its cooldown debuff is
-    // live — BEFORE consuming the item or casting, so a blocked re-bandage costs nothing. `has_aura`
-    // keys on the existing 11196 marker (applied by the bandage's E_TRIGGER eff1). Only the bandage is
-    // gated; every other consumable skips it (pure `bandage_cooldown_blocks` decides).
     if bandage_cooldown_blocks(
         inst.entry,
         crate::spell::has_aura(ctx, player_guid, RECENTLY_BANDAGED_SPELL),
     ) {
         return Err(refuse(ItemRefusal::NotRightNow, "Recently Bandaged"));
     }
-    // GATE A (the one surviving mana-class gate, retired its legacy-branch duplicate): a mana potion
-    // / drink restores POWER through E_ENERGIZE / A_PERIODIC_ENERGIZE — for a non-mana class that is
-    // rage/energy, the out-of-combat preload exploit. `begin_cast` has no power-class gate of its own, so
-    // DENY a power-restoring on-use spell here, BEFORE consuming/casting, when the user isn't a mana
-    // class. Only energize spells are gated (`spell_restores_power`); a heal/HoT/food/buff/recall is
-    // class-agnostic (Warriors can quaff a healing potion / eat / hearth).
+    // Energize restores rage or energy on non-mana classes, allowing out-of-combat preloading.
     if spell_restores_power(ctx, spell_id) && !is_mana_class(ctx, player_guid) {
         return Err(refuse(
             ItemRefusal::ItemNotUsable,
             "only mana users can use that",
         ));
     }
-    // Reusable spells keep the item. Other casts consume one unit on admission;
-    // a Refusal from begin_cast rolls back this inventory change with the Durable Request.
+    // Propagate cast Refusals so the reducer rolls back item consumption.
     if !spell_keeps_item(ctx, spell_id) {
         if inst.stack_count > 1 {
             inst.stack_count -= 1;
@@ -669,9 +551,6 @@ pub(crate) fn apply_item_use(
             instances.guid().delete(inst.guid);
         }
     }
-    // Cast at SELF. `begin_cast` runs the full effect list, emits the cast-START/GO events the gateway
-    // relays, and routes channeled, timed, and instant casts from the spell header. No
-    // per-item branching here.
     crate::spell::begin_cast(
         ctx,
         player_guid,
@@ -684,7 +563,6 @@ pub(crate) fn apply_item_use(
     .map_err(|detail| refuse(ItemRefusal::NotRightNow, detail))
 }
 
-/// Project owned item rows for the shared resistance fold.
 pub(crate) fn resistance_items(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -726,7 +604,6 @@ pub(crate) fn resistance_items(
         })
 }
 
-/// One item's template, applied enchantment, and Random Property contribution to a Stat Kind.
 fn item_stat_bonus_for_school(
     ctx: &ReducerContext,
     item: &ItemInstance,
@@ -793,12 +670,10 @@ fn equipped_stat_bonus_for_school(
     )
 }
 
-/// Sum one Stat Kind across working items in the equipment region.
 pub(crate) fn equipped_stat_bonus(ctx: &ReducerContext, owner_guid: u64, which: EquipStat) -> i32 {
     equipped_stat_bonus_for_school(ctx, owner_guid, which, u32::MAX)
 }
 
-/// The school-filtered form used by spell power. Effects with a zero school mask apply to every school.
 pub(crate) fn equipped_school_stat_bonus(
     ctx: &ReducerContext,
     owner_guid: u64,
@@ -808,23 +683,14 @@ pub(crate) fn equipped_school_stat_bonus(
     equipped_stat_bonus_for_school(ctx, owner_guid, which, u32::from(school_mask))
 }
 
-/// The pure per-item durability-loss formula `apply_death_durability_loss` applies to each equipped
-/// piece: 10% of MAX durability (rounded down, at least 1), saturating so it never wraps below 0.
-/// Returns the item UNCHANGED (no loss) when it has no durability concept (`max_durability == 0`) or is
-/// already broken (`durability == 0`) — matching the live gate that skips both cases. Extracted from
-/// `apply_death_durability_loss` (pure code-motion) so the formula is unit-tested without a live module.
 pub(crate) fn death_durability_loss(max_durability: u32, durability: u32) -> u32 {
     if max_durability == 0 || durability == 0 {
-        return durability; // no durability concept, or already broken — untouched
+        return durability;
     }
-    let loss = (max_durability / 10).max(1); // 10% of max, at least 1
+    let loss = (max_durability / 10).max(1);
     durability.saturating_sub(loss)
 }
 
-/// On a player's DEATH, every equipped item with a durability concept loses 10% of its MAX durability
-/// (rounded down, at least 1) — vanilla's dominant durability sink, on top of the slow per-swing wear
-/// (`combat::wear_weapon`). Saturates at 0 (a broken item gives unarmed/no-stats until repaired).
-/// Player-death only — creatures don't wear gear. Collect-then-mutate (don't write the table mid-scan).
 pub(crate) fn apply_death_durability_loss(ctx: &ReducerContext, player_guid: u64) {
     let instances = ctx.db.game_item_instance();
     let templates = ctx.db.game_item_template();
@@ -844,16 +710,6 @@ pub(crate) fn apply_death_durability_loss(ctx: &ReducerContext, player_guid: u64
     }
 }
 
-/// Typed take-an-item-from-a-corpse request for Package callers and the legacy player adapter
-/// (`CMSG_AUTOSTORE_LOOT_ITEM`):
-/// move one `game_corpse_loot` item into the looter's backpack. Validates the looter is in world and
-/// alive, the corpse exists / is dead / is on the same map; resolves the loot row at `loot_slot`, mints
-/// a fresh owned `ItemInstance` in the first free backpack slot, then DELETES the consumed loot row.
-/// Re-derives the corpse `LOOTABLE` flag after consuming (`loot::refresh_lootable` — cleared only
-/// when no rows remain AND money is 0). Errors if the looter is dead, the corpse is
-/// missing/alive/on another map, the Loot Tag excludes the looter, the slot has no loot, the item
-/// template is missing, or the backpack is full. Creature corpses clone quest rows to their resolved
-/// eligibility set. GameObjects retain their current-group clone behavior. [entity]
 pub(crate) fn request_take_loot(
     ctx: &ReducerContext,
     player_guid: u64,
@@ -864,17 +720,12 @@ pub(crate) fn request_take_loot(
     let player = entities.guid().find(player_guid).ok_or_else(|| {
         ActionRefusal::new(ActionRefusalKind::MissingActor, "looter not in world")
     })?;
-    // Death is server-authoritative everywhere — a dead/ghost looter can't take loot (mirrors loot_money).
     if player.dead {
         return Err(ActionRefusal::new(
             ActionRefusalKind::DeadActor,
             "dead players cannot loot",
         ));
     }
-    // The loot source is EITHER a dead creature corpse (game_world_entity) OR a used gameobject
-    // (game_gameobject — a chest, whose `use_gameobject` rolled rows into game_corpse_loot keyed on its
-    // guid). Resolve the source position for the range gate; a missing/alive corpse or an unknown guid
-    // is rejected. The dead-creature branch is byte-identical to before.
     let (src_map, src_instance, sx, sy, sz, source_is_corpse) =
         if let Some(corpse) = entities.guid().find(corpse_guid) {
             if !corpse.dead {
@@ -923,9 +774,6 @@ pub(crate) fn request_take_loot(
             "loot in another instance",
         ));
     }
-    // Range gate (anti-exploit), mirroring the money path `loot_money` — a client can't autostore a
-    // corpse's item from across the map. Shares the same `LOOT_RANGE_SQ` (10 yd)² so the loot paths
-    // never drift.
     let (dx, dy, dz) = (sx - player.x, sy - player.y, sz - player.z);
     if dx * dx + dy * dy + dz * dz > crate::loot::LOOT_RANGE_SQ {
         return Err(ActionRefusal::new(
@@ -933,7 +781,6 @@ pub(crate) fn request_take_loot(
             "loot out of range",
         ));
     }
-    // The specific loot-window row the client asked for. `by_corpse` then match the slot index.
     let loot = ctx.db.game_corpse_loot();
     let row = loot
         .by_corpse()
@@ -942,11 +789,6 @@ pub(crate) fn request_take_loot(
         .ok_or_else(|| {
             ActionRefusal::new(ActionRefusalKind::MissingTarget, "no loot in that slot")
         })?;
-    // Quest-only rows: the TAKER's OWN need is re-validated server-side (the
-    // gateway's window is a display hint, not authoritative) — an unreserved row (`reserved_for == 0`,
-    // the shared row nobody has split yet) is claimable by anyone who currently needs it; an already
-    // per-member-reserved clone is claimable ONLY by its reserved owner. A non-quest row (the common
-    // case) skips this entirely — unconditional FFA, byte-identical to before.
     if row.quest_only {
         let needs = crate::loot::killer_needs_item(ctx, Some(player_guid), row.item_entry);
         if !crate::loot::quest_take_allowed(row.reserved_for, player_guid, needs) {
@@ -966,10 +808,6 @@ pub(crate) fn request_take_loot(
         row.designated_looter_guid,
         player_guid,
     ) {
-        // Group loot methods: a NEED/GREED winner-locked row
-        // (`reserved_for`), a MASTER-only row, or a round-robin/below-threshold row designated to
-        // someone else all reject the plain autostore path here — server-authoritative, the gateway's
-        // per-viewer loot-window filter (`reads.rs`) is a display hint only.
         return Err(ActionRefusal::new(
             ActionRefusalKind::CannotAct,
             if row.master_only {
@@ -990,9 +828,7 @@ pub(crate) fn request_take_loot(
                 format!("no template for item entry {}", row.item_entry),
             )
         })?;
-    // Auto-store with stacking (parity): a looted stackable tops up a matching partial stack first,
-    // then spills into free slots (visible only to its owner via owner_identity). `?` so an inventory-full
-    // loot rolls back and the loot row stays for a retry.
+    // Grant before deleting the loot row; failed storage leaves it available for retry.
     store_item_typed(
         ctx,
         player_guid,
@@ -1002,13 +838,9 @@ pub(crate) fn request_take_loot(
         false,
         Some(row.random_property_id),
     )?;
-    // Consume the loot: remove the row so a second take can't dupe it.
     let (item_entry, count) = (row.item_entry, row.count.max(1));
     let (was_quest_only, was_unreserved) = (row.quest_only, row.reserved_for == 0);
     loot.id().delete(row.id);
-    // The first take of a shared quest-only row grants the other still-needing recipients their own
-    // reserved clone. Creature corpses use their resolved eligibility set. GameObjects keep the
-    // existing current-group calculation.
     if was_quest_only && was_unreserved {
         if source_is_corpse {
             crate::loot::clone_quest_loot_for_eligible(
@@ -1030,12 +862,9 @@ pub(crate) fn request_take_loot(
             );
         }
     }
-    // The flag follows the rule (rows remain OR money > 0) — taking the LAST item of a no-money
-    // corpse must drop the loot cursor. Gameobject sources carry no dynamic flag; skip them.
     if source_is_corpse {
         crate::loot::refresh_lootable(ctx, corpse_guid);
     }
-    // Notify-hook: one item stack looted (player + debug loot both route through this core).
     crate::hooks::fire_on_loot(
         ctx,
         &crate::hooks::LootPayload {
@@ -1076,35 +905,23 @@ mod tests {
         assert!(profile_item_target_admitted(200).is_ok());
     }
 
-    /// `use_spell_for`: `spellid_1` is the on-use spell IFF it's nonzero AND `spelltrigger_1` names
-    /// the on-use trigger slot (0 — `ItemSpellTriggerType::OnUse`). A trigger-1 (on-equip) spell is NOT
-    /// an on-use cast even with a nonzero id, and a zero `spellid_1` (a plain reagent/gear piece/
-    /// un-migrated item) resolves to `None` regardless of its trigger byte. Replaces the old hardcoded
-    /// `USE_EFFECTS` shadow-map drift guard — now there is nothing to drift, `spellid_1` IS the data.
     #[test]
     fn use_spell_for_reads_spellid_1_gated_on_the_on_use_trigger() {
         let mut tmpl = crate::seed::base_item(1, "x");
         tmpl.spellid_1 = 50110;
         tmpl.spelltrigger_1 = 0;
-        assert_eq!(use_spell_for(&tmpl), Some(50110)); // nonzero + trigger 0 -> the on-use cast
+        assert_eq!(use_spell_for(&tmpl), Some(50110));
 
         tmpl.spellid_1 = 0;
-        assert_eq!(use_spell_for(&tmpl), None); // no spell at all
+        assert_eq!(use_spell_for(&tmpl), None);
 
         tmpl.spellid_1 = 50110;
-        tmpl.spelltrigger_1 = 1; // trigger 1 = on-equip, NOT on-use
+        tmpl.spelltrigger_1 = 1;
         assert_eq!(use_spell_for(&tmpl), None);
     }
 
-    /// The re-bandage cooldown gate (the pure half — `has_aura` is the ctx half): a BANDAGE use is blocked
-    /// ONLY while the "Recently Bandaged" (11196) debuff is live; once it expires the bandage is usable
-    /// again. NO other consumable is cooldown-gated — a potion/food use is never blocked, even if a stray
-    /// 11196 aura were present (only the bandage entry gates). This is the load-bearing anti-spam gate.
     #[test]
     fn bandage_cooldown_gate_blocks_only_the_bandage_while_debuff_is_live() {
-        // BOTH bandages (real items 1251 Linen + 2581 Heavy Linen) are blocked iff the cooldown debuff is up
-        // and usable once it has expired — Gate B: vanilla shares ONE "Recently Bandaged" lockout across all
-        // bandages, so 1251/2581 can't be alternated to bypass the window.
         assert!(
             bandage_cooldown_blocks(1251, true),
             "re-bandage blocked while Recently Bandaged is live"
@@ -1121,23 +938,18 @@ mod tests {
             !bandage_cooldown_blocks(2581, false),
             "rank-2 bandage usable once the cooldown expired"
         );
-        // Potion (real 118) and food (real 2681) are NEVER cooldown-gated — the gate is bandage-only.
         assert!(!bandage_cooldown_blocks(118, true));
         assert!(!bandage_cooldown_blocks(2681, true));
-        // The gate keys on the real seeded debuff id (a drift guard if 11196 ever moves).
         assert_eq!(RECENTLY_BANDAGED_SPELL, 11196);
     }
 
-    /// DEATH DURABILITY LOSS: 10% of MAX durability, rounded down, floored at 1 — and saturating (never
-    /// wraps below 0). A 0-durability item (already broken) or a no-durability-concept template
-    /// (`max_durability == 0`) is left UNTOUCHED, matching the live gate that skips both.
     #[test]
     fn death_durability_loss_is_ten_percent_of_max_floored_at_one_and_saturating() {
-        assert_eq!(death_durability_loss(100, 100), 90); // 10% of 100 = 10
-        assert_eq!(death_durability_loss(10, 10), 9); // 10% of 10 = 1 (exact)
-        assert_eq!(death_durability_loss(5, 5), 4); // 10% of 5 floors to 0 -> floored up to 1
-        assert_eq!(death_durability_loss(100, 5), 0); // loss (10) saturates at 0, never wraps
-        assert_eq!(death_durability_loss(100, 0), 0); // already broken -> untouched
-        assert_eq!(death_durability_loss(0, 50), 50); // no durability concept -> untouched
+        assert_eq!(death_durability_loss(100, 100), 90);
+        assert_eq!(death_durability_loss(10, 10), 9);
+        assert_eq!(death_durability_loss(5, 5), 4);
+        assert_eq!(death_durability_loss(100, 5), 0);
+        assert_eq!(death_durability_loss(100, 0), 0);
+        assert_eq!(death_durability_loss(0, 50), 50);
     }
 }

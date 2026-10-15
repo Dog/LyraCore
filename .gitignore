@@ -1,67 +1,40 @@
 /target
 **/*.rs.bk
 
-# Local lifecycle state, logs, generated Gateway bindings, process ownership locks, and tool caches: the `lyracore`
-# CLI (.lyracore/cli/<rev>/) and the wire harness (.lyracore/wire-harness/<sha>/, #246 — a checkout
-# of LyraCoreProject/wire-harness plus its own target/, which is why this must stay ignored).
 /.lyracore/
 
-# Operator-pulled third-party data (cmangos classic-db) + generated bundles — NEVER committed (licensing firewall)
 /.import/
 
-# Blizzard client data — extracted DBCs / MPQ archives are COPYRIGHTED and MUST NEVER be committed.
-# The importer parses the operator's own client MPQs IN MEMORY and emits only derived game_* values;
-# this is a backstop in case a stray extract is ever written to the tree (the code never writes one).
+# Client archives and extracted game data must stay local.
 **/*.dbc
 **/*.MPQ
 **/*.mpq
 DBFilesClient/
 
-# Runtime logs (gateway/wine stderr captured by the wow-mcp harness) — never committed.
 gateway/gateway-stderr.log
 *-stderr.log
 
-# Stray `cargo doc` output at repo root.
 /doc/
 
-# Heap-profiling output from the `dhat-heap` feature (work-item 292, Runbook C).
 dhat-heap.json
 __pycache__/
 
-# cargo-mutants report output. Regenerated on every run, so it is never committed. This repository
-# carries no mutants configuration file; the maintainers run cargo-mutants from their own repository.
 /mutants.out/
 /mutants.out.old/
 .scratch/
 
-# Research notes stay local.
 /docs/research/
 /docs/verification/*-research.md
 
-# Agent-created Git worktrees are local execution state, not repository content.
 /.claude/worktrees/
 
-# Local fan-out briefs are agent execution state, not repository content.
 /.claude/tickets/
 
-# The Datascript toolchain's Bun project. `package.json`, `bun.lock`, `tsconfig.json` and the
-# Datascripts under `src/` ARE committed — the pin and the code are repository content.
-#
-# `generated/` is not: it is a ~400-file, 2 MB projection of the Module wasm that
-# `lyracore packages build` reproduces from `spacetime generate --lang typescript` on every run.
-# Committing it would put a large mechanical diff in every schema change and, worse, create a
-# second source of truth that can disagree with the Module. The Module is the schema's authority.
-#
-# `generated/base-snapshot.json` rides the same rule for a second reason: the importer derives it
-# from the OPERATOR's own client data (`--spell-snapshot`). It carries only mapped `game_*` values,
-# never client bytes, but it is the operator's own derived data and stays on the operator's machine.
 /datascripts/generated/
 /datascripts/node_modules/
 /datascripts/runtime-scripts/node_modules/
 
-# Installed Packages are local to this checkout. Reference Packages live in the collection.
 /packages/*
 !/packages/README.md
 
-# Generated Package output stays local. The collection may commit Script Artifacts, never Deltas.
 /packages/*/data/.generated/

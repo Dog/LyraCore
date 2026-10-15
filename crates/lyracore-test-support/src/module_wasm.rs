@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Build once per test process and retain immutable bytes. Publishers copy these into their own
-/// directories so concurrent fixtures never share the CLI optimizer's output file.
+// Each publisher needs its own copy because the CLI optimizer rewrites its input.
 pub fn module_bytes() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     WASM.get_or_init(build_module_bytes)
@@ -25,7 +24,6 @@ fn build_module_bytes() -> Vec<u8> {
     bytes
 }
 
-/// Build the managed Gateway source once per test process and return its exact artifact.
 pub fn gateway_binary() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY.get_or_init(|| build_artifact("lyracore-gateway", "lyracore-gateway", &[]))

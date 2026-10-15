@@ -2,25 +2,14 @@ use super::super::*;
 
 #[derive(Default)]
 pub(crate) struct QuestState {
-    /// Quest-giver evals returned by `giver_quest_evals` (the menu/status input).
     pub(crate) quest_evals: Vec<codec::GiverQuestEval>,
-    /// Quest details `quest_detail_view(id)` resolves from (matched by `quest_id`).
     pub(crate) quest_details: Vec<codec::QuestDetailView>,
-    /// The player's quest-log slots `player_quest_log` returns (drives the login descriptor block).
     pub(crate) quest_log_slots: Vec<codec::update_mask::QuestLogSlot>,
     pub(crate) quest_log_read_error: Option<String>,
     pub(crate) quest_log_after_subscribe:
         Option<Result<Vec<codec::update_mask::QuestLogSlot>, String>>,
-    /// Recorded `turn_in_quest` dispatches: (actor, giver, quest, reward_index) — so the
-    /// choose-reward socket test asserts the player's pick reached the store unchanged.
     pub(crate) turned_in: std::sync::Mutex<Vec<(u64, u64, u32, u32)>>,
-    /// A Reward Letter a successful `turn_in_quest` files as Escrow for the Character, as
-    /// `gw_turn_in_quest` does in its own transaction.
     pub(crate) turn_in_reward_letter: Option<crate::world::mail::HeldEscrow>,
-    /// The caller's quest log for `quest_status`, as `(quest_id, rewarded)` pairs — a quest id present
-    /// here is "taken"; `rewarded` distinguishes active vs. turned-in. Absent = never seen.
-    /// Behind a `Mutex` so a test can change the log WHILE a gossip window is open — the
-    /// HELLO→SELECT race the menu snapshot exists to close.
     pub(crate) quest_log: std::sync::Mutex<Vec<(u32, bool)>>,
 }
 
@@ -66,7 +55,6 @@ impl QuestActionStore for WorldFake {
         Ok(())
     }
 
-    /// No socket test drives an item-started quest — the route is proved at the quest seam.
     fn item_start_quest(&self, _owner_guid: u64, _slot: u8) -> Option<(u64, u32)> {
         None
     }

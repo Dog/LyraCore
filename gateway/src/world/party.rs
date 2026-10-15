@@ -1,43 +1,3 @@
-//! Realm-wide party state — the GROUP slice of realm-core's social & economy plane, part of the
-//! elastic world-sharding design.
-//!
-//! # What moved, and why here
-//!
-//! `game_group` / `game_group_member` / `game_group_invite` are authoritative on **realm-core**.
-//! None of the three is coupled to space — the spec's partition rule — and all three silently became
-//! shard-local the moment a second database existed: `group_invite` resolved its target inside the
-//! CALLING database, so a player inside Deadmines could not invite one standing in Elwynn, and the
-//! escrowed transfer's interim membership mirror was a snapshot taken at `begin_transfer`, so a party
-//! SPLIT across the boundary never saw itself. Both were observed live (2026-07-25), not theorised.
-//!
-//! This module is the ROUTING half of the fix and the only place that decides which database a party
-//! op runs against. Everything in it is generic over the Store families, so the decisions execute under
-//! test against the same in-memory shard topology the cross-database transfer uses — the seam the
-//! transfer-transport test harness built. The database-specific halves are thin: `Coordinator`'s
-//! trait impl (which database a handle names) and the module's `realm_group_op` (the rules, unchanged).
-//!
-//! # The three planes
-//!
-//! 1. **Realm-core** owns membership. Ops go there through the operator-gated `realm_group_op`, and
-//!    it is where invites, rosters and the leadership/disband rules live. One authority, so an invite
-//!    across a shard boundary is not a special case — it is the only case.
-//! 2. **Each world shard** keeps a MIRROR of the roster, refreshed by [`sync_mirrors`] after every op
-//!    and by [`on_world_entry`] when a character arrives. It exists because ~fifty in-world reads
-//!    (kill-XP split, quest credit, loot rules, the party's dungeon binding) resolve
-//!    membership locally on the hot path and must not become cross-database calls. Same relationship
-//!    `game_account`/`game_session` have had with realm-core from the start.
-//! 3. **A single-database gateway** has no realm-core to route to ([`ShardRoutingStore::realm_store`]
-//!    answers `None`), so every op takes the pre-realm-core path: the player's own connection, the
-//!    player-facing reducer, the shard's own tables. Byte-identical, and pinned by
-//!    `an_unsharded_gateway_runs_every_party_op_on_the_players_own_shard`.
-//!
-//! # What did NOT move
-//!
-//! `/say`-range chat, `/yell` and targeted emotes stay on the world shards as AOI-scoped events:
-//! they ARE spatial, which is the same rule that moved membership off them. Party (`/p`) chat is a
-//! Realm Chat Line: Realm-core reads its own membership in the transaction that writes the line, so
-//! the mirror plays no part in who hears it.
-
 use crate::world::{CharacterStore, SessionStore, ShardRoutingStore, SocialStore};
 use std::time::{Duration, Instant};
 
@@ -50,10 +10,7 @@ use lyracore_shared::group::{
     COMMAND_RESULT_WINDOW_MICROS,
 };
 
-/// Party membership: Realm-core group ops, roster reads, World Shard mirrors and companion commands.
 pub(crate) trait PartyStore: Send + Sync {
-    /// Admit and claim one Group Intent against current World Shard state. Refusals include a
-    /// consumed intent or suppressed action. Transport failures remain distinct.
     fn claim_bot_invite_intent(&self, intent_id: u64) -> Result<PartyOutcome>;
 
     fn claim_party_command_intent(&self, intent_id: u64, claim_token: u64) -> Result<()>;
@@ -89,13 +46,8 @@ pub(crate) trait PartyStore: Send + Sync {
 
     fn entity_partition(&self, guid: u64) -> Option<(u32, u64)>;
 
-    /// Acknowledged World Shard admission for one automatic group action. A later controller
-    /// selection cannot undo admission or membership already committed on Realm-core.
     fn admit_sessionless_group_action(&self, character_guid: u64) -> Result<PartyOutcome>;
 
-    /// `realm_group_op` — run one party op against the database this handle names: realm-core
-    /// when sharded, the only shard otherwise. The op byte and argument slots are
-    /// `lyracore_shared::group::realm_op`.
     fn realm_group_op(
         &self,
         op: u8,
@@ -106,9 +58,7 @@ pub(crate) trait PartyStore: Send + Sync {
         arg_c: u64,
     ) -> Result<PartyOutcome>;
 
-    /// [`Self::realm_group_op`] that returns only after this handle's Coordinator cache holds the
-    /// commit, so a roster read right after it sees the op. It waits on the Coordinator pump, so its
-    /// caller must run on another thread. Fakes may reuse the ordinary op.
+    /// Wait off-pump for the committed roster; this call depends on the Coordinator pump.
     fn realm_group_op_visible(
         &self,
         op: u8,
@@ -119,32 +69,18 @@ pub(crate) trait PartyStore: Send + Sync {
         arg_c: u64,
     ) -> Result<PartyOutcome>;
 
-    /// Realm-core LEAVE for a deleted Character. Production returns after its Coordinator cache
-    /// has the committed roster; Fakes may reuse the ordinary party operation.
     fn deleted_character_party_leave(&self, character: Actor) -> Result<PartyOutcome>;
 
-    /// The party `character_guid` is in, as THIS handle's database sees it: authoritative on
-    /// realm-core, a mirror on a world shard. `None` = not in a party there.
     fn group_roster(&self, character_guid: u64) -> Result<Option<GroupRoster>>;
 
-    /// Bounded party projection used by companion-command authority. A roster longer than a Raid,
-    /// or an otherwise unreadable projection, is an infrastructure failure, never proof of
-    /// membership.
     fn party_command_group_roster(&self, character_guid: u64) -> Result<Option<GroupRoster>>;
 
-    /// [`group_roster`](Self::group_roster) keyed by the group — the read the mirror push needs for a
-    /// party the acting character has just left.
     fn group_roster_by_id(&self, group_id: u64) -> Result<Option<GroupRoster>>;
 
-    /// Realm-core's durable order for a complete party roster, including a disbanded party.
     fn group_roster_revision(&self, group_id: u64) -> Result<u64>;
 
-    /// The Roster Revision this database holds for one party, or `None` when it holds no row. On a
-    /// World Shard it is the mirror's revision, kept after a disband; on Realm-core it is the
-    /// authoritative one.
     fn held_roster_revision(&self, group_id: u64) -> Result<Option<u64>>;
 
-    /// Realm-core's ordered locator for one Character. World Shards never supply this fact.
     fn realm_character_partition(
         &self,
         character_guid: u64,
@@ -159,40 +95,22 @@ pub(crate) trait PartyStore: Send + Sync {
 
     fn party_cleanup_group_roster_by_id(&self, group_id: u64) -> Result<Option<GroupRoster>>;
 
-    /// Every Character with authoritative Realm-core party membership.
     fn party_member_guids(&self) -> Result<Vec<u64>>;
 
-    /// Every party id held by this store. Realm-core rows are authoritative; World Shard rows are
-    /// mirrors that reconnect reconciliation must also inspect for stale parties.
     fn party_group_ids(&self) -> Result<Vec<u64>>;
 
-    /// `sync_group_mirror` — replace this shard's mirror of one party with realm-core's roster.
-    /// An empty `roster.members` is the disband tombstone.
     fn sync_group_mirror(&self, roster: &GroupRoster) -> Result<()>;
 
-    // The SINGLE-DATABASE party path (`world::party::run`'s `None` arm): the player-facing
-    // reducers, acting as the session's Character.
-
-    /// `CMSG_GROUP_INVITE` (name gateway-resolved). A `GroupRefusal` arrives as an outcome.
     fn group_invite(&self, actor: Actor, target_guid: u64) -> Result<PartyOutcome>;
 
-    /// `CMSG_GROUP_ACCEPT`.
     fn group_accept(&self, actor: Actor) -> Result<PartyOutcome>;
 
-    /// `CMSG_GROUP_DECLINE`.
     fn group_decline(&self, actor: Actor) -> Result<PartyOutcome>;
 
-    /// `CMSG_GROUP_DISBAND` (the client's "Leave Party").
     fn group_leave(&self, actor: Actor) -> Result<PartyOutcome>;
 
-    /// `CMSG_GROUP_UNINVITE` (name gateway-resolved) or `CMSG_GROUP_UNINVITE_GUID` — the leader or
-    /// an Assistant kicks a member.
     fn group_uninvite(&self, actor: Actor, target_guid: u64) -> Result<PartyOutcome>;
 
-    /// `CMSG_LOOT_METHOD` — the leader sets the party's loot method/
-    /// threshold/master. `loot_setting`/`loot_threshold` are the gateway-decoded `GroupLootSetting`/
-    /// `ItemQuality` wire bytes, passed straight through (the module adopted the wire ordering
-    /// verbatim — zero translation).
     fn group_loot_method(
         &self,
         actor: Actor,
@@ -202,25 +120,16 @@ pub(crate) trait PartyStore: Send + Sync {
     ) -> Result<PartyOutcome>;
 }
 
-/// One group, as the database that holds it sees it. Read from realm-core it is the authority; read
-/// from a world shard it is that shard's mirror. Names and online flags are deliberately NOT in it —
-/// realm-core has no character rows to resolve either from, so they are filled at render time from
-/// the shards ([`render_list`]).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct GroupRoster {
     pub group_id: u64,
-    /// Realm-core's order for this complete roster. World Shards retain the value after disband.
     pub roster_revision: u64,
     pub leader_guid: u64,
     pub loot_method: u8,
     pub loot_threshold: u8,
     pub master_looter_guid: u64,
     pub kind: GroupKind,
-    /// Members in join order (member-row id), which is the order leadership succeeds in, each with
-    /// its Raid Slot.
     pub members: Vec<GroupRosterMember>,
-    /// One ordered partition projection per member. Realm-core supplies both revisions; the
-    /// Gateway confirms the location against the World Shard that currently holds the Character.
     pub partitions: Vec<GroupMemberPartition>,
 }
 
@@ -406,9 +315,6 @@ fn append_departed_partitions(roster: &mut GroupRoster, previous: Option<&GroupR
 }
 
 impl GroupRoster {
-    /// The empty roster for a group that no longer exists — what [`sync_mirrors`] pushes to make a
-    /// shard forget a disbanded party. `members` empty is the disband signal `sync_group_mirror`
-    /// reads. The roster revision remains authoritative; the other fields are left at zero.
     pub fn disbanded(group_id: u64, roster_revision: u64) -> Self {
         Self {
             group_id,
@@ -417,7 +323,6 @@ impl GroupRoster {
         }
     }
 
-    /// Member guids in join order.
     pub fn member_guids(&self) -> Vec<u64> {
         self.members.iter().map(|member| member.guid).collect()
     }
@@ -426,9 +331,6 @@ impl GroupRoster {
         self.members.iter().any(|member| member.guid == guid)
     }
 
-    /// The list this roster renders as. Names are blank: [`render_list`] reads them from the
-    /// shards, since realm-core holds none. It carries no Target Icons: the Gateway reads none,
-    /// and only a LIST event from the party authority carries them.
     pub fn list_payload(&self) -> RosterPayload {
         RosterPayload {
             leader: self.leader_guid,
@@ -457,53 +359,48 @@ fn roster_or_disbanded(realm: &dyn WorldStore, group_id: u64) -> Result<GroupRos
     })
 }
 
-/// One party op, in the client's own vocabulary. The argument packing into `realm_group_op`'s slots
-/// happens once, in [`Op::realm_args`], against the shared
-/// [`lyracore_shared::group::realm_op`] contract.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
-    /// `CMSG_GROUP_INVITE`, target already resolved to a guid.
     Invite(u64),
-    /// `CMSG_GROUP_ACCEPT`.
     Accept,
-    /// `CMSG_GROUP_DECLINE`.
     Decline,
-    /// `CMSG_GROUP_DISBAND` — the client's "Leave Party".
     Leave,
-    /// `CMSG_GROUP_UNINVITE` (target name already resolved to a guid) or
-    /// `CMSG_GROUP_UNINVITE_GUID`: the leader or an Assistant kicks this member.
     Uninvite(u64),
-    /// `CMSG_LOOT_METHOD`.
     LootMethod {
         setting: u8,
         master: u64,
         threshold: u8,
     },
-    /// `CMSG_GROUP_RAID_CONVERT`.
     RaidConvert,
-    /// `CMSG_GROUP_SET_LEADER`: pass the lead to this member.
     SetLeader(u64),
-    /// `CMSG_GROUP_ASSISTANT_LEADER`: promote this member to Assistant, or demote it.
-    SetAssistant { target: u64, promote: bool },
-    /// `CMSG_GROUP_CHANGE_SUB_GROUP`, target already resolved to a guid.
-    ChangeSubgroup { target: u64, subgroup: u8 },
-    /// `CMSG_GROUP_SWAP_SUB_GROUP`, both targets already resolved to guids.
-    SwapSubgroup { first: u64, second: u64 },
-    /// `MSG_RAID_READY_CHECK` without a body.
+    SetAssistant {
+        target: u64,
+        promote: bool,
+    },
+    ChangeSubgroup {
+        target: u64,
+        subgroup: u8,
+    },
+    SwapSubgroup {
+        first: u64,
+        second: u64,
+    },
     ReadyCheckStart,
-    /// `MSG_RAID_READY_CHECK` with the answer's state byte.
     ReadyCheckAnswer(u8),
-    /// `MSG_RAID_TARGET_UPDATE`: a Target Icon 0 to 7 on `target` (0 clears it), or
-    /// [`lyracore_shared::group::TARGET_ICON_LIST_REQUEST`] for the full list.
-    TargetIcon { icon: u8, target: u64 },
-    /// `MSG_MINIMAP_PING`, the point on the minimap.
-    MinimapPing { x: f32, y: f32 },
-    /// `MSG_RANDOM_ROLL`, the bounds as the client sent them.
-    RandomRoll { min: u32, max: u32 },
+    TargetIcon {
+        icon: u8,
+        target: u64,
+    },
+    MinimapPing {
+        x: f32,
+        y: f32,
+    },
+    RandomRoll {
+        min: u32,
+        max: u32,
+    },
 }
 
-/// A Group Broadcast kind that one World Session may send only once per cooldown. Each kind has
-/// its own cooldown, so a ping does not hold back a `/roll`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThrottledBroadcast {
     ReadyCheck,
@@ -523,19 +420,12 @@ impl ThrottledBroadcast {
     }
 }
 
-/// The cooldown of one World Session's Ready Check starts, minimap pings and `/roll`s, each kind
-/// on its own. cmangos has no such limit, but here each one writes a row for every member of a
-/// Raid of up to 40 on the one realm-wide database.
 pub(crate) const GROUP_BROADCAST_THROTTLE: Duration = Duration::from_secs(1);
 
-/// When each [`ThrottledBroadcast`] kind may run again for one World Session.
 #[derive(Debug, Default)]
 pub(crate) struct GroupBroadcastCooldowns([Option<Instant>; ThrottledBroadcast::COUNT]);
 
 impl GroupBroadcastCooldowns {
-    /// Admit one party op at `now`, or refuse it because the last op of the same throttled kind
-    /// was inside [`GROUP_BROADCAST_THROTTLE`]. An op with no throttle is always admitted. Every
-    /// admitted op starts its kind's cooldown, including one the party authority then refuses.
     pub(crate) fn admit_at(&mut self, op: Op, now: Instant) -> bool {
         let Some(kind) = op.broadcast_throttle() else {
             return true;
@@ -549,22 +439,16 @@ impl GroupBroadcastCooldowns {
     }
 }
 
-/// `realm_group_op`'s argument slots after the actor: `(op, target_guid, arg_a, arg_b, arg_c)`.
 type RealmOpArgs = (u8, u64, u8, u8, u64);
 
-/// The class of a Character accepting an invite. Realm-core holds no Character rows, so an ACCEPT
-/// conveys it for the Seeker row a queued party gains. 0 when no World Shard names the Character.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AcceptorFacts {
     class: u8,
 }
 
 impl AcceptorFacts {
-    /// What `realm_group_op` receives for every op but ACCEPT.
     const NONE: Self = Self { class: 0 };
 
-    /// The facts an ACCEPT conveys, read realm-wide. A failed read conveys 0 rather than losing
-    /// the accept: the Module treats an unknown class as a seat with no role.
     fn of<St: CharacterStore + ShardRoutingStore + ?Sized>(store: &St, guid: u64) -> Self {
         match presence::character_anywhere(store, guid) {
             Ok(Some(character)) => Self {
@@ -578,7 +462,6 @@ impl AcceptorFacts {
         }
     }
 
-    /// [`Self::of`] for an ACCEPT, [`Self::NONE`] for any other op.
     fn for_op<St: CharacterStore + ShardRoutingStore + ?Sized>(
         store: &St,
         guid: u64,
@@ -592,7 +475,6 @@ impl AcceptorFacts {
 }
 
 impl Op {
-    /// The argument slots for this op. Only ACCEPT reads `acceptor`.
     fn realm_args(self, acceptor: AcceptorFacts) -> RealmOpArgs {
         match self {
             Op::Invite(target) => (realm_op::INVITE, target, 0, 0, 0),
@@ -617,7 +499,6 @@ impl Op {
             Op::ReadyCheckStart => (realm_op::READY_CHECK_START, 0, 0, 0, 0),
             Op::ReadyCheckAnswer(state) => (realm_op::READY_CHECK_ANSWER, 0, state, 0, 0),
             Op::TargetIcon { icon, target } => (realm_op::TARGET_ICON, target, icon, 0, 0),
-            // Bit patterns, so the floats reach the other members unchanged.
             Op::MinimapPing { x, y } => (
                 realm_op::MINIMAP_PING,
                 u64::from(x.to_bits()),
@@ -631,11 +512,6 @@ impl Op {
         }
     }
 
-    /// The cooldown this op shares with its own kind, or `None` when it runs unthrottled. A Ready
-    /// Check start, a minimap ping and a `/roll` each write one event row for every member on the
-    /// party authority, which on a sharded Realm is the one Realm-core database. A Ready Check
-    /// answer writes one row. A Target Icon is left alone because a leader marks several targets
-    /// in quick succession before a pull.
     pub(crate) fn broadcast_throttle(self) -> Option<ThrottledBroadcast> {
         match self {
             Op::ReadyCheckStart => Some(ThrottledBroadcast::ReadyCheck),
@@ -645,8 +521,6 @@ impl Op {
         }
     }
 
-    /// A Group Broadcast changes no roster, so it needs no roster read, no loot-roll flush and no
-    /// mirror push.
     fn is_group_broadcast(self) -> bool {
         matches!(
             self,
@@ -659,11 +533,6 @@ impl Op {
     }
 }
 
-/// Run `op` as `actor` through `realm_group_op` on `authority`, the database that holds the
-/// party: Realm-core when sharded, the home shard otherwise. It returns before the Coordinator
-/// cache holds the commit, so it is only for an op that pushes no Group mirror after it: a Group
-/// Broadcast, a Target Icon request, a declined invite, or an op on a single database. An ACCEPT
-/// changes a roster, so it never comes here.
 fn run_on_authority<A: PartyStore + ?Sized>(
     authority: &A,
     actor: Actor,
@@ -673,10 +542,6 @@ fn run_on_authority<A: PartyStore + ?Sized>(
     authority.realm_group_op(code, actor, target, arg_a, arg_b, arg_c)
 }
 
-/// [`run_on_authority`] that returns only after the Coordinator cache holds the commit, so the
-/// mirror push after it reads the op's own roster. Every op that changes a roster uses it, for a
-/// World Session and for a session-less Character alike. It waits on the Coordinator pump, so the
-/// caller must run on its own thread. `acceptor` is read only for an ACCEPT.
 fn run_on_authority_visible<A: PartyStore + ?Sized>(
     authority: &A,
     actor: Actor,
@@ -687,9 +552,6 @@ fn run_on_authority_visible<A: PartyStore + ?Sized>(
     authority.realm_group_op_visible(code, actor, target, arg_a, arg_b, arg_c)
 }
 
-/// What one party op answered. A [`GroupRefusal`] is a gameplay answer the client renders, so it
-/// arrives as `Ok`; a timeout, transport failure, or untagged reducer error stays `Err` and ends the
-/// session, because the durable outcome is then unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PartyOutcome {
     Ran,
@@ -808,9 +670,6 @@ fn same_authority(left: &GroupRoster, right: &GroupRoster) -> bool {
         && left_members == right_members
 }
 
-/// Claim, certify on Realm-core, compare the target mirror, apply once, then finalize at source.
-/// The Realm-core Durable Request is the authority point; a later party change cannot recall an
-/// already applied order. Every retry before target application repeats this operation.
 pub(crate) fn run_party_command_intent<St: WorldStore>(
     source: &St,
     intent: &PartyCommandIntent,
@@ -973,11 +832,6 @@ impl From<GroupRefusal> for PartyOutcome {
     }
 }
 
-/// `self_guid`'s own Group roster, read from the authority: Realm-core when sharded, this handle's
-/// own tables otherwise. Shared by [`resolve_roster_member_by_name`] and
-/// [`resolve_roster_members_by_name`] so a caller resolving more than one name reads the roster
-/// once rather than once per name, which would let two names resolve against two different
-/// snapshots of a roster another op changed in between.
 fn own_group_roster<St: PartyStore + ShardRoutingStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -988,7 +842,6 @@ fn own_group_roster<St: PartyStore + ShardRoutingStore + ?Sized>(
     }
 }
 
-/// Resolve a typed name against `roster`'s members: `None` for a name matching nobody there.
 fn resolve_in_roster<St: CharacterStore + ShardRoutingStore + ?Sized>(
     store: &St,
     roster: &GroupRoster,
@@ -1004,12 +857,6 @@ fn resolve_in_roster<St: CharacterStore + ShardRoutingStore + ?Sized>(
     Ok(None)
 }
 
-/// Resolve a typed name against `self_guid`'s OWN roster, for `CMSG_GROUP_CHANGE_SUB_GROUP`.
-/// cmangos's Swap Subgroup matches a typed name against the group's own member list this way
-/// (cm:GroupHandler.cpp:919-936); its Change Subgroup instead resolves the name realm-wide and
-/// refuses afterward when the result is not a member. LyraCore applies the member-list rule to
-/// both opcodes, so neither can reach a namesake standing outside the Raid, unlike
-/// [`presence::resolve_by_name`]. `None` for no Group, or a name matching no member.
 pub(crate) fn resolve_roster_member_by_name<
     St: CharacterStore + PartyStore + ShardRoutingStore + ?Sized,
 >(
@@ -1023,10 +870,6 @@ pub(crate) fn resolve_roster_member_by_name<
     resolve_in_roster(store, &roster, name)
 }
 
-/// [`resolve_roster_member_by_name`] for `CMSG_GROUP_SWAP_SUB_GROUP`'s two names, resolved against
-/// ONE roster read rather than two: reading the roster separately per name could resolve the pair
-/// against two different snapshots if another op changed the roster in between, letting a swap
-/// name a member who had already left. `(None, None)` for no Group.
 pub(crate) fn resolve_roster_members_by_name<
     St: CharacterStore + PartyStore + ShardRoutingStore + ?Sized,
 >(
@@ -1044,8 +887,6 @@ pub(crate) fn resolve_roster_members_by_name<
     ))
 }
 
-/// Route admission to the World Shard that reports the live entity. The acknowledged operation
-/// checks current Session ownership and consent there, even if that presence read was stale.
 fn admit_sessionless_answer<St: PartyStore + SessionStore + ShardRoutingStore + ?Sized>(
     store: &St,
     guid: u64,
@@ -1063,9 +904,6 @@ fn admit_sessionless_answer<St: PartyStore + SessionStore + ShardRoutingStore + 
     Ok(PartyOutcome::Refused(GroupRefusal::ActorUnavailable))
 }
 
-/// Admit the automatic answer on the owning World Shard, then apply party rules on Realm-core.
-/// Suppression or unavailable admission leaves the invite untouched. Admission and membership
-/// commit on separate Shards, so a later controller selection cannot recall an admitted answer.
 fn answer_for_session_less<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + ?Sized,
 >(
@@ -1104,17 +942,6 @@ fn answer_for_session_less<
     }
 }
 
-/// Run one party op as the session's Character, `actor`.
-///
-/// Unsharded → the pre-realm-core path, verbatim: the player's own connection calls the player-facing
-/// reducer on the player's own shard, and nothing else happens. A raid op, a leadership op or a
-/// Group Broadcast has no player-facing reducer, so it calls `realm_group_op` on that same shard.
-///
-/// Sharded → realm-core runs the op, then every connected world shard's mirror is refreshed. The
-/// op returns only after the Coordinator cache holds its commit, so the refresh reads the op's own
-/// roster. The refresh never fails the op (see [`sync_mirrors`]); an op that changes membership
-/// retries it first ([`sync_membership_mirrors`]). A Group Broadcast runs on Realm-core and nothing
-/// else happens.
 pub(crate) fn run<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + SocialStore + ?Sized,
 >(
@@ -1128,8 +955,6 @@ pub(crate) fn run<
             return Ok(GroupRefusal::WrongFaction.into());
         }
     }
-    // Vanilla passes the lead only to an online member (cm:GroupHandler.cpp:352-356). The party
-    // authority runs its rules without presence on both planes, so the Gateway answers it here.
     if let Op::SetLeader(target) = op {
         if !presence::live_anywhere(store, target) {
             return Ok(GroupRefusal::TargetOffline.into());
@@ -1147,9 +972,6 @@ pub(crate) fn run<
                 master,
                 threshold,
             } => store.group_loot_method(actor, setting, master, threshold),
-            // A raid op, a leadership op or a Group Broadcast has no player-facing reducer. With one
-            // database, the home shard holds the party, so it runs the same `realm_group_op`
-            // Realm-core would.
             Op::RaidConvert
             | Op::SetLeader(_)
             | Op::SetAssistant { .. }
@@ -1165,23 +987,11 @@ pub(crate) fn run<
     if op.is_group_broadcast() {
         return run_on_authority(realm.as_ref(), actor, op);
     }
-    // The two gates realm-core cannot run for itself, because the directory database holds neither
-    // characters nor live entities: does the target EXIST, and is it ONLINE. The gateway is the only
-    // party that can answer them across a boundary — which is precisely the bug being fixed — and it
-    // answers with the module's own Refusals, so the client-facing code is the same on both planes.
-    //
-    // Each gate is the module's own read, unioned across the shards — EXISTS is a `game_character`
-    // row ([`presence::of`]), ONLINE is a `game_world_entity` row ([`presence::live_anywhere`]).
-    // Reading the session flag for the second would silently refuse every session-less Character;
-    // see [`presence::live_anywhere`].
     if let Op::Invite(target) = op {
         if let Some(refusal) = invite_gate(store, target)? {
             return Ok(refusal.into());
         }
     }
-    // The group this character was in BEFORE the op — the only way to reach the party they may have
-    // just left (their membership row is gone by the time we look again, but the members still in it
-    // need their mirrors updated too).
     let before = realm.group_roster(self_guid)?;
     if matches!(op, Op::Leave | Op::Uninvite(_)) {
         crate::world::loot::flush_pending_promotions(store, realm.as_ref());
@@ -1192,9 +1002,6 @@ pub(crate) fn run<
     {
         return Ok(PartyOutcome::Refused(refusal));
     }
-    // Nobody is at the keyboard of a session-less Character, so nobody answers its dialog. Done
-    // BEFORE the mirror push, so the ONE push that follows already carries the bot as a member —
-    // which is what the shard's own party reads (kill-XP split, `/p`, follow-the-leader) need.
     if let Op::Invite(target) = op {
         answer_for_session_less(store, realm.as_ref(), target);
     }
@@ -1209,11 +1016,6 @@ pub(crate) fn run<
     Ok(PartyOutcome::Ran)
 }
 
-/// The mirror push after an op that changes who is in a Group. The Instance Pool starts and cancels
-/// Instance Removals from this push, so a lost push would send home a Character whom Realm-core
-/// shows back in its Group. Each touched Group gets [`sync_group_mirrors_required`]'s retries. The
-/// op has already committed, so a push that still fails is logged, not returned: the next op or
-/// world entry repairs it, as [`sync_mirrors`] documents.
 fn sync_membership_mirrors<St: ShardRoutingStore + ?Sized>(
     store: &St,
     realm: &dyn WorldStore,
@@ -1245,11 +1047,6 @@ fn sync_membership_mirrors<St: ShardRoutingStore + ?Sized>(
     }
 }
 
-/// Whether a successful op changed nothing, so no mirror needs a push: converting a Raid again,
-/// repeating a promotion or a demotion, a Change Subgroup into the Subgroup a member already
-/// holds, or a Swap Subgroup between two members of one Subgroup. The answer comes from the roster
-/// read before the op, not after it: a stale `before` costs at most a missed push, which the next
-/// op or world entry repairs, as [`sync_mirrors`] documents.
 fn op_changed_nothing(op: Op, before: Option<&GroupRoster>) -> bool {
     let Some(before) = before else {
         return false;
@@ -1262,7 +1059,6 @@ fn op_changed_nothing(op: Op, before: Option<&GroupRoster>) -> bool {
             .map(|member| member.slot.subgroup())
     };
     match op {
-        // A Raid never converts back.
         Op::RaidConvert => before.kind == GroupKind::Raid,
         Op::SetAssistant { target, promote } => before
             .members
@@ -1277,8 +1073,6 @@ fn op_changed_nothing(op: Op, before: Option<&GroupRoster>) -> bool {
     }
 }
 
-/// The invite gates realm-core cannot run for itself: does the target exist anywhere, and is it in
-/// the world anywhere. `None` means the invite may proceed.
 fn invite_gate<St: SessionStore + ShardRoutingStore + SocialStore + ?Sized>(
     store: &St,
     target: u64,
@@ -1292,11 +1086,6 @@ fn invite_gate<St: SessionStore + ShardRoutingStore + SocialStore + ?Sized>(
     Ok(None)
 }
 
-/// Vanilla's default refuses a party across factions (cm:GroupHandler.cpp:80,
-/// `AllowTwoSide.Interaction.Group = 0`). Neither the Module nor Realm-core can read both races, so
-/// the Gateway answers it on both planes, the way mail applies `same_team`. It runs only for a live
-/// target: vanilla looks the target up among online players first, so a missing or offline target
-/// keeps its own Refusal.
 fn cross_faction_invite<St: CharacterStore + SessionStore + ShardRoutingStore + ?Sized>(
     store: &St,
     inviter: u64,
@@ -1317,11 +1106,6 @@ fn cross_faction_invite<St: CharacterStore + SessionStore + ShardRoutingStore + 
     ))
 }
 
-/// Claim one subscribed intent on its World Shard, then execute it only for the winning Gateway.
-///
-/// `op` says which party op the row asks for ([`bot_op`]). A byte this gateway does not know is a
-/// module newer than the gateway, which is a deployment fault rather than a party outcome — it is
-/// refused by name instead of falling through to an invite.
 pub(crate) fn run_bot_invite_intent<St: WorldStore>(
     store: &St,
     intent_id: u64,
@@ -1341,25 +1125,11 @@ pub(crate) fn run_bot_invite_intent<St: WorldStore>(
     }
 }
 
-///
-/// There is no `account_id` here on purpose: a bot has no per-account connection for a reducer to
-/// authenticate as, on EITHER topology. So this never takes [`run`]'s unsharded arm (which needs
-/// exactly that connection to resolve the acting character via `ctx.sender()`) — it always uses the
-/// guid-based `realm_group_op`, targeting realm-core when the gateway is sharded and this database's
-/// OWN `game_group`/`game_group_member` otherwise. Unsharded that is still correct, not a special
-/// case: with one database, "realm-core" and "the world shard" are the same physical database, so
-/// writing there directly cannot diverge from itself — there is no mirror to contradict.
-///
-/// Otherwise this mirrors [`run`]'s sharded arm: same existence/online gates, same
-/// [`answer_for_session_less`] (a bot target still has no client to answer its own dialog — true of
-/// the INVITER here too, which is the whole point), same [`sync_mirrors`] push so the shard's own
-/// party reads (kill-XP split, `/p`, follow-the-leader) see the new member immediately.
 pub(crate) fn run_bot_invite<St: WorldStore>(
     store: &St,
     inviter_guid: u64,
     target_guid: u64,
 ) -> Result<PartyOutcome> {
-    // Guid 0 names no Character, so it can act in no party.
     let Some(inviter) = Actor::new(inviter_guid) else {
         return Ok(GroupRefusal::ActorUnavailable.into());
     };
@@ -1385,20 +1155,6 @@ pub(crate) fn run_bot_invite<St: WorldStore>(
     Ok(PartyOutcome::Ran)
 }
 
-/// Run a SERVER-DRIVEN leave with no client behind it — a bot leader whose party has run out of
-/// shared work parts ways with it.
-///
-/// The same authority wall as [`run_bot_invite`], for the same reason: membership is authoritative
-/// on realm-core, and a module-side `leave_group_for` would write this shard's own member rows for
-/// the next `sync_group_mirror` push to put straight back.
-///
-/// No existence or online gate. Those two answer "may this target be invited"; a leave names only
-/// the actor, and `leave_group_for` refuses a Character that is in no party — which is also what a
-/// decision the previous tick already got executed looks like.
-///
-/// The pending-roll flush is [`run`]'s, verbatim, and belongs here for the reason it gives: a LEAVE
-/// can shrink a group below two members and reach realm-core's disband branch, which force-resolves
-/// live loot rolls that the periodic relay may not have promoted yet.
 pub(crate) fn run_bot_leave<St: WorldStore>(store: &St, leaver_guid: u64) -> Result<PartyOutcome> {
     let Some(leaver) = Actor::new(leaver_guid) else {
         return Ok(GroupRefusal::ActorUnavailable.into());
@@ -1497,7 +1253,6 @@ pub(crate) enum DeletedCharacterPartyCleanup {
 
 const DELETED_CHARACTER_LEAVE_ATTEMPTS: usize = 3;
 
-/// Remove a deleted Character from its realm-core party after every World Shard confirms absence.
 pub(crate) fn cleanup_deleted_character<St: CharacterStore + ShardRoutingStore>(
     store: &St,
     character_guid: u64,
@@ -1505,7 +1260,6 @@ pub(crate) fn cleanup_deleted_character<St: CharacterStore + ShardRoutingStore>(
     let Some(realm) = store.realm_store()? else {
         return Ok(DeletedCharacterPartyCleanup::AlreadyClean);
     };
-    // Guid 0 names no Character, so no party holds it.
     let Some(character) = Actor::new(character_guid) else {
         return Ok(DeletedCharacterPartyCleanup::AlreadyClean);
     };
@@ -1541,8 +1295,6 @@ pub(crate) fn cleanup_deleted_character<St: CharacterStore + ShardRoutingStore>(
     }
 }
 
-/// Recheck authoritative party members after startup or a Coordinator reconnect. Row-delete
-/// callbacks are not replayed, so this closes cleanup attempts deferred while a Shard was down.
 pub(crate) fn reconcile_deleted_character_parties<St: CharacterStore + ShardRoutingStore>(
     store: &St,
 ) -> Result<()> {
@@ -1598,15 +1350,8 @@ pub(crate) fn reconcile_deleted_character_parties<St: CharacterStore + ShardRout
 
 const MIRROR_PUSH_ATTEMPTS: usize = 3;
 
-/// How long after a mirror push starts a failed Shard may still get another attempt. Each attempt
-/// can wait out the reducer call timeout, so without this window a Shard that accepts calls and
-/// never answers would hold the session for every attempt on every Shard. Every Shard still gets
-/// its first attempt. A timed-out push may still commit, and a repeated push is idempotent.
 const MIRROR_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Push Realm-core's roster or disband tombstone for one party to each of `shards`, with up to
-/// [`MIRROR_PUSH_ATTEMPTS`] attempts per Shard inside [`MIRROR_RETRY_WINDOW`]. Partition
-/// certification still reads every World Shard.
 pub(crate) fn sync_group_mirrors_required<St: ShardRoutingStore + ?Sized>(
     store: &St,
     realm: &dyn WorldStore,
@@ -1650,19 +1395,6 @@ pub(crate) fn sync_group_mirrors_required<St: ShardRoutingStore + ?Sized>(
     }
 }
 
-/// Push realm-core's roster for every party this op could have touched onto every connected world
-/// shard.
-///
-/// Two groups at most: the one the character is in NOW and the one they were in BEFORE (a leave, a
-/// kick, or an accept that moved them). A group that realm-core no longer has is pushed as
-/// [`GroupRoster::disbanded`], which is how a shard learns to drop it.
-///
-/// **Best-effort, deliberately.** The authoritative write has already committed on realm-core by the
-/// time this runs, so a failed mirror push must not turn a party op that DID happen into an error
-/// the client renders as a failure. The cost of a miss is bounded and self-healing: that shard's
-/// local reads (XP split, loot rules) use a stale roster until the next op or the next world entry
-/// re-pushes it, and the party FRAME — which is what the player sees — is rendered from realm-core
-/// through the relay, not from the mirror.
 pub(crate) fn sync_mirrors<St: ShardRoutingStore + ?Sized>(
     store: &St,
     realm: &dyn WorldStore,
@@ -1690,8 +1422,6 @@ pub(crate) fn sync_mirrors<St: ShardRoutingStore + ?Sized>(
     for group_id in touched {
         let roster = match roster_or_disbanded(realm, group_id) {
             Ok(r) => r,
-            // Gone from the authority = disbanded. Push the tombstone rather than skipping, or the
-            // shards keep a party that no longer exists and its members stay grouped locally.
             Err(e) => {
                 log::warn!(
                     "party: could not read realm-core group {group_id} ({e:#}) — shard mirrors unchanged"
@@ -1721,18 +1451,6 @@ pub(crate) fn sync_mirrors<St: ShardRoutingStore + ?Sized>(
     }
 }
 
-/// World entry (login, and every cross-shard arrival): put the party the player is actually in onto
-/// the shard they just entered, and re-render their party frame.
-/// A Party member also gets its Target Icons again, after the frame.
-///
-/// **This is what carries a party across a shard boundary now that the escrowed transfer's blob
-/// mirror is gone.** The
-/// blob could only carry the membership the character had when it stepped into the portal; this
-/// reads the authority at the moment of arrival, so a party formed — or joined, or left — while the
-/// player was on the loading screen is what lands.
-///
-/// Unsharded → returns immediately, before any read: the shard's own tables already are the
-/// authority and the login path is unchanged.
 pub(crate) fn on_world_entry<
     St: CharacterStore + PartyStore + SessionStore + ShardRoutingStore + ?Sized,
 >(
@@ -1751,10 +1469,7 @@ pub(crate) fn on_world_entry<
     Ok(())
 }
 
-/// A Party client clears its marks on every `SMSG_GROUP_LIST` (vm:Group.cpp:1343-1360). The list
-/// above carries no Target Icons, so ask the party authority for the full list, as the client's
-/// own `0xFF` request does. The answer rides the group event relay onto the same session writer
-/// and so lands after the list. A failure costs only the marks, so it logs.
+// GROUP_LIST clears client raid marks; request the full icon list after sending it.
 fn request_target_icons<St: ShardRoutingStore + ?Sized>(store: &St, character: Actor) {
     let realm = match store.realm_store() {
         Ok(Some(realm)) => realm,
@@ -1780,12 +1495,6 @@ fn request_target_icons<St: ShardRoutingStore + ?Sized>(store: &St, character: A
     }
 }
 
-/// The mirror half of [`on_world_entry`], without a client: put the party realm-core says
-/// `self_guid` is in onto the shard `store` names, and clear a mirror row of a party they have
-/// left. Answers the roster it pushed so the caller can render a frame for a player. Transfer
-/// settlement uses the strict sibling below before it drops an arrival fence.
-///
-/// Unsharded → `Ok(None)` before any read: the shard's own tables already are the authority.
 pub(crate) fn sync_arrival_mirror<St: PartyStore + ShardRoutingStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -1797,20 +1506,10 @@ pub(crate) fn sync_arrival_mirror<St: PartyStore + ShardRoutingStore + ?Sized>(
         .group_roster(self_guid)?
         .map(|roster| certify_roster_partitions(store, realm.as_ref(), roster))
         .transpose()?;
-    // A mirror on THIS shard that still has the arriving character in a party realm-core no longer
-    // has them in is the ONE staleness "re-syncs on the next op or world entry" does not cover by
-    // itself: with no roster to push there was nothing to overwrite it with, and the ops of the party
-    // they left never name them again — so the stale membership row survived every arrival, forever.
-    // The shard then runs that character's kill-XP split, quest credit, loot rules and
-    // dungeon binding against a party they are not in. Re-push the AUTHORITY's version of the group
-    // the mirror thinks they are in (a tombstone if it is gone) — the same repair `sync_mirrors`
-    // applies to the group an actor was in BEFORE an op.
     if let Some(stale) = store.group_roster(self_guid)? {
         if roster.as_ref().is_none_or(|r| r.group_id != stale.group_id) {
             let repair = roster_or_disbanded(realm.as_ref(), stale.group_id)?;
             let repair = certify_roster_partitions(store, realm.as_ref(), repair)?;
-            // Best-effort, like every other mirror write: this is a cache repair, and failing the
-            // world entry over it would be strictly worse than arriving with a stale roster.
             if let Err(e) = store.sync_group_mirror(&repair) {
                 log::warn!(
                     "party: could not clear guid {self_guid} from shard {}'s stale mirror of group \
@@ -1824,16 +1523,11 @@ pub(crate) fn sync_arrival_mirror<St: PartyStore + ShardRoutingStore + ?Sized>(
     let Some(roster) = roster else {
         return Ok(None);
     };
-    // The shard the player just entered. `store` is already the session's home-shard handle (every
-    // world-entry caller runs on the session's routed Store), so this is the one mirror that must exist
-    // before the player takes a single action here.
     store.sync_group_mirror(&roster)?;
     Ok(Some(roster))
 }
 
-/// Reconcile the same authoritative roster as [`sync_arrival_mirror`], but make every destination
-/// write part of Transfer settlement. The arrival fence stays up when realm-core or the mirror is
-/// unavailable, and a later Transfer retry repeats this operation before release.
+/// Keep the arrival fence until the authoritative Group mirror reaches the destination.
 pub(crate) fn sync_transfer_arrival_mirror<St: PartyStore + ShardRoutingStore + ?Sized>(
     store: &St,
     character_guid: u64,
@@ -1868,18 +1562,6 @@ pub(crate) fn sync_transfer_arrival_mirror<St: PartyStore + ShardRoutingStore + 
     Ok(())
 }
 
-/// Build `SMSG_GROUP_LIST` for `self_guid`. This is the one renderer: the LIST relay passes the
-/// event's payload, and world entry passes the authoritative roster's [`GroupRoster::list_payload`].
-/// The packet is raw because it ends with a byte gtker cannot encode (`codec::build_group_list_raw`).
-///
-/// Every member's ONLINE flag, and each blank NAME, comes from the shards. That is the price of
-/// realm-core owning membership: the directory database has no `game_character` or
-/// `game_world_entity` rows, so it cannot know what its members are called or whether they are in
-/// the world. The gateway can, because it reads every connected shard's cache, and it is the only party
-/// that can answer for a member standing on a different database than the viewer. A name the
-/// payload already carries is kept; the Module wrote it with the change. A member whose name will
-/// not resolve (a shard that is down) renders with an empty name rather than being dropped from the
-/// frame: a missing row in the party UI reads as "they left", which is a worse lie than a blank one.
 pub(crate) fn render_list<St: CharacterStore + SessionStore + ShardRoutingStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -1888,9 +1570,6 @@ pub(crate) fn render_list<St: CharacterStore + SessionStore + ShardRoutingStore 
     let mut roster = roster.clone();
     for member in &mut roster.members {
         if member.name.is_empty() {
-            // This handle first (the viewer's own shard, where most of the party is), then every
-            // other connected one — the member standing inside an instance is on a database this
-            // handle never reads. Empty on a single-database gateway, so the union never leaves it.
             member.name = presence::character_anywhere(store, member.guid)
                 .ok()
                 .flatten()

@@ -1,14 +1,10 @@
-//! Item-action dispatcher: protocol mapping and feedback for equip, use, and inventory operations.
-
 use super::super::*;
 use super::quest::{item_started_quest, QuestActionStore};
 use lyracore_shared::item::ItemRefusal;
 
-const MAIN_BAG: u8 = 255; // INVENTORY_SLOT_BAG_0 — backpack + equipped slots share this pseudo-bag
-const EQUIP_SLOT_END: u8 = 18; // EQUIPMENT_SLOT_END — last equipment slot (main-hand=15, off=16…)
+const MAIN_BAG: u8 = 255;
+const EQUIP_SLOT_END: u8 = 18;
 
-/// How the Module answered one item Durable Request. A Refusal is an outcome; a timeout, transport,
-/// or SDK failure stays an `Err` with an unknown durable result and ends the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ItemActionResult {
     Done,
@@ -36,8 +32,6 @@ pub(crate) trait ItemActionStore: Send + Sync {
     ) -> Result<ItemActionResult>;
 }
 
-/// Run one durable item request as the session's Actor and render its answer. A session without
-/// a Character in the world has nothing to act as, so the client gets an internal-error Refusal.
 fn act(
     player: &ProtocolSession,
     operation: &str,
@@ -60,7 +54,6 @@ fn act(
     )))
 }
 
-/// A request the Gateway refuses before any Durable Request, such as a bag position it cannot map.
 fn refuse(player: &ProtocolSession, operation: &str, refusal: ItemRefusal) -> ProtocolReply {
     ProtocolReply::from(inventory_action_outbound(
         player.account_id,
@@ -69,7 +62,6 @@ fn refuse(player: &ProtocolSession, operation: &str, refusal: ItemRefusal) -> Pr
     ))
 }
 
-/// A Refusal answers the client with its own result code; a completed action answers nothing.
 fn inventory_action_outbound(
     account_id: u64,
     operation: &str,
@@ -91,7 +83,6 @@ fn inventory_action_outbound(
     }
 }
 
-/// A quest-starting item needs the quest operation as well as inventory operations.
 pub(crate) struct Item;
 
 impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Item {
@@ -150,7 +141,6 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                 }),
                 _ => Ok(refuse(player, "move_item", ItemRefusal::WrongSlot)),
             },
-            // A quest-starting item opens quest details without consuming the item.
             ClientOpcodeMessage::CMSG_USE_ITEM(c) => {
                 let Some(slot) = codec::inventory_slot(c.bag_index, c.bag_slot) else {
                     return Ok(refuse(player, "use_item", ItemRefusal::WrongSlot));
@@ -185,15 +175,12 @@ pub(super) mod tests {
         pub(crate) unequip_result: Option<ItemActionResult>,
         pub(crate) move_result: Option<ItemActionResult>,
         pub(crate) use_result: Option<ItemActionResult>,
-        /// Every durable call fails with a Transport Loss.
         pub(crate) transport_lost: bool,
         pub(crate) start_quest: Option<(u64, u32)>,
         pub(crate) quest_detail: Option<codec::QuestDetailView>,
     }
 
     impl InMemoryItemActions {
-        /// The Coordinator answers a decoded Refusal or, for a Transport Loss, an error. The Fake
-        /// answers in those two shapes.
         fn answer(
             &self,
             operation: &str,
@@ -249,9 +236,6 @@ pub(super) mod tests {
         }
     }
 
-    /// The item seam reaches the quest family for one thing only: whether the used item starts a
-    /// quest. The rest of the quest vocabulary is out of reach from here, and saying so keeps a
-    /// future route from quietly reading a canned answer.
     impl QuestActionStore for InMemoryItemActions {
         fn giver_quest_evals(
             &self,
@@ -390,8 +374,6 @@ pub(super) mod tests {
         assert!(actions.use_requests.lock().unwrap().is_empty());
     }
 
-    // ── Equip ────────────────────────────────────────────────────────────────
-
     #[test]
     fn equip_from_the_main_bag_requests_the_durable_equip_for_the_actor_and_slot() {
         let actions = InMemoryItemActions::default();
@@ -423,8 +405,6 @@ pub(super) mod tests {
 
         assert_no_durable_requests(&actions);
     }
-
-    // ── Unequip ──────────────────────────────────────────────────────────────
 
     #[test]
     fn unequip_of_an_equipped_slot_requests_the_durable_unequip() {
@@ -492,8 +472,6 @@ pub(super) mod tests {
         assert_no_durable_requests(&actions);
     }
 
-    // ── Same-container move ──────────────────────────────────────────────────
-
     #[test]
     fn move_maps_the_wire_slots_to_the_durable_move() {
         let actions = InMemoryItemActions::default();
@@ -541,8 +519,6 @@ pub(super) mod tests {
         );
     }
 
-    // ── Same-container swap ──────────────────────────────────────────────────
-
     #[test]
     fn swap_within_the_main_bag_maps_both_slots_to_the_durable_move() {
         let actions = InMemoryItemActions::default();
@@ -574,8 +550,6 @@ pub(super) mod tests {
 
         assert_no_durable_requests(&actions);
     }
-
-    // ── Ordinary use ─────────────────────────────────────────────────────────
 
     #[test]
     fn use_from_the_main_bag_requests_the_durable_use_for_the_actor_and_slot() {
@@ -613,8 +587,6 @@ pub(super) mod tests {
         );
     }
 
-    // ── Item-starts-quest ────────────────────────────────────────────────────
-
     #[test]
     fn quest_start_use_returns_details_without_requesting_ordinary_use() {
         let actions = InMemoryItemActions {
@@ -647,8 +619,6 @@ pub(super) mod tests {
         handled_without_outbound(outcome);
         assert!(actions.use_requests.lock().unwrap().is_empty());
     }
-
-    // ── Player context and error classification ──────────────────────────────
 
     #[test]
     fn unresolved_player_requests_nothing_and_every_inventory_action_answers_a_refusal() {
@@ -691,7 +661,6 @@ pub(super) mod tests {
         use wow_world_messages::vanilla::SMSG_INVENTORY_CHANGE_FAILURE as Failure;
         use wow_world_messages::Guid;
         let (item1, item2, bag_type_subclass) = (Guid::new(0), Guid::new(0), 0u8);
-        // The vanilla 1.12 result each Refusal must reach the client as.
         let expected = |refusal| match refusal {
             ItemRefusal::Indestructible => Failure::CantDropSoulbound {
                 item1,
@@ -803,6 +772,4 @@ pub(super) mod tests {
         };
         inventory_failure(Item::handle(&refusing, &mut player(), equip(MAIN_BAG).into()).unwrap());
     }
-
-    // ── Pass-through ─────────────────────────────────────────────────────────
 }

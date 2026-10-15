@@ -1,6 +1,3 @@
-//! What one Package Delta reports about its own size, which is what an applier records as
-//! provenance and what a dry-run check prints.
-
 mod common;
 
 use common::{
@@ -38,8 +35,6 @@ fn a_package_counts_its_updates_and_its_inserts_apart() {
     assert_eq!(counts.updated_rows, 2);
     assert_eq!(counts.inserted_spells, 1);
     assert_eq!(counts.inserted_effects, 2);
-    // `inserted_rows` is the family-generic total: the spell writer fills it too, as the sum of
-    // its two legacy counts.
     assert_eq!(counts.inserted_rows, 3);
 }
 
@@ -58,8 +53,6 @@ fn a_package_that_only_tunes_existing_rows_inserts_nothing() {
     assert_eq!(counts.inserted_rows, 0);
 }
 
-/// The items family has no legacy pair of its own — every insert counts through `inserted_rows`
-/// alone, and `inserted_spells`/`inserted_effects` stay at zero.
 #[test]
 fn an_item_package_counts_its_inserts_through_the_family_generic_total_only() {
     let claims = [

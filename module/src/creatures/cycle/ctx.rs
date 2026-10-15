@@ -1,9 +1,3 @@
-//! The ONE production adapter: a real `ReducerContext` wearing the whole cycle world.
-//!
-//! **This layer is the seam's own blind spot.** The harness substitutes an in-memory `Scenario` for
-//! every line of it, so a no-op'd method here is invisible to every test in the crate. Keep every
-//! method a pass-through.
-
 use std::collections::HashSet;
 
 use lyracore_shared::{constants, spatial};
@@ -30,7 +24,6 @@ use crate::{
     game_world_entity, MeleeAttack, WorldEntity,
 };
 
-/// `tick_creatures`' one call into the cycle. The adapter never leaves this module.
 pub(crate) fn run(ctx: &ReducerContext, tick: TickContext) -> CycleOutcome {
     let regen_window = crate::combat::RegenWindow::new(
         tick.now_micros / 1_000,
@@ -49,13 +42,11 @@ pub(crate) fn run(ctx: &ReducerContext, tick: TickContext) -> CycleOutcome {
 struct CtxWorld<'a> {
     ctx: &'a ReducerContext,
     regen_window: crate::combat::RegenWindow,
-    /// Each leg advance this firing wrote: the stored row before it, and the row it wrote.
     advances: Vec<(WorldEntity, WorldEntity)>,
 }
 
 impl CtxWorld<'_> {
-    /// Put back each stored row whose advance [`tick::advance_needs_persist`] lets lag. Restoring
-    /// the stored row in the same transaction leaves no commit-log entry.
+    // Restoring the stored row in the same transaction leaves no commit-log entry.
     fn settle_advances(self) {
         let entities = self.ctx.db.game_world_entity();
         let now_micros = self.ctx.timestamp.to_micros_since_unix_epoch() as u64;
@@ -71,10 +62,7 @@ impl CtxWorld<'_> {
         }
     }
 
-    /// Move the creature's authoritative row to `at`, writing grid address and packed cell in the
-    /// SAME statement (a stale `cell` puts the row in the wrong AOI cell), and hand back the row as
-    /// written. `moved_ms` stamps the move clock; a halted creature passes `None` because it did not
-    /// travel. `orientation` turns it in that same statement, so a stop-and-turn costs one write.
+    // Position, grid address and packed cell must change in one entity write.
     fn place(
         &self,
         guid: u64,
@@ -101,8 +89,6 @@ impl CtxWorld<'_> {
     }
 }
 
-/// [`super::stop_on_leg`] for a stop outside a firing, on the mover's stored leg row. Only the
-/// obstruction check reads the world, and it ignores the regen window.
 pub(crate) fn stop_on_stored_leg(ctx: &ReducerContext, leg: CreatureSpline) -> Option<Stop> {
     let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as u64;
     let world = CtxWorld {
@@ -113,8 +99,6 @@ pub(crate) fn stop_on_stored_leg(ctx: &ReducerContext, leg: CreatureSpline) -> O
     super::stop_on_leg(&world, &as_leg(leg, false), now_micros)
 }
 
-/// The spline row as the cycle reads a leg. `mover_gone` is the caller's to answer: the advance
-/// phase has to reap orphans, while a chaser's leg belongs to a creature it just resolved.
 fn as_leg(s: CreatureSpline, mover_gone: bool) -> LegInFlight {
     LegInFlight {
         guid: s.guid,
@@ -143,20 +127,11 @@ fn as_leg(s: CreatureSpline, mover_gone: bool) -> LegInFlight {
     }
 }
 
-/// A unit's live translation flags as the chase decision reads them. A client-driven unit stamps its
-/// own on every heartbeat; a creature stamps none, so the leg the MODULE is moving it along is what
-/// says it travels — the same thing vanilla's spline launch records on the unit itself. Spline
-/// advance runs first in the cycle and reaps a landed leg, so a surviving leg with a real duration is
-/// still in flight, while a halt leaves a zero-duration row, which is a stop.
 fn translation_flags(unit: &WorldEntity, leg: Option<CreatureSpline>) -> u32 {
     let carried = leg.is_some_and(|l| l.dur_ms > 0);
     unit.movement_flags | if carried { MOVE_FLAG_FORWARD } else { 0 }
 }
 
-/// The longest ENEMY-cast range (yd) creature `entry` can bring to bear — the rotation nukes and
-/// debuffs that target the melee victim, plus the legacy single-spell cast row, mapped through
-/// `game_spell.range_yd`. 0 means it is no offensive caster (melee-only mobs, pure healers and
-/// buff-bots), and chase then closes to melee.
 fn caster_hold_range_yd(ctx: &ReducerContext, entry: u32) -> f32 {
     let spells = ctx.db.game_spell();
     let mut max_r = 0u32;
@@ -385,7 +360,6 @@ impl IdleSink for CtxWorld<'_> {
             .or_else(|| distraction::expired_facing(self.ctx, guid))
     }
     fn clear_pending_facing(&mut self, guid: u64) {
-        // Clear only the facing that played, so the other one plays on a later firing.
         if eventai::movement::facing(self.ctx, guid).is_some() {
             eventai::movement::clear_facing(self.ctx, guid);
         } else {
@@ -518,8 +492,6 @@ impl IdleSink for CtxWorld<'_> {
 }
 
 impl EngageSink for CtxWorld<'_> {
-    // KNOWN DEBT, inherited verbatim from the aggro pass: there is no players-only index, so the
-    // snapshot reads every entity row once per sense firing. Budgeted in `tripwires.rs`.
     fn players(&self) -> Vec<AggroTarget> {
         self.ctx
             .db
@@ -553,8 +525,6 @@ impl EngageSink for CtxWorld<'_> {
             .filter(|c| {
                 !c.is_player()
                     && !c.dead
-                    // A PET never pulls or assists on its owner's behalf — the pet phase arms it off
-                    // the owner's combat instead.
                     && c.owner_guid == 0
                     && melee.attacker_guid().find(c.guid).is_none()
             })
@@ -608,7 +578,6 @@ impl EngageSink for CtxWorld<'_> {
             .iter()
             .filter_map(|a| {
                 let attacker = entities.guid().find(a.attacker_guid);
-                // Both sides gone: nothing to flag, and `enter_combat` would have no-opped anyway.
                 let instance_id = attacker
                     .as_ref()
                     .map(|e| e.instance_id)
@@ -668,12 +637,7 @@ impl EngageSink for CtxWorld<'_> {
 }
 
 impl RegenSink for CtxWorld<'_> {
-    // KNOWN DEBT, inherited verbatim with the pass: no index answers "hurt, or carrying a power
-    // bar", so the candidates cost one entity read per sense firing. Budgeted in `tripwires.rs`.
     fn recovering(&self, flagged: &[u64]) -> Vec<Recovering> {
-        // Both halves of "in combat": every side of a live engagement, plus the flag the sweep
-        // harvested at the top of this cycle (a pure caster or a Bloodrage warrior carries the flag
-        // with no melee row at all).
         let mut in_combat = crate::combat::melee_combatant_guids(self.ctx);
         in_combat.extend_from_slice(flagged);
         self.ctx
@@ -691,10 +655,6 @@ impl RegenSink for CtxWorld<'_> {
             })
             .collect()
     }
-    // ponytail: each rate re-finds the unit's row, where the old pass computed from the one snapshot
-    // it had scanned. Ceiling: up to three PK point reads per recovering unit per sense firing. The
-    // alternative is carrying spirit, level, power type and the five-second-rule clock in the
-    // cycle's own vocabulary, which is the schema wearing a behavior hat.
     fn healed_to(&self, u: &Recovering) -> u32 {
         self.ctx
             .db
@@ -743,12 +703,9 @@ impl RegenSink for CtxWorld<'_> {
                 crate::combat::regen_entity_power(&e, u.in_combat, self.regen_window, mana_per_five)
             })
     }
-    // ponytail: one row write per unit, where the old pass wrote health and power in two separate
-    // loops. Ceiling: a unit recovering both bars relays one update instead of two.
     fn restore(&mut self, guid: u64, health: Option<u32>, power: Option<u32>) {
         let entities = self.ctx.db.game_world_entity();
-        // The LIVE row, never the snapshot the decision was made from: a movement write earlier in
-        // this cycle must not be reverted by writing a stale position back.
+        // Re-read the live row so regeneration cannot restore a stale position.
         let Some(mut live) = entities.guid().find(guid) else {
             return;
         };
@@ -764,7 +721,6 @@ impl RegenSink for CtxWorld<'_> {
 }
 
 impl CtxWorld<'_> {
-    /// The template this creature was spawned from — the key both spell tables are authored against.
     fn entry_of(&self, guid: u64) -> Option<u32> {
         self.ctx
             .db
@@ -778,7 +734,6 @@ impl CtxWorld<'_> {
 impl CastSink for CtxWorld<'_> {
     fn casters(&self, scope: &TickScope) -> Vec<Caster> {
         let entities = self.ctx.db.game_world_entity();
-        // Same candidate discovery as chase: the engaged rows ARE the set, one per attacker.
         self.ctx
             .db
             .game_melee_attack()
@@ -879,8 +834,6 @@ impl ThreatSink for CtxWorld<'_> {
         crate::threat::threat_of(self.ctx, creature, source)
     }
     fn retarget(&mut self, creature: u64, victim: u64) {
-        // The engagement keeps its PK and its swing clock — only the victim moves, so the creature
-        // swings at the new foe on its own cadence instead of restarting the swing timer.
         let melee = self.ctx.db.game_melee_attack();
         if let Some(mut row) = melee.attacker_guid().find(creature) {
             row.target_guid = victim;
@@ -900,8 +853,6 @@ impl PursuitSink for CtxWorld<'_> {
     fn pursuits(&self, scope: &TickScope) -> Vec<Pursuit> {
         let entities = self.ctx.db.game_world_entity();
         let splines = self.ctx.db.game_creature_spline();
-        // The engaged rows ARE the candidate set (one per attacker, few), so this stays O(fights)
-        // rather than scanning the world. A player's own attack row is dropped by `movable_creature`.
         self.ctx
             .db
             .game_melee_attack()
@@ -961,9 +912,6 @@ impl PursuitSink for CtxWorld<'_> {
             .map_or(0.0, |c| caster_hold_range_yd(self.ctx, c.entry))
     }
     fn face(&mut self, guid: u64, at: Point, orientation: f32, spline_id: u32) {
-        // Position and facing land in ONE entity write, beside the ONE spline row the relay carries:
-        // `place` re-finds the live row rather than carrying the snapshot the decision was made
-        // from, so another write to it inside the same tick is not clobbered by a stale copy.
         let Some(e) = self.place(guid, at, None, Some(orientation)) else {
             return;
         };
@@ -981,15 +929,9 @@ impl PursuitSink for CtxWorld<'_> {
 }
 
 impl RoutSink for CtxWorld<'_> {
-    // ponytail: `creature_is_routing` re-derives eligibility that `eligible` already carries, because
-    // it is the ONE predicate chase, this phase and `combat::swing` share and forking it would let a
-    // creature be diverted out of chasing with nothing left to move it. Ceiling: one extra template
-    // read plus one aura scan per engaged creature per firing.
     fn routers(&self, scope: &TickScope) -> Vec<Router> {
         let entities = self.ctx.db.game_world_entity();
         let splines = self.ctx.db.game_creature_spline();
-        // The engaged rows ARE the candidate set — the rout clock lives on them, so the state is in
-        // hand with no extra lookup, and a creature whose row is gone can never have been routing.
         self.ctx
             .db
             .game_melee_attack()
@@ -1030,8 +972,6 @@ impl RoutSink for CtxWorld<'_> {
 }
 
 impl FearSink for CtxWorld<'_> {
-    // One row per aura, not per feared creature, so a doubly-feared creature is resolved twice and
-    // the phase collapses it. A second `fear_source` probe preserves the first-caster tie break.
     fn panicked(&self, scope: &TickScope) -> Vec<Panicked> {
         let entities = self.ctx.db.game_world_entity();
         let melee = self.ctx.db.game_melee_attack();
@@ -1042,8 +982,6 @@ impl FearSink for CtxWorld<'_> {
             .filter((crate::spell::A_CONTROL, crate::spell::M_FEAR))
             .filter_map(|a| {
                 let c = tick::movable_creature(self.ctx, a.target_guid, scope)?;
-                // Re-resolved rather than read off the row above, so which caster wins when a
-                // creature carries two fears stays `fear_source`'s own find order.
                 let source = crate::spell::fear_source(self.ctx, c.guid)?;
                 let at = entities.guid().find(source).or_else(|| {
                     melee
@@ -1090,7 +1028,6 @@ impl PetSink for CtxWorld<'_> {
                     },
                     map_id: p.map_id,
                     instance_id: p.instance_id,
-                    // A dead owner reads the same as a missing one: the pet despawns either way.
                     owner: entities
                         .guid()
                         .find(p.owner_guid)
@@ -1129,7 +1066,6 @@ impl PetSink for CtxWorld<'_> {
     fn take_victim(&mut self, guid: u64, victim: u64) {
         let melee = self.ctx.db.game_melee_attack();
         match melee.attacker_guid().find(guid) {
-            // Re-point at the owner's current foe WITHOUT resetting the swing cadence.
             Some(mut row) => {
                 if row.target_guid != victim {
                     row.target_guid = victim;
@@ -1140,8 +1076,8 @@ impl PetSink for CtxWorld<'_> {
                 melee.insert(MeleeAttack {
                     attacker_guid: guid,
                     target_guid: victim,
-                    last_swing_ms: 0,   // swing on the next melee tick
-                    ranged_spell_id: 0, // an Imp's Firebolt is cast by the cast phase, not this field
+                    last_swing_ms: 0,
+                    ranged_spell_id: 0,
                     last_offhand_swing_ms: 0,
                     rout_ends_ms: 0,
                     pursuit_ends_ms: 0,

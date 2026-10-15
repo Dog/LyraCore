@@ -1,5 +1,3 @@
-//! Typed Relay declarations own both the Coordinator query and its row callbacks.
-
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -10,7 +8,6 @@ use super::world_index::ShardId;
 use super::world_view::{GroupEventSource, WorldView};
 use super::Coordinator;
 
-/// Initial subscription rows arrive as inserts. Updates and deletes are always live deltas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Replay {
     Snapshot,
@@ -26,9 +23,7 @@ impl Replay {
 #[derive(Clone)]
 pub(crate) struct RelayContext {
     pub(crate) view: Arc<WorldView>,
-    /// World reads use the default World Shard even for Realm-core callbacks.
     pub(crate) coord: Coordinator,
-    /// Guild reads use the connection that owns the subscribed rows.
     pub(crate) realm: Coordinator,
     pub(crate) shard: ShardId,
     pub(crate) source: GroupEventSource,
@@ -44,8 +39,6 @@ pub(crate) struct RelayTable {
     pub(crate) legs: &'static [(&'static str, Replay)],
 }
 
-/// The declaration's table accessor fixes the row type of every callback. The same entry emits
-/// its query, replay policy and registration, so adding a Relay cannot omit its subscription.
 macro_rules! declare_relays {
     ($($table:ident [$realm:literal] {
         $($leg:ident($replay:ident) => $callback:expr;)*

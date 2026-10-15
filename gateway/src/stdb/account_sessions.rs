@@ -1,5 +1,3 @@
-//! Realm-core Account claims and their World Shard fences.
-
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,9 +36,6 @@ fn shadow_account(account: &Account) -> bool {
         && account.verifier.is_empty()
 }
 
-/// The Realm Account name one World Shard holds for a Character. The Account Character Owner is
-/// exact. Without one, a real local Account carries the Realm Account's name, and a shadow
-/// Account names nobody.
 fn realm_account_of(
     owner: Option<&AccountCharacterOwner>,
     local_account: Option<&Account>,
@@ -100,7 +95,6 @@ impl SessionOwnership {
 }
 
 impl Coordinator {
-    /// The Realm Account name THIS handle holds for `character_guid`, by primary key reads only.
     pub(crate) fn realm_account_name(&self, character_guid: u64) -> Option<String> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
@@ -116,13 +110,10 @@ impl Coordinator {
         realm_account_of(owner.as_ref(), local_account.as_ref())
     }
 
-    /// `actor` acting under this handle's Account Claim.
     pub(crate) fn session_actor(&self, actor: Actor) -> SessionActor {
         self.signed_actor(actor.guid())
     }
 
-    /// The bound owner's Character, for Durable Requests the Gateway makes on the World Session's
-    /// behalf rather than a client's. Guid 0 when no session is bound.
     pub(crate) fn owner_actor(&self) -> SessionActor {
         self.signed_actor(self.2.as_ref().map_or(0, |owner| owner.character_guid))
     }
@@ -264,8 +255,6 @@ impl Coordinator {
                 )
             )?;
         }
-        // No renewal is started for an incomplete admission. Its claim expires so another
-        // generation can finish fencing Shards that the interrupted attempt did not reach.
         Ok(token)
     }
 
@@ -296,8 +285,7 @@ impl Coordinator {
                 }
                 let coord = unbound.clone();
                 let token = owner.token;
-                // World Sessions can occupy every Tokio blocking slot. Renewal must keep
-                // progressing independently of those long-lived readers.
+                // Renew off Tokio's blocking pool; World Sessions can occupy every slot.
                 let (reply, result) = tokio::sync::oneshot::channel();
                 let started = std::thread::Builder::new()
                     .name("account-renewal".into())
@@ -727,8 +715,6 @@ mod tests {
             1
         );
 
-        // Hold A's cleanup while its Realm claim expires. The World Shard still has A's old
-        // generation, which B must advance before entering.
         fixture.assert_sql(&format!(
             "UPDATE game_account_claim SET expires_micros = 0 WHERE account_id = {}",
             first.account_id

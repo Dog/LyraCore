@@ -1,10 +1,5 @@
-//! Cast, channel and aura cancellation. Durable changes drive the protocol feedback.
-
 use super::*;
 
-/// `CMSG_CANCEL_CAST`: drop the caller's pending cast so its scheduled completion cannot fire a
-/// phantom `SMSG_SPELL_GO` that wedges the client in "Another action is in progress". The client's
-/// spell id is unused: the caller has at most one pending cast, which names it.
 pub(super) fn cancel_cast<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -12,8 +7,6 @@ pub(super) fn cancel_cast<St: CastStore + ?Sized>(
     best_effort(session, "cancel_cast", |actor| store.cancel_cast(actor))
 }
 
-/// `CMSG_CANCEL_AURA`: remove the caller's own aura named by the wire spell id. The aura relay then
-/// re-syncs the buff bar.
 pub(super) fn cancel_aura<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -24,9 +17,6 @@ pub(super) fn cancel_aura<St: CastStore + ?Sized>(
     })
 }
 
-/// The shared cancellation outcome: nothing on the wire, no session transition, and a Refusal that
-/// is logged rather than raised. Only a Transport Loss ends the session, because no later request
-/// could be served either. A session with no Actor has nothing to cancel.
 fn best_effort(
     session: &mut ProtocolSession,
     what: &str,
@@ -48,7 +38,6 @@ mod tests {
     use super::*;
     use wow_world_messages::vanilla::{CMSG_CANCEL_AURA, CMSG_CANCEL_CAST};
 
-    /// A store that refuses both cancellations, as a race with completion or expiry would.
     fn refusing_store(error: &str) -> InMemoryCasts {
         InMemoryCasts {
             cancel_error: Some(error.into()),

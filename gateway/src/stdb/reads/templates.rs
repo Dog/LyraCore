@@ -1,15 +1,9 @@
-//! Static-template cache-accessor methods (creature/gameobject/item entries) — pure
-//! code-motion split of the former `reads.rs`.
-
 use anyhow::Result;
 
 use super::super::bindings::*;
 use super::super::connection::Coordinator;
 
 impl Coordinator {
-    /// Read a gameobject template by entry for a `CMSG_GAMEOBJECT_QUERY` reply. A Meeting Stone's
-    /// `data0..data2` come from its stone row, the only copy of its level range and dungeon area,
-    /// so the client tooltip shows the range.
     pub fn gameobject_template(
         &self,
         entry: u32,

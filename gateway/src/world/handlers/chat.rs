@@ -1,14 +1,8 @@
-//! Realm Chat Lines, away status and ignored whispers. The Gateway reads Speaker Facts on the
-//! Home Shard; the Module decides the audience on Realm-core. Query owns `CMSG_MESSAGECHAT`
-//! and routes its Realm Chat Kinds here.
-
 use super::super::*;
 use crate::stdb::{classify, DurableFailure};
 use lyracore_shared::chat::{chat_kind, language, ChatRefusal};
 use wow_world_messages::vanilla::{CMSG_CHAT_IGNORED, SMSG_NOTIFICATION};
 
-/// What the speaker's Home Shard knows about them. The Coordinator conveys race and chat tag to
-/// the Module; `name` stays in the Gateway for lines that must name the speaker to someone else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpeakerFacts {
     pub(crate) race: u8,
@@ -16,35 +10,26 @@ pub(crate) struct SpeakerFacts {
     pub(crate) name: String,
 }
 
-/// One client line on its way to the `realm_chat` reducer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RealmChatRequest {
     pub(crate) kind: u8,
     pub(crate) language: u32,
-    /// CHANNEL only.
     pub(crate) channel_name: String,
-    /// IGNORED only.
     pub(crate) target_guid: u64,
     pub(crate) message: String,
     pub(crate) speaker: SpeakerFacts,
 }
 
-/// What the Gateway read about a whisper's target on whichever World Shard holds it
-/// (`world::whisper::target_facts`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WhisperTargetFacts {
     pub(crate) guid: u64,
     pub(crate) race: u8,
-    /// The canonical spelling.
     pub(crate) name: String,
     pub(crate) ignores_speaker: bool,
-    /// 0, `chat_kind::AFK` or `chat_kind::DND`.
     pub(crate) away_kind: u8,
-    /// The stored Auto-Reply. Empty means the Module's default text.
     pub(crate) away_message: String,
 }
 
-/// One whisper on its way to the `realm_whisper` reducer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WhisperRequest {
     pub(crate) language: u32,
@@ -53,8 +38,6 @@ pub(crate) struct WhisperRequest {
     pub(crate) target: WhisperTargetFacts,
 }
 
-/// How the Module answered one Realm Chat request. A timeout, transport or SDK failure stays an
-/// `Err` with an unknown durable outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatOutcome {
     Delivered,
@@ -62,31 +45,19 @@ pub(crate) enum ChatOutcome {
 }
 
 pub(crate) trait ChatActionStore: Send + Sync {
-    /// Durable Read on the speaker's Home Shard. `None` when the speaker has no live entity.
     fn speaker_facts(&self, speaker_guid: u64) -> Result<Option<SpeakerFacts>>;
-    /// Durable Request on Realm-core. The Coordinator picks the database; handlers never do.
     fn realm_chat(&self, actor: Actor, request: RealmChatRequest) -> Result<ChatOutcome>;
-    /// Durable Request on the speaker's Home Shard: one `/afk` or `/dnd`.
     fn set_away(&self, actor: Actor, kind: u8, message: String) -> Result<()>;
-    /// Durable Read across every World Shard: the online Character the typed name reaches, with
-    /// the facts the Module's whisper Gates need. `None` when no online Character has that name.
     fn whisper_target(
         &self,
         speaker_guid: u64,
         typed_name: &str,
     ) -> Result<Option<WhisperTargetFacts>>;
-    /// Durable Request on Realm-core.
     fn realm_whisper(&self, actor: Actor, request: WhisperRequest) -> Result<ChatOutcome>;
-    /// The speaker's GM level, read on its Home Shard. The Chat Flood Limiter never mutes a
-    /// Character above 0.
     fn speaker_gm_level(&self, speaker_guid: u64) -> Result<u8>;
 }
 
-/// Durable Requests for Speech, and for the GM dot-command a Say line can carry.
 pub(crate) trait SpeechStore: Send + Sync {
-    /// Speak (`CMSG_MESSAGECHAT`, social tier): broadcast a say, yell or `/e` line
-    /// (`lyracore_shared::chat::broadcast_chat`). A language the speaker's race does not know is a
-    /// Refusal.
     fn send_chat(
         &self,
         actor: Actor,
@@ -95,9 +66,6 @@ pub(crate) trait SpeechStore: Send + Sync {
         message: String,
     ) -> Result<ChatOutcome>;
 
-    /// Perform an emote (`CMSG_TEXT_EMOTE`, social tier): broadcast the "X dances." line + animation.
-    /// `target_guid` (0 = untargeted) is the client's selected target — the gateway resolves it to a
-    /// name so the chat line reads "X waves at <target>."
     fn send_emote(
         &self,
         actor: Actor,
@@ -106,24 +74,11 @@ pub(crate) trait SpeechStore: Send + Sync {
         target_guid: u64,
     ) -> Result<()>;
 
-    /// GM playtest dot-command for the proof-validated, realm-wide `account_name`: `text` is the
-    /// raw Say line, STILL carrying its
-    /// leading `.` — the Say handler intercepts it BEFORE any chat relay/insert and forwards it here
-    /// verbatim (module-side parsing keeps the command set data-free). A Refusal's reason is relayed
-    /// back to the SENDER ONLY as a system chat line (never broadcast, never a `game_chat_event`
-    /// row). Any other `Err` ends the World Session.
     fn gm_command(&self, account_name: &str, actor: Actor, text: String) -> Result<()>;
 }
 
-/// cm mangos.sql:4044, sent by cm:ChatHandler.cpp:107-110.
 const UNKNOWN_LANGUAGE_NOTICE: &str = "You don't know that language";
 
-/// The wire `chat_kind` for a Chat Kind whose own audience Refusals are silent here: Raid, Raid
-/// Leader, Raid Warning, Guild and Officer. `None` for every other `CMSG_MESSAGECHAT_ChatType`,
-/// Party and Channel included (they keep their own arms for a Refusal that answers the client).
-/// The shared Refusals still answer through `refusal_outbound` below — `UnknownLanguage` gets its
-/// vanilla notice whichever of these five kinds sent the line. Each family owns its audience rule
-/// on the Module side; this only picks the wire kind so they can share this arm's dispatch.
 fn silent_refusal_chat_kind(chat_type: &CMSG_MESSAGECHAT_ChatType) -> Option<u8> {
     match chat_type {
         CMSG_MESSAGECHAT_ChatType::Raid => Some(chat_kind::RAID),
@@ -135,7 +90,6 @@ fn silent_refusal_chat_kind(chat_type: &CMSG_MESSAGECHAT_ChatType) -> Option<u8>
     }
 }
 
-/// Handle Realm Chat Lines and away status. Query routes the matching Chat Kinds here.
 pub(crate) struct Chat;
 
 impl<St: ChatActionStore + ?Sized> ProtocolFamily<St> for Chat {
@@ -173,7 +127,6 @@ impl<St: ChatActionStore + ?Sized> ProtocolFamily<St> for Chat {
                     message,
                     speaker,
                 })? {
-                    // Speaking from no party is today's "You aren't in a party" answer.
                     Some(ChatRefusal::NotInGroup) => vec![Outbound::One(
                         ServerOpcodeMessage::SMSG_PARTY_COMMAND_RESULT(Box::new(
                             codec::build_party_command_result(
@@ -224,10 +177,6 @@ impl<St: ChatActionStore + ?Sized> ProtocolFamily<St> for Chat {
     }
 }
 
-/// One whisper: the target is resolved realm-wide, the Module applies the Gates on Realm-core, and
-/// the lines return on the Relay. A name no online Character holds answers
-/// `SMSG_CHAT_PLAYER_NOT_FOUND` with the typed name (cm:ChatHandler.cpp:243-266), and so does a
-/// target whose Realm Presence is unknown.
 fn whisper<St: ChatActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -254,7 +203,6 @@ fn whisper<St: ChatActionStore + ?Sized>(
     };
     match store.realm_whisper(actor, request) {
         Ok(ChatOutcome::Delivered) => Ok(Vec::new()),
-        // cm:ChatHandler.cpp:268-275, cm:ChatHandler.cpp:824-828: an empty packet.
         Ok(ChatOutcome::Refused(ChatRefusal::WrongFaction)) => Ok(vec![Outbound::One(
             ServerOpcodeMessage::SMSG_CHAT_WRONG_FACTION,
         )]),
@@ -272,8 +220,6 @@ fn player_not_found(name: String) -> Outbound {
     )))
 }
 
-/// `/afk` or `/dnd`. The client prints its own notice, and observers see the `PLAYER_FLAGS`
-/// change on the entity Relay, so nothing answers here.
 fn set_away<St: ChatActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -289,8 +235,6 @@ fn set_away<St: ChatActionStore + ?Sized>(
     Ok(Vec::new())
 }
 
-/// `CMSG_CHAT_IGNORED`: this player's client dropped a line from `dropped_speaker`, who learns
-/// "X is ignoring you." (cm:ChatHandler.cpp:801-815). The notice carries the ignorer's own name.
 fn chat_ignored<St: ChatActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -307,9 +251,6 @@ fn chat_ignored<St: ChatActionStore + ?Sized>(
     Ok(refusal_outbound(player, refusal))
 }
 
-/// Send one line through the Realm Chat path. `request` builds the Durable Request from the
-/// Speaker Facts. `Ok(None)` means the line went out or was dropped; a Refusal comes back for the
-/// calling arm to answer. A Transport Loss is fatal.
 fn send_line<St: ChatActionStore + ?Sized>(
     store: &St,
     player: &ProtocolSession,
@@ -330,9 +271,6 @@ fn send_line<St: ChatActionStore + ?Sized>(
     )
 }
 
-/// Sort one chat Durable Request's result. `Ok(None)` means the line went out, or was dropped for
-/// a Refusal this Gateway does not know; a Refusal it knows comes back for the caller to answer.
-/// A Transport Loss is fatal.
 pub(crate) fn settle(
     player: &ProtocolSession,
     line: impl std::fmt::Display,
@@ -348,7 +286,6 @@ pub(crate) fn settle(
     }
 }
 
-/// The answer every Chat Kind shares. Vanilla answers most chat Refusals with silence.
 pub(crate) fn refusal_outbound(
     player: &ProtocolSession,
     refusal: Option<ChatRefusal>,
@@ -371,8 +308,6 @@ pub(crate) fn refusal_outbound(
     }
 }
 
-/// A Refusal this Gateway has no answer for drops the request and keeps the World Session. A
-/// Transport Loss leaves the outcome unknown, so it ends the session.
 pub(super) fn drop_unrecognised_refusal(
     player: &ProtocolSession,
     request: impl std::fmt::Display,
@@ -398,13 +333,10 @@ mod tests {
     use std::sync::Mutex;
     use wow_world_messages::vanilla::Language;
 
-    /// How a Fake's Durable Request fails.
     #[derive(Clone, Copy)]
     enum Failure {
-        /// The Module rejects with a tag this Gateway does not know.
         Refused,
         TransportLost,
-        /// Another World Shard cannot vouch for a Character's absence.
         PresenceUnknown,
     }
 
@@ -562,11 +494,6 @@ mod tests {
         );
     }
 
-    /// Every racial language reaches the Module as its wire value (gtker vanilla `language.rs`),
-    /// so the Module's language Gate judges what the client sent. The addon bridge in
-    /// `world/mod.rs` only intercepts its own STC-prefixed frames; an addon-language line from any
-    /// other addon still reaches this dispatcher on Party, Raid, Guild or Officer
-    /// (`gateway/src/codec/addon.rs`).
     #[test]
     fn each_racial_language_reaches_the_module_as_its_wire_value() {
         for (language, wire) in [
@@ -648,8 +575,6 @@ mod tests {
         }
     }
 
-    /// Raid, Raid Leader, Raid Warning, Guild and Officer each route to the seam with their own
-    /// Chat Kind. The Module decides the audience; the Gateway only conveys the request.
     #[test]
     fn raid_and_guild_lines_carry_their_own_chat_kind() {
         for (chat_type, kind) in [
@@ -683,9 +608,6 @@ mod tests {
         }
     }
 
-    /// `SendAddonMessage` shares the Guild and Officer channels with the addon bridge
-    /// (`gateway/src/codec/addon.rs`). The addon language forwards to the Module unchanged, which
-    /// keeps it rather than forcing Universal (`cm:ChatHandler.cpp:369,409`).
     #[test]
     fn guild_and_officer_lines_forward_the_addon_language() {
         for (chat_type, label) in [
@@ -709,9 +631,6 @@ mod tests {
         }
     }
 
-    /// cmangos answers a raid or guild audience Refusal with silence, the same as every other
-    /// Chat Kind: a member who cannot speak on it hears nothing back, and neither does anyone else
-    /// (`cm:ChatHandler.cpp:367-369`, `cm:Guild.cpp:559-561`).
     #[test]
     fn every_raid_and_guild_chat_refusal_is_silent() {
         for refusal in [
@@ -793,7 +712,6 @@ mod tests {
         );
     }
 
-    /// cm:Channel.cpp:593-664 answers each refused line with one notice to the speaker alone.
     #[test]
     fn a_refused_channel_line_answers_the_channels_notice() {
         for (refusal, code) in [
@@ -890,7 +808,6 @@ mod tests {
         );
     }
 
-    /// cm:ChatHandler.cpp:243-266: the typed name comes back as the client typed it.
     #[test]
     fn a_whisper_to_nobody_online_answers_player_not_found() {
         let store = whisper_store(Ok(None), None);
@@ -919,7 +836,6 @@ mod tests {
         assert!(store.whispers.lock().unwrap().is_empty());
     }
 
-    /// cm:ChatHandler.cpp:824-828: the opcode alone, with an empty body.
     #[test]
     fn a_cross_faction_whisper_answers_wrong_faction() {
         let store = whisper_store(
@@ -975,7 +891,6 @@ mod tests {
         assert!(outbound.is_empty());
     }
 
-    /// `/afk` and `/dnd` answer nothing: the client prints its own notice.
     #[test]
     fn afk_and_dnd_set_the_away_status_of_the_speaker() {
         let store = store(None);
@@ -1013,7 +928,6 @@ mod tests {
         assert!(Chat::handle(&lost, &mut player(), afk().into()).is_err());
     }
 
-    /// cm:ChatHandler.cpp:801-815: the ignorer's name, to the Character whose line was dropped.
     #[test]
     fn chat_ignored_sends_the_ignorers_name_to_the_dropped_speaker() {
         let store = store(None);

@@ -1,5 +1,3 @@
-//! Table Relays for this Protocol Family.
-
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::world_index::EntityLayer;
@@ -9,17 +7,12 @@ use crate::world::Outbound;
 use std::sync::{Arc, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-/// The Guild Projection of `character_guid`, read from the Realm-core cache. `(0, 0)` when
-/// Realm-core cannot answer: the next membership relay corrects it.
 pub(crate) fn guild_projection_of(coord: &Coordinator, character_guid: u64) -> (u32, u32) {
     coord
         .realm_core()
         .map_or((0, 0), |realm| realm.guild_projection(character_guid))
 }
 
-/// Relay the current Guild Projection of `character_guid` to a viewer that holds its entity: the
-/// member itself or a viewer whose `created` set has the guid. `projection` is read when the job
-/// runs, so a delayed job never writes a value older than the cache.
 pub(crate) fn guild_values_outbound(
     viewer: &Viewer,
     character_guid: u64,
@@ -35,9 +28,6 @@ pub(crate) fn guild_values_outbound(
     vec![Outbound::Raw { opcode, body }]
 }
 
-/// Render one Guild Event row. The row carries its final strings. Kinds 0x40 (INVITE) and 0x41
-/// (DECLINE) are membership offers with their own wire shape; every other kind not built from a
-/// shared snapshot (see `GuildEventSnapshot`) rides the generic SMSG_GUILD_EVENT builder.
 pub(crate) fn guild_event_outbound(row: &GuildEvent) -> Vec<Outbound> {
     match row.kind {
         lyracore_shared::guild::event_kind::INVITE => {
@@ -60,10 +50,6 @@ pub(crate) fn guild_event_outbound(row: &GuildEvent) -> Vec<Outbound> {
     }
 }
 
-/// Render one petition Guild Event (`0x70..=0x7F`). The Charter is in `other_guid` and the
-/// signer or decliner in `subject_guid`. `petition` is the Petition of that Charter, read when the
-/// job runs; only PETITION_OFFERED and PETITION_CHANGED need it, and a Petition that is gone by
-/// then renders nothing.
 pub(crate) fn petition_event_outbound(
     row: &GuildEvent,
     petition: Option<&codec::PetitionView>,
@@ -142,10 +128,6 @@ pub(crate) fn petition_read(realm: &Coordinator) -> PetitionRead {
     Arc::new(move |charter_item_guid| realm.guild_petition_of_charter(charter_item_guid))
 }
 
-/// A membership row changed: re-send the member's Guild Projection to the member and to every
-/// viewer that holds its entity. The member is always addressed, as `cell_audience` keeps its owner
-/// leg, so an entity the cell index has not seen yet cannot hide a removal from the member's own
-/// client. The job reads membership when it runs, so after a delete it sends 0 and 0.
 pub(crate) fn guild_membership_changed(
     view: &WorldView,
     membership: &GuildMembershipRead,
@@ -181,14 +163,6 @@ pub(crate) fn guild_membership_changed(
     }
 }
 
-/// A Guild Event landed. An addressed row reaches its recipient; a broadcast row reaches every
-/// online member on this Gateway. A member signing on does not hear its own SIGNED_ON: mangos
-/// broadcasts it before the Character is in the world (`cm:CharacterHandler.cpp:787`).
-///
-/// `TABARD_CHANGED`, `ROSTER_TO_ACTOR` and `ROSTER_REFRESH` also carry a query response, a roster,
-/// or both; the first recipient's job reads the Guild (and, for the two roster kinds, its roster)
-/// once through `snapshot_read` and every other recipient's job reuses that one snapshot, so a
-/// broadcast to a large Guild costs one Realm-core read, not one per online member.
 pub(crate) fn guild_event_appeared(
     view: &WorldView,
     membership: &GuildMembershipRead,
@@ -271,8 +245,6 @@ pub(crate) fn guild_event_appeared(
     }
 }
 
-/// A petition Guild Event landed: it reaches its one addressed recipient. The two kinds that show
-/// a Petition read it when the job runs, once per event.
 pub(crate) fn petition_event_appeared(
     view: &WorldView,
     petitions: &PetitionRead,
@@ -303,8 +275,6 @@ pub(crate) fn petition_event_appeared(
     });
 }
 
-/// A Petition opened: its owner's Guild Charter shows the Petition id in ITEM_FIELD_ENCHANTMENT,
-/// where the client reads it back for its petition queries (`cm:PetitionsHandler.cpp:141`).
 pub(crate) fn charter_petition_opened(view: &WorldView, row: &GuildPetition) {
     let Some(viewer) = view
         .session_of_owner(row.owner_guid)

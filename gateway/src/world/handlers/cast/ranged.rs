@@ -1,20 +1,11 @@
-//! The ranged auto-repeat route: Auto Shot and wand Shoot are attack LOOPS, not one-shot casts.
-//!
-//! Activation arms the durable loop and parks a cast in the client's auto-repeat slot; each real
-//! shot belongs to the durable swing tick and its combat-event relay. Cancellation only clears the
-//! loop. Both directions update the shared ranged state that melee requests also read.
-
 use super::*;
 
-/// Arm or refuse a ranged auto-repeat loop (`CMSG_CAST_SPELL` for Auto Shot / wand Shoot).
 pub(super) fn activate<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
     c: &CMSG_CAST_SPELL,
 ) -> Result<ProtocolReply> {
     let spell = c.spell;
-    // The shot's target rides the cast's UNIT block. No current-selection fallback: Auto Shot and
-    // Shoot are cast ON a target, so the client always sends one.
     let target = unit_target(c);
     log::info!(
         "world[autoshot]: activate spell={spell} target={target} already_repeating={} (account {})",
@@ -22,10 +13,6 @@ pub(super) fn activate<St: CastStore + ?Sized>(
         session.account_id
     );
 
-    // Arm the durable loop FIRST, before any success outcome exists. A refusal then answers only
-    // the raw failure result, and the 5875 client drops its auto-repeat toggle on that — client and
-    // server stay in lockstep. Acknowledging first and failing after left the client toggled ON
-    // over a dead loop, so the next press sent a cancel instead of a cast.
     let Some(actor) = session.actor() else {
         return refuse(store, session, spell, NO_ACTOR);
     };
@@ -33,10 +20,7 @@ pub(super) fn activate<St: CastStore + ?Sized>(
         return refuse(store, session, spell, &refusal_reason(e)?);
     }
 
-    // The activation ack is `SMSG_SPELL_START` alone: timer 0 (the wind-up is an attack timer, not
-    // a cast bar — the client animates its own), the ammo block that nocks the projectile, and the
-    // real unit target. No CAST_RESULT(OK) and no GO: this cast parks in the client's auto-repeat
-    // slot and never resolves, and each shot's GO comes from the swing-tick relay.
+    // Auto-repeat activation sends START alone; CAST_RESULT or GO would clear its repeat slot.
     let caster = actor.guid();
     let outbound = vec![Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(
         Box::new(codec::build_spell_start(
@@ -55,7 +39,6 @@ pub(super) fn activate<St: CastStore + ?Sized>(
     })
 }
 
-/// A refused activation. A Refusal is a handled outcome; a Transport Loss never reaches here.
 fn refuse<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -70,9 +53,6 @@ fn refuse<St: CastStore + ?Sized>(
         opcode: OP_CAST_RESULT,
         body: codec::build_cast_result_failed(spell, codec::cast_failure_reason_for(reason)),
     }];
-    // A refused RETARGET drops the client's toggle on that failure result, so the still-firing OLD
-    // loop has to go too — otherwise the server keeps shooting a target the client believes it
-    // stopped. A fresh activation has no older loop, and must not touch unrelated engagement state.
     if !matches!(&session.state, WorldState::InWorld(world) if world.ranged_repeat) {
         return Ok(outbound.into());
     }
@@ -85,7 +65,6 @@ fn refuse<St: CastStore + ?Sized>(
     })
 }
 
-/// `CMSG_CANCEL_AUTO_REPEAT_SPELL`: the client toggled the loop off, or auto-switched to melee.
 pub(super) fn cancel<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -95,10 +74,7 @@ pub(super) fn cancel<St: CastStore + ?Sized>(
         matches!(&session.state, WorldState::InWorld(world) if world.ranged_repeat),
         session.account_id
     );
-    // The durable stop runs ONLY when a ranged loop was armed. A melee press sends CMSG_ATTACKSWING
-    // and this cancel back to back, and the swing handler has already overwritten the shared
-    // engagement row to melee — an unconditional stop deleted that just-armed melee row. No inline
-    // ack either: the engagement's on_delete relay is the one sender of SMSG_CANCEL_AUTO_REPEAT.
+    // An unconditional stop could erase a melee engagement that just replaced the ranged loop.
     if matches!(&session.state, WorldState::InWorld(world) if world.ranged_repeat) {
         stop_loop(store, session, "cancel_auto_repeat")?;
     }
@@ -110,8 +86,6 @@ pub(super) fn cancel<St: CastStore + ?Sized>(
     })
 }
 
-/// Ask the module to tear the engagement down. A Refusal (nothing armed, a race with the swing
-/// tick) must not end the session or reach the client; a Transport Loss ends the session.
 fn stop_loop<St: CastStore + ?Sized>(
     store: &St,
     session: &mut ProtocolSession,
@@ -130,11 +104,6 @@ fn stop_loop<St: CastStore + ?Sized>(
     Ok(())
 }
 
-/// The `(display_id, inv_type)` ammo block for the activation START. `Some` only when the ranged
-/// slot (17) holds a launcher (weapon class 2, subclass 2/3/18 — bow/gun/crossbow) and a live
-/// projectile stack is in the bags. A wand fires its own bolt, and a launcher with no live stack
-/// omits the block so the durable loop alone decides whether a shot can happen. Inventory type 24
-/// (INVTYPE_AMMO) is hardcoded, matching the GO relay.
 fn ammo_display<St: CastStore + ?Sized>(store: &St, self_guid: u64) -> Option<(u32, u32)> {
     let items = store.player_items(self_guid).ok()?;
     let launcher = items
@@ -167,7 +136,6 @@ mod tests {
 
     const AUTO_SHOT: u32 = 75;
 
-    /// One owned item: `entry` in inventory `slot`, holding `stack_count`.
     fn owned(slot: u8, entry: u32, stack_count: u32) -> ItemInstanceView {
         ItemInstanceView {
             guid: u64::from(entry),
@@ -179,7 +147,6 @@ mod tests {
         }
     }
 
-    /// A weapon template (class 2). Subclass 2/3/18 is a bow/gun/crossbow; 19 is a wand.
     fn launcher(entry: u32, subclass: u8) -> ItemTemplateView {
         ItemTemplateView {
             entry,
@@ -189,7 +156,6 @@ mod tests {
         }
     }
 
-    /// A projectile template (class 6) with its own display id.
     fn projectile(entry: u32, display_id: u32) -> ItemTemplateView {
         ItemTemplateView {
             entry,
@@ -199,7 +165,6 @@ mod tests {
         }
     }
 
-    /// A store whose spell 75 routes as ranged auto-repeat.
     fn ranged_store() -> InMemoryCasts {
         InMemoryCasts {
             ranged_auto_repeat: vec![AUTO_SHOT],
@@ -207,7 +172,6 @@ mod tests {
         }
     }
 
-    /// A player with an older ranged loop already armed.
     fn repeating() -> ProtocolSession {
         let mut session = session();
         if let WorldState::InWorld(world) = &mut session.state {
@@ -216,7 +180,6 @@ mod tests {
         session
     }
 
-    /// The single `SMSG_SPELL_START` in the batch.
     fn spell_start(outbound: &[Outbound]) -> &wow_world_messages::vanilla::SMSG_SPELL_START {
         outbound
             .iter()
@@ -227,15 +190,12 @@ mod tests {
             .expect("the batch has no SMSG_SPELL_START")
     }
 
-    /// The ammo block the activation START carries, if any.
     fn ammo_block(outbound: &[Outbound]) -> Option<(u32, u32)> {
         spell_start(outbound)
             .flags
             .get_ammo()
             .map(|a| (a.ammo_display_id, a.ammo_inventory_type))
     }
-
-    // ── Activation ───────────────────────────────────────────────────────────
 
     #[test]
     fn activation_arms_the_durable_loop_and_acknowledges_with_a_zero_timer_start() {
@@ -337,8 +297,6 @@ mod tests {
         .is_err());
     }
 
-    // ── Cancellation ─────────────────────────────────────────────────────────
-
     #[test]
     fn cancelling_an_active_loop_clears_the_state_and_stops_it_with_no_inline_ack() {
         let store = ranged_store();
@@ -381,9 +339,6 @@ mod tests {
         assert!(outbound.is_empty());
     }
 
-    // ── Ammo display ─────────────────────────────────────────────────────────
-
-    /// Ranged slot 17 holds `launcher`, and the given projectile stacks sit in the bags.
     fn armed_with(launcher: ItemTemplateView, ammo: Vec<(u8, u32, u32)>) -> InMemoryCasts {
         let mut items = vec![owned(17, launcher.entry, 1)];
         let mut templates = vec![launcher];

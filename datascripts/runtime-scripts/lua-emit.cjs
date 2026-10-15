@@ -1,39 +1,12 @@
-// The two things this printer owns: the shape generated Lua must not take on the pinned
-// interpreter, and the entry point every Runtime Script declares.
-//
-// # The table-constructor guard
-//
-// piccolo 0.3.3 passes an inline table constructor's ELEMENT COUNT as an extra argument when the
-// constructor is the LAST argument of a call, so `f({7, 8, 9})` reaches a two-parameter `f` as
-// `f(table, 3)`. `x = x or default` is the commonest shape in transpiler output, so generated Lua
-// meets it constantly. Both facts are pinned in the Module by
-// `piccolo_leaks_a_table_constructors_element_count_as_an_extra_argument`.
-//
-// Parentheses do not help: the leak is in how the call site counts arguments, not in value
-// adjustment. Passing the table through a one-parameter function does, because that function drops
-// the extra value and returns exactly one. So this printer rewrites `f(a, {…})` to
-// `f(a, ____tbl({…}))` and prepends `____tbl` to every emitted file.
-//
-// A printer rather than a TypeScript visitor: it sees the whole Lua AST, including the calls tstl
-// itself invents for classes, spreads and library helpers, which a visitor over TypeScript nodes
-// never meets.
-//
-// Named Event Bindings get their invocation wrapper from build-scripts.ts. Legacy sources still
-// declare script(); the appended call preserves its Script Answer.
-
 const ts = require("typescript");
 const tstl = require("typescript-to-lua");
 const lua = require("typescript-to-lua/dist/LuaAST");
 
-/// The one-parameter passthrough. Named in the `____` space tstl reserves for its own locals.
 const GUARD = "____tbl";
 
-/// The function name every authored `.ts` Runtime Script declares.
 const ENTRY = "script";
 
-/// `params` with a trailing table constructor wrapped in the guard. Only the last argument is
-/// rewritten: Lua adjusts only the last argument of a call to multiple values, and that is exactly
-/// where the leak lands.
+// Piccolo 0.3.3 leaks a trailing table constructor's element count as an extra argument.
 function guardTrailingTable(params) {
   if (!params || params.length === 0) return params;
   const last = params[params.length - 1];
@@ -42,9 +15,6 @@ function guardTrailingTable(params) {
   return [...params.slice(0, -1), wrapped];
 }
 
-/// `local function ____tbl(t) return t end`, prepended to every file whether or not a call needed
-/// it. Emitting it unconditionally keeps the output a pure function of the source: whether the
-/// guard is reachable never changes a byte anywhere else.
 function guardDeclaration() {
   const parameter = lua.createIdentifier("t");
   return lua.createVariableDeclarationStatement(
@@ -56,8 +26,6 @@ function guardDeclaration() {
   );
 }
 
-/// `return script()` — the last statement of every emitted file, so the chunk's return value is the
-/// Script Answer.
 function entryCall() {
   return lua.createReturnStatement([
     lua.createCallExpression(lua.createIdentifier(ENTRY), []),
@@ -66,7 +34,7 @@ function entryCall() {
 
 class PiccoloPrinter extends tstl.LuaPrinter {
   printCallExpression(expression) {
-    // The guard's own call must not be wrapped again, or printing never terminates.
+    // Wrapping the passthrough itself would recurse forever.
     if (lua.isIdentifier(expression.expression) && expression.expression.text === GUARD) {
       return super.printCallExpression(expression);
     }
@@ -93,8 +61,6 @@ function acceptsScriptAnswer(type) {
   return (type.flags & (ts.TypeFlags.NumberLike | ts.TypeFlags.Void | ts.TypeFlags.Undefined | ts.TypeFlags.Never)) !== 0;
 }
 
-/// Every non-declaration source file must declare `function script(): number | void` with no
-/// parameters. The Host invokes it without arguments and reads only a numeric Script Answer.
 function requireEntryPoint(program) {
   const diagnostics = [];
   const checker = program.getTypeChecker();

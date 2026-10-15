@@ -1024,8 +1024,8 @@ fn an_ordinary_refused_cast_spends_its_repeat_opportunity() {
         ))
         .not_ready(92);
 
-    fire(&mut scenario); // arms the timer
-    fire(&mut scenario); // due, and the cast is refused
+    fire(&mut scenario);
+    fire(&mut scenario);
 
     assert!(scenario.casts().is_empty());
     assert_eq!(

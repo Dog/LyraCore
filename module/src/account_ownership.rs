@@ -1,5 +1,3 @@
-//! Account ownership shared by independent Gateways. Closed generations remain as fences.
-
 use spacetimedb::{reducer, table, ReducerContext, SpacetimeType, Table};
 
 use crate::{game_account, game_character, game_gateway_session, game_world_entity, Account};
@@ -16,8 +14,6 @@ pub struct WorldSessionToken {
     pub request_nonce: u128,
 }
 
-/// A request retains its World Session's token even while queued for delivery.
-/// An absent token is reserved for Operator-driven Characters without a World Session.
 #[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionActor {
     pub guid: u64,
@@ -47,9 +43,7 @@ pub struct AccountFence {
     pub closed: bool,
 }
 
-/// Retained Realm Account ownership for one globally unique Character guid. Every World Shard
-/// keeps this row across Transfer, logout and Character deletion so a shadow Account never becomes
-/// an ownership authority by itself.
+// Retain ownership across Transfer, logout and deletion; shadow Accounts confer no authority.
 #[table(
     accessor = game_account_character_owner,
     index(accessor = by_account, btree(columns = [account_id]))
@@ -140,7 +134,7 @@ fn deadline(ctx: &ReducerContext) -> Result<i64, String> {
         .ok_or_else(|| "Account claim deadline overflow".into())
 }
 
-/// Retry the same request nonce to recover a lost reply. A closed or expired request never reopens.
+// Retrying a nonce can recover its reply but cannot reopen a closed or expired generation.
 #[reducer]
 pub fn claim_account(
     ctx: &ReducerContext,
@@ -183,8 +177,7 @@ pub fn claim_account(
             .ok_or("Account generation exhausted")?,
         None => 1,
     };
-    // The prior generation is dead: released, or expired before the reaper closed it. What it
-    // admitted ends before the new generation exists. A no-op after release.
+    // End the old generation's admitted state before installing its successor.
     if let Some(row) = &prior {
         claim_ended(ctx, row.character_guid);
     }
@@ -239,16 +232,12 @@ pub fn release_account_claim(ctx: &ReducerContext, token: WorldSessionToken) -> 
     Ok(())
 }
 
-/// End what an Account Claim admitted for its Character: every Chat Channel Membership and a solo
-/// Seeker. Each place that releases, replaces or reaps a claim calls this, so the next claim-scoped
-/// state hooks here once.
 fn claim_ended(ctx: &ReducerContext, character_guid: u64) {
     crate::channel::leave_all(ctx, character_guid);
     crate::meeting_stone::claim_ended(ctx, character_guid);
 }
 
-/// The Gateway must obtain this generation from Realm-core and install it on every configured
-/// World Shard before admission. Older deliveries cannot lower a Shard's retained generation.
+// Install the Realm-core generation on every World Shard before admitting the Character.
 #[reducer]
 pub fn fence_account(
     ctx: &ReducerContext,
@@ -274,8 +263,7 @@ pub fn fence_account(
         if token.generation < row.generation {
             return Err(STALE.into());
         }
-        // This is the only ownership history an upgraded Shard can recover without trusting its
-        // local Account id. Preserve it before a new generation replaces the fence.
+        // Preserve prior ownership before replacing the fence; local Account ids are not authority.
         remember_character_owner(ctx, row.account_id, &row.account_name, row.character_guid)?;
     }
     if !character_belongs_to_account(ctx, token.account_id, &account_name, character_guid) {
@@ -478,8 +466,7 @@ fn remove_exact_character(ctx: &ReducerContext, guid: u64) {
     ctx.db.game_gateway_session().entity_guid().delete(guid);
 }
 
-/// Shared Gate for gameplay, Realm-core actions and Transfer steps. It checks the token in the
-/// transaction that acts on the Character; a prior Gateway read grants no authority.
+// Check the token in the transaction that acts; a prior Gateway read grants no authority.
 pub(crate) fn require_actor(ctx: &ReducerContext, actor: SessionActor) -> Result<u64, String> {
     if let Some(token) = actor.ownership {
         if let Some(row) = ctx
@@ -530,8 +517,6 @@ pub(crate) fn require_actor(ctx: &ReducerContext, actor: SessionActor) -> Result
     }
 }
 
-/// Completion requests must name the Character stored in the referenced durable operation.
-/// Operator recovery without a token still checks that Character's current ownership.
 pub(crate) fn require_actor_for(
     ctx: &ReducerContext,
     actor: SessionActor,
@@ -550,11 +535,6 @@ pub(crate) fn require_actor_for(
     .map(|_| ())
 }
 
-/// Close open Account Claims whose deadline has passed, at most [`REAP_LIMIT`] per call. Called
-/// from the Gateway lease schedule, so a crashed Gateway's Characters leave their Chat Channels
-/// and the Meeting Stone Queue.
-/// [`claim_account`] and [`require_actor`] already treat an expired claim as dead, so closing one
-/// changes no admission outcome.
 pub(crate) fn reap_account_claims(ctx: &ReducerContext) {
     let cutoff = now(ctx);
     let expired: Vec<AccountClaim> = ctx
@@ -573,8 +553,6 @@ pub(crate) fn reap_account_claims(ctx: &ReducerContext) {
     }
 }
 
-/// Called from the existing Gateway lease schedule; one surviving Gateway cannot renew another
-/// World Session's Account claim or keep its Character alive.
 pub(crate) fn reap_account_fences(ctx: &ReducerContext) {
     let cutoff = now(ctx);
     let expired: Vec<_> = ctx

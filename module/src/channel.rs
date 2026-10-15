@@ -1,14 +1,3 @@
-//! Chat Channels on Realm-core: one copy of every channel per team, whichever World Shard its
-//! members play on.
-//!
-//! Every op runs through [`realm_channel_op`]. A successful op writes its Channel Notices as
-//! [`ChatChannelNoticeEvent`] rows with explicit recipients, which the Gateway delivers like a
-//! Realm Chat Line. A Refusal rolls the transaction back, so the Gateway answers it from the tag.
-//! Channel speech is a Realm Chat Line of kind CHANNEL; [`chat_audience`] is its audience rule.
-//!
-//! Channel Membership lasts as long as the Account Claim generation that admitted it. The claim
-//! code calls [`leave_all`] when it releases, replaces or reaps a claim.
-
 use spacetimedb::{reducer, table, ReducerContext, SpacetimeType, Table, Timestamp};
 
 use lyracore_shared::channel::{
@@ -20,8 +9,6 @@ use lyracore_shared::faction::team_for_race;
 
 use crate::realm_chat::{ChatAudience, RealmChatRequest, SpeakerFacts};
 
-/// One Chat Channel. Private: the owner-token Coordinator is its only reader. Deleted with its
-/// bans when its last member leaves. [entity]
 #[table(
     accessor = game_chat_channel,
     index(accessor = by_name, btree(columns = [team, name_key]))
@@ -30,26 +17,17 @@ pub struct ChatChannel {
     #[primary_key]
     #[auto_inc]
     pub channel_id: u64,
-    /// `lyracore_shared::faction` team id. Each team has its own channels.
     pub team: u32,
-    /// The lowercase name. With `team`, the channel's identity.
     pub name_key: String,
-    /// The creator's spelling, echoed on the wire.
     pub name: String,
-    /// The ChatChannels id. 0 for a custom channel.
     pub builtin_id: u32,
-    /// `lyracore_shared::channel::channel_flag` bits.
     pub flags: u8,
     pub password: String,
-    /// 0 for none. Built-in channels never have one.
     pub owner_guid: u64,
-    /// JOINED and LEFT go to the other members.
     pub announcements: bool,
-    /// Only moderators may speak.
     pub moderated: bool,
 }
 
-/// One Channel Membership. The row id is the join order that owner succession reads. [entity]
 #[table(
     accessor = game_chat_channel_member,
     index(accessor = by_channel, btree(columns = [channel_id])),
@@ -61,14 +39,12 @@ pub struct ChatChannelMember {
     pub id: u64,
     pub channel_id: u64,
     pub character_guid: u64,
-    /// `lyracore_shared::channel::member_flag` bits.
     pub member_flags: u8,
-    /// The Account Claim that admitted the member. 0 for an actor without a World Session.
+    // Membership ends with the Account Claim generation that admitted it.
     pub account_id: u64,
     pub claim_generation: u64,
 }
 
-/// A Character banned from one channel. Deleted with its channel. [entity]
 #[table(
     accessor = game_chat_channel_ban,
     index(accessor = by_channel, btree(columns = [channel_id]))
@@ -81,58 +57,34 @@ pub struct ChatChannelBan {
     pub character_guid: u64,
 }
 
-/// One Channel Notice with its complete recipient list. Private, reaped by the shared event GC.
-/// Which fields a notice fills follows cm:Channel.cpp:748-946. [event]
 #[table(accessor = game_chat_channel_notice_event)]
 pub struct ChatChannelNoticeEvent {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    /// `lyracore_shared::channel::notice`.
     pub notice: u8,
     pub channel_name: String,
-    /// JOINED, LEFT, MODE_CHANGE, PLAYER_ALREADY_MEMBER, OWNER_CHANGED, the target of
-    /// PLAYER_KICKED, PLAYER_BANNED and PLAYER_UNBANNED, and the inviter of INVITE.
     pub subject_guid: u64,
-    /// PASSWORD_CHANGED, the announcement and moderation toggles, and the source of
-    /// PLAYER_KICKED, PLAYER_BANNED and PLAYER_UNBANNED.
     pub actor_guid: u64,
-    /// MODE_CHANGE only.
     pub old_flags: u8,
     pub new_flags: u8,
-    /// YOU_JOINED only: the wire channel flags.
     pub channel_flags: u32,
-    /// The name PLAYER_INVITED and PLAYER_INVITE_BANNED carry.
     pub text: String,
     pub recipients: Vec<u64>,
     pub created_at: Timestamp,
 }
 
-/// One channel op as the client asked for it, with the facts only the Gateway can read. Every op
-/// uses the same shape, so adding an op never changes the reducer signature.
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Eq)]
 pub struct ChannelRequest {
-    /// As the client typed it.
     pub channel_name: String,
-    /// JOIN and PASSWORD.
     pub password: String,
-    /// Ops that name a player. The Gateway resolves the name realm-wide.
     pub target_guid: u64,
-    /// The target's name, for notices that carry one.
     pub target_name: String,
-    /// INVITE: the target's team check.
     pub target_race: u8,
-    /// INVITE: read from the target's own contact rows.
     pub target_ignores_actor: bool,
-    /// The actor. Its race decides the team.
     pub speaker: SpeakerFacts,
 }
 
-/// Run one channel op for `request_actor`.
-///
-/// Operator-gated because the actor is an argument: Realm-core has no live entity to derive it
-/// from. A Refusal rolls the transaction back and returns its stable tag. An op byte this Module
-/// does not know is an untagged error.
 #[reducer]
 pub fn realm_channel_op(
     ctx: &ReducerContext,
@@ -190,8 +142,6 @@ pub fn realm_channel_op(
     })
 }
 
-/// cm:Channel.cpp:59-124. The channel is created on the first join; a refused join rolls the
-/// creation back with it.
 fn join(
     ctx: &ReducerContext,
     team: u32,
@@ -201,10 +151,6 @@ fn join(
 ) -> Result<(), ChannelRefusal> {
     let name = channel_name(&request.channel_name)?;
     check_password(&request.password)?;
-    // A Guild member stays out of GuildRecruitment and hears nothing about it. mangos tests the
-    // channel's wire flags 0x38, which only GuildRecruitment carries (cm:Channel.cpp:94-95). The
-    // test runs before the channel is found or created, so the committed Ok leaves no empty
-    // channel behind. mangos runs it after the ban test; a banned Guild member hears silence here.
     if classify(&name.display).is_some_and(|builtin| builtin.id == GUILD_RECRUITMENT_ID)
         && crate::guild::member(ctx, joiner).is_some()
     {
@@ -212,7 +158,6 @@ fn join(
     }
     let channel = find(ctx, team, &name.key).unwrap_or_else(|| create(ctx, team, name));
     if member_of(ctx, channel.channel_id, joiner).is_some() {
-        // Built-in channels answer a repeat join with nothing (cm:Channel.cpp:64-72).
         return if channel.builtin_id != 0 {
             Ok(())
         } else {
@@ -225,8 +170,6 @@ fn join(
     if !channel.password.is_empty() && channel.password != request.password {
         return Err(ChannelRefusal::WrongPassword);
     }
-    // A built-in channel can hold every player of a team, so its member list is read only when an
-    // announcement or a first owner needs it. Built-in channels need neither.
     let takes_ownership = channel.builtin_id == 0 && channel.owner_guid == 0;
     let others = if channel.announcements || takes_ownership {
         members_in_join_order(ctx, channel.channel_id)
@@ -266,7 +209,6 @@ fn join(
     Ok(())
 }
 
-/// cm:Channel.cpp:126-167.
 fn leave(
     ctx: &ReducerContext,
     team: u32,
@@ -285,7 +227,6 @@ fn leave(
     Ok(())
 }
 
-/// cm:Channel.cpp:288-317.
 fn set_password(
     ctx: &ReducerContext,
     team: u32,
@@ -311,9 +252,6 @@ fn set_password(
     Ok(())
 }
 
-/// SET_OWNER (cm:Channel.cpp:393-444, cm:Channel.cpp:976-1017). The actor must be the owner
-/// (`NotOwner`) and the target must be a member (`PlayerNotFound`). A built-in channel has no
-/// owner, so its `owner_guid` is always 0 and every actor fails the owner check.
 fn set_owner(
     ctx: &ReducerContext,
     team: u32,
@@ -332,11 +270,6 @@ fn set_owner(
     Ok(())
 }
 
-/// MODERATOR, UNMODERATOR, MUTE and UNMUTE (cm:Channel.cpp:319-391, cm:Channel.cpp:960-974). The
-/// actor must be a moderator (`NotModerator`) and the target must be a member (`PlayerNotFound`).
-/// Naming the owner refuses `NotOwner`, except that the owner's own MODERATOR bit never changes
-/// (cm:Channel.cpp:359-360): a silent no-op, not a mute exemption. `change_member_flags` already
-/// silently skips a flag that is already at the requested state.
 fn set_mode_flag(
     ctx: &ReducerContext,
     team: u32,
@@ -371,11 +304,6 @@ fn set_mode_flag(
     Ok(())
 }
 
-/// KICK and BAN (cm:Channel.cpp:169-237). The actor must be a moderator; only the owner may remove
-/// the owner. A BAN of a Character not yet banned records the ban and writes PLAYER_BANNED;
-/// otherwise, and for KICK, write PLAYER_KICKED. Either notice names target and actor and goes to
-/// every member, target included, before the target departs (cm:Channel.cpp:231-233). `depart`
-/// sends no LEFT of its own here, because this notice already covers the departure.
 fn kick_or_ban(
     ctx: &ReducerContext,
     team: u32,
@@ -421,11 +349,6 @@ fn kick_or_ban(
     Ok(())
 }
 
-/// UNBAN (cm:Channel.cpp:239-286). The actor must be a moderator. An unresolved target (guid 0,
-/// the Gateway's sentinel for a name that did not resolve to an online Character) refuses
-/// `PlayerNotFound`, the same as cmangos's own `GetPlayer` miss, checked before the ban table,
-/// never after: no real Character ever holds guid 0. A Character not banned refuses
-/// `PlayerNotBanned`. Otherwise remove the ban and write PLAYER_UNBANNED naming target and actor.
 fn unban(
     ctx: &ReducerContext,
     team: u32,
@@ -465,13 +388,6 @@ fn unban(
     Ok(())
 }
 
-/// INVITE (cm:Channel.cpp:666-726). Needs no moderator right. An unresolved target (guid 0, the
-/// Gateway's sentinel for a name that did not resolve to an online Character) refuses
-/// `PlayerNotFound`, cmangos's own `GetPlayer` miss, checked first: race 0 would otherwise pass
-/// the team check below as Alliance and falsely succeed. A target already a member refuses
-/// `PlayerAlreadyMember`; a banned target refuses `PlayerInviteBanned`; another team refuses
-/// `InviteWrongFaction`. Otherwise write INVITE naming the actor to the target, unless the target
-/// ignores the actor, and write PLAYER_INVITED with the target's name to the actor.
 fn invite(
     ctx: &ReducerContext,
     team: u32,
@@ -513,14 +429,11 @@ fn invite(
     Ok(())
 }
 
-/// What [`toggle`] flips.
 enum Toggle {
     Announcements,
     Moderate,
 }
 
-/// ANNOUNCEMENTS and MODERATE (cm:Channel.cpp:523-591). The actor must be a moderator. Flip the
-/// flag and tell every member.
 fn toggle(
     ctx: &ReducerContext,
     team: u32,
@@ -564,8 +477,6 @@ fn toggle(
     Ok(())
 }
 
-/// Leave every channel without YOU_LEFT, as vanilla does at logout (cm:Player.cpp:4739-4750).
-/// The other members still see LEFT where announced, and ownership passes on.
 pub(crate) fn leave_all(ctx: &ReducerContext, character_guid: u64) {
     let memberships: Vec<ChatChannelMember> = ctx
         .db
@@ -586,12 +497,6 @@ pub(crate) fn leave_all(ctx: &ReducerContext, character_guid: u64) {
     }
 }
 
-/// Remove one member: LEFT to the rest when `notify_left`, owner succession, and the empty channel
-/// deleted with its password and bans (cm:ChannelMgr.cpp:85-103). Built-in channels keep no state
-/// worth an empty row either. `notify_left` is `channel.announcements` for a plain leave; KICK and
-/// BAN pass `false`, because their own PLAYER_KICKED or PLAYER_BANNED notice already covers the
-/// departure and vanilla does not double-announce it. The remaining members are read only when a
-/// notice or a new owner needs them, so leaving a built-in channel never reads its member list.
 fn depart(
     ctx: &ReducerContext,
     channel: ChatChannel,
@@ -629,9 +534,6 @@ fn depart(
     }
 }
 
-/// Owner succession: the earliest-joined moderator, else the earliest joiner. mangos
-/// `SelectNewOwner` does the same with guid order (cm:Channel.cpp:948-958); join order is the
-/// fairer tie-break. `members` is in join order and not empty.
 pub(crate) fn successor(members: &[ChatChannelMember]) -> u64 {
     members
         .iter()
@@ -640,9 +542,6 @@ pub(crate) fn successor(members: &[ChatChannelMember]) -> u64 {
         .map_or(0, |member| member.character_guid)
 }
 
-/// Make `new_owner` the owner of a custom channel (cm:Channel.cpp:976-1016). A previous owner who
-/// is still a member keeps MODERATOR and loses OWNER. The new owner gains both. Each change is one
-/// MODE_CHANGE to every member, and OWNER_CHANGED follows when `exclaim` is set.
 pub(crate) fn hand_ownership(
     ctx: &ReducerContext,
     mut channel: ChatChannel,
@@ -668,8 +567,6 @@ pub(crate) fn hand_ownership(
     }
 }
 
-/// Rewrite one member's flags and tell every member with MODE_CHANGE. No row, no notice when the
-/// character is not a member or the flags do not change.
 pub(crate) fn change_member_flags(
     ctx: &ReducerContext,
     channel: &ChatChannel,
@@ -705,9 +602,6 @@ pub(crate) fn change_member_flags(
     );
 }
 
-/// Who hears a CHANNEL line (cm:Channel.cpp:593-664): every member, speaker included. A listener
-/// who ignores the speaker skips the line unless the speaker is a moderator (cm:Channel.cpp:663,
-/// vm:Channel.cpp:677). Vanilla has no death check here.
 pub(crate) fn chat_audience(
     ctx: &ReducerContext,
     speaker_guid: u64,
@@ -731,7 +625,6 @@ pub(crate) fn chat_audience(
     })
 }
 
-/// The channel `raw_name` names for `team`, and `character_guid`'s membership in it.
 pub(crate) fn membership(
     ctx: &ReducerContext,
     team: u32,
@@ -745,8 +638,6 @@ pub(crate) fn membership(
     Ok((channel, member))
 }
 
-/// `character_guid`'s membership in one channel, read through the Character's own few
-/// memberships rather than the channel's member list.
 fn member_of(
     ctx: &ReducerContext,
     channel_id: u64,
@@ -767,8 +658,6 @@ fn find(ctx: &ReducerContext, team: u32, key: &str) -> Option<ChatChannel> {
         .next()
 }
 
-/// A built-in channel gets its wire flags, no announcements and never an owner. A custom channel
-/// gets CUSTOM and announcements (cm:Channel.cpp:26-57).
 fn create(ctx: &ReducerContext, team: u32, name: ChannelName) -> ChatChannel {
     let builtin = classify(&name.display);
     ctx.db.game_chat_channel().insert(ChatChannel {
@@ -825,8 +714,6 @@ pub(crate) fn guids(members: &[ChatChannelMember]) -> Vec<u64> {
     members.iter().map(|member| member.character_guid).collect()
 }
 
-/// A [`ChatChannelNoticeEvent`] without the channel, recipients, id and time. Unused fields stay
-/// zero.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Notice {
     pub(crate) notice: u8,
@@ -839,7 +726,6 @@ pub(crate) struct Notice {
 }
 
 impl Notice {
-    /// A notice that names one member, or none when `subject_guid` is 0.
     pub(crate) fn about(notice: u8, subject_guid: u64) -> Self {
         Self {
             notice,
@@ -849,7 +735,6 @@ impl Notice {
     }
 }
 
-/// The only writer of `game_chat_channel_notice_event`. Nothing is written for an empty audience.
 pub(crate) fn notify(
     ctx: &ReducerContext,
     channel: &ChatChannel,

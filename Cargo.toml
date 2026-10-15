@@ -8,31 +8,17 @@ members = [
     "gateway",
     "importer",
 ]
-# The headless build-5875 wire client is deliberately not a member. It lives in its own repository,
-# LyraCoreProject/wire-harness, and is consumed as a pinned release; `.wire-harness-rev` holds the
-# pin and `lyracore dev smoke` resolves it. It is a server-agnostic protocol tool, and a workspace
-# membership was the coupling that made "does this run against any other 5875 core?" unanswerable.
 
-# The SpacetimeDB module compiles to wasm and pulls its own (large) dependency tree;
-# keep workspace-wide settings minimal so the module and the native gateway can diverge.
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-# Two facts set this floor, both re-checked at the 2.7.1 bump: every `spacetimedb-*` crate declares
-# `rust-version = "1.93.0"`, and they declare `edition = "2024"`, which Cargo below 1.85 cannot even
-# parse. So the real MSRV equals the toolchain pinned in `rust-toolchain.toml` and there is nothing
-# lower to test. Keep the two numbers equal. Lowering this needs a build attempt, not an assumption.
+# Keep this floor equal to rust-toolchain.toml; SpacetimeDB 2.7.1 requires Rust 1.93.0.
 rust-version = "1.93.0"
 repository = "https://github.com/LyraCoreProject/LyraCore"
 homepage = "https://github.com/LyraCoreProject/LyraCore"
-# Every crate here is internal to the LyraCore server. None is a library anyone should depend on from
-# crates.io, so the whole workspace is publish-gated once rather than crate by crate.
 publish = false
 
-# A function above the threshold in `clippy.toml` no longer fits in one head. Existing warnings
-# mark untouched long functions; changed code stays below the 200-line ceiling. Lower it as those
-# functions shrink.
 [workspace.lints.clippy]
 too_many_lines = "warn"
 

@@ -2,7 +2,6 @@ use spacetimedb::{reducer, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::auth::{game_session, game_session_reaper_schedule};
 
-/// Exercise the real recurring scheduler without waiting for the production interval.
 #[reducer]
 pub(crate) fn debug_accelerate_session_reaper(ctx: &ReducerContext) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -16,7 +15,6 @@ pub(crate) fn debug_accelerate_session_reaper(ctx: &ReducerContext) -> Result<()
     Ok(())
 }
 
-/// Expire an Account's Session so the handshake and scheduled reaper can be verified.
 #[reducer]
 pub fn debug_expire_session(ctx: &ReducerContext, account_id: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -30,7 +28,6 @@ pub fn debug_expire_session(ctx: &ReducerContext, account_id: u64) -> Result<(),
     Ok(())
 }
 
-/// Drive `package_account::create_package_character` for `package_name` without a Package present.
 #[reducer]
 pub fn debug_create_package_character(
     ctx: &ReducerContext,

@@ -1,93 +1,33 @@
-//! Spatial helpers for visibility / interest management.
-//!
-//! The slice queries visibility with a bounding box over `x`/`y`, but the entity table also
-//! carries pre-baked `grid_x`/`grid_y` cell columns so production can switch to grid-cell
-//! interest management without a schema migration. These helpers compute those cells and the
-//! box predicate consistently in both tiers.
-
-/// Vanilla map coordinate span constant: cells are measured from +COORD_MAX downwards, the
-/// same convention the client/grids use, so cell math matches existing tooling.
+// Cell indices count down from +MAP_COORD_MAX.
 pub const MAP_COORD_MAX: f32 = 17066.666;
 
-/// Side length of an AOI interest cell in yards. The gateway subscribes a `(2·BOX_HALF_SPAN+1)`-square
-/// `GridBox`; the guaranteed-visible radius (player → nearest box edge, worst case at a cell boundary)
-/// is `BOX_HALF_SPAN × GRID_CELL_SIZE`. Tuned for VANILLA feel: 50yd cells × span 2 (5×5) → min-visible
-/// **100yd** (≈ the ~90-100yd vanilla unit view, so no pop-in), loading to ~150yd on an axis / ~212yd at
-/// a corner. Finer cells + a wider span give a tighter box for the same min-visible than a coarse 3×3
-/// (less cell-anchor slop). A box is a square approximation of vanilla's circle (the subscription SQL
-/// can't do the `(x-px)²+(y-py)²` arithmetic), so a √2 corner over-reach is inherent; a true radius
-/// would need an un-indexed `Box2` x/y filter. Both tiers bake `grid_x`/`grid_y` from this, so a change
-/// needs a re-grid (`debug_regrid`).
+// AOI cell side length in yards.
 pub const GRID_CELL_SIZE: f32 = 50.0;
 
-/// AOI box half-span in cells: the box is the anchor cell ± this on each axis, i.e.
-/// `(2·BOX_HALF_SPAN+1)²` cells. 2 → a 5×5 box. The gateway subscription AND the module's
-/// movement-recipient selection both derive their range from this (via `GridBox::bounds`), so they
-/// stay ALIGNED automatically (a peer is animated exactly when it's spawned).
 pub const BOX_HALF_SPAN: i32 = 2;
 
-/// Default visibility radius in yards for the slice's box predicate. Roughly the vanilla
-/// active-object range; tune during bring-up.
 pub const DEFAULT_VISIBILITY_RADIUS: f32 = 100.0;
 
-/// Compute the grid cell (x, y) for a world position, matching the vanilla convention.
 pub fn grid_cell(x: f32, y: f32) -> (i32, i32) {
     let gx = ((MAP_COORD_MAX - x) / GRID_CELL_SIZE).floor() as i32;
     let gy = ((MAP_COORD_MAX - y) / GRID_CELL_SIZE).floor() as i32;
     (gx, gy)
 }
 
-/// Pack a `(grid_x, grid_y)` cell address into ONE `i64` — the `cell` column every AOI-scoped table
-/// carries alongside its `grid_x`/`grid_y` pair.
-///
-/// # Why a packed column exists at all
-///
-/// SpacetimeDB 2.7.1's subscription planner (`IxScanFromPredicates`) can only serve a query from an
-/// index when **every column of that index is matched by an equality term**, and it skips any index
-/// with more than 3 columns outright (`MAX_EXACT_INDEX_COLS = 3`). Range predicates are never
-/// index-served at all — `IndexProbe::Range` is documented in that release as "we currently never
-/// construct this variant" — and a disjunction (`OR`) is evaluated row-by-row, never turned into
-/// multiple probes. So the 4-column `by_grid` index `(map_id, instance_id, grid_x, grid_y)` is
-/// *unusable* from SQL, and a `grid_x BETWEEN .. AND grid_y BETWEEN ..` box is a residual filter over
-/// a full scan no matter how the columns are ordered. Folding the two grid columns into one turns the
-/// only shape the planner CAN serve — a 3-column all-equality probe on
-/// `(map_id, instance_id, cell)` — into an exact match for a single grid cell.
-///
-/// # Why this encoding cannot collide
-///
-/// It is a **bijection** on the whole `(i32, i32)` domain, not merely collision-free over the
-/// coordinate range in use. `gx as i64` sign-extends and the `<< 32` leaves the low 32 bits zero;
-/// `gy as u32 as i64` is `gy`'s exact 32 two's-complement bits zero-extended into those low 32 bits.
-/// The two operands therefore occupy **disjoint bit ranges**, so the `|` loses nothing and the high
-/// and low halves recover `gx` and `gy` exactly ([`grid_cell_of_id`]). Two distinct cells cannot
-/// share an id because that would require two distinct 64-bit patterns to be equal. No assumption is
-/// made about map extent, cell size, or sign — a negative cell index on either axis round-trips like
-/// any other, which matters because [`grid_cell`] inverts the axis and out-of-bounds coordinates
-/// legitimately produce negative indices.
+// SpacetimeDB 2.7.1 needs one equality query per packed cell for indexed AOI reads.
 pub fn grid_cell_id(gx: i32, gy: i32) -> i64 {
     ((gx as i64) << 32) | (gy as u32 as i64)
 }
 
-/// Inverse of [`grid_cell_id`] — recovers `(grid_x, grid_y)` from a packed cell id. Exists to make
-/// the bijection testable (and to keep the encoding honest: an encoding you cannot invert is one you
-/// cannot prove collision-free).
 pub fn grid_cell_of_id(id: i64) -> (i32, i32) {
     ((id >> 32) as i32, (id as u32) as i32)
 }
 
-/// The packed [`grid_cell_id`] for a world position — the one-call form every row writer uses, so a
-/// `cell` column can never disagree with the `grid_x`/`grid_y` pair written beside it.
 pub fn cell_id_at(x: f32, y: f32) -> i64 {
     let (gx, gy) = grid_cell(x, y);
     grid_cell_id(gx, gy)
 }
 
-/// The inclusive grid-cell box `(gx0, gx1, gy0, gy1)` covering every point within `radius` yards
-/// of `(x, y)` — the query shape for a `by_grid`-indexed neighborhood read.
-/// `grid_cell` inverts the axis (`(MAP_COORD_MAX - v) / CELL`), so `+radius` yields the LOW cell
-/// index and `-radius` the high one; monotonicity of `grid_cell` makes the two endpoints bracket
-/// every intermediate cell. A non-positive (or NaN-tainted) radius degrades to the single anchor
-/// cell rather than an inverted, silently-empty range.
 pub fn covering_cell_box(x: f32, y: f32, radius: f32) -> (i32, i32, i32, i32) {
     let r = if radius > 0.0 { radius } else { 0.0 };
     let (gx0, gy0) = grid_cell(x + r, y + r);
@@ -95,8 +35,6 @@ pub fn covering_cell_box(x: f32, y: f32, radius: f32) -> (i32, i32, i32, i32) {
     (gx0, gx1, gy0, gy1)
 }
 
-/// Axis-aligned bounding box used by the slice's nearby-entity subscription predicate:
-/// `map_id == m AND x BETWEEN x0..x1 AND y BETWEEN y0..y1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Box2 {
     pub map_id: u32,
@@ -107,7 +45,6 @@ pub struct Box2 {
 }
 
 impl Box2 {
-    /// The visibility box centered on `(x, y)` with the given radius on `map_id`.
     pub fn around(map_id: u32, x: f32, y: f32, radius: f32) -> Self {
         Self {
             map_id,
@@ -118,38 +55,24 @@ impl Box2 {
         }
     }
 
-    /// True if `(x, y)` on `map_id` falls inside this box.
     pub fn contains(&self, map_id: u32, x: f32, y: f32) -> bool {
         map_id == self.map_id && x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
 }
 
-/// The Area-of-Interest footprint: a `(2·BOX_HALF_SPAN+1)`-square grid-cell box anchored on one cell. The
-/// gateway subscribes to `game_world_entity` rows whose `(map_id, grid_x, grid_y)` fall in this box (an
-/// index-friendly range on the `by_grid` btree), and RECENTERS it (unsubscribe+resubscribe) when the
-/// player crosses out of the anchor cell. Pure so the cell/box math is unit-tested + shared between tiers.
-/// At `GRID_CELL_SIZE` 50yd × `BOX_HALF_SPAN` 2 the 5×5 spans ~250yd with a **100yd** guaranteed-visible
-/// radius (≈ the vanilla unit view → no pop-in), culling beyond ~150yd/axis (~212yd corner). Changing the
-/// cell size needs a re-grid of stored `grid_x`/`grid_y` (the `debug_regrid` reducer re-stamps in place).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridBox {
     pub map_id: u32,
-    /// The anchor cell (the box is `gx-1..=gx+1`, `gy-1..=gy+1`).
     pub gx: i32,
     pub gy: i32,
 }
 
 impl GridBox {
-    /// The box (anchor cell ± [`BOX_HALF_SPAN`]) anchored on the cell containing `(x, y)` on `map_id`.
     pub fn around(map_id: u32, x: f32, y: f32) -> Self {
         let (gx, gy) = grid_cell(x, y);
         Self { map_id, gx, gy }
     }
 
-    /// Inclusive grid-cell bounds of the box (anchor ± [`BOX_HALF_SPAN`]): `(gx_min, gx_max, gy_min,
-    /// gy_max)` — the WHERE-clause range the AOI subscription uses (`grid_x BETWEEN gx_min AND gx_max AND
-    /// grid_y BETWEEN ...`). The SAME range drives the module's movement-recipient selection, so the
-    /// gateway's spawn set and the peer-movement relay stay aligned.
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
         (
             self.gx - BOX_HALF_SPAN,
@@ -164,17 +87,10 @@ impl GridBox {
         (gx_min..=gx_max).flat_map(move |gx| (gy_min..=gy_max).map(move |gy| (gx, gy)))
     }
 
-    /// The box's cells as PACKED ids, [`GridBox::cells`] run through [`grid_cell_id`]. This is
-    /// what the AOI subscription enumerates: one equality query per cell is the only box-shaped read
-    /// SpacetimeDB 2.7.1's planner can serve entirely from an index (see [`grid_cell_id`]).
     pub fn cell_ids(self) -> impl Iterator<Item = i64> {
         self.cells().map(|(gx, gy)| grid_cell_id(gx, gy))
     }
 
-    /// Should the box RECENTER on `(map_id, x, y)`? True when the position is on a different map, or in a
-    /// different cell than the anchor (the player crossed a cell boundary). The cell-change trigger keeps
-    /// the player roughly centered; at 50yd a walking player crosses a boundary every ~7s, so the resubscribe
-    /// rate stays low. (A ½-cell hysteresis to damp exact-boundary thrash is a refinement.)
     pub fn needs_recenter(&self, map_id: u32, x: f32, y: f32) -> bool {
         if map_id != self.map_id {
             return true;
@@ -184,15 +100,6 @@ impl GridBox {
     }
 }
 
-/// An axis-aligned grid-cell RECTANGLE with no anchor — the per-shard split unit for cross-seam
-/// view-merge. A [`GridBox`] is always a fixed-size square around one anchor cell; a
-/// `GridRect` is any inclusive `(gx_min..=gx_max) × (gy_min..=gy_max)` span, which is what a straddling
-/// box's per-shard share looks like after [`crate::region`]'s rectangle boundaries cut it.
-///
-/// A non-straddling box's home share is exactly the whole box: [`GridRect::from_box`] and
-/// [`GridBox::bounds`] emit the identical four integers, so a caller building the same 4 table
-/// queries from either one produces byte-identical SQL — the property that makes "no seam in view"
-/// cost nothing extra.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridRect {
     pub map_id: u32,
@@ -203,8 +110,6 @@ pub struct GridRect {
 }
 
 impl GridRect {
-    /// The whole box, as a rect with no anchor — the identity conversion a non-straddling recenter
-    /// takes.
     pub fn from_box(b: &GridBox) -> Self {
         let (gx_min, gx_max, gy_min, gy_max) = b.bounds();
         Self {
@@ -216,16 +121,10 @@ impl GridRect {
         }
     }
 
-    /// Inclusive grid-cell bounds — the same 4-tuple shape [`GridBox::bounds`] returns, so both types
-    /// can feed one query-builder.
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
         (self.gx_min, self.gx_max, self.gy_min, self.gy_max)
     }
 
-    /// Every cell in the rect as a PACKED id, the rect twin of [`GridBox::cell_ids`], and what
-    /// a per-shard AOI rect actually subscribes. A rect built from a whole box
-    /// ([`GridRect::from_box`]) emits the identical id sequence [`GridBox::cell_ids`] does, which is
-    /// what keeps a non-straddling recenter byte-identical to the login subscription.
     pub fn cell_ids(self) -> impl Iterator<Item = i64> {
         (self.gx_min..=self.gx_max)
             .flat_map(move |gx| (self.gy_min..=self.gy_max).map(move |gy| grid_cell_id(gx, gy)))
@@ -240,21 +139,14 @@ mod tests {
     fn grid_box_bounds_and_recenter() {
         let b = GridBox::around(0, -8949.95, -132.493);
         let (xmin, xmax, ymin, ymax) = b.bounds();
-        assert_eq!(xmax - xmin, 2 * BOX_HALF_SPAN); // 5x5 → anchor ±2
+        assert_eq!(xmax - xmin, 2 * BOX_HALF_SPAN);
         assert_eq!(ymax - ymin, 2 * BOX_HALF_SPAN);
-        assert_eq!((xmin + BOX_HALF_SPAN, ymin + BOX_HALF_SPAN), (b.gx, b.gy)); // anchor is the center
-                                                                                // A few yards away → same cell → no recenter.
+        assert_eq!((xmin + BOX_HALF_SPAN, ymin + BOX_HALF_SPAN), (b.gx, b.gy));
         assert!(!b.needs_recenter(0, -8945.0, -130.0));
-        // A different map → recenter.
         assert!(b.needs_recenter(1, -8949.95, -132.493));
-        // Well over a cell away (600yd ≫ the 50yd cell) → different cell → recenter.
         assert!(b.needs_recenter(0, -8949.95 - 600.0, -132.493));
     }
 
-    /// a non-straddling recenter's home share must be BYTE-IDENTICAL to today's whole-box
-    /// query, and this is the property that makes that true — `GridRect::from_box` emits the exact
-    /// same 4-tuple `GridBox::bounds` does, so a query builder driven by either type produces the
-    /// same SQL string for the same box.
     #[test]
     fn grid_rect_from_box_matches_bounds_exactly() {
         let b = GridBox::around(0, -8949.95, -132.493);
@@ -266,10 +158,6 @@ mod tests {
         assert_eq!(r.bounds(), b.bounds());
     }
 
-    /// `cells()` must emit EXACTLY the cell set `bounds()`'s four inequalities accept — the module's
-    /// movement relay swapped a full entity scan filtered by those inequalities for one indexed probe
-    /// per emitted cell, so the two forms are only interchangeable while this holds. A `..` for a
-    /// `..=`, a swapped axis or a repeated cell all show up here (and nowhere else in the suite).
     #[test]
     fn grid_box_cells_are_exactly_the_cells_bounds_accepts() {
         let b = GridBox::around(0, -8949.95, -132.493);
@@ -283,17 +171,12 @@ mod tests {
             cells.len(),
             "a repeated cell would double a peer's movement rows"
         );
-        // Sweep a margin around the box: membership must agree with the inequality predicate in BOTH
-        // directions (a dropped edge cell = a peer that stops seeing the mover; an extra one = a
-        // recipient outside the AOI box the gateway spawns from).
         for gx in (x0 - 2)..=(x1 + 2) {
             for gy in (y0 - 2)..=(y1 + 2) {
                 let inside = gx >= x0 && gx <= x1 && gy >= y0 && gy <= y1;
                 assert_eq!(unique.contains(&(gx, gy)), inside, "cell ({gx},{gy})");
             }
         }
-        // Negative cell indices (the far quadrant of a map) enumerate identically — the anchor is
-        // always emitted, and the count never changes with the sign of the anchor.
         let neg = GridBox {
             map_id: 0,
             gx: -3,
@@ -306,15 +189,8 @@ mod tests {
         );
     }
 
-    /// The packed `cell` id must be a BIJECTION over `(i32, i32)`. Every writer of `grid_x`/
-    /// `grid_y` also writes this value and the AOI subscription probes it with an equality, so a
-    /// collision would silently merge two cells — two players 500yd apart would see each other, and
-    /// the entities of one cell would be delivered to the wrong box. Round-tripping is the proof:
-    /// an invertible map cannot collide.
     #[test]
     fn grid_cell_id_round_trips_and_never_collides() {
-        // Round-trip the interesting corners of the i32 domain, not just the coordinate range in use:
-        // grid_cell inverts the axis, so out-of-bounds world coords legitimately go negative.
         let interesting = [
             0i32,
             1,
@@ -347,14 +223,9 @@ mod tests {
                 );
             }
         }
-        // The two halves are DISJOINT bit ranges: changing gy can never disturb the gx half and vice
-        // versa. This is the property the `|` relies on, and the one a `gx * K + gy` style pack
-        // (which overflows into its neighbour once gy exceeds K) would not have.
         assert_eq!(grid_cell_id(0, -1), 0x0000_0000_FFFF_FFFFu64 as i64);
         assert_eq!(grid_cell_id(-1, 0), -1i64 << 32);
         assert_ne!(grid_cell_id(1, 0), grid_cell_id(0, 1));
-        // An exhaustive sweep over a realistic map's cell range (map extent / GRID_CELL_SIZE is ~683
-        // cells per axis) — no duplicate across the whole plane, which is the live-data guarantee.
         let mut all = std::collections::HashSet::new();
         for gx in -5..=690 {
             for gy in -5..=690 {
@@ -364,9 +235,6 @@ mod tests {
         assert_eq!(all.len(), 696 * 696);
     }
 
-    /// `cell_id_at` must agree with `grid_cell` + `grid_cell_id` composed by hand — it is the ONE
-    /// call every row writer makes, so a divergence here would stamp a `cell` that disagrees with the
-    /// `grid_x`/`grid_y` written beside it on the same row.
     #[test]
     fn cell_id_at_matches_grid_cell_composed_with_the_packer() {
         for (x, y) in [
@@ -382,10 +250,6 @@ mod tests {
         }
     }
 
-    /// `cell_ids()` must be exactly `cells()` packed — the AOI subscription enumerates the former and
-    /// the module's movement-recipient probe enumerates the latter, so the two describing different
-    /// cell sets would spawn a peer the relay never animates (or vice versa), the exact class
-    /// `grid_box_cells_are_exactly_the_cells_bounds_accepts` guards for the unpacked form.
     #[test]
     fn box_and_rect_cell_ids_are_exactly_the_packed_cells() {
         let b = GridBox::around(0, -8949.95, -132.493);
@@ -402,14 +266,11 @@ mod tests {
             got.len(),
             "a duplicate id inside one box would double-deliver a cell"
         );
-        // A rect built from the whole box emits the IDENTICAL sequence — the property that keeps a
-        // non-straddling recenter byte-identical to the login subscription (see GridRect::from_box).
         assert_eq!(
             GridRect::from_box(&b).cell_ids().collect::<Vec<_>>(),
             got,
             "rect-of-a-whole-box must equal the box's own id sequence"
         );
-        // A negative-anchor box behaves identically (no sign-dependent shortcuts in the packer).
         let neg = GridBox {
             map_id: 0,
             gx: -3,
@@ -425,17 +286,15 @@ mod tests {
         assert!(b.contains(0, 100.0, 200.0));
         assert!(b.contains(0, 110.0, 210.0));
         assert!(!b.contains(0, 111.0, 200.0));
-        assert!(!b.contains(1, 100.0, 200.0)); // different map
+        assert!(!b.contains(1, 100.0, 200.0));
     }
 
     #[test]
     fn covering_cell_box_brackets_the_radius() {
-        // 150yd radius over 50yd cells → 7 cells per axis, anchor cell strictly inside.
         let (ax, ay) = grid_cell(0.0, 0.0);
         let (gx0, gx1, gy0, gy1) = covering_cell_box(0.0, 0.0, 150.0);
         assert_eq!((gx1 - gx0, gy1 - gy0), (6, 6));
         assert!(gx0 < ax && ax < gx1 && gy0 < ay && ay < gy1);
-        // Every point inside the radius maps into the box (monotonicity, spot-checked at the rim).
         for (px, py) in [
             (150.0, 0.0),
             (-150.0, 0.0),
@@ -449,7 +308,6 @@ mod tests {
                 "({px},{py}) escaped the box"
             );
         }
-        // Degenerate radii collapse to the single anchor cell — never an inverted/empty range.
         assert_eq!(covering_cell_box(0.0, 0.0, 0.0), (ax, ax, ay, ay));
         assert_eq!(covering_cell_box(0.0, 0.0, -5.0), (ax, ax, ay, ay));
         assert_eq!(covering_cell_box(0.0, 0.0, f32::NAN), (ax, ax, ay, ay));
@@ -459,19 +317,16 @@ mod tests {
     fn grid_cells_are_stable_for_nearby_points() {
         let a = grid_cell(-8949.95, -132.493);
         let b = grid_cell(-8945.0, -130.0);
-        assert_eq!(a, b); // points a few yards apart share a cell
+        assert_eq!(a, b);
     }
 
     #[test]
     fn grid_cell_pins_exact_indices_at_cell_edges() {
-        // At the coordinate origin, both axes sit in cell 0.
         assert_eq!(grid_cell(MAP_COORD_MAX, MAP_COORD_MAX), (0, 0));
-        // Exactly one cell size in: the boundary itself belongs to the NEXT cell (floor semantics).
         assert_eq!(
             grid_cell(MAP_COORD_MAX - GRID_CELL_SIZE, MAP_COORD_MAX),
             (1, 0)
         );
-        // A hair before the boundary is still cell 0; a hair past it is already cell 1.
         assert_eq!(
             grid_cell(MAP_COORD_MAX - GRID_CELL_SIZE + 0.002, MAP_COORD_MAX),
             (0, 0)
@@ -480,7 +335,6 @@ mod tests {
             grid_cell(MAP_COORD_MAX - GRID_CELL_SIZE - 0.002, MAP_COORD_MAX),
             (1, 0)
         );
-        // Two cells in on the y axis, independent of x.
         assert_eq!(
             grid_cell(MAP_COORD_MAX, MAP_COORD_MAX - 2.0 * GRID_CELL_SIZE),
             (0, 2)

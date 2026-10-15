@@ -1,20 +1,12 @@
-//! Account / auth tables (private — never delivered to clients) and the two gateway-coordination
-//! reducers that provision SRP6 credentials and establish a session. [session]
-
 use spacetimedb::{
     reducer, table, Identity, ReducerContext, ScheduleAt, Table, TimeDuration, Timestamp,
 };
 
-use crate::items::game_item_instance; // monotonic-guid: don't reuse a guid that still owns items
+use crate::items::game_item_instance;
 use crate::{
     game_char_base_info, game_character, game_start_position, game_world_entity, Character,
 };
 
-// ===========================================================================================
-//  Account / auth tables [session] — PRIVATE
-// ===========================================================================================
-
-/// SRP6 verifier material — never the password. Private. [session]
 #[table(accessor = game_account)]
 pub struct Account {
     #[primary_key]
@@ -26,14 +18,10 @@ pub struct Account {
     pub verifier: Vec<u8>, // 32 bytes
     pub identity: Option<Identity>,
     pub banned: bool,
-    /// Account-owned Alpha Test Tools authority. Existing rows enroll on the additive migration;
-    /// new rows copy [`AlphaTestToolsEnrollment::enabled`].
     #[default(true)]
     pub alpha_test_tools: bool,
 }
 
-/// Whether newly provisioned Accounts receive Alpha Test Tools. Private and authoritative on
-/// Realm-core. A missing row means enabled so an additive publish behaves like a fresh database.
 #[table(accessor = game_alpha_test_tools_enrollment)]
 pub struct AlphaTestToolsEnrollment {
     #[primary_key]
@@ -69,26 +57,6 @@ fn current_alpha_test_tools_enrollment(ctx: &ReducerContext) -> bool {
     )
 }
 
-/// Ensure a SHADOW account row exists for `account_id` on THIS database.
-///
-/// Accounts are realm-scoped: SRP6 lives on the logon tier and writes `game_account` on the realm
-/// (default) database only. An instance/continent shard therefore has no account row at all — and
-/// `gw::gw_player_login` resolves the account by id, so a character that arrives via
-/// `transfer::import_character_blob` could not log in.
-///
-/// This row is an INDEX ENTRY, not a credential: `salt`/`verifier` are empty, so it can never
-/// satisfy an SRP proof even if the logon tier were ever pointed at this database. `identity` is
-/// left unbound; the gateway calls `establish_session` here at every world entry, which is the only
-/// field the row exists to carry.
-///
-/// Deliberate simplification: the username is synthetic (`#<id>`, which no real account name can
-/// collide with — account names are uppercased alphanumerics) purely to satisfy the `#[unique]`
-/// constraint. Upgrade path: realm-core owns accounts for every shard and this function is
-/// deleted.
-/// Idempotent — a second call is a no-op, and it NEVER overwrites a real account row. The explicit
-/// id does not advance the table's `auto_inc` sequence (danger-zones §2), which is safe only
-/// because nothing ever calls `provision_account` on a non-realm shard — if that ever changes, this
-/// is where the collision comes from.
 pub(crate) fn ensure_shadow_account(ctx: &ReducerContext, account_id: u64) {
     let accounts = ctx.db.game_account();
     if accounts.id().find(account_id).is_some() {
@@ -105,9 +73,6 @@ pub(crate) fn ensure_shadow_account(ctx: &ReducerContext, account_id: u64) {
     });
 }
 
-/// Gateway coordination: shared session key K. Private. [session]
-/// A row lives `SESSION_TTL_MICROS` from its last logon; the world handshake refuses an expired
-/// row and `reap_sessions` deletes it.
 #[table(accessor = game_session)]
 pub struct Session {
     #[primary_key]
@@ -118,14 +83,9 @@ pub struct Session {
     pub expires_at: Timestamp,
 }
 
-/// How long a logon's session key stays valid for the world handshake. Every logon rewrites the
-/// row, so a returning Account always gets a fresh window.
 pub(crate) const SESSION_TTL_MICROS: i64 = 3_600_000_000;
-/// How often the reaper deletes expired sessions.
 pub(crate) const SESSION_REAP_MICROS: i64 = 300_000_000;
 
-/// Drives `reap_sessions`. Armed lazily by `establish_session`, so no post-publish repair step
-/// is needed for it.
 #[table(accessor = game_session_reaper_schedule, scheduled(reap_sessions))]
 pub struct SessionReaperSchedule {
     #[primary_key]
@@ -134,12 +94,10 @@ pub struct SessionReaperSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// Expiry includes the deadline itself, as in the Gateway handshake.
 pub(crate) fn session_expired(now_micros: i64, expires_at_micros: i64) -> bool {
     expires_at_micros <= now_micros
 }
 
-/// Which of `sessions` (account id, expiry) the reaper deletes at `now_micros`.
 pub(crate) fn expired_sessions(
     sessions: impl Iterator<Item = (u64, i64)>,
     now_micros: i64,
@@ -150,7 +108,6 @@ pub(crate) fn expired_sessions(
         .collect()
 }
 
-/// Delete every session whose window has closed. Scheduler-only.
 #[reducer]
 pub fn reap_sessions(ctx: &ReducerContext, _schedule: SessionReaperSchedule) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
@@ -180,15 +137,11 @@ fn ensure_session_reaper_armed(ctx: &ReducerContext) {
     });
 }
 
-/// The single trusted OPERATOR identity — the gateway's coordinator connection + the deploy CLI, which
-/// both authenticate with the owner token (verified: that identity is NOT `ctx.database_identity()`, the
-/// module's own identity, so we capture it rather than derive it). `require_operator` gates the
-/// privileged owner-fired reducers against this, defending them from a direct anonymous SpacetimeDB
-/// connection that bypasses the gateway. Set once via `claim_operator` (TOFU). Private. [session]
+// The Owner Token caller differs from ctx.database_identity(), so capture it explicitly.
 #[table(accessor = game_operator)]
 pub struct Operator {
     #[primary_key]
-    pub id: u8, // singleton: always 0
+    pub id: u8,
     pub identity: Identity,
 }
 
@@ -198,8 +151,6 @@ enum OperatorClaimAction {
     AlreadyOwned,
 }
 
-/// Decide whether a claim inserts the singleton, succeeds as an idempotent retry, or must refuse a
-/// different identity. Kept context-free so all three authorization outcomes are unit-testable.
 fn operator_claim_action(
     claimed_identity: Option<Identity>,
     sender: Identity,
@@ -211,15 +162,9 @@ fn operator_claim_action(
     }
 }
 
-/// Trust-on-first-use claim of the operator identity: the deploy admin calls this right after the
-/// first publish over the owner token, so `ctx.sender()` is the coordinator/CLI identity. A retry by
-/// that same identity is an idempotent success; a different identity is refused. Persists across
-/// additive republishes; only a `-c` reprovision clears it (re-claim then). NOT gated — it's the
-/// bootstrap; it's safe because it can only ever be set when unclaimed or confirmed by the owner.
 #[reducer]
 pub fn claim_operator(ctx: &ReducerContext) -> Result<(), String> {
     let ops = ctx.db.game_operator();
-    // `find(0)`, not `find(&0)` — main's clippy sweep dropped the needless borrow.
     let claimed_identity = ops.id().find(0).map(|operator| operator.identity);
     if operator_claim_action(claimed_identity, ctx.sender())? == OperatorClaimAction::Insert {
         ops.insert(Operator {
@@ -265,13 +210,6 @@ mod operator_claim_tests {
     }
 }
 
-// ===========================================================================================
-//  Session establishment (gateway coordination)
-// ===========================================================================================
-
-/// Provision (or update) an account's SRP6 credentials. Called by the trusted gateway, which
-/// computes the salt/verifier with `wow_srp`. Privileged in production (restrict to the
-/// gateway identity); permissive here for the slice.
 #[reducer]
 pub fn provision_account(
     ctx: &ReducerContext,
@@ -282,18 +220,14 @@ pub fn provision_account(
     crate::helpers::require_operator(ctx)?;
     let accounts = ctx.db.game_account();
     match accounts.username().find(&username) {
-        // Existing account → rotate its credentials (e.g. give the seeded TEST a real password).
         Some(mut acc) => {
             acc.salt = salt;
             acc.verifier = verifier;
             accounts.id().update(acc);
         }
-        // New account → create it (e.g. TEST2 through `gateway provision TEST2 --password-stdin`
-        // for two-client tests). No bound identity yet (a login binds it via establish_session);
-        // not banned. Upsert so provisioning a new username works.
         None => {
             accounts.insert(Account {
-                id: 0, // auto_inc
+                id: 0,
                 username,
                 salt,
                 verifier,
@@ -309,7 +243,6 @@ pub fn provision_account(
     Ok(())
 }
 
-/// Set whether genuinely new Accounts receive Alpha Test Tools. Existing Accounts are unchanged.
 #[reducer]
 pub fn set_alpha_test_tools_enrollment(ctx: &ReducerContext, enabled: bool) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -349,14 +282,12 @@ fn set_account_alpha_test_tools(
     Ok(())
 }
 
-/// Grant Alpha Test Tools to one Account by realm-wide, uppercased Account name.
 #[reducer]
 pub fn grant_alpha_test_tools(ctx: &ReducerContext, account_name: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
     set_account_alpha_test_tools(ctx, &account_name, true)
 }
 
-/// Revoke Alpha Test Tools from one Account by realm-wide, uppercased Account name.
 #[reducer]
 pub fn revoke_alpha_test_tools(ctx: &ReducerContext, account_name: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -394,8 +325,6 @@ mod alpha_test_tools_tests {
     }
 }
 
-/// Logon writes the shared session key K and binds the per-account identity.
-/// In production, restrict the caller to the gateway identity.
 #[reducer]
 pub fn establish_session(
     ctx: &ReducerContext,
@@ -411,10 +340,6 @@ pub fn establish_session(
         .ok_or_else(|| format!("no such account id: {account_id}"))?;
     acc.identity = Some(bound_identity);
     accounts.id().update(acc);
-
-    // No per-character owner_identity restamp here: it existed so per-owner RLS would admit the
-    // player's own connection, which no longer exists — `apply_player_login` stamps owner rows
-    // via `restamp_owned_data`, and the gateway predicates are the visibility layer.
 
     let now = ctx.timestamp;
     let expires = now
@@ -455,32 +380,18 @@ mod session_expiry_tests {
     }
 }
 
-// ===========================================================================================
-//  Realm-safe guid allocation
-// ===========================================================================================
-
-/// Shared durable high-water mark for Character and item creation. Deletion and Transfer never
-/// lower it. With a range installed, only local Character GUIDs advance the Transfer floor.
-/// A scan of surviving rows cannot replace it, because issued identities may now live elsewhere.
+// Deletion and Transfer never lower the issued GUID floor; surviving rows cannot recover it.
 #[table(accessor = game_guid_allocator)]
 pub struct GuidAllocator {
     #[primary_key]
-    pub id: u32, // singleton: always 0 (matches game_config's convention, config.rs:50)
+    pub id: u32,
     pub high_water: u64,
 }
 
-/// Never let the high-water mark move backwards. This one line IS the whole guarantee: as long as
-/// every write to `GuidAllocator.high_water` goes through it, a deleted character's guid can never
-/// come back into circulation. Pure — no `ReducerContext` — so it's unit-testable directly (the
-/// module crate has no ctx test harness by design; playbook §7).
 fn ratchet_high_water(current: u64, floor: u64) -> u64 {
     current.max(floor)
 }
 
-/// The ORIGINAL per-database scan (the precursor — see `create_character`'s old comment),
-/// generalised over guid iterators so it needs no `ReducerContext` either. Used ONLY to seed a
-/// `game_guid_allocator` row that has never been touched — an auto-migrated database that already
-/// has characters seeds from their real max instead of resetting to 0 and re-issuing them.
 fn legacy_guid_seed(
     char_guids: impl Iterator<Item = u64>,
     owned_guids: impl Iterator<Item = u64>,
@@ -495,19 +406,10 @@ fn allocate_next_guid(seed: u64) -> u64 {
     seed + 1
 }
 
-/// Read the singleton row, whole. `None` means "never written" — every caller here treats that as
-/// "run the legacy seed", never as "the mark is 0". Callers that need just the mark derive it with
-/// `.map(|r| r.high_water)` rather than this function returning a second, redundant `Option<u64>`.
 fn read_high_water(ctx: &ReducerContext) -> Option<GuidAllocator> {
     ctx.db.game_guid_allocator().id().find(0)
 }
 
-/// The ONLY raw `game_character`/`game_item_instance` scan site in this file (both
-/// `next_character_guid` and `bump_guid_high_water` below route through it via
-/// `Option::unwrap_or_else`, so it only actually runs on a mark's first-ever touch) — deliberately
-/// factored out so it stays ONE occurrence rather than two, which is what
-/// `character_fence_tripwire`'s per-file raw-lookup budget (module/src/tripwires.rs's auth.rs
-/// WHITELIST entry) counts.
 fn legacy_guid_seed_now(ctx: &ReducerContext) -> u64 {
     legacy_guid_seed(
         ctx.db.game_character().iter().map(|c| c.guid),
@@ -532,7 +434,6 @@ fn write_high_water(ctx: &ReducerContext, existing: Option<GuidAllocator>, mark:
     }
 }
 
-/// Allocate and persist the next Character guid from the durable high-water mark.
 pub(crate) fn next_character_guid(ctx: &ReducerContext) -> u64 {
     let existing = read_high_water(ctx);
     let seed = existing
@@ -544,8 +445,6 @@ pub(crate) fn next_character_guid(ctx: &ReducerContext) -> u64 {
     next
 }
 
-/// Reserve a batch from this Shard's GUID Range. Items and Characters consume the same durable
-/// high-water mark; deletion and Transfer never return issued identities to the range.
 pub(crate) fn reserve_guids(
     ctx: &ReducerContext,
     count: u64,
@@ -589,9 +488,7 @@ fn guid_batch_end(
     Ok(last)
 }
 
-/// Preserve a Character's issued GUID before import or deletion. Once a range is installed,
-/// foreign Characters cannot advance its mark, including cleanup before a Transfer import.
-/// Before installation, retain the legacy floor so a provisioning failure cannot erase it.
+// Foreign guids cannot advance an installed range; retain the legacy floor before installation.
 pub(crate) fn bump_guid_high_water(ctx: &ReducerContext, guid: u64) {
     let range = ctx
         .db
@@ -609,29 +506,24 @@ pub(crate) fn bump_guid_high_water(ctx: &ReducerContext, guid: u64) {
         .unwrap_or_else(|| legacy_guid_seed_now(ctx));
     let mark = ratchet_high_water(seed, guid);
     if mark == seed && existing.is_some() {
-        return; // already seeded, already ahead — avoid a no-op write
+        return;
     }
     write_high_water(ctx, existing, mark);
 }
 
-/// The permanent GUID Range assigned by Realm-core. Character and item creation both require it.
-/// Reassignment would let the Shard reuse identities still held in other Shards or Escrow.
+// Reassignment could reissue identities still held in other Shards or Escrow.
 #[table(accessor = game_guid_range)]
 pub struct GuidRange {
     #[primary_key]
-    pub id: u32, // singleton: always 0 (game_config's convention)
+    pub id: u32,
     pub base: u64,
     pub size: u64,
 }
 
-/// May this Shard mint one more GUID? The next value must remain below the exclusive range end.
-/// Pure, so both allocation paths use the same range boundary.
 pub(crate) fn may_mint(range: Option<(u64, u64)>, mark: u64) -> Result<(), String> {
     guid_batch_end(range, mark, 1, u64::MAX).map(|_| ())
 }
 
-/// [`may_mint`]'s ctx glue: read this database's range + mark and apply the rule. Called by
-/// `create_character` BEFORE anything is written, so a refusal leaves nothing behind.
 pub(crate) fn require_guid_range(ctx: &ReducerContext) -> Result<(), String> {
     let range = ctx
         .db
@@ -643,8 +535,6 @@ pub(crate) fn require_guid_range(ctx: &ReducerContext) -> Result<(), String> {
     may_mint(range, mark.unwrap_or(0))
 }
 
-/// True only inside an installed range. Transfer uses this Gate directly; legacy deletion
-/// retains its old high-water floor until a range is installed.
 pub(crate) fn in_guid_range(range: Option<(u64, u64)>, guid: u64) -> bool {
     let Some((base, size)) = range else {
         return false;
@@ -652,24 +542,14 @@ pub(crate) fn in_guid_range(range: Option<(u64, u64)>, guid: u64) -> bool {
     guid >= base && guid < base.saturating_add(size)
 }
 
-/// Install the range realm-core assigned to this database. Idempotent — re-installing the
-/// same range is how the gateway confirms one is held — and it never *moves* a range: a different
-/// base is an error, not an overwrite.
-///
-/// Ratchets the allocator up to `base` through the same `bump_guid_high_water` every other caller
-/// uses, so installing can only ever move the mark UP. Refuses a range this database has already
-/// minted past, which is the loud failure that replaces the silent one: it means the range being
-/// assigned is not the range in use.
 #[reducer]
 pub fn install_guid_range(ctx: &ReducerContext, base: u64) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
-    // One owner for the size (`realm_core::GUID_RANGE_SIZE`, which is also what carves the slots),
-    // so the gateway never carries a second copy of it that could drift from the registry's.
     let size = crate::realm_core::GUID_RANGE_SIZE;
     let ranges = ctx.db.game_guid_range();
     if let Some(row) = ranges.id().find(0) {
         if row.base == base && row.size == size {
-            return Ok(()); // already held — the gateway's confirm path
+            return Ok(());
         }
         return Err(format!(
             "install_guid_range: this database already holds [{}, {}) and a range is never \
@@ -705,11 +585,7 @@ mod guid_allocator_tests {
 
     #[test]
     fn a_guid_floor_only_ever_ratchets_upwards() {
-        // A fresh shard given a floor: the mark jumps to it, so the next guid is above it.
         assert_eq!(ratchet_high_water(0, 1_000_000_000), 1_000_000_000);
-        // A shard that has ALREADY issued guids past the floor keeps its mark — re-running the
-        // provisioning step, or applying a floor to the default shard by mistake, must not hand out
-        // a guid that is already alive.
         assert_eq!(
             ratchet_high_water(2_000_000_050, 1_000_000_000),
             2_000_000_050,
@@ -738,9 +614,6 @@ mod guid_allocator_tests {
         );
     }
 
-    /// The floor above is monotonic but *optional* — a shard nobody ran it on mints
-    /// from zero. This is the rule that makes it non-optional, and the two refusals are the whole
-    /// point: no range at all, and a mark that has escaped the range it was assigned.
     #[test]
     fn a_database_without_an_assigned_range_refuses_to_mint() {
         use super::may_mint;
@@ -751,28 +624,20 @@ mod guid_allocator_tests {
             "having minted before is not a licence — that IS the shard that mints into someone \
              else's range"
         );
-        // A licensed shard mints anywhere inside its range, including at the very base.
         assert!(may_mint(Some((1_000_000_000, 1_000_000_000)), 1_000_000_000).is_ok());
         assert!(may_mint(Some((1_000_000_000, 1_000_000_000)), 1_999_999_998).is_ok());
         assert!(may_mint(Some((1_000_000_000, 1_000_000_000)), 1_999_999_999).is_err());
-        // The next GUID must stay below the exclusive end.
         assert_eq!(
             may_mint(Some((1_000_000_000, 1_000_000_000)), 2_000_000_000).unwrap_err(),
             "GUID_RANGE_EXHAUSTED"
         );
     }
 
-    /// `in_guid_range` is the pure decision `transfer::apply_import_blob` calls to
-    /// decide whether an ARRIVING character's guid may ratchet this database's allocator.
-    /// Boundary-checked the same way as `may_mint` just above (base included, end excluded), and,
-    /// like it, conservative when there is no range installed at all.
     #[test]
     fn in_guid_range_only_admits_guids_inside_the_installed_range() {
         use super::in_guid_range;
-        // No installed range proves membership. Legacy deletion preserves its floor separately.
         assert!(!in_guid_range(None, 0));
         assert!(!in_guid_range(None, 4242));
-        // Inside a real range, base included, end excluded — same boundary shape as `may_mint`.
         let range = Some((1_000_000_000, 1_000_000_000));
         assert!(
             in_guid_range(range, 1_000_000_000),
@@ -786,7 +651,6 @@ mod guid_allocator_tests {
             !in_guid_range(range, 2_000_000_000),
             "the end itself belongs to the NEXT range"
         );
-        // Anything below base, or from another shard's slot entirely, is foreign.
         assert!(!in_guid_range(range, 0));
         assert!(!in_guid_range(range, 3_000_000_000));
     }
@@ -832,7 +696,7 @@ mod guid_allocator_tests {
 
     #[test]
     fn defect_1_transfer_then_create_no_longer_reissues_the_departed_guid() {
-        let chars_after_transfer = [10u64, 30, 49]; // guid 50 already gone when this runs
+        let chars_after_transfer = [10u64, 30, 49];
         let seed = legacy_guid_seed(chars_after_transfer.into_iter(), std::iter::empty());
         let allocator_mark_after_delete = ratchet_high_water(seed, 50);
         assert_eq!(allocator_mark_after_delete, 50);
@@ -842,15 +706,9 @@ mod guid_allocator_tests {
     }
 }
 
-// ===========================================================================================
-//  Character creation (CMSG_CHAR_CREATE)
-// ===========================================================================================
-
-/// Most Characters one Account holds. The 5875 client cannot render a longer character list: it
-/// rejects SMSG_CHAR_ENUM with "Error retrieving character list".
+// The 5875 client refuses a Character list longer than this limit.
 pub(crate) const CHARACTERS_PER_ACCOUNT: usize = 10;
 
-/// The look bytes a client picks at character creation.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Appearance {
     pub gender: u8,
@@ -861,12 +719,6 @@ pub(crate) struct Appearance {
     pub facial_hair: u8,
 }
 
-/// Create a new character for `account_id` (called by the trusted gateway on `CMSG_CHAR_CREATE`,
-/// like `provision_account`/`establish_session`; restrict to the gateway identity in production).
-/// Returns a distinguished `Err("NAME_IN_USE")` for a taken name (the gateway maps it to
-/// `CharCreateNameInUse`); any other `Err` maps to a generic failure. The new character spawns at
-/// the seeded start position for its (race, class), falling back to Human Warrior's if that combo
-/// has none seeded (we have no DBC; the slice only seeds Human Warrior).
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn create_character(
@@ -894,19 +746,13 @@ pub fn create_character(
     insert_new_character(ctx, account_id, name, race, class, appearance).map(|_| ())
 }
 
-/// The Refusals a new Character meets before anything is written. Client and Package creation
-/// both pass through here.
 pub(crate) fn check_new_character(
     ctx: &ReducerContext,
     name: &str,
     race: u8,
     class: u8,
 ) -> Result<(), String> {
-    // Minting is licensed by a range realm-core assigned, and an unlicensed database refuses
-    // rather than minting from zero into another shard's guids. FIRST — before the cheaper
-    // validations, so the refusal is unambiguous in the log.
     require_guid_range(ctx)?;
-    // `name` is unique; check first so we can return a clean, distinguished result.
     if ctx
         .db
         .game_character()
@@ -916,9 +762,6 @@ pub(crate) fn check_new_character(
     {
         return Err("NAME_IN_USE".to_string());
     }
-    // Reject an illegal (race, class) (e.g. Human Shaman) — server-side defense-in-depth from the
-    // imported CharBaseInfo.dbc (the client already gates the UI). Skipped when the table is empty
-    // (unloaded), so creation still works pre-import. [importer P1]
     let cbi = ctx.db.game_char_base_info();
     if cbi.count() > 0
         && cbi
@@ -931,7 +774,6 @@ pub(crate) fn check_new_character(
     Ok(())
 }
 
-/// Whether `account_id` holds fewer than [`CHARACTERS_PER_ACCOUNT`] Characters on this database.
 pub(crate) fn account_has_room(ctx: &ReducerContext, account_id: u64) -> bool {
     ctx.db
         .game_character()
@@ -941,8 +783,6 @@ pub(crate) fn account_has_room(ctx: &ReducerContext, account_id: u64) -> bool {
         < CHARACTERS_PER_ACCOUNT
 }
 
-/// Create a Character for `account_id` and return its guid. Applies every
-/// [`check_new_character`] Refusal, then the per-Account cap.
 pub(crate) fn insert_new_character(
     ctx: &ReducerContext,
     account_id: u64,
@@ -952,8 +792,6 @@ pub(crate) fn insert_new_character(
     appearance: Appearance,
 ) -> Result<u64, String> {
     check_new_character(ctx, &name, race, class)?;
-    // The distinguished error the gateway maps to CHAR_CREATE_SERVER_LIMIT ("cannot create any
-    // more").
     if !account_has_room(ctx, account_id) {
         return Err("SERVER_LIMIT".to_string());
     }
@@ -965,7 +803,6 @@ pub(crate) fn insert_new_character(
         .find(account_id)
         .ok_or_else(|| format!("no such account id: {account_id}"))?;
 
-    // Start position for this (race, class); fall back to Human(1)/Warrior(1) if unseeded.
     let positions = ctx.db.game_start_position();
     let race_class = ((race as u16) << 8) | class as u16;
     let human_warrior = (1u16 << 8) | 1u16;
@@ -975,19 +812,11 @@ pub(crate) fn insert_new_character(
         .or_else(|| positions.race_class().find(human_warrior))
         .ok_or_else(|| "no start position seeded".to_string())?;
 
-    // Realm-safe GUID allocation: a durable high-water mark, not a per-transaction scan
-    // of THIS database alone. The old scan (still the seed a never-touched mark bootstraps from —
-    // see `legacy_guid_seed`) looked free the instant a cross-database transfer deleted the departed
-    // character's row (and its items) here, and the next creation could re-issue that guid while the
-    // character was still alive on the destination database. `next_character_guid` never re-derives
-    // the mark from a scan once it's seeded, and never lets it move backwards.
     let next_guid = next_character_guid(ctx);
 
     let row = Character {
         guid: next_guid,
         account_id,
-        // Bind to the account's identity (set at establish_session) so the per-owner RLS lets the
-        // player see it immediately; ZERO if somehow unbound (gateway reads via the owner conn anyway).
         owner_identity: account.identity.unwrap_or(Identity::ZERO),
         name: name.clone(),
         race,
@@ -1009,37 +838,31 @@ pub(crate) fn insert_new_character(
         orientation: sp.orientation,
         first_login: true,
         online: false,
-        money: 0,     // new characters start broke
-        rested_xp: 0, // rank 30: no rested XP until the first logout/login cycle
+        money: 0,
+        rested_xp: 0,
         last_logout_micros: 0,
-        // Hearthstone home = the start position — a fresh character recalls to where it began until it
-        // binds at an innkeeper (`bind_home`).
         home_map: sp.map_id,
         home_zone: sp.zone_id,
         home_x: sp.x,
         home_y: sp.y,
         home_z: sp.z,
-        played_total_secs: 0,    // fresh character, nothing played yet
-        session_start_micros: 0, // no live session until player_login stamps it
-        health: 0, // sentinel: no persisted value yet — build_player_entity spawns at full health
-        power: 0, // sentinel: no persisted value yet — build_player_entity spawns at starting power
+        played_total_secs: 0,
+        session_start_micros: 0,
+        health: 0,
+        power: 0,
         respec_count: 0,
-        death_expire_micros: 0, // never died // fresh character, never respec'd
-        pending_instance_id: 0, // open world
-        gm_level: 0,            // no GM access until granted via set_gm_level
+        death_expire_micros: 0,
+        pending_instance_id: 0,
+        gm_level: 0,
         pending_ghost: false,
-        resting: false,         // 196: not in an inn until they walk into one
-        rested_since_micros: 0, // 196: live-accrual clock idle
-        pending_godmode: false, // 289: GM playtest carry — off until `.god` + a map change
-        pending_run_speed_mult_bp: crate::world::RUN_SPEED_BP_1X, // 289: 1× until `.speed` + a map change
-        bank_bag_slots: 0,                                        // none bought yet
+        resting: false,
+        rested_since_micros: 0,
+        pending_godmode: false,
+        pending_run_speed_mult_bp: crate::world::RUN_SPEED_BP_1X,
+        bank_bag_slots: 0,
         watched_faction_index: -1,
     };
 
-    // `try_insert` rather than `insert`: if a same-name character was created between the find()
-    // above and here (the race the early check can't fully close), the `#[unique] name` constraint
-    // makes this fail cleanly instead of panicking. `name` is game_character's only unique
-    // constraint and `guid` is max+1, so a failure here means the name is now taken → NAME_IN_USE.
     if chars.try_insert(row).is_err() {
         return if chars.name().find(&name).is_some() {
             Err("NAME_IN_USE".to_string())
@@ -1047,24 +870,14 @@ pub(crate) fn insert_new_character(
             Err("character create failed".to_string())
         };
     }
-    // Same transaction as the insert: the createinfo kit becomes the character's spellbook rows —
-    // the one castability source (`knows_spell`) and the gateway's SMSG_INITIAL_SPELLS both read them.
     let owner = account.identity.unwrap_or(Identity::ZERO);
     crate::spell::spellbook::grant_createinfo_spells(ctx, next_guid, owner, race, class);
-    // Action-bar rows: copies `game_createinfo_action` the same way the spell grant
-    // above copies `game_createinfo_spell` — a no-op pre-import (table empty), so the gateway's login
-    // synth covers it until the dump is imported.
     crate::action_bar::grant_createinfo_actions(ctx, next_guid, owner, race, class);
 
     crate::items::grant_starter_item(ctx, next_guid, owner)?;
     Ok(next_guid)
 }
 
-/// Delete `character_guid` for `account_id` — the player `CMSG_CHAR_DELETE` path. Operator-gated (the
-/// gateway coordinator calls it) AND ownership-checked: the character must belong to `account_id`, so
-/// one account can't delete another's. Cascades via [`crate::world::cascade_delete_character`] (items,
-/// learned spells/skills/talents, quest log, buyback, corpse, world entity) so no orphaned rows survive
-/// for a reused guid to inherit (the Warrior-wore-Warlock-gear bug).
 #[reducer]
 pub fn delete_character(
     ctx: &ReducerContext,
@@ -1082,17 +895,6 @@ pub fn delete_character(
     if c.account_id != account_id {
         return Err("NOT_OWNER".to_string());
     }
-    // IN-TRANSIT FENCE. `cascade_delete_character` runs the `character_owned!` delete
-    // sweeps, which include `sweep_delete_game_transfer_out` — so a delete landing mid-transfer wipes
-    // the character AND both escrow rows in one transaction, voiding a transfer another shard is
-    // still driving. Cross-database that is the annihilation case: the destination's in-row and its
-    // arrival copy survive the source's delete, and its reaper (no out-row ⇒ `Hold`) never settles
-    // them. The escrow must be resolved (finished or reaped) before the character can be destroyed.
-    //
-    // Routed through the shared gate rather than a bespoke `is_in_transit` call, but the
-    // DISTINGUISHED error is kept: the raw `find` above is what lets NO_SUCH_CHAR / NOT_OWNER /
-    // CHAR_IN_TRANSIT stay three different answers, which `character_by_guid` alone would flatten to
-    // NO_SUCH_CHAR. The gateway maps every non-OK delete the same way, so no seam either way.
     if crate::helpers::character_by_guid(ctx, character_guid).is_none() {
         return Err("CHAR_IN_TRANSIT".to_string());
     }

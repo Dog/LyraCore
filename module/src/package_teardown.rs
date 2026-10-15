@@ -1,14 +1,3 @@
-//! Package Teardown: the Operator step that stops one Package on one Shard before the Package
-//! leaves the build.
-//!
-//! A publish that removes a table refuses while the table holds rows. So before a Package's folder
-//! moves, its tables must be empty, and its code must not write them again before the publish.
-//! Teardown empties every table the Package declares, deletes its Package Config, and makes its
-//! Characters Dormant Characters. It then records the Package as torn down, which stops every
-//! registration the Package made (`build.rs` wraps each one in [`runs`]). The record goes away by
-//! itself on the first tick of a build that no longer compiles the Package, so enabling the Package
-//! again starts it fresh.
-
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
 use crate::package_account::game_package_account;
@@ -17,31 +6,24 @@ use crate::sessionless::game_sessionless_action_consent;
 use crate::transfer::{game_bot_transfer_intent, game_transfer_in, game_transfer_out};
 use crate::{game_character, game_world_entity};
 
-/// One row per Package torn down on this Shard. Private. [server]
 #[table(accessor = game_package_teardown)]
 pub struct PackageTeardown {
     #[primary_key]
     pub package_name: String,
 }
 
-/// One compiled Package, as `build.rs` generates it into `GAME_PACKAGES`.
 pub struct InstalledPackage {
-    /// The Package's Rust identifier: its folder name with `-` folded to `_`.
     pub name: &'static str,
-    /// Every table the Package declares. Debug-only tables are absent from a release build.
     pub tables: &'static [&'static str],
-    /// The Package's `game_package_characters!` read, when it registers one.
     pub characters: Option<fn(&ReducerContext) -> Vec<u64>>,
 }
 
-/// Whether a Package's registered code may run on this Shard.
-#[cfg_attr(not(has_packages), allow(dead_code))] // package-only caller — see `build.rs`
+#[cfg_attr(not(has_packages), allow(dead_code))]
 pub(crate) fn runs(ctx: &ReducerContext, package: &str) -> bool {
     let torn_down = ctx.db.game_package_teardown();
     torn_down.count() == 0 || torn_down.package_name().find(package.to_string()).is_none()
 }
 
-/// Forget the teardown of a Package this build no longer compiles. Runs every scheduler tick.
 pub(crate) fn forget_removed_packages(ctx: &ReducerContext) {
     let torn_down = ctx.db.game_package_teardown();
     if torn_down.count() == 0 {
@@ -57,9 +39,6 @@ pub(crate) fn forget_removed_packages(ctx: &ReducerContext) {
     }
 }
 
-/// Tear down `package_name` on this Shard. Idempotent; run it on every Shard of the Realm, then
-/// once more on each, so a Character that crossed into an already torn-down Shard is caught. A
-/// Refusal writes nothing.
 #[reducer]
 pub fn teardown_package(ctx: &ReducerContext, package_name: String) -> Result<(), String> {
     crate::helpers::require_operator(ctx)?;
@@ -75,7 +54,7 @@ pub fn teardown_package(ctx: &ReducerContext, package_name: String) -> Result<()
         ));
     }
 
-    // First, so the Package's own hooks stay silent while its Characters leave the world.
+    // Silence Package hooks before its Characters leave the world.
     if ctx
         .db
         .game_package_teardown()
@@ -105,7 +84,6 @@ pub fn teardown_package(ctx: &ReducerContext, package_name: String) -> Result<()
     Ok(())
 }
 
-/// The Characters on Accounts the Package owns here, plus the ones it names itself.
 fn package_characters(
     ctx: &ReducerContext,
     package: &InstalledPackage,
@@ -131,8 +109,7 @@ fn package_characters(
     guids
 }
 
-/// An escrow row or a claimed Transfer Intent. The escrow blob names the Package's tables, so it
-/// must settle while those tables still exist.
+// Settle Escrow before removing the Package tables named in its blob.
 fn crossing(ctx: &ReducerContext, guid: u64) -> bool {
     ctx.db
         .game_transfer_out()
@@ -155,8 +132,6 @@ fn crossing(ctx: &ReducerContext, guid: u64) -> bool {
             .any(|intent| intent.claim_token != 0)
 }
 
-/// Offline, with no live entity, no consent and no pending Intent. The Account and Character rows
-/// stay. A Character with a World Session is a player's, so it is left alone.
 fn make_dormant(ctx: &ReducerContext, guid: u64) {
     if crate::helpers::character_by_guid(ctx, guid).is_none_or(|character| character.online) {
         return;
@@ -175,7 +150,6 @@ fn make_dormant(ctx: &ReducerContext, guid: u64) {
     }
 }
 
-/// Empty one table by name. A table this build does not compile has nothing to empty.
 fn clear_table(name: &str) -> Result<(), String> {
     use spacetimedb::sys::{datastore_clear, table_id_from_name, Errno};
     match table_id_from_name(name) {

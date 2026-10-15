@@ -1,5 +1,3 @@
-//! EventAI production-boundary verifiers for standalone tests.
-
 use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::{
@@ -9,7 +7,6 @@ use crate::{
 const FIXTURE_OWNER_ENTRY: u32 = 51_000;
 const FIXTURE_OWNER_GUID: u64 = (0xF130_u64 << 48) | ((FIXTURE_OWNER_ENTRY as u64) << 24) | 1;
 
-/// Prove action 56 reaches spell-created guardians, which have an owner but no EventAI summon row.
 #[reducer]
 pub fn debug_verify_eventai_spell_guardian_cleanup(ctx: &ReducerContext) -> Result<(), String> {
     crate::creatures::replace_relay_catalogue_for_debug(ctx, "")?;
@@ -92,8 +89,6 @@ pub fn debug_verify_eventai_spell_guardian_cleanup(ctx: &ReducerContext) -> Resu
     Ok(())
 }
 
-/// Create a replacement summon, deliver its prior life's callback, and leave a short-lived
-/// disengaged summon for the real scheduler to expire.
 #[reducer]
 pub fn debug_verify_eventai_summon_expiry(ctx: &ReducerContext) -> Result<(), String> {
     let owner = ctx
@@ -105,9 +100,6 @@ pub fn debug_verify_eventai_summon_expiry(ctx: &ReducerContext) -> Result<(), St
     crate::creatures::verify_summon_expiry_boundaries_for_debug(ctx, &owner, FIXTURE_OWNER_ENTRY)
 }
 
-/// Start a relay that runs `source_guid` to `selected_guid` and, once the leg lands, equips item 50
-/// through an arrival relay. The test reads the equipment row to see whether the arrival fired.
-/// It replaces the entire relay catalogue, so never call it on a live realm.
 #[reducer]
 pub fn debug_start_relay_move(
     ctx: &ReducerContext,
@@ -118,9 +110,6 @@ pub fn debug_start_relay_move(
     start_relay_move(ctx, source_guid, selected_guid)
 }
 
-/// [`debug_start_relay_move`], then run its arrival at once. The arrival must put the mover on the
-/// destination, reap the leg and run the arrival relay. It replaces the entire relay catalogue, so
-/// never call it on a live realm.
 #[reducer]
 pub fn debug_verify_relay_arrival_placement(
     ctx: &ReducerContext,

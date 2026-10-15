@@ -3,59 +3,28 @@ use super::super::*;
 #[derive(Default)]
 pub(crate) struct PartyState {
     pub(crate) group_invites: std::sync::Mutex<Vec<u64>>,
-    /// Recorded `group_loot_method` calls: (loot_setting, master_guid, loot_threshold).
     pub(crate) group_loot_methods: std::sync::Mutex<Vec<(u8, u64, u8)>>,
-    /// Unclaimed bot invite intent ids on this World Shard. Two concurrent consumers share this
-    /// collection, matching the Module table both Gateways call into.
     pub(crate) bot_invite_intents: std::sync::Mutex<Vec<u64>>,
-    /// Current consent returned by the owned admission seam, independent of presence reads.
     pub(crate) sessionless_admission:
         std::sync::Mutex<std::collections::HashMap<u64, GroupRefusal>>,
     pub(crate) sessionless_admission_unavailable: std::sync::Mutex<Vec<u64>>,
     pub(crate) suppress_after_admission: std::sync::Mutex<Vec<u64>>,
     pub(crate) bot_intent_claim_refusals:
         std::sync::Mutex<std::collections::HashMap<u64, GroupRefusal>>,
-    /// The AUTHORITATIVE party state, when this handle is the realm-core one. Shared with
-    /// nobody — a realm handle owns exactly one of these, and every shard reads its own `mirror`.
     pub(crate) party: std::sync::Arc<std::sync::Mutex<FakeParty>>,
-    /// Realm-core's Coordinator cache lags a call-pipe commit: after `realm_group_op`, roster reads
-    /// answer from `stale_party` until a `realm_group_op_visible` returns. The production shape of
-    /// a call pipe, which subscribes no group table.
     pub(crate) cache_lags: std::sync::atomic::AtomicBool,
-    /// The party as the lagging cache still shows it.
     pub(crate) stale_party: std::sync::Mutex<Option<FakeParty>>,
-    /// True when this handle is realm-core, so `group_roster` answers from `party` (the
-    /// authority) instead of `mirror` (this shard's cache of it).
     pub(crate) is_realm: bool,
-    /// What `sync_group_mirror` wrote onto THIS shard, latest per group. The invalidation
-    /// story, made observable.
     pub(crate) mirror: std::sync::Mutex<Vec<crate::world::party::GroupRoster>>,
-    /// The Roster Revision each `sync_group_mirror` accepted on THIS shard, kept after the disband
-    /// tombstone, as the Module's mirror keeps its `game_group_roster_revision` row.
     pub(crate) mirror_revisions: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
-    /// When set, `sync_group_mirror` fails with this message — a world shard that cannot be
-    /// mirrored (an unreachable database), which must not fail a party op realm-core already took.
     pub(crate) mirror_error: Option<String>,
-    /// How many mirror writes fail before this Shard accepts one.
     pub(crate) mirror_failures: std::sync::atomic::AtomicUsize,
-    /// When set, `realm_group_op(ACCEPT, …)` fails with this message. INJECTED because a real
-    /// one cannot be staged synchronously: every accept-time refusal the module has (already grouped,
-    /// party full, the inviter no longer leads) needs the party to change BETWEEN the invite and the
-    /// accept, and the gateway's bot answer runs in the same call as the invite. The failure is still
-    /// reachable in production — a concurrent op on another socket — and what it must not do is leave
-    /// the invite dialog hanging.
     pub(crate) party_accept_error: Option<String>,
-    /// How many Realm-core LEAVE calls fail before one reaches the party state.
     pub(crate) party_leave_failures: std::sync::atomic::AtomicUsize,
-    /// When set, every Group Broadcast op fails as a lost connection would.
     pub(crate) group_broadcast_error: bool,
-    /// Return a connection failure after the next Realm-core LEAVE commits.
     pub(crate) party_leave_commit_then_error: std::sync::atomic::AtomicBool,
-    /// Fail one `group_roster` read by its one-based call number.
     pub(crate) group_roster_error_on_read: std::sync::Mutex<Option<(usize, String)>>,
-    /// Number of `group_roster` reads on this handle.
     pub(crate) group_roster_reads: std::sync::atomic::AtomicUsize,
-    /// When set, this handle cannot enumerate its mirrored party ids.
     pub(crate) party_group_ids_error: std::sync::Mutex<Option<String>>,
     pub(crate) party_command_claims: std::sync::Mutex<Vec<(u64, u64)>>,
     pub(crate) party_command_finishes:
@@ -74,12 +43,9 @@ pub(crate) struct PartyState {
         )>,
     >,
     pub(crate) entity_partitions: std::sync::Mutex<Vec<(u64, u32, u64)>>,
-    /// Characters Realm-core reports in a pending Transfer. Read on the realm handle only.
     pub(crate) members_in_transit: std::sync::Mutex<Vec<u64>>,
 }
 
-/// The Fake's reducer edge for a party op: the Module answers a Refusal as the bare tag, and
-/// anything else — a timeout, a dead transport — is a failure with an unknown durable outcome.
 pub(crate) fn faked_party(operation: &str, error: &str) -> Result<PartyOutcome> {
     match lyracore_shared::group::GroupRefusal::parse_tag(error) {
         Some(refusal) => Ok(refusal.into()),
@@ -92,11 +58,6 @@ impl PartyStore for WorldFake {
         &self,
         character_guid: u64,
     ) -> Result<Option<crate::world::party::RealmCharacterPartition>> {
-        // `members_in_transit` is Member Stats' own per-guid fixture (`presence::of`'s
-        // `realm_transfer_pending` reads this trait method on the realm handle, same as
-        // `Coordinator::member_presence` did before the two merged). Checked first so it can name
-        // one guid as pending without disturbing `realm_partition`, which every other test that
-        // exercises a real Transfer already drives.
         if self
             .party
             .members_in_transit
@@ -134,12 +95,6 @@ impl PartyStore for WorldFake {
         })
     }
 
-    // Group: a minimal in-memory party — enough for the dispatch tests to drive
-    // invite-result mapping and the GROUP_LIST build without a live module.
-    //
-    // Each of these records the SHARD it ran on (`rec`), so a test can tell the
-    // single-database path (the op lands on the player's own shard, here) apart from the realm-core
-    // one (it lands in `FakeParty::ops` and never reaches these at all).
     fn group_invite(&self, _actor: Actor, target_guid: u64) -> Result<PartyOutcome> {
         self.rec("group_invite");
         if let Some(e) = &self.trade_error {
@@ -385,9 +340,7 @@ impl PartyStore for WorldFake {
         Ok(PartyOutcome::Ran)
     }
 
-    /// The module's `realm_group_op`, modelled: the rules the ROUTING depends on, applied to the
-    /// authority this handle owns.
-    #[allow(clippy::too_many_lines)] // One arm per realm group op, as the Module's reducer has.
+    #[allow(clippy::too_many_lines)]
     fn realm_group_op(
         &self,
         op: u8,
@@ -449,7 +402,6 @@ impl PartyStore for WorldFake {
                     None => {
                         p.next_group_id += 1;
                         let g = p.next_group_id;
-                        // The vanilla defaults a freshly-formed party gets: GROUP loot, Uncommon.
                         p.groups.push((g, inviter, 3, 2, 0));
                         p.members.push((g, inviter));
                         g
@@ -587,8 +539,6 @@ impl PartyStore for WorldFake {
                 return Ok(p.change_subgroup(actor_guid, target_guid, arg_a))
             }
             realm_op::SWAP_SUBGROUP => return Ok(p.swap_subgroup(actor_guid, target_guid, arg_c)),
-            // Group Broadcasts. Who hears each one is the Module's rule; the routing needs only
-            // the op on the authority, and a Refusal for a member of no group.
             realm_op::READY_CHECK_START..=realm_op::RANDOM_ROLL
                 if self.party.group_broadcast_error =>
             {
@@ -608,7 +558,6 @@ impl PartyStore for WorldFake {
         Ok(PartyOutcome::Ran)
     }
 
-    /// The visibility receipt: the op commits, then the Coordinator cache holds it.
     fn realm_group_op_visible(
         &self,
         op: u8,
@@ -783,8 +732,6 @@ impl PartyStore for WorldFake {
             .insert(roster.group_id, roster.roster_revision);
         let mut mirror = self.party.mirror.lock().unwrap();
         mirror.retain(|r| r.group_id != roster.group_id);
-        // An empty roster is the disband tombstone — the shard forgets the party rather than
-        // keeping an empty one, which is what the module's own `sync_group_mirror` does.
         if !roster.members.is_empty() {
             mirror.push(roster.clone());
         }
@@ -797,36 +744,16 @@ impl PartyStore for WorldFake {
     }
 }
 
-/// Realm-core's authoritative party state, as far as the gateway's routing can see it —
-/// the module's `realm_group_op` rules, modelled at the granularity the ROUTING depends on:
-/// which database the op lands on, who ends up in which group, and who gets notified.
-///
-/// Same instrument, and same limits, as [`FakeShardDb`]: the module's own reducer bodies cannot run
-/// in a gateway test (no `ReducerContext`), so what executes here is the gateway's production
-/// routing (`world::party`) against a faithful stand-in for the authority. The rules themselves are
-/// the module's to test.
 #[derive(Default, Clone)]
 pub(crate) struct FakeParty {
     pub(crate) next_group_id: u64,
-    /// group_id → (leader, loot_method, loot_threshold, master_looter).
     pub(crate) groups: Vec<(u64, u64, u8, u8, u64)>,
-    /// (group_id, character_guid), in join order — the order realm-core's roster read returns.
     pub(crate) members: Vec<(u64, u64)>,
-    /// (target_guid, inviter_guid) — at most one pending per target, newest wins.
     pub(crate) invites: Vec<(u64, u64)>,
-    /// Groups their leader converted to a Raid.
     pub(crate) raids: Vec<u64>,
-    /// Each Raid member's Raid Slot; a member absent here holds the Party default.
     pub(crate) slots: std::collections::HashMap<u64, RaidSlot>,
-    /// group_id → how many times [`Self::push_list`] fired for it — this Fake's stand-in for the
-    /// Roster Revision. A group absent here has never had a list pushed. Bumped exactly where a
-    /// real accepted change would advance the revision, so [`crate::world::party::roster_unchanged`]'s
-    /// no-mirror-push optimization is exercised against a real signal rather than a constant.
     pub(crate) revisions: std::collections::HashMap<u64, u64>,
-    /// Every op that reached the AUTHORITY: `(op, actor, target, arg_a, arg_b, arg_c)`. The
-    /// assertion that a party op ran on realm-core rather than on the player's shard.
     pub(crate) ops: Vec<(u8, u64, u64, u8, u8, u64)>,
-    /// Every notification the authority pushed: `(recipient_guid, kind)` — the relay's input.
     pub(crate) events: Vec<(u64, u8)>,
 }
 
@@ -854,7 +781,6 @@ impl FakeParty {
             .collect()
     }
 
-    /// The Module's own placement rule, `RaidSlot::for_raid_joiner`, over this Fake's slots.
     pub(crate) fn joining_slot(&self, group_id: u64) -> RaidSlot {
         if self.kind_of(group_id) == GroupKind::Party {
             return RaidSlot::default();
@@ -896,7 +822,6 @@ impl FakeParty {
             .map_or(0, |group| group.1)
     }
 
-    /// The leader, or an Assistant.
     pub(crate) fn manages(&self, group_id: u64, guid: u64) -> bool {
         self.leader_of(group_id) == guid
             || self
@@ -905,8 +830,6 @@ impl FakeParty {
                 .is_some_and(|slot| slot.is_assistant())
     }
 
-    /// The Module's `change_subgroup_on`, modelled: leader-or-Assistant, Raid-only, capacity
-    /// decided by the shared [`RaidSlot::moved_to_subgroup`] rule.
     pub(crate) fn change_subgroup(
         &mut self,
         actor_guid: u64,
@@ -952,8 +875,6 @@ impl FakeParty {
         }
     }
 
-    /// The Module's `swap_subgroup_on`, modelled: same gates as [`Self::change_subgroup`], the
-    /// shared [`RaidSlot::swapped_with`] rule, and no capacity Gate.
     pub(crate) fn swap_subgroup(
         &mut self,
         actor_guid: u64,
@@ -985,8 +906,6 @@ impl FakeParty {
         PartyOutcome::Ran
     }
 
-    /// Hand the lead to `leader` and announce it to every member, as the Module does, before the
-    /// list.
     pub(crate) fn set_leader(&mut self, group_id: u64, leader: u64) {
         if let Some(entry) = self.groups.iter_mut().find(|(g, ..)| *g == group_id) {
             entry.1 = leader;
@@ -1011,8 +930,6 @@ impl FakeParty {
         }
     }
 
-    /// Drop `guid` from its party, applying the module's own disband rule (a party of one is no
-    /// party) — the half `sync_mirrors` has to observe to push the right tombstone.
     pub(crate) fn remove_member(&mut self, guid: u64) {
         use lyracore_shared::group::event_kind as kind;
         let Some(group_id) = self.group_of(guid) else {
@@ -1038,8 +955,6 @@ impl FakeParty {
             self.raids.retain(|g| *g != group_id);
         } else {
             if self.leader_of(group_id) == guid {
-                // The Module's succession: a Raid's first Assistant in join order, else the
-                // longest-standing member.
                 let raid = self.kind_of(group_id) == GroupKind::Raid;
                 let heir = remaining
                     .iter()
@@ -1054,8 +969,6 @@ impl FakeParty {
 }
 
 impl WorldFake {
-    /// Read realm-core's party the way its Coordinator cache shows it: stale after a lagging
-    /// call-pipe commit, current otherwise.
     pub(crate) fn realm_cache<R>(&self, read: impl FnOnce(&FakeParty) -> R) -> R {
         if let Some(stale) = &*self.party.stale_party.lock().unwrap() {
             return read(stale);

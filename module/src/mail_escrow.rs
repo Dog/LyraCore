@@ -1,5 +1,3 @@
-//! Delete-last transfer of mail value across databases, keyed by a caller-chosen escrow ID.
-
 use spacetimedb::{log, reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use lyracore_shared::mail::RewardHeader;
@@ -10,8 +8,8 @@ use crate::mail::game_mail;
 
 #[cfg(test)]
 mod harness;
-pub(crate) const MAIL_ESCROW_STALE_MICROS: i64 = 30_000_000; // 30s
-const MAIL_ESCROW_REAP_INTERVAL_MICROS: u64 = 5_000_000; // 5s
+pub(crate) const MAIL_ESCROW_STALE_MICROS: i64 = 30_000_000;
+const MAIL_ESCROW_REAP_INTERVAL_MICROS: u64 = 5_000_000;
 #[table(
     accessor = game_mail_escrow,
     index(accessor = by_sender, btree(columns = [sender_guid]))
@@ -45,19 +43,14 @@ pub struct MailEscrow {
     pub cod: u32,
     #[default(0)]
     pub random_property_id: u32,
-    /// The Delivery Delay the fence resolved for its letter, so a re-driven commit keeps it. 0 for
-    /// a take, a COD payment and every fence filed before the column existed.
     #[default(0u32)]
     pub delivery_delay_secs: u32,
-    /// A Reward Letter's quest giver, as `game_mail.sender_kind` and `sender_entry` store it, and
-    /// the Mail Template it names. 0 for every other fence, which is a Character's letter.
     #[default(0u8)]
     pub sender_kind: u8,
     #[default(0u32)]
     pub sender_entry: u32,
     #[default(0u32)]
     pub mail_template_id: u32,
-    /// The attached Plain Letter's `ITEM_FIELD_ITEM_TEXT_ID`, as `game_mail.item_text_id`.
     #[default(0u32)]
     pub item_text_id: u32,
 }
@@ -100,12 +93,7 @@ crate::character_owned!(delete, fn sweep_delete_game_mail_escrow(ctx, character_
         escrows.escrow_id().delete(r.escrow_id);
     }
 });
-// A Home Shard escrow row is a letter its Character still owes the mail plane: a send whose purse
-// was debited, or a Reward Letter. It travels with the Character, because the Gateway drives only
-// the escrows the Character's current Home Shard holds, and a row left on the old Shard would be
-// deleted with the Character there. The escrow id stays the receipt key on Realm-core, so a drive
-// that races the hop still writes one letter. A take fence lives on Realm-core, which no Character
-// leaves.
+// Home Shard Escrow travels with its Character so recovery can still find and deliver its value.
 crate::character_owned!(transfer, fn sweep_transfer_game_mail_escrow(ctx, character_guid, io) {
     table = game_mail_escrow,
     by = by_sender,
@@ -118,8 +106,6 @@ crate::character_owned!(delete, fn sweep_delete_game_mail_delivery(ctx, characte
     }
 });
 crate::character_owned!(not_transported, fn sweep_transfer_game_mail_delivery());
-/// A letter as its sender wrote it, with the postage paid for it. The commit turns it into a
-/// [`crate::mail::Letter`], which adds the header.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Draft {
     pub recipient_guid: u64,
@@ -176,24 +162,17 @@ pub(crate) enum CommitPlan {
 }
 
 const LEGACY_COD_PAYMENT_PREFIX: &str = "COD Payment: ";
-/// The Mail a COD payment is for, as the mail plane sees it now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct PricedMail {
     pub recipient_guid: u64,
     pub cod: u32,
     pub delivered: bool,
 }
-/// What a commit does with a COD payment. The payer's copper is already in the fence, so every
-/// outcome except `Hold` must land it in a Mail.
+// COD copper already left the purse; every outcome except Hold must land it in Mail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CodPayment {
-    /// The payer owes a delivered price: pay the seller and settle the price.
     Pay,
-    /// The payer owes the price, but the Mail is not delivered on this plane's clock yet, which
-    /// runs behind the Gateway's. The payment waits in its fence for a later commit.
     Hold,
-    /// Nobody owes the price any more: Mail Expiry or a return sent the Mail back, it was deleted,
-    /// or the price was paid. The payment goes back to the payer as a Returned Mail.
     Refund,
 }
 pub(crate) fn plan_cod_payment(priced: Option<PricedMail>, payer_guid: u64) -> CodPayment {
@@ -529,9 +508,6 @@ pub(crate) fn apply_fence<S: FenceSink>(
     );
     Ok(())
 }
-/// File a Reward Letter as Escrow for its recipient, in the turn-in's transaction. The recipient's
-/// session drives it to the mail plane as it drives a stalled send of its own. No purse pays: the
-/// quest creates the letter's copper and item, as it creates quest money and items.
 pub(crate) fn apply_file_reward<S: EscrowLedger>(
     sink: &mut S,
     escrow_id: u64,
@@ -580,7 +556,6 @@ pub(crate) fn apply_file_reward<S: EscrowLedger>(
     );
     Ok(())
 }
-/// [`apply_file_reward`] on this database.
 pub(crate) fn file_reward(
     ctx: &ReducerContext,
     escrow_id: u64,
@@ -589,7 +564,7 @@ pub(crate) fn file_reward(
 ) -> Result<(), String> {
     apply_file_reward(&mut CtxDb { ctx }, escrow_id, recipient_guid, letter)
 }
-#[allow(clippy::too_many_arguments)] // it takes the reducer's wire arguments
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_commit<S: DeliverySink>(
     sink: &mut S,
     escrow_id: u64,
@@ -616,8 +591,7 @@ pub(crate) fn apply_commit<S: DeliverySink>(
         }
         CommitPlan::Deliver => {}
     }
-    // A commit that settles another mail's price is that price's payment. The take fence that
-    // follows refuses a Mail the payment did not pay for, so the payment cannot buy an item.
+    // Bind the take fence to the exact Mail paid by the preceding COD commit.
     let pays_cod = cod_mail_id != 0;
     if pays_cod && reward.is_some() {
         return Err(format!(
@@ -658,12 +632,9 @@ pub(crate) fn apply_commit<S: DeliverySink>(
             *item,
         ),
     };
-    // The Delivery Delay counts from this commit. A COD payment and its refund carry copper only
-    // and arrive at once (cmangos `MailHandler.cpp:475-477`).
     let letter = match payment {
         None => letter.delayed(sink.now_micros(), delivery_delay_secs),
         Some(CodPayment::Pay) => letter.into_cod_payment(),
-        // A refund. `Hold` returned above.
         Some(_) => letter.into_returned(),
     };
     let delivered_to = letter.recipient_guid;
@@ -672,7 +643,7 @@ pub(crate) fn apply_commit<S: DeliverySink>(
         sink.settle_cod(cod_mail_id);
     }
     let created_micros = sink.now_micros();
-    // The receipt names the Draft's recipient even for a refund, so a replayed commit finds it.
+    // Keep the Draft recipient on refund receipts so replay finds the original commit.
     sink.file_receipt(MailDelivery {
         escrow_id,
         mail_id,
@@ -917,7 +888,7 @@ pub(crate) fn apply_confirm<S: EscrowLedger>(sink: &mut S, escrow_id: u64) -> Re
         ));
     };
     if row.delivered {
-        return Ok(()); // already attested — replay-safe like every other step
+        return Ok(());
     }
     sink.attest_delivery(escrow_id);
     log::info!("mail escrow {escrow_id}: delivery attested; the fence may now be settled");
@@ -967,8 +938,6 @@ pub(crate) fn apply_reap<S: ReapSink>(sink: &mut S) {
         }
     }
 }
-/// `same_account` says whether the sender and the recipient belong to one Realm Account. The fence
-/// knows whether it detached an item, so it resolves the Delivery Delay and stores it.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn realm_mail_fence(
@@ -1004,10 +973,6 @@ pub fn realm_mail_fence(
         same_account,
     )
 }
-/// `delivery_delay_secs` is the Delivery Delay the fence stored. The letter arrives that long after
-/// this commit. A Reward Letter's escrow row also stores `sender_kind`, `sender_entry` and
-/// `mail_template_id`, and the commit writes the letter from its quest giver. They are 0 for a
-/// Character's letter.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn realm_mail_commit(

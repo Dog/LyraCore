@@ -136,17 +136,6 @@ impl WorldImportScope {
     }
 
     pub(crate) fn canonical(profile: WorldImportProfile) -> Result<Self> {
-        // Human bounds are the existing canonical importer rectangle. Dwarf/Gnome and Night Elf
-        // bounds were narrowed with `--print-extents` against the local classic-db dump. Their
-        // samples are `playercreateinfo` anchors or real creature rows emitted by that command.
-        // Keeping the catalogue here lets later Verification refine data without changing callers.
-        //
-        // A sample must stand on the ADT heightmap: the terrain self-check interpolates the
-        // heightmap at the sample and the nav self-check rasterizes it, so a spawn on a WMO floor
-        // (a cave, a porch, a dam) reads tens of yards off the surface. The Loch Modan sample is
-        // Mountaineer Kadrell's spawn on the Thelsamar road; the owned 1.12.1 client's heightmap
-        // interpolates to 327.700 there. The nearest-to-centre spawn `--print-extents` offers for
-        // this rectangle is a Tunnel Rat Surveyor 28 yards under the surface in Silver Stream Mine.
         let eastern = || -> Result<Vec<BoundedMapSlice>> {
             Ok(vec![
                 BoundedMapSlice::rectangle(
@@ -186,8 +175,6 @@ impl WorldImportScope {
             ])
         };
 
-        // These Eastern Kingdoms quest givers complete chains whose other endpoints are in the
-        // bounded slices. Their placed spawns bypass slice geometry, but never the scope's map fence.
         let eastern_forced_creatures = || {
             vec![
                 344, 11_406, 266, 415, 1_343, 6_966, 5_165, 6_166, 6_569, 5_149,
@@ -264,8 +251,7 @@ impl WorldImportScope {
     }
 
     fn full(profile: WorldImportProfile) -> Result<Self> {
-        // The client continent grid is 64 tiles of 533 1/3 yards, centred on zero.
-        // Stay inside its outer edge so inclusive cell ranges remain in 0..1024.
+        // Stay inside the 64-tile client grid so inclusive cell indices remain below 1024.
         let bounds = (-17_066.66, 17_066.66, -17_066.66, 17_066.66);
         let mut slices = Vec::new();
         if matches!(
@@ -741,9 +727,6 @@ mod tests {
 
     #[test]
     fn loch_modan_anchor_is_the_thelsamar_road_spawn_inside_its_own_slice() {
-        // Mountaineer Kadrell's spawn on the Thelsamar road: a heightmap ground point, not a WMO
-        // floor. The earlier Silver Stream Mine sample sat 28 yards under the surface and failed
-        // the terrain self-check on the live Realm.
         let kadrell = (-5_367.58, -2_936.21, 327.64);
         let eastern = WorldImportScope::canonical(WorldImportProfile::AllianceEastern)
             .expect("eastern profile");

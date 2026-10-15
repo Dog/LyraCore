@@ -1,9 +1,3 @@
-//! Member Stats: the Store seam that finds a group member on any World Shard, the Relay tick that
-//! decides what one viewer is sent, and the `CMSG_REQUEST_PARTY_MEMBER_STATS` answer.
-//!
-//! A member inside the viewer's AOI is already created on the client, which draws its frame from
-//! the object fields. Member Stats go only to the others (cm:Group.cpp:718-733).
-
 use super::super::*;
 use crate::codec::{
     build_member_stats, build_member_status, full_update_mask, member_status, stats_delta,
@@ -12,44 +6,26 @@ use crate::codec::{
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// Where one group member is, as the Gateway's Coordinator caches see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MemberPresence {
-    /// A live `game_world_entity` row on some World Shard. Boxed: `MemberStats` carries a 32-slot
-    /// and a 16-slot aura array plus its pet's own copies, so an unboxed variant would triple the
-    /// size of every `MemberPresence`, most of which are `InTransit` or `Offline`.
     Live(Box<MemberStatsView>),
-    /// No live entity, but the member is between two places: a pending Transfer, or the loading
-    /// screen of a map change. Reporting it offline would make the frame flicker.
     InTransit,
     Offline,
 }
 
 pub(crate) trait MemberStatsStore: Send + Sync {
-    /// Every other member of `self_guid`'s group, from the party authority's cache: Realm-core on
-    /// a sharded Realm, the only database otherwise. Empty when `self_guid` has no group.
     fn group_mates(&self, self_guid: u64) -> Result<Vec<u64>>;
 
-    /// The member's presence, projected from its Realm Presence
-    /// ([`crate::world::presence::of`]): a live entity is `Live`, `Whereabouts::InTransit` is
-    /// `InTransit`, and `Whereabouts::Offline` or no Realm Presence at all is `Offline`.
     fn member_presence(&self, guid: u64) -> Result<MemberPresence>;
 }
 
-/// What the Relay last sent one viewer about one group mate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MemberSnapshot {
     Offline,
-    /// Boxed for the same reason as [`MemberPresence::Live`].
     Live(Box<MemberStatsView>),
 }
 
-/// What one World Session's client holds of each group mate's Member Stats.
-///
-/// The Relay and the session share it, and only jobs on the session's writer change it, so it
-/// follows the order in which the client reads packets. A packet that sets a frame some other way
-/// (`SMSG_GROUP_LIST`, a FULL answer) forgets what it overwrote, and the next tick sends every
-/// field of that member again.
+/// Only writer jobs may change these snapshots, in the same order as client packets.
 #[derive(Clone, Default)]
 pub(crate) struct MemberStatsRecord(Arc<Mutex<HashMap<u64, MemberSnapshot>>>);
 
@@ -67,12 +43,6 @@ impl MemberStatsRecord {
     }
 }
 
-/// One Relay tick for one viewer: the `SMSG_PARTY_MEMBER_STATS` packets it needs, in group order.
-///
-/// `snapshots` is the viewer's record of what it holds. It changes only when the tick succeeds, so
-/// a failed read never leaves a record of a packet that was not sent. A mate created on the client
-/// loses its record, so the tick after it leaves the AOI sends every field again, because the
-/// client's party cache may be stale by then.
 pub(crate) fn member_stats_tick<St: MemberStatsStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -132,8 +102,6 @@ pub(crate) fn member_stats_tick<St: MemberStatsStore + ?Sized>(
 pub(crate) struct MemberStats;
 
 impl<St: MemberStatsStore + ?Sized> ProtocolFamily<St> for MemberStats {
-    /// Answer on the writer and clear the previous Relay record before the next tick.
-    /// An unreadable group member sends nothing and leaves the World Session open.
     fn handle(
         store: &St,
         session: &mut ProtocolSession,
@@ -168,14 +136,6 @@ impl<St: MemberStatsStore + ?Sized> ProtocolFamily<St> for MemberStats {
     }
 }
 
-/// Only the requester's group mates get their state. Any other guid gets the offline answer
-/// (cm:GroupHandler.cpp:764-771), as in vmangos (vm:GroupHandler.cpp:782). cmangos answers any
-/// guid, which would show a stranger's zone and position to anyone who asks.
-///
-/// A mate between two places answers online with `ZONE_OUT`. cmangos finds a teleporting player
-/// too (`FindPlayer(guid, false)`, cm:GroupHandler.cpp:764) and flags it `ZONE_OUT`
-/// (cm:Group.cpp:54-55). Its entity is gone here, so the answer carries the status alone and the
-/// client keeps the other fields it has.
 fn full_answer<St: MemberStatsStore + ?Sized>(
     store: &St,
     self_guid: u64,
@@ -202,10 +162,6 @@ fn full_answer<St: MemberStatsStore + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The live-entity/in-transit/absence-gated-offline decision itself is pinned in
-    // `world::presence_tests`, against `presence::of` — this file no longer runs its own
-    // discovery, so it no longer needs its own Store Fake for one.
 
     #[test]
     fn forgetting_one_member_keeps_the_others() {
