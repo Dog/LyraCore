@@ -110,6 +110,8 @@ const SELF_ENERGIZE: u32 = 509_0101;
 fn a_direct_energize_records_the_power_given_on_the_go() {
     let mut standalone = Standalone::start("energize-log");
     standalone.publish_module();
+    standalone.assert_sql("DELETE FROM game_creature_move_schedule");
+    standalone.assert_sql("DELETE FROM game_event_reaper_schedule");
     standalone.assert_call("debug_spawn_player_entity", &[&CHARACTER.to_string()]);
     standalone.assert_sql(&format!(
         "DELETE FROM game_spell WHERE spell_id = {SELF_ENERGIZE}"
