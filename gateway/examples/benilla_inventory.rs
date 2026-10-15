@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use syn::visit::{self, Visit};
 
+#[path = "benilla_inventory/behavior.rs"]
+mod behavior;
+
 type References = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Default)]
@@ -362,10 +365,15 @@ fn inventory() -> Result<Value> {
             rows.push(row(direction, number, &names, source, &lyra));
         }
     }
+    let behaviors = behavior::inventory(root)?;
+    for row in &mut rows {
+        row["behavior_evidence"] = behavior::matching_behaviors(row, &behaviors);
+    }
     Ok(json!({
         "benilla_source": package["source"],
         "scope": "World messages. Source evidence is not scenario verification. Raw numeric sends and macros other than matches! require manual inspection. No decoder reference is itself a requirement to emit a message.",
         "messages": rows,
+        "behaviors": behaviors,
     }))
 }
 

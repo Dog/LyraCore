@@ -81,6 +81,19 @@ Logon packets use a separate protocol and are covered by the scenario instead.
 
 The inventory scanner tests run in `cargo test -p lyracore-gateway`.
 
+The `behaviors` list supplements those source observations with curated gameplay
+evidence. Each entry names requests, replies, Module operations, content prerequisites,
+test functions and remaining gaps. Message rows link to matching entries through
+`behavior_evidence`. An empty list means no curated entry, not missing support.
+
+The inventory checks that each named test exists as a Rust test declaration. It
+records whether the test is ignored by default and marks execution as
+`not_run_by_inventory`. It does not run tests or infer that a feature works from a
+function name. `support` is a reviewed scope description; even an unavailable feature
+can have a passing refusal test. `real_client` remains `unverified` until a separate
+Verification records it. Add evidence in
+`gateway/examples/benilla_inventory/behaviors.json` as scenarios grow.
+
 ## Transport movement
 
 The build-5875 movement codec uses transport flag `0x02000000`, a full 64-bit
