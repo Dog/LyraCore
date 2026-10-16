@@ -1,6 +1,7 @@
 use super::{Outbound, SessionSender, SessionTx, WriterTrace};
 use crate::accept::BlockingTaskCapacity;
 use anyhow::{anyhow, bail, Result};
+use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc::SendError, Arc};
@@ -183,18 +184,23 @@ pub(crate) fn encode(outbound: Vec<Outbound>) -> io::Result<Vec<Packet>> {
     Ok(packets)
 }
 
+fn is_job(queued: &Queued) -> bool {
+    matches!(queued.out, Some(Outbound::Job(_)))
+}
+
 pub(super) async fn write<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut encrypt: EncrypterHalf,
     mut receiver: mpsc::Receiver<Queued>,
+    closed: watch::Receiver<bool>,
     workers: BlockingTaskCapacity,
     account_id: u64,
 ) -> Result<()> {
     let mut trace = crate::config::writer_trace_enabled().then(WriterTrace::new);
     let mut buffer = Vec::with_capacity(4096);
-    let mut pending = None;
+    let mut pending = VecDeque::new();
     loop {
-        let first = match pending.take() {
+        let first = match pending.pop_front() {
             Some(first) => first,
             None => match receiver.recv().await {
                 Some(first) => first,
@@ -202,31 +208,35 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
             },
         };
         let mut oldest = first.since;
+        let mut jobs_only = is_job(&first);
         let mut batch = vec![first];
         while batch.len() < ENCODE_BATCH {
-            match receiver.try_recv() {
-                Ok(next) => {
-                    // A Relay job can close the socket; write preceding packets before invoking it.
-                    if matches!(next.out, Some(Outbound::Job(_))) {
-                        pending = Some(next);
-                        break;
-                    }
-                    oldest = oldest.min(next.since);
-                    batch.push(next);
-                }
-                Err(_) => break,
+            let Some(next) = pending.pop_front().or_else(|| receiver.try_recv().ok()) else {
+                break;
+            };
+            // A Relay Job can close the socket; write preceding plain packets before invoking it.
+            if is_job(&next) && !jobs_only {
+                pending.push_front(next);
+                break;
             }
+            jobs_only &= is_job(&next);
+            oldest = oldest.min(next.since);
+            batch.push(next);
         }
         let deadline = tokio::time::Instant::from_std(oldest + MAX_AGE);
         if tokio::time::Instant::now() >= deadline {
             bail!("World Session outbound queue exceeded age limit");
         }
+        let job_closed = closed.clone();
         let encoded = tokio::time::timeout_at(
             deadline,
             workers.run(move || {
                 let mut frames = Vec::new();
                 let mut total = 0usize;
                 for queued in &mut batch {
+                    if *job_closed.borrow() || total >= QUEUE_BYTES {
+                        break;
+                    }
                     let outbound = match queued.out.take() {
                         Some(Outbound::Job(job)) => job(),
                         Some(other) => vec![other],
@@ -237,9 +247,6 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
                         .iter()
                         .map(|packet| 4 + packet.body.len())
                         .sum::<usize>();
-                    if total > QUEUE_BYTES {
-                        bail!("World Session encoded batch exceeds byte limit");
-                    }
                     frames.extend(packets);
                 }
                 Ok::<_, anyhow::Error>((batch, frames))
@@ -247,7 +254,15 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
         )
         .await
         .map_err(|_| anyhow!("World Session outbound queue exceeded age limit"))???;
-        let (_reservations, frames) = encoded;
+        let (batch, frames) = encoded;
+        if *closed.borrow() {
+            return Ok(());
+        }
+        let (unencoded, _reservations): (Vec<_>, Vec<_>) =
+            batch.into_iter().partition(|queued| queued.out.is_some());
+        for queued in unencoded.into_iter().rev() {
+            pending.push_front(queued);
+        }
         if tokio::time::Instant::now() >= deadline {
             bail!("World Session outbound encoding exceeded age limit");
         }
@@ -361,6 +376,7 @@ mod tests {
             tokio::io::sink(),
             crypto.split().0,
             receiver,
+            watch::channel(false).1,
             BlockingTaskCapacity::new(1),
             1,
         )
@@ -368,5 +384,80 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("age limit"));
         assert_eq!(tx.depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn jobs_past_the_batch_byte_limit_are_written_in_a_later_batch() {
+        let (tx, receiver, closed) = channel();
+        let ran = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let ran = ran.clone();
+            tx.send(Outbound::Job(Box::new(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+                (0..40)
+                    .map(|_| Outbound::Raw {
+                        opcode: 0x01dd,
+                        body: vec![0; 60_000],
+                    })
+                    .collect()
+            })))
+            .unwrap_or_else(|_| panic!("within budget"));
+        }
+        drop(tx);
+        let (_, crypto) = wow_srp::vanilla_header::ProofSeed::new().into_client_header_crypto(
+            &wow_srp::normalized_string::NormalizedString::new("TESTER").unwrap(),
+            super::super::test_support::K,
+            0,
+        );
+
+        write(
+            tokio::io::sink(),
+            crypto.split().0,
+            receiver,
+            closed,
+            BlockingTaskCapacity::new(1),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn jobs_queued_behind_a_closing_job_do_not_run() {
+        let (tx, receiver, closed) = channel();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let closing = tx.clone();
+        tx.send(Outbound::Job(Box::new(move || {
+            closing.close();
+            Vec::new()
+        })))
+        .unwrap_or_else(|_| panic!("within budget"));
+        for _ in 0..3 {
+            let ran = ran.clone();
+            tx.send(Outbound::Job(Box::new(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            })))
+            .unwrap_or_else(|_| panic!("within budget"));
+        }
+        drop(tx);
+        let (_, crypto) = wow_srp::vanilla_header::ProofSeed::new().into_client_header_crypto(
+            &wow_srp::normalized_string::NormalizedString::new("TESTER").unwrap(),
+            super::super::test_support::K,
+            0,
+        );
+
+        write(
+            tokio::io::sink(),
+            crypto.split().0,
+            receiver,
+            closed,
+            BlockingTaskCapacity::new(1),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
     }
 }

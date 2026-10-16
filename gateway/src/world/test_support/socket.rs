@@ -70,7 +70,7 @@ pub(crate) fn start_writer(
     stream: std::os::unix::net::UnixStream,
     encrypt: EncrypterHalf,
 ) -> (SessionTx, std::thread::JoinHandle<Result<()>>) {
-    let (tx, receiver, _) = egress::channel();
+    let (tx, receiver, closed) = egress::channel();
     let writer = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -81,6 +81,7 @@ pub(crate) fn start_writer(
                     stream.into_async()?,
                     encrypt,
                     receiver,
+                    closed,
                     BlockingTaskCapacity::new(1),
                     1,
                 )

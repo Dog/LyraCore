@@ -197,12 +197,13 @@ where
     let writer_close = tx.close_socket.clone();
     let mut writer_stopped = stopped.clone();
     let mut writer_closed = closed.clone();
+    let closed_for_writer = closed.clone();
     let mut writer_task = tokio::spawn(async move {
         let result = tokio::select! {
             biased;
             _ = writer_stopped.wait_for(|stop| *stop) => Ok(()),
             _ = writer_closed.wait_for(|closed| *closed) => Ok(()),
-            result = egress::write(writer, encrypt, receiver, encoders, account_id) => result,
+            result = egress::write(writer, encrypt, receiver, closed_for_writer, encoders, account_id) => result,
         };
         if let Some(close) = writer_close {
             close();
