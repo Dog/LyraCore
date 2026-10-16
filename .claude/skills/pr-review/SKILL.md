@@ -127,7 +127,9 @@ links to published commits or the follow-up PR. State what was checked and any m
 End with the actual status and resulting behavior. If nothing needed changing, say that plainly.
 
 Keep this a short maintainer reply, not a transcript of agent rounds or a list of demands.
-Distinguish local additions from published code. Use a draft when publication is outside scope.
+Distinguish local additions from published code. When publication is outside scope, show the complete
+draft directly in the current thread. Include it before any request for publication approval. Save
+the draft as a separate file only when the user requests one.
 Before posting, check for an existing reply to avoid duplicates. Preserve actual newlines with
 structured comment tools or `gh pr comment --body-file`. Report the posted comment's URL, or the
-draft's location, along with any remaining blocker.
+complete draft inline, along with any remaining blocker.
