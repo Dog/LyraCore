@@ -381,9 +381,11 @@ pub(crate) fn relay_entity_update(
             return offer_peer_create_for(coord, view, shard, viewer, new);
         }
     }
-    let dynamic_flags = {
+    let dynamic_flags = if old.dynamic_flags != new.dynamic_flags {
         let guard = coord.0.coord();
         projected_dynamic_flags(&guard, viewer.self_guid, new)
+    } else {
+        new.dynamic_flags
     };
     let mut out: Vec<Outbound> =
         entity_update_to_outbound_with_dynamic_flags(old, new, dynamic_flags)
@@ -666,11 +668,49 @@ pub(crate) fn entity_changed(
             }
         }
     }
+    let descriptors_changed = entity_descriptors_changed(old, new);
+    // A cell crossing must retain re-entry behind an already queued DESTROY.
+    let lifecycle_changed =
+        previous != Some(key) || old.npc_flags != new.npc_flags || old.owner_guid != new.owner_guid;
     let old = Arc::new(old.clone());
     let new = Arc::new(new.clone());
     for session in new_recipients {
+        let Some(viewer) = view.viewer(session) else {
+            continue;
+        };
+        let owner_died_or_revived = viewer.self_guid == new.guid && old.dead != new.dead;
+        if !descriptors_changed
+            && !owner_died_or_revived
+            && !lifecycle_changed
+            && (viewer.self_guid == new.guid || viewer.created.lock().unwrap().contains(&new.guid))
+        {
+            continue;
+        }
         update_job(view, shard, session, &old, &new);
     }
+}
+
+fn entity_descriptors_changed(old: &WorldEntity, new: &WorldEntity) -> bool {
+    let character = new.type_mask & lyracore_shared::constants::type_mask::PLAYER_BIT != 0;
+    old.health != new.health
+        || old.max_health != new.max_health
+        || old.max_power != new.max_power
+        || old.dynamic_flags != new.dynamic_flags
+        || old.target_guid != new.target_guid
+        || old.mount_display_id != new.mount_display_id
+        || old.unit_flags != new.unit_flags
+        || old.unit_bytes_2 != new.unit_bytes_2
+        || old.run_speed_mult_bp != new.run_speed_mult_bp
+        || old.display_id != new.display_id
+        || (character
+            && (old.level != new.level
+                || old.xp != new.xp
+                || old.next_level_xp != new.next_level_xp
+                || old.money != new.money
+                || (old.player_bytes_2 ^ new.player_bytes_2) & 0x00ff_0000 != 0
+                || old.player_flags != new.player_flags
+                || old.unit_bytes_1 != new.unit_bytes_1
+                || old.power != new.power))
 }
 
 pub(crate) fn entity_vanished(view: &WorldView, shard: ShardId, guid: u64, owner_guid: u64) {

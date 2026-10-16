@@ -1156,13 +1156,29 @@ pub(crate) fn aura_applied(
     }
 }
 
-pub(crate) fn aura_updated(
-    view: &Arc<WorldView>,
-    coord: &Coordinator,
-    shard: ShardId,
-    row: &Aura,
-    expires_changed: bool,
-) {
+pub(crate) fn aura_updated(view: &Arc<WorldView>, shard: ShardId, old: &Aura, row: &Aura) {
+    view.auras.upsert(shard, row);
+    let visible_changed = (old.spell_id, old.slot, old.flags, old.level)
+        != (row.spell_id, row.slot, row.flags, row.level)
+        || (old.eff_kind, old.eff_p_0, old.amount, old.stacks)
+            != (row.eff_kind, row.eff_p_0, row.amount, row.stacks);
+    let duration_changed = old.expires_at != row.expires_at || old.applied_at != row.applied_at;
+    if !visible_changed {
+        if duration_changed {
+            if let Some(viewer) = view.viewer_of_owner_on_shard(shard, OwnerGuid(row.target_guid)) {
+                let row = row.clone();
+                enqueue(viewer, move |viewer| {
+                    aura_duration_packet(&row, viewer.self_guid)
+                        .into_iter()
+                        .collect()
+                });
+            }
+        }
+        return;
+    }
+    let Some(coord) = view.shard(shard) else {
+        return;
+    };
     let row = Arc::new(row.clone());
     for viewer in aura_audience(view, shard, &row) {
         let (row, coord, view) = (row.clone(), coord.clone(), view.clone());
@@ -1174,7 +1190,7 @@ pub(crate) fn aura_updated(
                 &viewer.created,
                 viewer.self_guid,
                 &row,
-                expires_changed,
+                duration_changed,
             )
         });
     }
@@ -1281,7 +1297,7 @@ crate::stdb::relays::declare_relays! {
     }
     game_aura [false] {
         insert(Snapshot) => |context, _event, row| { context.view.auras.upsert(context.shard, row); let count = context.view.auras.stealth_count(context.shard, row.target_guid); aura_applied(&context.view, &context.coord, context.shard, row, count); };
-        update(Snapshot) => |context, _event, old, row| { context.view.auras.upsert(context.shard, row); aura_updated(&context.view, &context.coord, context.shard, row, old.expires_at != row.expires_at); };
+        update(Snapshot) => |context, _event, old, row| aura_updated(&context.view, context.shard, old, row);
         delete(Snapshot) => |context, _event, row| { context.view.auras.remove(context.shard, row); let count = context.view.auras.stealth_count(context.shard, row.target_guid); aura_removed(&context.view, &context.coord, context.shard, row, count); };
     }
 }
@@ -1386,6 +1402,56 @@ pub(crate) mod tests {
         assert!(aura_duration_packet(&toggle, self_guid).is_none());
         let expired = aura(self_guid, 0xA1, 1, 10, 5_000_000, 5_000_000);
         assert!(aura_duration_packet(&expired, self_guid).is_none());
+    }
+
+    #[test]
+    fn aura_bookkeeping_updates_the_cache_without_observer_jobs() {
+        use crate::stdb::world_view::test_support::registered_viewer;
+
+        let view = Arc::new(WorldView::new(true));
+        let (_, owner) = registered_viewer(&view, 0, 7);
+        let (peer, observer) = registered_viewer(&view, 0, 8);
+        peer.created.lock().unwrap().insert(7);
+        let old = aura(7, 0, 0, 10, 0, 5_000_000);
+        let mut new = old.clone();
+        new.next_tick_micros = 1_000_000;
+        new.amount_remaining = 7;
+        new.proc_charges = 2;
+        new.proc_ready_micros = 2_000_000;
+
+        aura_updated(&view, 0, &old, &new);
+
+        assert_eq!(view.auras.on_target(0, 7), vec![new]);
+        assert!(owner.try_recv().is_err());
+        assert!(observer.try_recv().is_err());
+    }
+
+    #[test]
+    fn refreshing_an_unchanged_aura_updates_only_its_owners_duration() {
+        use crate::stdb::world_view::test_support::{queued_job, registered_viewer};
+
+        let view = Arc::new(WorldView::new(true));
+        let (_, owner) = registered_viewer(&view, 0, 7);
+        let (peer, observer) = registered_viewer(&view, 0, 8);
+        let (_, other_shard) = registered_viewer(&view, 1, 9);
+        peer.created.lock().unwrap().insert(7);
+        let old = aura(7, A_MOD_SPEED, i32::from(SPEED_MOVE), 50, 0, 5_000_000);
+        let mut new = old.clone();
+        new.applied_at = spacetimedb_sdk::Timestamp::from_micros_since_unix_epoch(1_000_000);
+        new.expires_at = spacetimedb_sdk::Timestamp::from_micros_since_unix_epoch(7_000_000);
+
+        aura_updated(&view, 0, &old, &new);
+
+        let packets = queued_job(&owner);
+        let [Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_AURA_DURATION(duration))] =
+            packets.as_slice()
+        else {
+            panic!("a refresh must send only the owner duration");
+        };
+        assert_eq!(*duration, codec::build_aura_duration(3, 6000));
+        assert!(owner.try_recv().is_err());
+        assert!(observer.try_recv().is_err());
+        assert!(other_shard.try_recv().is_err());
     }
 
     #[test]
