@@ -375,9 +375,8 @@ pub(crate) fn armor_packet(
         return None;
     }
     let guard = coord.0.coord();
-    let db = &guard.conn.db;
-    let eff = crate::stdb::armor::effective_resistances(db, self_guid);
-    let pos = crate::stdb::armor::aura_armor_positive(db, self_guid);
+    let eff = crate::stdb::armor::effective_resistances(&guard, self_guid);
+    let pos = crate::stdb::armor::aura_armor_positive(&guard, self_guid);
     Some(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
         Box::new(codec::build_armor_values(self_guid, eff, pos)),
     )))

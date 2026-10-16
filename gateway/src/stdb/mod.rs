@@ -18,7 +18,7 @@ pub(crate) mod world_view;
 
 pub use connection::Coordinator;
 pub(crate) use connection::ReducerCallError;
-pub(crate) use connection::{classify, DurableFailure};
+pub(crate) use connection::{classify, DurableFailure, LiveConn};
 pub use subscriptions::PlayerSubscriptions;
 #[allow(unused_imports)]
 pub use views::{AccountRow, RealmRow};

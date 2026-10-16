@@ -596,9 +596,13 @@ The SDK cache has only unique-index finders, and a whole-table `iter()` copies e
 lock the pump needs. So relays and per-request reads use Gateway-side indexes, each kept from its
 table's insert, update and delete callbacks and registered before the subscription applies:
 `PartyMembershipIndex`, `ChannelIndex`, `GuildIndex`, `MailEscrowIndex`, `AuctionIndex`,
-`ContactIndex` (owner to friends and ignores) and `CharacterNameIndex` (lowercase name to guid,
-per Shard). Each lives on its connection generation, so a reconnect rebuilds it from the fresh
-subscription.
+`ContactIndex`, `CharacterNameIndex`, and indexes for inventory, skills, quest progress, loot
+entitlement, target auras and enchantment effects. Each lives on its connection generation, so a
+reconnect rebuilds it from the fresh subscription. Indexed inventory and projection reads hold a
+snapshot read guard. The pump holds the write guard only while polling an SDK update, so these reads
+see both the committed cache and all of that update's index callbacks. The guard releases while the
+SDK awaits network input. Pump callbacks enqueue these guarded projections instead of reading them
+synchronously.
 
 Combat, spell cast, spell impact, Speech and emote notifications use native `*_event_live` tables.
 The ordinary predecessors retain their published schemas for additive upgrades and expire through the
