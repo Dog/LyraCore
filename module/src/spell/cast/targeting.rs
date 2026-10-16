@@ -911,7 +911,7 @@ fn apply_restore_effect(
                 let before = t.health;
                 t.health = t.max_health;
                 let effective = t.health.saturating_sub(before);
-                ctx.db.game_world_entity().guid().update(t);
+                t.update(ctx);
                 crate::threat::add_heal_threat(ctx, caster_guid, target_guid, effective);
             }
             EffectHit::none()
@@ -923,7 +923,7 @@ fn apply_restore_effect(
                 // vmangos `EnergizeBySpell` logs the full grant, not the gain.
                 hit.energized = points.max(0) as u32;
                 hit.power_type = t.power_type();
-                ctx.db.game_world_entity().guid().update(t);
+                t.update(ctx);
             }
             if e.enters_combat {
                 crate::combat::enter_combat(ctx, caster_guid);
@@ -946,7 +946,7 @@ fn apply_restore_effect(
                 return EffectHit::none();
             }
             t.power -= drained;
-            ctx.db.game_world_entity().guid().update(t);
+            t.update(ctx);
             let damage = mana_burn_damage(drained, e.p1);
             let (dealt, absorbed) = apply_target_damage(
                 ctx,
@@ -1005,7 +1005,7 @@ fn apply_threat_effect(
             // Vanilla charges a queued strike when its swing fires, including a miss.
             if let Some(mut c) = ctx.db.game_world_entity().guid().find(caster_guid) {
                 c.next_swing_spell = e.spell_id;
-                ctx.db.game_world_entity().guid().update(c);
+                c.update(ctx);
             }
             EffectHit::none()
         }
@@ -1097,12 +1097,12 @@ fn apply_inventory_effect(
                         .unwrap_or_else(|| pickpocket_copper(target.level));
                     if let Some(mut rogue) = entities.guid().find(caster_guid) {
                         rogue.money = rogue.money.saturating_add(copper);
-                        entities.guid().update(rogue);
+                        rogue.update(ctx);
                     }
 
                     let target_entry = target.entry;
                     target.pickpocketed = true;
-                    entities.guid().update(target);
+                    target.update(ctx);
                     crate::loot::roll_pickpocket_loot(ctx, target_entry, target_guid);
                 }
             }
@@ -1228,12 +1228,12 @@ fn apply_character_effect(
                     // Preserve byte 3, which carries the ghost visibility flag.
                     let form_id = client_form_for_stance(new_stance) << 16;
                     c.unit_bytes_1 = (c.unit_bytes_1 & 0xFF00_0000) | form_id;
-                    ctx.db.game_world_entity().guid().update(c);
+                    c.update(ctx);
                 } else if form_recast_toggles_off(c.stance, new_stance) {
                     // Druid caster form uses zero; client_form_for_stance(0) is Battle Stance.
                     c.stance = 0;
                     c.unit_bytes_1 &= 0xFF00_0000;
-                    ctx.db.game_world_entity().guid().update(c);
+                    c.update(ctx);
                 }
             }
             EffectHit::none()
@@ -1264,7 +1264,7 @@ pub(crate) fn apply_direct_heal(
         let before = t.health;
         t.health = healed_value(t.health, t.max_health, basis);
         let effective = t.health.saturating_sub(before);
-        ctx.db.game_world_entity().guid().update(t);
+        t.update(ctx);
         crate::threat::add_heal_threat(ctx, healer_guid, target_guid, effective);
         effective
     } else {
@@ -1278,7 +1278,7 @@ fn convert_health_to_power(ctx: &ReducerContext, caster_guid: u64, amount: i32) 
         let drain = amount.min(c.health.saturating_sub(1));
         c.health -= drain;
         c.power = energized_value(c.power, c.max_power, drain as i32);
-        ctx.db.game_world_entity().guid().update(c);
+        c.update(ctx);
     }
 }
 
@@ -1444,7 +1444,7 @@ fn charge_to_target(ctx: &ReducerContext, caster_guid: u64, target_guid: u64) {
     if dist < 0.5 {
         if let Some(mut c) = entities.guid().find(caster_guid) {
             c.orientation = facing;
-            entities.guid().update(c);
+            c.update(ctx);
         }
         return;
     }
@@ -1474,7 +1474,7 @@ fn charge_to_target(ctx: &ReducerContext, caster_guid: u64, target_guid: u64) {
         c.cell = lyracore_shared::spatial::grid_cell_id(gx, gy);
         c.orientation = facing;
         c.last_move_ms = now_ms;
-        entities.guid().update(c);
+        c.update(ctx);
     }
 }
 

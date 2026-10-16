@@ -179,7 +179,7 @@ pub(crate) fn set_character_level(
         apply_level_stats(ctx, &mut e, race, class, level);
         e.health = e.max_health;
         e.power = e.max_power;
-        entities.guid().update(e);
+        e.update(ctx);
         crate::spell::recompute_sheet(ctx, character_guid);
     }
 

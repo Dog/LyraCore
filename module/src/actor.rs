@@ -266,8 +266,8 @@ pub(crate) fn restore_sessionless_body(
     ctx: &ReducerContext,
     character_guid: u64,
 ) -> Option<crate::tables::WorldEntity> {
-    use crate::tables::{game_creature_spline, game_world_entity};
-    use spacetimedb::{Identity, Table};
+    use crate::tables::game_creature_spline;
+    use spacetimedb::Identity;
 
     if let Ok(entity) = crate::helpers::live_entity(ctx, character_guid) {
         return Some(entity);
@@ -282,7 +282,7 @@ pub(crate) fn restore_sessionless_body(
         entity.player_flags = player_flags;
         entity.unit_bytes_1 = unit_bytes_1;
     }
-    let entity = ctx.db.game_world_entity().insert(entity);
+    let entity = entity.insert(ctx);
     ctx.db.game_creature_spline().guid().delete(character_guid);
     Some(entity)
 }
@@ -302,7 +302,7 @@ pub(crate) fn stop_movement(ctx: &ReducerContext, actor_guid: u64) {
     }
     if let Some(mut entity) = ctx.db.game_world_entity().guid().find(actor_guid) {
         crate::creatures::tick::stop_where_rendered(ctx, &mut entity);
-        ctx.db.game_world_entity().guid().update(entity);
+        entity.update(ctx);
     } else {
         ctx.db.game_creature_spline().guid().delete(actor_guid);
     }

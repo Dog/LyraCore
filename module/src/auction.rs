@@ -1761,7 +1761,7 @@ fn consume_listing_value(ctx: &ReducerContext, listing: &PreparedListing) {
     let mut seller = crate::helpers::acting_entity_by_guid(ctx, listing.request.seller_guid)
         .expect("validated listing seller remains present in the reducer transaction");
     seller.money -= listing.deposit;
-    ctx.db.game_world_entity().guid().update(seller);
+    seller.update(ctx);
     ctx.db
         .game_item_instance()
         .guid()
@@ -1920,7 +1920,7 @@ impl BidSource for CtxBidSource<'_> {
             .money
             .checked_sub(request.offer)
             .ok_or(AuctionRefusal::NotEnoughMoney)?;
-        self.ctx.db.game_world_entity().guid().update(bidder);
+        bidder.update(self.ctx);
         self.ctx.db.game_auction_bid_hold().insert(AuctionBidHold {
             operation_id: request.operation_id,
             bidder_guid: request.bidder_guid,
@@ -1951,7 +1951,7 @@ impl BidSource for CtxBidSource<'_> {
                 .ok_or(AuctionRefusal::Database)?;
             let (money, deferred_refund) = crate::mail::split_refund(bidder.money, refund);
             bidder.money = money;
-            self.ctx.db.game_world_entity().guid().update(bidder);
+            bidder.update(self.ctx);
             deferred_refund
         } else {
             0

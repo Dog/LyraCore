@@ -267,6 +267,9 @@ pub(crate) mod tests {
             sheet_ranged_ap: 0,
             sheet_ranged_dmg_min: 0,
             sheet_ranged_dmg_max: 0,
+            regeneration_pending: false,
+            combat_active: false,
+            simulation_indexed: false,
         }
     }
 

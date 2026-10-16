@@ -67,7 +67,7 @@ fn leash_pass(ctx: &ReducerContext) {
         if let Some(mut c) = entities.guid().find(creature) {
             if c.health != c.max_health {
                 c.health = c.max_health;
-                entities.guid().update(c);
+                c.update(ctx);
             }
         }
     }
@@ -443,7 +443,7 @@ fn fire_melee_swing(
         if let Some(mut a) = entities.guid().find(attacker_guid) {
             if a.power >= cost {
                 a.power -= cost;
-                entities.guid().update(a);
+                a.update(ctx);
                 swing_is_spell = true;
             } else {
                 ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {

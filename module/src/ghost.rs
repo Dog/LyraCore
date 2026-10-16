@@ -29,7 +29,7 @@ pub(crate) fn finish_resurrection(ctx: &ReducerContext, guid: u64) {
         character.dead = false;
         character.player_flags &= !player_flags::GHOST;
         character.unit_bytes_1 &= !unit_vis_flags::GHOST;
-        ctx.db.game_world_entity().guid().update(character);
+        character.update(ctx);
     }
     let auras = ctx
         .db

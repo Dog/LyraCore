@@ -52,7 +52,7 @@ pub(crate) fn distract(
         return;
     }
     tick::stop_facing(ctx, &mut creature, (dest.0, dest.1));
-    entities.guid().update(creature);
+    creature.update(ctx);
     let row = CreatureDistraction {
         creature_guid,
         ends_ms: now_ms(ctx) + length_ms,

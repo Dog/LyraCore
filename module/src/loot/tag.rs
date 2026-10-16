@@ -127,7 +127,7 @@ pub(crate) fn record_first_threat(
         & !lyracore_shared::constants::unit_dynamic_flags::TAPPED_BY_PLAYER;
     if creature.dynamic_flags != stored {
         creature.dynamic_flags = stored;
-        entities.guid().update(creature);
+        creature.update(ctx);
     }
     true
 }
@@ -346,7 +346,7 @@ pub(crate) fn clear(ctx: &ReducerContext, creature_guid: u64) {
             | lyracore_shared::constants::unit_dynamic_flags::TAPPED_BY_PLAYER;
         if creature.dynamic_flags & tag_flags != 0 {
             creature.dynamic_flags &= !tag_flags;
-            entities.guid().update(creature);
+            creature.update(ctx);
         }
     }
 }
@@ -427,7 +427,7 @@ pub fn debug_verify_loot_tag_fixture(ctx: &ReducerContext) -> Result<(), String>
         .ok_or_else(|| "tag-less fixture creature is missing".to_string())?;
     tagless_live.money = 17;
     tagless_live.dynamic_flags |= lyracore_shared::constants::unit_dynamic_flags::LOOTABLE;
-    ctx.db.game_world_entity().guid().update(tagless_live);
+    tagless_live.update(ctx);
     ctx.db.game_corpse_loot().insert(super::CorpseLoot {
         id: 0,
         corpse_guid: tagless,
@@ -801,7 +801,7 @@ fn insert_fixture_corpse(
     corpse.dead = true;
     corpse.health = 0;
     corpse.money = money;
-    entities.guid().update(corpse);
+    corpse.update(ctx);
 }
 
 #[cfg(feature = "debug_reducers")]
@@ -881,7 +881,7 @@ fn insert_fixture_entity(
         entity.faction_template = 1;
         entity.next_level_xp = crate::xp::xp_to_next_level(1);
     }
-    ctx.db.game_world_entity().insert(entity);
+    entity.insert(ctx);
 }
 
 #[cfg(feature = "debug_reducers")]
@@ -896,7 +896,7 @@ fn move_fixture_entity(ctx: &ReducerContext, guid: u64, x: f32) -> Result<(), St
     entity.grid_x = grid_x;
     entity.grid_y = grid_y;
     entity.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
-    entities.guid().update(entity);
+    entity.update(ctx);
     Ok(())
 }
 

@@ -2,6 +2,7 @@ use crate::terrain::game_terrain_chunk;
 use lyracore_shared::terrain::cell_key;
 use lyracore_shared::vmap::{decode, RayFlavor, VmapTri};
 use spacetimedb::{reducer, table, ReducerContext, Table};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 const STAGING: u8 = 0;
 const VERIFIED: u8 = 1;
@@ -9,6 +10,60 @@ const ACTIVE: u8 = 2;
 const DISCARDED: u8 = 3;
 const MANIFEST_DOMAIN: &[u8] = b"lyracore-vmap-manifest-v1";
 const COVERAGE_MANIFEST_DOMAIN: &[u8] = b"lyracore-vmap-nav-coverage-manifest-v1";
+
+const QUERY_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const QUERY_CACHE_CELLS: usize = 128;
+
+#[derive(Default)]
+struct QueryCache {
+    cells: BTreeMap<(u64, u64), Option<Rc<[VmapTri]>>>,
+    bytes: usize,
+}
+
+impl QueryCache {
+    fn cell(
+        &mut self,
+        generation_id: u64,
+        key: u64,
+        load: impl FnOnce() -> Option<Vec<VmapTri>>,
+    ) -> Option<CellTriangles> {
+        if let Some(cached) = self.cells.get(&(generation_id, key)) {
+            return cached.clone().map(CellTriangles::Shared);
+        }
+        let triangles = load();
+        let bytes = triangles
+            .as_ref()
+            .map_or(0, |rows| std::mem::size_of_val(rows.as_slice()));
+        if bytes > QUERY_CACHE_BYTES {
+            return triangles.map(CellTriangles::Owned);
+        }
+        if self.cells.len() == QUERY_CACHE_CELLS || self.bytes + bytes > QUERY_CACHE_BYTES {
+            self.cells.clear();
+            self.bytes = 0;
+        }
+        let triangles = triangles.map(Rc::<[VmapTri]>::from);
+        self.bytes += bytes;
+        self.cells.insert((generation_id, key), triangles.clone());
+        triangles.map(CellTriangles::Shared)
+    }
+}
+
+thread_local! {
+    static QUERY_CACHE: RefCell<Option<QueryCache>> = const { RefCell::new(None) };
+}
+
+// Static cells are immutable after generation verification; dynamic colliders bypass this cache.
+pub(crate) fn with_query_cache<T>(query: impl FnOnce() -> T) -> T {
+    struct RestoreCache(Option<QueryCache>);
+    impl Drop for RestoreCache {
+        fn drop(&mut self) {
+            QUERY_CACHE.with(|cache| *cache.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        RestoreCache(QUERY_CACHE.with(|cache| cache.replace(Some(QueryCache::default()))));
+    query()
+}
 
 fn require_staging(state: u8) -> Result<(), String> {
     (state == STAGING)
@@ -674,25 +729,48 @@ pub(crate) fn rays_enabled(ctx: &ReducerContext) -> bool {
         .is_some_and(|c| c.vmap_enabled)
 }
 
-fn fetcher(ctx: &ReducerContext, map_id: u32) -> impl FnMut(u16, u16) -> Option<Vec<VmapTri>> + '_ {
+enum CellTriangles {
+    Owned(Vec<VmapTri>),
+    Shared(Rc<[VmapTri]>),
+}
+
+impl AsRef<[VmapTri]> for CellTriangles {
+    fn as_ref(&self) -> &[VmapTri] {
+        match self {
+            Self::Owned(triangles) => triangles,
+            Self::Shared(triangles) => triangles,
+        }
+    }
+}
+
+fn fetcher(
+    ctx: &ReducerContext,
+    map_id: u32,
+) -> impl FnMut(u16, u16) -> Option<CellTriangles> + '_ {
     let generation_id = active_generation_id(ctx, map_id);
     move |cx, cy| {
         let generation_id = generation_id?;
         let key = cell_key(map_id, cx, cy);
-        let mut tris = Vec::new();
-        let mut any = false;
-        for row in ctx
-            .db
-            .game_vmap_generation_chunk()
-            .by_generation_cell()
-            .filter((generation_id, key))
-        {
-            any = true;
-            if let Ok(mut t) = decode(&row.blob) {
-                tris.append(&mut t);
+        let load = || {
+            let mut tris = Vec::new();
+            let mut any = false;
+            for row in ctx
+                .db
+                .game_vmap_generation_chunk()
+                .by_generation_cell()
+                .filter((generation_id, key))
+            {
+                any = true;
+                if let Ok(mut t) = decode(&row.blob) {
+                    tris.append(&mut t);
+                }
             }
-        }
-        any.then_some(tris)
+            any.then_some(tris)
+        };
+        QUERY_CACHE.with(|cache| match cache.borrow_mut().as_mut() {
+            Some(cache) => cache.cell(generation_id, key, load),
+            None => load().map(CellTriangles::Owned),
+        })
     }
 }
 
@@ -891,6 +969,109 @@ pub(crate) fn is_indoor(ctx: &ReducerContext, map_id: u32, x: f32, y: f32, z: f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_rays_decode_each_static_cell_once_and_generation_changes_reload_it() {
+        use lyracore_shared::vmap::{cast_ray, encode, TriClass};
+        let wall = |x| {
+            vec![VmapTri {
+                verts: [[x, 1199.0, 49.0], [x, 1202.0, 49.0], [x, 1200.0, 52.0]],
+                class: TriClass::Wmo {
+                    group_id: 1,
+                    mogp_flags: 0,
+                },
+            }]
+        };
+        let mut cache = QueryCache::default();
+        let mut decodes = 0;
+        let from = [1200.0, 1200.0, 50.0];
+        let to = [1201.0, 1200.0, 50.0];
+        let first_blob = encode(&wall(1200.25));
+        let mut first_count = 0;
+        for query in 0..32 {
+            let hit = cast_ray(
+                &mut |cx, cy| {
+                    cache.cell(7, cell_key(0, cx, cy), || {
+                        decodes += 1;
+                        Some(decode(&first_blob).unwrap())
+                    })
+                },
+                from,
+                to,
+                RayFlavor::Los,
+            );
+            assert_eq!(hit, Some([1200.25, 1200.0, 50.0]));
+            if query == 0 {
+                first_count = decodes;
+            }
+            assert_eq!(decodes, first_count);
+        }
+        let next_blob = encode(&wall(1200.75));
+        let next_hit = cast_ray(
+            &mut |cx, cy| {
+                cache.cell(8, cell_key(0, cx, cy), || {
+                    decodes += 1;
+                    Some(decode(&next_blob).unwrap())
+                })
+            },
+            from,
+            to,
+            RayFlavor::Collision,
+        );
+        assert_eq!(next_hit, Some([1200.75, 1200.0, 50.0]));
+        assert_eq!(decodes, first_count * 2);
+    }
+
+    #[test]
+    fn query_cache_does_not_carry_static_cells_into_the_next_firing() {
+        with_query_cache(|| {
+            QUERY_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .cell(1, 2, || Some(Vec::new()));
+            });
+        });
+        with_query_cache(|| {
+            QUERY_CACHE.with(|cache| assert!(cache.borrow().as_ref().unwrap().cells.is_empty()));
+        });
+        QUERY_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+    }
+
+    #[test]
+    fn cached_missing_cells_have_a_fixed_memory_bound() {
+        let mut cache = QueryCache::default();
+        for key in 0..QUERY_CACHE_CELLS as u64 + 1 {
+            assert!(cache.cell(7, key, || None).is_none());
+            assert!(cache.cells.len() <= QUERY_CACHE_CELLS);
+        }
+        assert_eq!(cache.cells.len(), 1);
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn oversized_cells_keep_the_decoded_allocation_and_leave_the_cache_unchanged() {
+        let mut cache = QueryCache::default();
+        let triangle = VmapTri {
+            verts: [[0.0; 3]; 3],
+            class: lyracore_shared::vmap::TriClass::M2,
+        };
+        let cached = cache.cell(7, 1, || Some(vec![triangle])).unwrap();
+        let cached_pointer = cached.as_ref().as_ptr();
+        let triangles = vec![triangle; QUERY_CACHE_BYTES / std::mem::size_of::<VmapTri>() + 1];
+        let decoded_pointer = triangles.as_ptr();
+
+        let oversized = cache.cell(7, 2, || Some(triangles)).unwrap();
+        assert_eq!(oversized.as_ref().as_ptr(), decoded_pointer);
+        assert_eq!(cache.cells.len(), 1);
+        assert_eq!(cache.bytes, std::mem::size_of::<VmapTri>());
+        let retained = cache
+            .cell(7, 1, || panic!("the cached cell must not be loaded again"))
+            .unwrap();
+        assert_eq!(retained.as_ref().as_ptr(), cached_pointer);
+    }
+
     #[test]
     fn only_a_complete_staging_generation_can_be_verified() {
         assert!(require_staging(STAGING).is_ok());

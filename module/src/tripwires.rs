@@ -802,6 +802,62 @@ mod build_scan_strip_tripwire {
 }
 
 #[cfg(test)]
+mod entity_simulation_write_discipline {
+    fn raw_writes(source: &str) -> Vec<(usize, &'static str)> {
+        let source = source.replace("self.ctx", "ctx");
+        crate::test_scan::raw_table_reads(&source, &["game_world_entity"], |source, offset| {
+            let tail: String = source[offset..]
+                .chars()
+                .take(96)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            tail.starts_with(".insert(")
+                || tail.starts_with(".try_insert(")
+                || tail.starts_with(".guid().update(")
+        })
+    }
+
+    #[test]
+    fn the_scan_detects_entity_writes_and_ignores_comments_and_test_code() {
+        let source = r#"
+            fn f(ctx: &ReducerContext) {
+                ctx.db.game_world_entity().insert(row);
+                let entities = self.ctx.db.game_world_entity();
+                entities.guid().update(row);
+                // entities.insert(row);
+                row.update(ctx);
+            }
+            #[cfg(test)]
+            fn fixture(ctx: &ReducerContext) {
+                ctx.db.game_world_entity().insert(row);
+            }
+        "#;
+        assert_eq!(raw_writes(source).len(), 2);
+    }
+
+    #[test]
+    fn entity_writes_stamp_the_simulation_predicates() {
+        let root = crate::test_scan::repo_root();
+        let mut violations = Vec::new();
+        for file in super::character_owned_tripwire::scanned_files() {
+            let relative = file.strip_prefix(&root).unwrap_or(&file);
+            if relative == std::path::Path::new("module/src/world/simulation.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&file).expect("readable Module source");
+            for (line, _) in raw_writes(&source) {
+                violations.push(format!("{}:{line}", relative.display()));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "entity writes must use WorldEntity::insert/update: {}",
+            violations.join(", ")
+        );
+    }
+}
+
+#[cfg(test)]
 mod partition_discipline_tripwire {
     use crate::test_scan::{line_of, on_comment_line, repo_root};
 
@@ -824,8 +880,6 @@ mod partition_discipline_tripwire {
         ("module/src/encounter.rs", 2, "guid high-water marks over spawn/gameobject TEMPLATE rows when allocating a wave guid, not live-world reads"),
         ("module/src/creatures/pet.rs", 1, "`nearest_hostile_near` — KNOWN DEBT, a textbook `entities_near` radius search kept only because pets are rare (one per online warlock)"),
         ("packages/deadmines/src/choreography.rs", 1, "single instance-scoped boss-liveness check inside one encounter"),
-        ("module/src/creatures/tick/mod.rs", 3, "Active-cell classification snapshots all players. Diagnostic counters measure total rows and narrowed pass candidates."),
-        ("module/src/creatures/cycle/ctx.rs", 2, "Aggro snapshots all players and regeneration selects entities with health or power. Neither predicate has its own index."),
         ("module/src/spell/cast/targeting.rs", 1, "AoE/chain target resolution by full-iter + squared distance; a textbook `helpers::entities_near` call (perf-catalog Tier 1)"),
     ];
 

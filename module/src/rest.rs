@@ -1,8 +1,6 @@
 use spacetimedb::{table, ReducerContext, Table, Timestamp};
 
 use crate::game_character;
-#[cfg(feature = "debug_reducers")]
-use crate::game_world_entity;
 use crate::world::WorldEntity;
 use lyracore_shared::packing;
 
@@ -109,7 +107,7 @@ pub fn debug_check_rest_at(
     e.x = x;
     e.y = y;
     check_rest_state(ctx, &mut e);
-    ctx.db.game_world_entity().guid().update(e);
+    e.update(ctx);
     Ok(())
 }
 

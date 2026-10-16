@@ -120,7 +120,7 @@ pub fn tick_breath(ctx: &ReducerContext, _schedule: BreathSchedule) {
                     if let Some(mut pre_death) = ctx.db.game_world_entity().guid().find(entity_guid)
                     {
                         pre_death.health = health;
-                        ctx.db.game_world_entity().guid().update(pre_death);
+                        pre_death.update(ctx);
                     }
                 }
                 crate::combat::kill_player(ctx, entity_guid, entity_guid);
@@ -137,7 +137,7 @@ pub fn tick_breath(ctx: &ReducerContext, _schedule: BreathSchedule) {
         if !died && health != entity.health {
             let mut hurt = entity;
             hurt.health = health;
-            ctx.db.game_world_entity().guid().update(hurt);
+            hurt.update(ctx);
         }
     }
 }

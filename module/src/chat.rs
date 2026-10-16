@@ -122,7 +122,7 @@ fn write_chat_event(
     if lyracore_shared::chat::broadcast_chat::is_zone_wide(chat_type) {
         sender.zone_id =
             crate::terrain::zone_id_at(ctx, sender.map_id, sender.x, sender.y).unwrap_or(0);
-        sender = ctx.db.game_world_entity().guid().update(sender);
+        sender = sender.update(ctx);
     }
     ctx.db.game_chat_event_live().insert(ChatEvent {
         id: 0,

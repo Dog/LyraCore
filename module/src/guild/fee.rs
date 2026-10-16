@@ -485,7 +485,7 @@ impl FeePurse for CtxPurse<'_> {
             .checked_sub(hold.copper)
             .ok_or(FeeError::Refused(GuildRefusal::NotEnoughMoney))?;
         let owner_identity = payer.owner_identity;
-        self.ctx.db.game_world_entity().guid().update(payer);
+        payer.update(self.ctx);
         if let HeldTerms::Charter {
             charter_item_guid, ..
         } = &mut hold.terms
@@ -520,7 +520,7 @@ impl FeePurse for CtxPurse<'_> {
                 .money
                 .checked_add(credit)
                 .ok_or(FeeError::Conflict("refund does not fit in the purse"))?;
-            self.ctx.db.game_world_entity().guid().update(payer);
+            payer.update(self.ctx);
         }
         if mailed != 0 {
             self.mail_refund(hold, mailed)?;

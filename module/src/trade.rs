@@ -705,7 +705,7 @@ fn run_trade_commit(
                 partner_side.gold_offered,
             )
             .ok_or("trade commit: gold arithmetic refused")?;
-            entities.guid().update(acceptor_row);
+            acceptor_row.update(ctx);
             let mut partner_row = entities
                 .guid()
                 .find(partner.guid)
@@ -716,7 +716,7 @@ fn run_trade_commit(
                 acceptor_side.gold_offered,
             )
             .ok_or("trade commit: gold arithmetic refused")?;
-            entities.guid().update(partner_row);
+            partner_row.update(ctx);
 
             remove_session(ctx, &session);
             push_trade_event(ctx, acceptor.guid, event_kind::TRADE_COMPLETE, partner.guid);

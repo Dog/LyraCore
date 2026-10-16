@@ -198,7 +198,7 @@ fn binding_items_require_the_circle_and_complete_both_quest_variants_without_rep
     node.assert_call("install_guid_range", &["0"]);
     node.assert_sql("UPDATE game_character SET level = 20, class = 9, race = 1 WHERE guid = 1");
     node.assert_call("debug_spawn_player_entity", &[PLAYER]);
-    node.assert_sql("UPDATE game_world_entity SET level = 20, health = 100000, max_health = 100000 WHERE guid = 1");
+    node.assert_sql("UPDATE game_world_entity SET simulation_indexed = false, level = 20, health = 100000, max_health = 100000 WHERE guid = 1");
     copy_template(
         &node,
         "game_creature_template",
@@ -344,7 +344,7 @@ fn binding_items_require_the_circle_and_complete_both_quest_variants_without_rep
             inventory
         );
         node.assert_sql(&format!(
-            "UPDATE game_world_entity SET health = 1 WHERE guid = {}",
+            "UPDATE game_world_entity SET simulation_indexed = false, health = 1 WHERE guid = {}",
             summon["guid"]
         ));
         node.assert_call("gw_attack", &[&support::actor(PLAYER), &summon["guid"]]);

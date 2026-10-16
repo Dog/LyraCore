@@ -158,7 +158,7 @@ fn start(name: &str) -> Standalone {
     standalone.publish_module();
     standalone.assert_call("debug_spawn_player_entity", &[&PLAYER.to_string()]);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET max_health = 1000, health = 1000 WHERE guid = {PLAYER}"
+        "UPDATE game_world_entity SET simulation_indexed = false, max_health = 1000, health = 1000 WHERE guid = {PLAYER}"
     ));
     insert_spell(
         &standalone,
@@ -204,7 +204,7 @@ fn set_class(standalone: &Standalone, class: u32, power_type: u32, max_power: u3
     let bytes = number(&entity(standalone), "unit_bytes_0");
     let bytes = (bytes & 0x00FF_00FF) | (class << 8) | (power_type << 24);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_bytes_0 = {bytes}, max_power = {max_power}, \
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_bytes_0 = {bytes}, max_power = {max_power}, \
          power = {max_power} WHERE guid = {PLAYER}"
     ));
 }
@@ -212,7 +212,7 @@ fn set_class(standalone: &Standalone, class: u32, power_type: u32, max_power: u3
 fn hold_vitals(standalone: &Standalone) {
     let flags = number(&entity(standalone), "unit_flags");
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_flags = {}, combat_until_ms = {}, \
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_flags = {}, combat_until_ms = {}, \
          mana_regen_paused_until_ms = {} WHERE guid = {PLAYER}",
         flags | unit_flags::IN_COMBAT,
         u64::MAX,

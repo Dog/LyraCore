@@ -474,7 +474,7 @@ pub fn debug_stage_auction_cancel_fixture(
             .ok_or_else(|| format!("auctioneer {auctioneer_guid} is not in the world"))?;
         auctioneer.faction_template = CANCEL_FIXTURE_FACTION_TEMPLATE;
         auctioneer.npc_flags |= lyracore_shared::constants::npc_flags::AUCTIONEER;
-        ctx.db.game_world_entity().guid().update(auctioneer);
+        auctioneer.update(ctx);
     }
 
     let expires_micros = ctx

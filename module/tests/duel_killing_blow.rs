@@ -41,7 +41,7 @@ fn a_duel_ending_swing_is_no_killing_blow() {
         number(&player, "z"),
     );
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET x = {}, y = {y}, z = {z}, health = 1 WHERE guid = {rival}",
+        "UPDATE game_world_entity SET simulation_indexed = false, x = {}, y = {y}, z = {z}, health = 1 WHERE guid = {rival}",
         x + 1.0
     ));
     standalone.assert_sql(&format!(

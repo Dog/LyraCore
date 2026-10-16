@@ -55,7 +55,7 @@ pub(crate) fn do_self_resurrect(ctx: &ReducerContext, character_guid: u64) -> Re
     );
     character.health = health;
     character.power = power;
-    entities.guid().update(character);
+    character.update(ctx);
     crate::ghost::finish_resurrection(ctx, character_guid);
     Ok(())
 }

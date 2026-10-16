@@ -52,7 +52,7 @@ pub(crate) fn recompute_mount(ctx: &ReducerContext, guid: u64) {
     }
     e.mount_display_id = display;
     e.run_speed_mult_bp = speed_bp;
-    entities.guid().update(e);
+    e.update(ctx);
 }
 
 pub(crate) fn dismount(ctx: &ReducerContext, guid: u64) {

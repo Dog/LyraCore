@@ -173,7 +173,7 @@ pub(crate) fn recompute_vitals(ctx: &ReducerContext, unit_guid: u64) {
     e.max_power = new_max_power;
     e.power = e.power.min(new_max_power);
     e.spirit = new_spirit;
-    entities.guid().update(e);
+    e.update(ctx);
 }
 
 pub(crate) fn recompute_sheet(ctx: &ReducerContext, unit_guid: u64) {
@@ -240,7 +240,7 @@ pub(crate) fn recompute_sheet(ctx: &ReducerContext, unit_guid: u64) {
     e.sheet_ranged_ap = ranged_ap;
     e.sheet_ranged_dmg_min = ranged_dmg_min;
     e.sheet_ranged_dmg_max = ranged_dmg_max;
-    entities.guid().update(e);
+    e.update(ctx);
 }
 
 pub(crate) fn absorb_incoming(ctx: &ReducerContext, target_guid: u64, incoming: u32) -> u32 {

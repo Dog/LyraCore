@@ -23,7 +23,7 @@ pub(crate) fn enter_combat(ctx: &ReducerContext, guid: u64) {
     }
     e.combat_until_ms = now_ms + COMBAT_DROP_MS;
     e.unit_flags |= lyracore_shared::constants::unit_flags::IN_COMBAT;
-    entities.guid().update(e);
+    e.update(ctx);
     crate::creatures::distraction::clear(ctx, guid);
 }
 
@@ -53,7 +53,7 @@ pub(crate) fn arm_creature_engagement(
     if let Some(mut creature) = entities.guid().find(creature_guid) {
         if creature.target_guid != target_guid {
             creature.target_guid = target_guid;
-            entities.guid().update(creature);
+            creature.update(ctx);
         }
     }
     crate::hooks::fire_on_aggro(
@@ -133,7 +133,7 @@ pub(crate) fn disengage(ctx: &ReducerContext, guid: u64) {
             if e.unit_flags & lyracore_shared::constants::unit_flags::IN_COMBAT != 0 {
                 e.unit_flags &= !lyracore_shared::constants::unit_flags::IN_COMBAT;
                 e.combat_until_ms = 0;
-                entities.guid().update(e);
+                e.update(ctx);
             }
         }
     }
@@ -161,7 +161,7 @@ pub(crate) fn stop_duel_combat(ctx: &ReducerContext, first_guid: u64, second_gui
         if let Some(mut entity) = entities.guid().find(guid) {
             entity.unit_flags &= !lyracore_shared::constants::unit_flags::IN_COMBAT;
             entity.combat_until_ms = 0;
-            entities.guid().update(entity);
+            entity.update(ctx);
         }
     }
 }
@@ -171,7 +171,7 @@ pub(crate) fn clear_target(ctx: &ReducerContext, guid: u64) {
     if let Some(mut e) = entities.guid().find(guid) {
         if !e.is_player() && e.target_guid != 0 {
             e.target_guid = 0;
-            entities.guid().update(e);
+            e.update(ctx);
         }
     }
 }
@@ -227,14 +227,6 @@ pub(crate) fn is_hostile_target(
     attacker.guid != target.guid
         && (crate::duel::active_opponents(ctx, attacker.guid, target.guid)
             || crate::faction::is_hostile(ctx, attacker.faction_template, target.faction_template))
-}
-
-pub(crate) fn melee_combatant_guids(ctx: &ReducerContext) -> Vec<u64> {
-    ctx.db
-        .game_melee_attack()
-        .iter()
-        .flat_map(|a| [a.attacker_guid, a.target_guid])
-        .collect()
 }
 
 #[table(
@@ -462,7 +454,7 @@ fn face_requested_melee_target(ctx: &ReducerContext, attacker_guid: u64, target_
     let partition = (attacker.map_id, attacker.instance_id);
     let grid = (attacker.grid_x, attacker.grid_y);
     attacker.orientation = orientation;
-    entities.guid().update(attacker);
+    attacker.update(ctx);
     crate::creatures::tick::emit_facing_spline(
         ctx,
         attacker_guid,
@@ -521,7 +513,7 @@ fn start_attack(
         if let Some(mut creature) = ctx.db.game_world_entity().guid().find(attacker.guid) {
             if creature.target_guid != target_guid {
                 creature.target_guid = target_guid;
-                ctx.db.game_world_entity().guid().update(creature);
+                creature.update(ctx);
             }
         }
     }

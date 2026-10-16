@@ -284,7 +284,7 @@ fn existing_live_pet_recovers_rename_eligibility_without_losing_other_flags() {
     let original_name = protocol_name(&shard);
     shard.assert_sql("UPDATE game_hunter_pet SET name_timestamp = 0 WHERE owner_guid = 1");
     shard.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_flags = 512 WHERE guid = {pet}"
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_flags = 512 WHERE guid = {pet}"
     ));
     assert!(poll_until(POLL_TIMEOUT, || live_pet_flags(&shard)
         & PET_RENAME_FLAG
@@ -296,7 +296,7 @@ fn existing_live_pet_recovers_rename_eligibility_without_losing_other_flags() {
     let renamed_name = protocol_name(&shard);
     assert!(renamed_name.1 > original_name.1);
     shard.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_flags = 528 WHERE guid = {pet}"
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_flags = 528 WHERE guid = {pet}"
     ));
     assert!(poll_until(POLL_TIMEOUT, || live_pet_flags(&shard)
         & PET_RENAME_FLAG

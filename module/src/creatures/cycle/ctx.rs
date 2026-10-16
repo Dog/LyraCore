@@ -25,6 +25,12 @@ use crate::{
 };
 
 pub(crate) fn run(ctx: &ReducerContext, tick: TickContext) -> CycleOutcome {
+    if !crate::world::backfill_simulation(ctx) {
+        return CycleOutcome {
+            awake: 0,
+            rows_visited: Vec::new(),
+        };
+    }
     let regen_window = crate::combat::RegenWindow::new(
         tick.now_micros / 1_000,
         (f64::from(tick.sense_secs) * 1_000.0).round() as u64,
@@ -34,7 +40,7 @@ pub(crate) fn run(ctx: &ReducerContext, tick: TickContext) -> CycleOutcome {
         regen_window,
         advances: Vec::new(),
     };
-    let outcome = run_cycle(&mut world, tick);
+    let outcome = crate::vmap::with_query_cache(|| run_cycle(&mut world, tick));
     world.settle_advances();
     outcome
 }
@@ -57,7 +63,7 @@ impl CtxWorld<'_> {
             let leg = self.ctx.db.game_creature_spline().guid().find(stored.guid);
             if !tick::advance_needs_persist(&stored, &advanced, &settled, leg.as_ref(), now_micros)
             {
-                entities.guid().update(stored);
+                stored.update(self.ctx);
             }
         }
     }
@@ -85,7 +91,7 @@ impl CtxWorld<'_> {
         if let Some(rad) = orientation {
             e.orientation = rad;
         }
-        Some(entities.guid().update(e))
+        Some(e.update(self.ctx))
     }
 }
 
@@ -202,17 +208,22 @@ impl MotionSink for CtxWorld<'_> {
         }
         None
     }
-    fn legs_in_flight(&self) -> Vec<LegInFlight> {
+    fn legs_in_flight(&self, scope: &TickScope) -> Vec<LegInFlight> {
         let entities = self.ctx.db.game_world_entity();
-        self.ctx
-            .db
-            .game_creature_spline()
-            .iter()
-            .map(|s| {
-                let gone = entities.guid().find(s.guid).is_none();
-                as_leg(s, gone)
-            })
-            .collect()
+        let splines = self.ctx.db.game_creature_spline();
+        let rows: Box<dyn Iterator<Item = CreatureSpline> + '_> = match scope {
+            TickScope::Only(instance_id) => Box::new(splines.by_instance().filter(instance_id)),
+            TickScope::CatchAll { .. } => Box::new(
+                splines
+                    .iter()
+                    .filter(|spline| scope.covers(spline.instance_id)),
+            ),
+        };
+        rows.map(|s| {
+            let gone = entities.guid().find(s.guid).is_none();
+            as_leg(s, gone)
+        })
+        .collect()
     }
     fn movement_suppressed(&self, guid: u64) -> bool {
         crate::spell::is_self_movement_suppressed(self.ctx, guid)
@@ -469,7 +480,7 @@ impl IdleSink for CtxWorld<'_> {
         let entities = self.ctx.db.game_world_entity();
         if let Some(mut e) = entities.guid().find(guid) {
             e.wp_target = waypoint_id;
-            entities.guid().update(e);
+            e.update(self.ctx);
         }
     }
     fn reached_home(&mut self, guid: u64) {
@@ -496,7 +507,8 @@ impl EngageSink for CtxWorld<'_> {
         self.ctx
             .db
             .game_world_entity()
-            .iter()
+            .by_entry()
+            .filter(0u32)
             .filter(|e| e.is_player())
             .map(|e| AggroTarget {
                 guid: e.guid,
@@ -631,27 +643,29 @@ impl EngageSink for CtxWorld<'_> {
         let entities = self.ctx.db.game_world_entity();
         if let Some(mut e) = entities.guid().find(guid) {
             e.unit_flags &= !constants::unit_flags::IN_COMBAT;
-            entities.guid().update(e);
+            e.update(self.ctx);
         }
     }
 }
 
 impl RegenSink for CtxWorld<'_> {
     fn recovering(&self, flagged: &[u64]) -> Vec<Recovering> {
-        let mut in_combat = crate::combat::melee_combatant_guids(self.ctx);
-        in_combat.extend_from_slice(flagged);
+        let flagged: HashSet<_> = flagged.iter().copied().collect();
+        let melee = self.ctx.db.game_melee_attack();
         self.ctx
             .db
             .game_world_entity()
-            .iter()
-            .filter(|e| !e.dead && (e.health < e.max_health || e.max_power > 0))
+            .by_regeneration_pending()
+            .filter(true)
             .map(|e| Recovering {
                 guid: e.guid,
                 health: e.health,
                 max_health: e.max_health,
                 power: e.power,
                 max_power: e.max_power,
-                in_combat: in_combat.contains(&e.guid),
+                in_combat: flagged.contains(&e.guid)
+                    || melee.attacker_guid().find(e.guid).is_some()
+                    || melee.by_target().filter(e.guid).next().is_some(),
             })
             .collect()
     }
@@ -716,7 +730,7 @@ impl RegenSink for CtxWorld<'_> {
         }
         live.health = next_health;
         live.power = next_power;
-        entities.guid().update(live);
+        live.update(self.ctx);
     }
 }
 
@@ -843,7 +857,7 @@ impl ThreatSink for CtxWorld<'_> {
         if let Some(mut c) = entities.guid().find(creature) {
             if c.target_guid != victim {
                 c.target_guid = victim;
-                entities.guid().update(c);
+                c.update(self.ctx);
             }
         }
     }
@@ -1091,7 +1105,7 @@ impl PetSink for CtxWorld<'_> {
         if let Some(mut p) = entities.guid().find(guid) {
             if p.target_guid != victim {
                 p.target_guid = victim;
-                entities.guid().update(p);
+                p.update(self.ctx);
             }
         }
     }
@@ -1116,7 +1130,7 @@ impl PetSink for CtxWorld<'_> {
         p.grid_y = gy;
         p.cell = spatial::grid_cell_id(gx, gy);
         p.last_move_ms = now_ms;
-        entities.guid().update(p);
+        p.update(self.ctx);
     }
 }
 

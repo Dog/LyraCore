@@ -104,7 +104,7 @@ pub(crate) fn clear_queued_strike(ctx: &ReducerContext, guid: u64) {
     if let Some(mut e) = entities.guid().find(guid) {
         if e.next_swing_spell != 0 {
             e.next_swing_spell = 0;
-            entities.guid().update(e);
+            e.update(ctx);
         }
     }
 }
@@ -130,7 +130,7 @@ pub(crate) fn arm_react(ctx: &ReducerContext, guid: u64, kind: ReactKind) {
             ReactKind::Overpower => e.overpower_until_ms = until,
             ReactKind::Revenge => e.revenge_until_ms = until,
         }
-        entities.guid().update(e);
+        e.update(ctx);
     }
 }
 

@@ -805,13 +805,12 @@ pub(crate) struct CoreEffects<'a> {
 
 impl EffectSink for CoreEffects<'_> {
     fn grant_xp(&mut self, character_guid: u64, amount: u32) {
-        use crate::game_world_entity;
         let Some(mut entity) = crate::helpers::acting_entity_by_guid(self.ctx, character_guid)
         else {
             return;
         };
         crate::xp::grant_xp(self.ctx, &mut entity, amount);
-        self.ctx.db.game_world_entity().guid().update(entity);
+        entity.update(self.ctx);
     }
 
     fn heal(&mut self, healer_guid: u64, target_guid: u64, amount: u32) {

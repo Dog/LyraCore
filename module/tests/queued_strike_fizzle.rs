@@ -164,7 +164,7 @@ fn spawn_target(standalone: &Standalone) -> u64 {
         .max()
         .expect("the spawned wolf must exist");
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 100000, max_health = 100000 WHERE guid = {guid}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 100000, max_health = 100000 WHERE guid = {guid}"
     ));
     guid
 }

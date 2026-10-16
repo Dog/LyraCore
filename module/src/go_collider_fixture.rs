@@ -64,7 +64,7 @@ fn blink(ctx: &ReducerContext, instance: u64, expected_x: f32) -> Result<(), Str
     caster.orientation = 0.0;
     (caster.grid_x, caster.grid_y) = lyracore_shared::spatial::grid_cell(caster.x, caster.y);
     caster.cell = lyracore_shared::spatial::cell_id_at(caster.x, caster.y);
-    ctx.db.game_world_entity().guid().update(caster);
+    caster.update(ctx);
     crate::spell::blink_forward(ctx, 1, 8.0);
     let landed = ctx
         .db
