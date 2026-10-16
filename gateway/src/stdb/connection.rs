@@ -195,6 +195,7 @@ type PumpWork<C = DbConnection> = Box<dyn FnOnce(&C) + Send>;
 
 enum PumpCommand<C = DbConnection> {
     Run(PumpWork<C>),
+    AfterMessage(Box<dyn Fn() + Send>),
     Park(std::sync::mpsc::Sender<std::result::Result<(), String>>),
     Resume,
     Stop,
@@ -206,12 +207,14 @@ async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result
     advance: impl Fn() -> F,
 ) -> std::result::Result<(), E> {
     let mut parked = false;
+    let mut after_message: Option<Box<dyn Fn() + Send>> = None;
     loop {
         tokio::select! {
             // SubscribeApplied queues Park before returning; consume it before another SDK message.
             biased;
             command = commands.recv() => match command {
                 Some(PumpCommand::Run(work)) => work(conn),
+                Some(PumpCommand::AfterMessage(hook)) => after_message = Some(hook),
                 Some(PumpCommand::Park(applied)) => {
                     parked = true;
                     let _ = applied.send(Ok(()));
@@ -219,7 +222,12 @@ async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result
                 Some(PumpCommand::Resume) => parked = false,
                 Some(PumpCommand::Stop) | None => return Ok(()),
             },
-            result = advance(), if !parked => result?,
+            result = advance(), if !parked => {
+                result?;
+                if let Some(hook) = &after_message {
+                    hook();
+                }
+            }
         }
     }
 }
@@ -690,6 +698,14 @@ impl CoordinatorInner {
         rx.recv_timeout(Duration::from_secs(15))
             .map_err(|error| anyhow!("{} Relay setup did not complete: {error}", self.db_name))?
             .map_err(|error| anyhow!("{} {error}", self.db_name))
+    }
+
+    /// Runs `hook` after each SDK message applies its row callbacks; replaces any earlier hook.
+    pub(crate) fn after_each_message(&self, hook: impl Fn() + Send + 'static) -> Result<()> {
+        self.coord()
+            .pump_commands
+            .send(PumpCommand::AfterMessage(Box::new(hook)))
+            .map_err(|_| anyhow!("{} Coordinator pump is stopped", self.db_name))
     }
 
     pub(crate) fn call_pipe(&self) -> std::sync::RwLockReadGuard<'_, LiveConn> {
@@ -1973,6 +1989,35 @@ mod pump_tests {
         assert_eq!(advances.load(Ordering::Relaxed), 1);
         commands.send(PumpCommand::Stop).unwrap();
         assert_eq!(pump.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn the_after_message_hook_runs_once_after_each_applied_message() {
+        let (commands, work) = mpsc::unbounded_channel();
+        let applied = std::sync::Arc::new(AtomicUsize::new(0));
+        let flushed = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = applied.clone();
+        let hook_flushed = flushed.clone();
+        commands
+            .send(PumpCommand::AfterMessage(Box::new(move || {
+                assert_eq!(
+                    seen.load(Ordering::Relaxed),
+                    hook_flushed.load(Ordering::Relaxed) + 1
+                );
+                hook_flushed.fetch_add(1, Ordering::Relaxed);
+            })))
+            .unwrap();
+        let messages = AtomicUsize::new(0);
+        let result = pump_messages(&(), work, || async {
+            if messages.fetch_add(1, Ordering::Relaxed) == 3 {
+                return Err(());
+            }
+            applied.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert_eq!(result, Err(()));
+        assert_eq!(flushed.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

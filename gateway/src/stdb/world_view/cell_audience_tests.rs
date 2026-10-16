@@ -9,7 +9,7 @@ use crate::codec::entity::subscriptions::entity_vanished;
 use crate::codec::gameobject::subscriptions::{gameobject_appeared, gameobject_vanished};
 use crate::codec::item::subscriptions::trade_event_appeared;
 use crate::codec::leveling::subscriptions::rest_state_appeared;
-use crate::codec::movement::subscriptions::{creature_leg, motion};
+use crate::codec::movement::subscriptions::{creature_leg, flush_motion, motion};
 use crate::codec::social::subscriptions::{chat_audience, emote_audience};
 use crate::codec::taxi::subscriptions::taxi_spline;
 use crate::codec::trainer::subscriptions::skill_changed;
@@ -1326,6 +1326,7 @@ fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
         latest = queue_motion(&batch, seq);
     }
     motion(&view, 0, &latest, &batch.delivery);
+    flush_motion(&view, 0);
 
     assert!(matches!(rx.try_recv().unwrap(), Outbound::Job(_)));
     assert!(rx.try_recv().is_err());
@@ -1333,6 +1334,34 @@ fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
     assert_eq!(delta.queued, 172);
     assert_eq!(delta.callbacks, 1);
     assert!(!delta.is_silent());
+}
+
+#[test]
+fn motion_rows_in_one_message_queue_one_flush_after_the_message() {
+    let view = WorldView::new(true);
+    let (tx, rx) = SessionTx::with_depth(0);
+    let peer = viewer(1, PLAYER_BASE + 10, tx);
+    peer.created
+        .lock()
+        .unwrap()
+        .extend([PLAYER_BASE, PLAYER_BASE + 1]);
+    view.add_viewer_on_shard(peer.clone(), CellKey::at(0, 0, 0, 0), 0);
+    let delivery = super::super::movement_batch::MotionDelivery::default();
+    for guid in [PLAYER_BASE, PLAYER_BASE + 1] {
+        let mut row = queue_motion(&super::super::movement_batch::MovementBatch::new(), 1);
+        row.guid = guid;
+        motion(&view, 0, &row, &delivery);
+        assert!(rx.try_recv().is_err(), "no flush before the message ends");
+    }
+
+    flush_motion(&view, 0);
+
+    let Outbound::Job(job) = rx.try_recv().unwrap() else {
+        panic!("one flush Job");
+    };
+    assert!(rx.try_recv().is_err());
+    job();
+    assert!(peer.motion_pending.entity.lock().unwrap().is_empty());
 }
 
 #[test]
