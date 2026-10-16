@@ -298,9 +298,10 @@ pub use tables::{
     game_aura, game_aura_schedule, game_createinfo_spell, game_dynamic_object, game_ground_area,
     game_ground_area_schedule, game_pending_cast, game_pending_spell_impact, game_player_spell,
     game_resurrect_request, game_school_lockout, game_self_resurrect_option, game_spell,
-    game_spell_cast_event, game_spell_cd, game_spell_chain, game_spell_cooldown, game_spell_effect,
-    game_spell_impact_event, game_spell_learn, game_spell_proc_event, game_spell_reagent, Aura,
-    AuraSchedule, CreateinfoSpell, DynamicObject, GroundArea, GroundAreaSchedule, PendingCast,
+    game_spell_cast_event, game_spell_cast_event_live, game_spell_cd, game_spell_chain,
+    game_spell_cooldown, game_spell_effect, game_spell_impact_event, game_spell_impact_event_live,
+    game_spell_learn, game_spell_proc_event, game_spell_reagent, Aura, AuraSchedule,
+    CreateinfoSpell, DynamicObject, GroundArea, GroundAreaSchedule, PendingCast,
     PendingSpellImpact, PlayerSpell, ResurrectRequest, SchoolLockout, SelfResurrectOption, Spell,
     SpellCastEvent, SpellCd, SpellChain, SpellCooldown, SpellEffect, SpellImpactEvent, SpellLearn,
     SpellProcEvent, SpellReagent,
@@ -323,9 +324,9 @@ pub use tables::{
 };
 pub use tables::{
     game_channel_event, game_channel_member, game_character_contact, game_chat_event,
-    game_emote_event, game_roll_event, game_system_message_event, game_whisper_event, ChannelEvent,
-    ChannelMember, ChatEvent, ContactEntry, EmoteEvent, RollEvent, SystemMessageEvent,
-    WhisperEvent,
+    game_chat_event_live, game_emote_event, game_emote_event_live, game_roll_event,
+    game_system_message_event, game_whisper_event, ChannelEvent, ChannelMember, ChatEvent,
+    ContactEntry, EmoteEvent, RollEvent, SystemMessageEvent, WhisperEvent,
 };
 pub use tables::{game_character, Character};
 pub use tables::{game_character_away, CharacterAway};
@@ -348,8 +349,8 @@ pub use tables::{
 };
 pub use tables::{game_class_level_stats, game_level_stats, ClassLevelStats, LevelStats};
 pub use tables::{
-    game_combat_event, game_melee_attack, game_melee_schedule, game_ranged_impact_schedule,
-    CombatEvent, MeleeAttack, MeleeSchedule, RangedImpactSchedule,
+    game_combat_event, game_combat_event_live, game_melee_attack, game_melee_schedule,
+    game_ranged_impact_schedule, CombatEvent, MeleeAttack, MeleeSchedule, RangedImpactSchedule,
 };
 pub use tables::{game_combo_point, ComboPoint};
 pub use tables::{game_corpse, Corpse};

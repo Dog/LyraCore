@@ -6,7 +6,10 @@ use lyracore_shared::spell::taxonomy::{
     A_PERIODIC_DAMAGE, E_DAMAGE, E_ENERGIZE, T_SELF, T_TARGET_ENEMY,
 };
 
-use support::{number, poll_until, Row, Standalone, POLL_TIMEOUT};
+use support::{
+    event_rows, number, poll_until, wait_for_event_rows, Row, Standalone, TableSubscription,
+    POLL_TIMEOUT,
+};
 
 const CHARACTER: u64 = 1;
 const WOLF: u64 = (0xF130_u64 << 48) | (51_000_u64 << 24) | 1;
@@ -54,6 +57,9 @@ fn damage_heal_and_energize_ticks_each_log_their_outcome() {
             "UPDATE game_aura SET eff_kind = {kind}, amount = {amount} WHERE spell_id = {spell_id}"
         ));
     }
+    let events = standalone.subscribe(&[&format!(
+        "SELECT * FROM game_spell_cast_event_live WHERE kind = {PERIODIC_LOG}"
+    )]);
     let due = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -64,11 +70,11 @@ fn damage_heal_and_energize_ticks_each_log_their_outcome() {
     ));
 
     assert!(
-        poll_until(POLL_TIMEOUT, || logs(&standalone).len() >= 3),
+        poll_until(POLL_TIMEOUT, || logs(&events).len() >= 3),
         "every tick must leave a log, got {:?}",
-        logs(&standalone)
+        logs(&events)
     );
-    let logs = logs(&standalone);
+    let logs = logs(&events);
     let log = |spell_id: u32| -> &Row {
         logs.iter()
             .find(|row| number::<u32>(row, "spell_id") == spell_id)
@@ -96,11 +102,8 @@ fn damage_heal_and_energize_ticks_each_log_their_outcome() {
     assert_eq!(number::<u32>(energize, "power_type"), power_type);
 }
 
-fn logs(standalone: &Standalone) -> Vec<Row> {
-    standalone.query_rows(&format!(
-        "SELECT spell_id, caster_guid, target_guid, damage, healed, energized, power_type \
-         FROM game_spell_cast_event WHERE kind = {PERIODIC_LOG}"
-    ))
+fn logs(events: &TableSubscription) -> Vec<Row> {
+    event_rows(events, "game_spell_cast_event_live")
 }
 
 const SELF_ENERGIZE: u32 = 509_0101;
@@ -143,6 +146,9 @@ fn a_direct_energize_records_the_power_given_on_the_go() {
         .expect("the Character must be live");
     let power_type = (number::<u32>(&character, "unit_bytes_0") >> 24) & 0xFF;
 
+    let events = standalone.subscribe(&[&format!(
+        "SELECT * FROM game_spell_cast_event_live WHERE spell_id = {SELF_ENERGIZE} AND kind = 2"
+    )]);
     standalone.assert_call(
         "debug_cast_at",
         &[
@@ -152,11 +158,7 @@ fn a_direct_energize_records_the_power_given_on_the_go() {
         ],
     );
 
-    let go = standalone
-        .query_rows(&format!(
-            "SELECT energized, power_type FROM game_spell_cast_event \
-             WHERE spell_id = {SELF_ENERGIZE} AND kind = 2"
-        ))
+    let go = wait_for_event_rows(&events, "game_spell_cast_event_live")
         .pop()
         .expect("the energize must report its GO");
     let power: u32 = number(
@@ -228,10 +230,12 @@ fn a_resisted_spell_lands_none_of_its_effects_and_reports_the_resist() {
 
     let mut missed = None;
     for _ in 0..10 {
-        standalone.assert_sql("DELETE FROM game_spell_cast_event");
         standalone.assert_sql(&format!(
             "DELETE FROM game_aura WHERE spell_id = {FIRE_WITH_DOT}"
         ));
+        let events = standalone.subscribe(&[&format!(
+            "SELECT * FROM game_spell_cast_event_live WHERE spell_id = {FIRE_WITH_DOT} AND kind = 2"
+        )]);
         standalone.assert_call(
             "debug_cast_at",
             &[
@@ -240,11 +244,7 @@ fn a_resisted_spell_lands_none_of_its_effects_and_reports_the_resist() {
                 &wolf.to_string(),
             ],
         );
-        let go = standalone
-            .query_rows(&format!(
-                "SELECT miss_info, damage FROM game_spell_cast_event \
-                 WHERE spell_id = {FIRE_WITH_DOT} AND kind = 2"
-            ))
+        let go = wait_for_event_rows(&events, "game_spell_cast_event_live")
             .pop()
             .expect("the cast must report its GO");
         if number::<u32>(&go, "miss_info") != 0 {

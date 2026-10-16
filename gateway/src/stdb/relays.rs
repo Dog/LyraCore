@@ -1,6 +1,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
+use spacetimedb_sdk::table::WithInsert;
 use spacetimedb_sdk::{Table, TableWithPrimaryKey};
 
 use super::bindings::{EventContext, Reducer, RemoteTables};
@@ -82,7 +83,7 @@ fn guarded(label: &str, body: impl FnOnce()) {
     }
 }
 
-pub(crate) fn insert<T: Table<EventContext = EventContext>>(
+pub(crate) fn insert<T: WithInsert<EventContext = EventContext>>(
     table: T,
     label: &'static str,
     context: RelayContext,

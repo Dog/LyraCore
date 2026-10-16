@@ -1,7 +1,7 @@
 mod support;
 
 use std::time::{Duration, Instant};
-use support::{poll_until, Standalone, POLL_TIMEOUT};
+use support::{event_rows, poll_until, Standalone, POLL_TIMEOUT};
 
 const ENTRY: u32 = 51_000;
 const CREATURE: u64 = (0xF130_u64 << 48) | ((ENTRY as u64) << 24) | 1;
@@ -48,6 +48,9 @@ fn zone_speech_resolves_terrain_imported_after_the_creature_spawn() {
         ],
     );
     shard.assert_sql("INSERT INTO game_creature_ai_broadcast_text (id,male_text,female_text,chat_type,language_id,emote_delay_1_ms,emote_id_1,emote_delay_2_ms,emote_id_2,emote_delay_3_ms,emote_id_3) VALUES (5099000,'Zone speech','',6,0,0,0,0,0,0,0)");
+    let speech = shard.subscribe(&[&format!(
+        "SELECT * FROM game_chat_event_live WHERE sender_guid = {CREATURE} AND chat_type = 6"
+    )]);
     let rules = "900003,health:0:100,100,4294967295,repeat:500:500,all,ordinary,any-posture,auto-attack:0+speak:zone-yell:self:5099000";
     shard.assert_call(
         "debug_stage_eventai_revision_fixture",
@@ -70,11 +73,11 @@ fn zone_speech_resolves_terrain_imported_after_the_creature_spawn() {
         ))[0]["zone_id"]
             == zone.to_string()));
     }
-    assert!(!shard
-        .query_rows(&format!(
-            "SELECT id FROM game_chat_event WHERE sender_guid = {CREATURE} AND chat_type = 6"
-        ))
-        .is_empty());
+    assert!(poll_until(POLL_TIMEOUT, || !event_rows(
+        &speech,
+        "game_chat_event_live"
+    )
+    .is_empty()));
 }
 
 #[test]

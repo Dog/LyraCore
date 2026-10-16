@@ -22,8 +22,9 @@ pub(crate) use engage::{
     validate_attack_target, SWING_ERROR_BAD_FACING, SWING_ERROR_NONE, SWING_ERROR_NOT_IN_RANGE,
 };
 pub use engage::{
-    game_combat_event, game_melee_attack, game_melee_schedule, game_ranged_impact_schedule,
-    AttackStart, CombatEvent, MeleeAttack, MeleeSchedule, RangedImpactSchedule,
+    game_combat_event, game_combat_event_live, game_melee_attack, game_melee_schedule,
+    game_ranged_impact_schedule, AttackStart, CombatEvent, MeleeAttack, MeleeSchedule,
+    RangedImpactSchedule,
 };
 pub(crate) use folds::{
     arm_react, aura_attack_power_bonus, clear_queued_strike, effective_agility, effective_crit_bp,

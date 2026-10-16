@@ -584,6 +584,12 @@ table's insert, update and delete callbacks and registered before the subscripti
 per Shard). Each lives on its connection generation, so a reconnect rebuilds it from the fresh
 subscription.
 
+Combat, spell cast, spell impact, Speech and emote notifications use native `*_event_live` tables.
+The ordinary predecessors retain their published schemas for additive upgrades and expire through the
+event reaper. The Gateway handles inserts without caching or replaying notification rows. Group events
+still use their ordered committed batch, and login still reads retained System Messages. Read
+[danger-zones.md](./danger-zones.md) before publishing the matching Module and Gateway.
+
 ### 5.4 RLS is not a universal backstop — state this plainly
 
 - **Anyone who can reach the node's `:3000` port** can connect with no token, get a minted

@@ -396,7 +396,7 @@ fn fire_proc_damage(ctx: &ReducerContext, row: &Aura, counterparty_guid: u64) ->
         Hit::spell(HitSource::Triggered, row.spell_id, false),
     );
     if dealt > 0 || absorbed > 0 {
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             target_guid: counterparty_guid,
             damage: dealt,
             school: school_index(school_mask),

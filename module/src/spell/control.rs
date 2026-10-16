@@ -309,7 +309,7 @@ pub(crate) fn pushback_cast(ctx: &ReducerContext, caster_guid: u64) {
         let new_count = p.pushback_count;
         p.scheduled_at = ScheduleAt::Time(new_fire_at);
         pending.scheduled_id().update(p);
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             delay_ms: CAST_PUSHBACK_MS as u32,
             ..SpellCastEvent::signal(ctx, caster_guid, spell_id, SpellCastEventKind::Pushback)
         });
@@ -352,7 +352,7 @@ fn interrupt_cast_with_outcome(
     for (id, spell_id, target_guid) in hits {
         pending.scheduled_id().delete(id);
         clear_dead_callback_cast_admission(ctx, caster_guid, spell_id);
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             is_interrupted: true,
             ..SpellCastEvent::signal(ctx, caster_guid, spell_id, SpellCastEventKind::Interrupt)
         });

@@ -3,7 +3,7 @@ mod support;
 use serde_json::Value;
 use support::{actor, Standalone};
 
-const CHAT_ROWS: &str = "SELECT * FROM game_chat_event";
+const CHAT_ROWS: &str = "SELECT * FROM game_chat_event_live";
 const CHARACTER: u64 = 1;
 
 fn refused(standalone: &Standalone, args: &[&str], tag: &str) {
@@ -20,7 +20,7 @@ fn refused(standalone: &Standalone, args: &[&str], tag: &str) {
 }
 
 fn inserted_rows(update: &Value) -> Vec<Value> {
-    update["game_chat_event"]["inserts"]
+    update["game_chat_event_live"]["inserts"]
         .as_array()
         .cloned()
         .unwrap_or_default()

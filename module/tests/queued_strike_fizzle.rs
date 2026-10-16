@@ -5,7 +5,7 @@ use lyracore_shared::spell::taxonomy::{E_NEXT_SWING, T_TARGET_ENEMY};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use support::{poll_until, Standalone, POLL_TIMEOUT};
+use support::{event_rows, poll_until, Standalone, TableSubscription, POLL_TIMEOUT};
 
 type SqlRow = BTreeMap<String, String>;
 
@@ -53,7 +53,7 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "the shout must leave the Warrior short of Heroic Strike's cost, had {rage_at_the_swing}"
     );
 
-    swing(&standalone);
+    let (casts, landed) = swing(&standalone);
 
     let after = player(&standalone);
     assert!(
@@ -66,7 +66,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "0",
         "the queued strike must be cleared, so the ability can be queued again"
     );
-    let casts = cast_events(&standalone);
     assert!(
         casts.iter().any(|row| is_power_failure(row, HEROIC_STRIKE)),
         "the caster must be told the strike failed for lack of rage, got {casts:?}"
@@ -76,8 +75,7 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "a fizzled strike must not report a cast, got {casts:?}"
     );
     assert_eq!(
-        own_swing(&standalone)["spell_swing"],
-        "false",
+        landed["spell_swing"], "false",
         "the attack must resolve as an ordinary white swing"
     );
 
@@ -87,7 +85,7 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
 
     stage_power(&standalone, CLEAVE_COST);
     cast(&standalone, CLEAVE, wolf);
-    swing(&standalone);
+    let (casts, landed) = swing(&standalone);
 
     let after = player(&standalone);
     assert_eq!(
@@ -96,7 +94,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "an exactly affordable strike spends it all"
     );
     assert_eq!(queued_spell(&after), "0");
-    let casts = cast_events(&standalone);
     assert!(
         casts.iter().any(|row| fired(row, CLEAVE)),
         "rage equal to the cost must fire the strike, got {casts:?}"
@@ -106,15 +103,14 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "an affordable strike must not report a failure, got {casts:?}"
     );
     assert_eq!(
-        own_swing(&standalone)["spell_swing"],
-        "true",
+        landed["spell_swing"], "true",
         "a fired strike replaces the white swing"
     );
 
     stage_power(&standalone, CLEAVE_COST);
     cast(&standalone, CLEAVE, wolf);
     stage_power(&standalone, CLEAVE_COST - 1);
-    swing(&standalone);
+    let (casts, landed) = swing(&standalone);
 
     let after = player(&standalone);
     assert_eq!(
@@ -123,7 +119,6 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         "a fizzle leaves the pool exactly as it found it"
     );
     assert_eq!(queued_spell(&after), "0");
-    let casts = cast_events(&standalone);
     assert!(
         casts.iter().any(|row| is_power_failure(row, CLEAVE)),
         "one point short must fizzle with the same failure, got {casts:?}"
@@ -132,7 +127,7 @@ fn a_queued_strike_fizzles_into_a_white_swing_when_the_rage_is_gone() {
         !casts.iter().any(|row| fired(row, CLEAVE)),
         "a fizzled strike must not report a cast, got {casts:?}"
     );
-    assert_eq!(own_swing(&standalone)["spell_swing"], "false");
+    assert_eq!(landed["spell_swing"], "false");
 }
 
 fn stage_on_next_swing_spell(standalone: &Standalone, spell_id: u32, name: &str, cost: u32) {
@@ -175,9 +170,11 @@ fn spawn_target(standalone: &Standalone) -> u64 {
 }
 
 fn engage(standalone: &Standalone, target: u64) {
+    let events =
+        standalone.subscribe(&["SELECT * FROM game_combat_event_live WHERE attacker_guid = 1"]);
     standalone.assert_call("debug_engage", &["1", &target.to_string()]);
     assert!(
-        poll_until(POLL_TIMEOUT, || !own_swings(standalone).is_empty()),
+        poll_until(POLL_TIMEOUT, || !own_swings(&events).is_empty()),
         "the engagement never swung"
     );
 }
@@ -195,16 +192,19 @@ fn cast(standalone: &Standalone, spell_id: u32, target: u64) {
     );
 }
 
-fn swing(standalone: &Standalone) {
+fn swing(standalone: &Standalone) -> (Vec<SqlRow>, SqlRow) {
     hold_the_swing(standalone);
-    standalone.assert_sql("DELETE FROM game_spell_cast_event");
-    standalone.assert_sql("DELETE FROM game_combat_event");
+    let events = standalone.subscribe(&[
+        "SELECT * FROM game_combat_event_live WHERE attacker_guid = 1",
+        "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1",
+    ]);
     standalone.assert_sql("UPDATE game_melee_attack SET last_swing_ms = 1 WHERE attacker_guid = 1");
     assert!(
-        poll_until(POLL_TIMEOUT, || !own_swings(standalone).is_empty()),
+        poll_until(POLL_TIMEOUT, || !own_swings(&events).is_empty()),
         "the swing never fired"
     );
     hold_the_swing(standalone);
+    (cast_events(&events), own_swing(&events))
 }
 
 fn hold_the_swing(standalone: &Standalone) {
@@ -234,11 +234,8 @@ fn queued_spell(row: &SqlRow) -> String {
     row["next_swing_spell"].clone()
 }
 
-fn cast_events(standalone: &Standalone) -> Vec<SqlRow> {
-    standalone.query_rows(&format!(
-        "SELECT spell_id, is_interrupted, is_completion, failure_reason FROM \
-         game_spell_cast_event WHERE caster_guid = {PLAYER}"
-    ))
+fn cast_events(events: &TableSubscription) -> Vec<SqlRow> {
+    event_rows(events, "game_spell_cast_event_live")
 }
 
 fn is_power_failure(row: &SqlRow, spell_id: u32) -> bool {
@@ -251,14 +248,12 @@ fn fired(row: &SqlRow, spell_id: u32) -> bool {
     row["spell_id"] == spell_id.to_string() && row["is_completion"] == "true"
 }
 
-fn own_swings(standalone: &Standalone) -> Vec<SqlRow> {
-    standalone.query_rows(&format!(
-        "SELECT damage, hit_info, spell_swing FROM game_combat_event WHERE attacker_guid = {PLAYER}"
-    ))
+fn own_swings(events: &TableSubscription) -> Vec<SqlRow> {
+    event_rows(events, "game_combat_event_live")
 }
 
-fn own_swing(standalone: &Standalone) -> SqlRow {
-    own_swings(standalone)
+fn own_swing(events: &TableSubscription) -> SqlRow {
+    own_swings(events)
         .pop()
         .expect("the swing must have been logged")
 }

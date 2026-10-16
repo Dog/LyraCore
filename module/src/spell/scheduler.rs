@@ -39,7 +39,7 @@ pub(crate) fn fire_pending_cast(ctx: &ReducerContext, sched: PendingCast) {
             e
         );
         // A failed completion needs SMSG_SPELL_FAILURE to clear the filled client cast bar.
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             is_interrupted: true,
             ..SpellCastEvent::signal(
                 ctx,
@@ -84,22 +84,24 @@ pub fn fire_spell_impact(ctx: &ReducerContext, sched: PendingSpellImpact) {
         ),
     );
     let (map_id, instance_id, grid_x, grid_y) = crate::helpers::grid_of(ctx, sched.caster_guid);
-    ctx.db.game_spell_impact_event().insert(SpellImpactEvent {
-        id: 0,
-        caster_guid: sched.caster_guid,
-        target_guid: sched.target_guid,
-        spell_id: sched.spell_id,
-        created_at: ctx.timestamp,
-        damage: dealt,
-        school: sched.school_index,
-        is_crit: sched.is_crit,
-        resisted: sched.resisted,
-        absorbed,
-        map_id,
-        instance_id,
-        grid_x,
-        grid_y,
-    });
+    ctx.db
+        .game_spell_impact_event_live()
+        .insert(SpellImpactEvent {
+            id: 0,
+            caster_guid: sched.caster_guid,
+            target_guid: sched.target_guid,
+            spell_id: sched.spell_id,
+            created_at: ctx.timestamp,
+            damage: dealt,
+            school: sched.school_index,
+            is_crit: sched.is_crit,
+            resisted: sched.resisted,
+            absorbed,
+            map_id,
+            instance_id,
+            grid_x,
+            grid_y,
+        });
 }
 
 pub(crate) fn do_cast_spell(
@@ -338,7 +340,7 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                     .unwrap_or(0);
                 let amount =
                     resist_magic_damage(ctx, a.target_guid, school, a.level as u32, a.amount);
-                ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
                     damage: amount.max(0) as u32,
                     school: crate::spell::school_index(school),
                     resisted: a.amount.saturating_sub(amount).max(0) as u32,
@@ -398,7 +400,7 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                 let new_health = healed_value(cur, target.max_health, a.amount);
                 pending.insert(a.target_guid, new_health);
                 if cur < target.max_health {
-                    ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                    ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
                         healed: a.amount.max(0) as u32,
                         ..SpellCastEvent::periodic_log(ctx, a.caster_guid, a.spell_id, &target)
                     });
@@ -415,7 +417,7 @@ pub fn tick_auras(ctx: &ReducerContext, _schedule: AuraSchedule) {
                     a.target_guid,
                     energized_value(cur, target.max_power, a.amount),
                 );
-                ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
                     energized: a.amount.max(0) as u32,
                     power_type: target.power_type(),
                     ..SpellCastEvent::periodic_log(ctx, a.caster_guid, a.spell_id, &target)
@@ -625,7 +627,7 @@ pub fn tick_ground_areas(ctx: &ReducerContext, _schedule: GroundAreaSchedule) {
             );
             if dealt > 0 || absorbed > 0 {
                 ctx.db
-                    .game_spell_cast_event()
+                    .game_spell_cast_event_live()
                     .insert(crate::spell::SpellCastEvent {
                         target_guid: t,
                         damage: dealt,

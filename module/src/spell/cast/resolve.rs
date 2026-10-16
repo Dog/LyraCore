@@ -317,7 +317,7 @@ fn run_spell_effects(
     }
     let school_index = crate::spell::school_index(hdr.school_mask);
     let (is_completion, client_initiated) = origin.cast_event_flags();
-    ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+    ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
         target_guid,
         is_completion,
         damage: total_damage,
@@ -1239,7 +1239,7 @@ pub(crate) fn begin_cast_with_admission(
         dest_z: dz,
     });
     start_global_cooldown(ctx, caster_guid, hdr.gcd_ms);
-    ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+    ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
         target_guid,
         cast_time_ms: completion_ms,
         ..SpellCastEvent::signal(ctx, caster_guid, spell_id, SpellCastEventKind::Start)

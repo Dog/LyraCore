@@ -30,6 +30,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test -p lyracore-importer
 cargo test -p lyracore-module --lib --features=debug_reducers
 cargo test -p lyracore-module --test build_script
+cargo test -p lyracore-module --test notification_tables
 cargo test -p lyracore-module --test package_api_lint
 cargo test -p lyracore-package-delta
 cargo test -p lyracore-gateway
@@ -49,8 +50,8 @@ compile checks their types and generated registrations.
 
 ## Durable tier
 
-From `.github/workflows/module-durable.yml`. Each test in `module/tests/` is `#[ignore]`d because it
-starts its own SpacetimeDB standalone on a free loopback port, publishes the Module with
+From `.github/workflows/module-durable.yml`. Durable tests in `module/tests/` are `#[ignore]`d because
+each starts its own SpacetimeDB standalone on a free loopback port, publishes the Module with
 `--features=debug_reducers,package_test_fixture`, calls reducers and reads the result. The
 `lyracore-test-support` crate owns that fixture. Standalone logs go to `lyracore-standalone-logs`
 under the system temp directory.

@@ -9,6 +9,46 @@ pub const LEG_YD: f32 = 20.0;
 
 pub type Row = BTreeMap<String, String>;
 
+pub fn event_rows(subscription: &TableSubscription, table: &str) -> Vec<Row> {
+    subscription
+        .inserts(table)
+        .into_iter()
+        .map(|row| {
+            row.as_object()
+                .expect("event row is an object")
+                .iter()
+                .map(|(column, value)| {
+                    let value = if let Some(micros) =
+                        value["__timestamp_micros_since_unix_epoch__"].as_i64()
+                    {
+                        spacetimedb::Timestamp::from_micros_since_unix_epoch(micros)
+                            .to_rfc3339()
+                            .expect("event timestamp is representable")
+                    } else {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                    };
+                    (column.clone(), value)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub fn wait_for_event_rows(subscription: &TableSubscription, table: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            rows = event_rows(subscription, table);
+            !rows.is_empty()
+        }),
+        "no inserts arrived for {table}"
+    );
+    rows
+}
+
 pub fn number<T: std::str::FromStr>(row: &Row, column: &str) -> T {
     row[column]
         .parse()

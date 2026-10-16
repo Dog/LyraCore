@@ -274,6 +274,7 @@ pub const SWING_ERROR_BAD_FACING: u8 = 2;
     public,
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y]))
 )]
+#[table(accessor = game_combat_event_live, public, event)]
 pub struct CombatEvent {
     #[primary_key]
     #[auto_inc]

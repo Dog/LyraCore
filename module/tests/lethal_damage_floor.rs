@@ -1,6 +1,6 @@
 mod support;
 
-use support::Standalone;
+use support::{event_rows, poll_until, Standalone, POLL_TIMEOUT};
 
 const PLAYER_GUID: u64 = 1;
 const WOLF_ENTRY: u32 = 51_000;
@@ -100,6 +100,10 @@ fn authoritative_damage_honors_the_lethal_floor_and_its_lifetime() {
         &[&PLAYER_GUID.to_string(), &WOLF_ENTRY.to_string(), "1.0"],
     );
     stage(&standalone, THIRD_WOLF_GUID);
+    let casts = standalone.subscribe(&[&format!(
+        "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = {PLAYER_GUID} \
+         AND target_guid = {THIRD_WOLF_GUID} AND spell_id = 75 AND is_proc_log = true"
+    )]);
     standalone.assert_call(
         "debug_stage_ranged_lethal_damage_floor_fixture",
         &[
@@ -113,14 +117,19 @@ fn authoritative_damage_honors_the_lethal_floor_and_its_lifetime() {
         "debug_set_lethal_damage_floor_health_fixture",
         &[&THIRD_WOLF_GUID.to_string(), "5"],
     );
-    standalone.wait_until_call_succeeds(
-        "debug_verify_ranged_lethal_damage_floor_fixture",
-        &[
-            &PLAYER_GUID.to_string(),
-            &THIRD_WOLF_GUID.to_string(),
-            "1",
-            "4",
-        ],
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            event_rows(&casts, "game_spell_cast_event_live")
+                .iter()
+                .any(|row| row["damage"] == "4")
+        }),
+        "the ranged impact must report the four damage above the lethal floor"
+    );
+    assert_eq!(
+        standalone.query_rows(&format!(
+            "SELECT health FROM game_world_entity WHERE guid = {THIRD_WOLF_GUID}"
+        ))[0]["health"],
+        "1"
     );
 }
 
