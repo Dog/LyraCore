@@ -660,7 +660,7 @@ pub(crate) struct CoordinatorInner {
     token: Option<String>,
     uri: String,
     db_name: String,
-    sharded_tables: bool,
+    subscription: CoordinatorSubscription,
     call_pipes: Vec<CallPipe>,
     call_pipe_next: std::sync::atomic::AtomicUsize,
     pub(crate) party_command_lane_overflow: AtomicBool,
@@ -978,7 +978,61 @@ fn call_pipe_needs_repair(is_healthy: bool, already_reconnecting: bool) -> bool 
     !is_healthy && !already_reconnecting
 }
 
-fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoordinatorSubscription {
+    SingleShard,
+    WorldShard,
+    RealmCore,
+}
+
+impl CoordinatorSubscription {
+    fn for_shard(map: &ShardMap, shard: &str) -> Self {
+        if map.databases().len() <= 1 {
+            Self::SingleShard
+        } else if map.realm_core_db() == Some(shard)
+            && !map.shards().iter().any(|world| world == shard)
+        {
+            Self::RealmCore
+        } else {
+            Self::WorldShard
+        }
+    }
+}
+
+const WORLD_CATALOG_QUERIES: &[&str] = &[
+    "SELECT * FROM game_creature_template",
+    "SELECT * FROM game_creature_spawn_map",
+    "SELECT * FROM game_area",
+    "SELECT * FROM game_taxi_node",
+    "SELECT * FROM game_taxi_path",
+    "SELECT * FROM game_taxi_path_node",
+    "SELECT * FROM game_start_position",
+    "SELECT * FROM game_spell",
+    "SELECT * FROM game_spell_effect",
+    "SELECT * FROM game_npc_vendor",
+    "SELECT * FROM game_gossip_menu",
+    "SELECT * FROM game_gossip_condition",
+    "SELECT * FROM game_gossip_option",
+    "SELECT * FROM game_gossip_menu_profile",
+    "SELECT * FROM game_gossip_menu_profile_option",
+    "SELECT * FROM game_creature_gossip_menu_override",
+    "SELECT * FROM game_npc_text",
+    "SELECT * FROM game_npc_text_slot",
+    "SELECT * FROM game_quest_template",
+    "SELECT * FROM game_quest_text",
+    "SELECT * FROM game_quest_objective",
+    "SELECT * FROM game_quest_reward_item",
+    "SELECT * FROM game_quest_reward_choice",
+    "SELECT * FROM game_creature_quest",
+    "SELECT * FROM game_gameobject_quest",
+    "SELECT * FROM game_trainer_spell",
+    "SELECT * FROM game_spell_chain",
+    "SELECT * FROM game_gameobject_template",
+    "SELECT * FROM game_talent",
+    "SELECT * FROM game_faction",
+];
+
+fn coordinator_queries(subscription: CoordinatorSubscription) -> Vec<&'static str> {
     let mut queries = crate::stdb::relays::queries();
     queries.extend([
         "SELECT * FROM game_realm",
@@ -1017,53 +1071,26 @@ fn coordinator_queries(sharded_tables: bool) -> Vec<&'static str> {
         "SELECT * FROM game_meeting_stone",
         "SELECT * FROM game_meeting_stone_seeker",
         "SELECT * FROM game_config",
-        "SELECT * FROM game_creature_template",
-        "SELECT * FROM game_creature_spawn_map",
-        "SELECT * FROM game_area",
-        "SELECT * FROM game_taxi_node",
-        "SELECT * FROM game_taxi_path",
-        "SELECT * FROM game_taxi_path_node",
         "SELECT * FROM game_taxi_service_reply",
-        "SELECT * FROM game_start_position",
         "SELECT * FROM game_item_template",
         "SELECT * FROM game_item_random_property",
         "SELECT * FROM game_item_enchantment",
-        "SELECT * FROM game_spell",
-        "SELECT * FROM game_spell_effect",
         "SELECT * FROM game_character_buyback",
         "SELECT * FROM game_corpse_loot",
-        "SELECT * FROM game_npc_vendor",
-        "SELECT * FROM game_gossip_menu",
-        "SELECT * FROM game_gossip_condition",
-        "SELECT * FROM game_gossip_option",
-        "SELECT * FROM game_gossip_menu_profile",
-        "SELECT * FROM game_gossip_menu_profile_option",
-        "SELECT * FROM game_creature_gossip_menu_override",
-        "SELECT * FROM game_npc_text",
-        "SELECT * FROM game_npc_text_slot",
-        "SELECT * FROM game_quest_template",
-        "SELECT * FROM game_quest_text",
-        "SELECT * FROM game_quest_objective",
-        "SELECT * FROM game_quest_reward_item",
-        "SELECT * FROM game_quest_reward_choice",
-        "SELECT * FROM game_creature_quest",
-        "SELECT * FROM game_gameobject_quest",
         "SELECT * FROM game_player_spell",
         "SELECT * FROM game_player_action",
-        "SELECT * FROM game_trainer_spell",
-        "SELECT * FROM game_spell_chain",
-        "SELECT * FROM game_gameobject_template",
-        "SELECT * FROM game_talent",
         "SELECT * FROM game_character_talent",
         "SELECT * FROM game_mail",
         "SELECT * FROM game_mail_escrow",
         "SELECT * FROM game_item_text",
-        "SELECT * FROM game_faction",
         "SELECT * FROM game_faction_template",
         "SELECT * FROM game_guid_allocator",
         "SELECT * FROM game_guid_range",
     ]);
-    if sharded_tables {
+    if subscription != CoordinatorSubscription::RealmCore {
+        queries.extend_from_slice(WORLD_CATALOG_QUERIES);
+    }
+    if subscription != CoordinatorSubscription::SingleShard {
         queries.extend([
             "SELECT * FROM game_character_shard",
             "SELECT * FROM game_group",
@@ -1082,10 +1109,10 @@ fn connect_blocking(
     uri: String,
     db_name: String,
     token: Option<String>,
-    sharded_tables: bool,
+    subscription: CoordinatorSubscription,
     park_for_relays: bool,
 ) -> Result<LiveConn> {
-    let queries = coordinator_queries(sharded_tables);
+    let queries = coordinator_queries(subscription);
     let role_label = coordinator_role_label(&db_name);
     connect_subscribed(
         uri,
@@ -1145,7 +1172,7 @@ fn spawn_coordinator_watchdog(inner: Arc<CoordinatorInner>) -> std::thread::Join
                     inner.uri.clone(),
                     inner.db_name.clone(),
                     inner.token.clone(),
-                    inner.sharded_tables,
+                    inner.subscription,
                     true,
                 ) {
                     Ok(fresh) => {
@@ -1412,29 +1439,142 @@ pub(crate) fn recv_reducer_on(
 
 #[cfg(test)]
 mod coordinator_query_tests {
-    use super::{call_pipe_queries, coordinator_queries, CALL_PIPE_LIVENESS_QUERY};
+    use super::{
+        call_pipe_queries, coordinator_queries, CoordinatorSubscription, ShardMap,
+        CALL_PIPE_LIVENESS_QUERY, WORLD_CATALOG_QUERIES,
+    };
 
     #[test]
     fn coordinator_subscribes_source_map_coverage_in_each_topology() {
-        for sharded in [false, true] {
-            assert!(coordinator_queries(sharded).contains(&"SELECT * FROM game_creature_spawn_map"));
+        for subscription in [
+            CoordinatorSubscription::SingleShard,
+            CoordinatorSubscription::WorldShard,
+        ] {
+            assert!(coordinator_queries(subscription)
+                .contains(&"SELECT * FROM game_creature_spawn_map"));
         }
     }
 
     #[test]
     fn coordinator_subscribes_bot_intents_in_each_topology() {
-        for sharded in [false, true] {
-            let queries = coordinator_queries(sharded);
+        for subscription in [
+            CoordinatorSubscription::SingleShard,
+            CoordinatorSubscription::WorldShard,
+        ] {
+            let queries = coordinator_queries(subscription);
             for query in [
                 "SELECT * FROM game_bot_invite_intent",
                 "SELECT * FROM game_bot_transfer_intent",
             ] {
                 assert!(
                     queries.contains(&query),
-                    "missing {query}, sharded={sharded}"
+                    "missing {query}, subscription={subscription:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn realm_core_skips_world_catalogs_and_keeps_every_control_and_relay_query() {
+        let world = coordinator_queries(CoordinatorSubscription::WorldShard);
+        let realm = coordinator_queries(CoordinatorSubscription::RealmCore);
+        let removed: Vec<_> = world
+            .iter()
+            .filter(|query| !realm.contains(query))
+            .copied()
+            .collect();
+        assert_eq!(removed, WORLD_CATALOG_QUERIES);
+        for query in crate::stdb::relays::queries().into_iter().chain([
+            "SELECT * FROM game_bot_invite_intent",
+            "SELECT * FROM game_bot_transfer_intent",
+            "SELECT * FROM game_party_command_intent WHERE pending = true",
+            "SELECT * FROM game_party_command_dispatch_lane",
+            "SELECT * FROM game_transfer_out",
+            "SELECT * FROM game_transfer_in",
+            "SELECT * FROM game_character_shard",
+            "SELECT * FROM game_account",
+            "SELECT * FROM game_account_fence",
+            "SELECT * FROM game_account_character_owner",
+            "SELECT * FROM game_item_template",
+            "SELECT * FROM game_item_random_property",
+            "SELECT * FROM game_item_enchantment",
+            "SELECT * FROM game_faction_template",
+        ]) {
+            assert!(realm.contains(&query), "missing Realm-core query {query}");
+        }
+    }
+
+    #[test]
+    fn a_realm_core_named_as_a_world_owner_keeps_world_catalogs() {
+        let map = ShardMap::parse("world", "0:*=realm").with_realm_core(Some("realm"));
+        let role = CoordinatorSubscription::for_shard(&map, "realm");
+        assert_eq!(role, CoordinatorSubscription::WorldShard);
+        assert!(coordinator_queries(role).contains(&"SELECT * FROM game_spell"));
+    }
+
+    #[test]
+    fn subscription_roles_keep_all_world_shards_ready_without_viewers() {
+        let map = ShardMap::parse("world", "0:*=world;1:*=idle").with_realm_core(Some("realm"));
+        assert_eq!(map.shards(), ["world", "idle"]);
+        for name in map.shards() {
+            let role = CoordinatorSubscription::for_shard(&map, &name);
+            assert_eq!(role, CoordinatorSubscription::WorldShard);
+            let queries = coordinator_queries(role);
+            assert!(queries.contains(&"SELECT * FROM game_spell"));
+            assert!(queries.contains(&"SELECT * FROM game_bot_invite_intent"));
+            assert!(queries.contains(&"SELECT * FROM game_bot_transfer_intent"));
+        }
+        assert_eq!(
+            CoordinatorSubscription::for_shard(&map, "realm"),
+            CoordinatorSubscription::RealmCore
+        );
+        let single = ShardMap::parse("world", "");
+        assert_eq!(
+            CoordinatorSubscription::for_shard(&single, "world"),
+            CoordinatorSubscription::SingleShard
+        );
+    }
+
+    #[test]
+    fn coordinator_reconnect_restores_the_saved_subscription_scope() {
+        fn restores_scope(source: &str) -> bool {
+            use syn::visit::Visit;
+            struct SavedScope(bool);
+            impl<'ast> Visit<'ast> for SavedScope {
+                fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                    if let syn::Expr::Path(path) = call.func.as_ref() {
+                        if path.path.is_ident("connect_blocking") {
+                            self.0 = matches!(call.args.iter().nth(3), Some(syn::Expr::Field(field))
+                                if matches!(&field.member, syn::Member::Named(member) if member == "subscription")
+                                && matches!(field.base.as_ref(), syn::Expr::Path(base) if base.path.is_ident("inner")));
+                        }
+                    }
+                    syn::visit::visit_expr_call(self, call);
+                }
+            }
+            let file = syn::parse_file(source).unwrap();
+            let watchdog = file
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(function)
+                        if function.sig.ident == "spawn_coordinator_watchdog" =>
+                    {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let mut scope = SavedScope(false);
+            scope.visit_block(&watchdog.block);
+            scope.0
+        }
+        let source = include_str!("connection.rs");
+        assert!(restores_scope(source));
+        assert!(!restores_scope(&source.replace(
+            "inner.subscription,",
+            "CoordinatorSubscription::WorldShard,",
+        )));
     }
 
     const MULTI_DB_TABLES: &[&str] = &[
@@ -1449,7 +1589,7 @@ mod coordinator_query_tests {
 
     #[test]
     fn a_single_database_gateway_subscribes_no_multi_database_table() {
-        let single = coordinator_queries(false);
+        let single = coordinator_queries(CoordinatorSubscription::SingleShard);
         for table in MULTI_DB_TABLES {
             assert!(
                 !single.contains(table),
@@ -1461,7 +1601,7 @@ mod coordinator_query_tests {
 
     #[test]
     fn loot_tag_projection_rows_are_in_every_base_subscription() {
-        let queries = coordinator_queries(false);
+        let queries = coordinator_queries(CoordinatorSubscription::SingleShard);
         for table in [
             "SELECT * FROM game_creature_quest_tap",
             "SELECT * FROM game_creature_quest_tap_member",
@@ -1478,8 +1618,8 @@ mod coordinator_query_tests {
 
     #[test]
     fn the_multi_database_flag_adds_exactly_those_tables_and_changes_nothing_else() {
-        let single = coordinator_queries(false);
-        let sharded = coordinator_queries(true);
+        let single = coordinator_queries(CoordinatorSubscription::SingleShard);
+        let sharded = coordinator_queries(CoordinatorSubscription::WorldShard);
         assert_eq!(
             sharded.len(),
             single.len() + MULTI_DB_TABLES.len(),
@@ -1512,7 +1652,7 @@ mod coordinator_query_tests {
             "a reducer-only pipe must carry only its game_config liveness signal"
         );
 
-        let coordinator_queries = coordinator_queries(false);
+        let coordinator_queries = coordinator_queries(CoordinatorSubscription::SingleShard);
         assert!(coordinator_queries.len() > pipe_queries.len());
         assert!(coordinator_queries.contains(&CALL_PIPE_LIVENESS_QUERY));
     }
@@ -2150,7 +2290,7 @@ impl Coordinator {
     async fn connect_shard(
         cfg: &GatewayConfig,
         db_name: &str,
-        sharded_tables: bool,
+        subscription: CoordinatorSubscription,
     ) -> Result<Arc<CoordinatorInner>> {
         let uri = cfg.stdb_uri.clone();
         let db = db_name.to_string();
@@ -2159,7 +2299,7 @@ impl Coordinator {
         let join_role_label = role_label.clone();
         let build_thread = std::thread::Builder::new()
             .name("stdb-coordinator-connect".into())
-            .spawn(move || connect_blocking(uri, db, token, sharded_tables, false))
+            .spawn(move || connect_blocking(uri, db, token, subscription, false))
             .context(format!("spawn {role_label} connect thread"))?;
         let live = tokio::task::spawn_blocking(move || -> Result<LiveConn> {
             build_thread
@@ -2208,7 +2348,7 @@ impl Coordinator {
             token: cfg.coordinator_token.clone(),
             uri: cfg.stdb_uri.clone(),
             db_name: db_name.to_string(),
-            sharded_tables,
+            subscription,
             call_pipes,
             call_pipe_next: std::sync::atomic::AtomicUsize::new(0),
             party_command_lane_overflow: AtomicBool::new(false),
@@ -2264,10 +2404,9 @@ impl Coordinator {
             );
         }
         let map = ShardMap::from_env(&cfg.module_name);
-        let sharded_tables = map.databases().len() > 1;
         let mut conns: HashMap<String, Arc<CoordinatorInner>> = HashMap::new();
         for db in map.databases() {
-            match Self::connect_shard(cfg, &db, sharded_tables).await {
+            match Self::connect_shard(cfg, &db, CoordinatorSubscription::for_shard(&map, &db)).await {
                 Ok(inner) => {
                     log::info!("coordinator connected to shard {db}");
                     conns.insert(db, inner);

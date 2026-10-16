@@ -1153,10 +1153,14 @@ fn extract_select_star_tables(source: &str) -> Vec<String> {
     let file = syn::parse_file(source).expect("valid query source");
     let mut queries = Queries(Vec::new());
     for item in file.items {
-        if let syn::Item::Fn(function) = item {
-            if function.sig.ident == "coordinator_queries" {
+        match item {
+            syn::Item::Fn(function) if function.sig.ident == "coordinator_queries" => {
                 queries.visit_block(&function.block);
             }
+            syn::Item::Const(catalogs) if catalogs.ident == "WORLD_CATALOG_QUERIES" => {
+                queries.visit_expr(&catalogs.expr);
+            }
+            _ => {}
         }
     }
     queries.0
@@ -1227,12 +1231,13 @@ fn completeness_inventory_detects_an_unmanifested_read() {
         fn coordinator_queries() {
             ["SELECT * FROM game_real_one", "SELECT * FROM game_missing_read WHERE pending = true"];
         }
+        const WORLD_CATALOG_QUERIES: &[&str] = &["SELECT * FROM game_missing_catalog"];
         #[cfg(test)]
         fn unrelated_test() { "SELECT * FROM game_test_only"; }
     "#;
     assert_eq!(
         missing_manifest_tables(&extract_select_star_tables(source), &["game_real_one"]),
-        ["game_missing_read"],
+        ["game_missing_read", "game_missing_catalog"],
     );
 }
 
