@@ -273,6 +273,7 @@ pub(crate) struct WorldView {
     next_session: AtomicU64,
     countdowns_shown: Mutex<HashSet<u64>>,
     online_characters: Mutex<HashSet<u64>>,
+    motion_flushes: Mutex<HashMap<ShardId, Vec<Arc<Viewer>>>>,
 }
 
 impl WorldView {
@@ -285,7 +286,31 @@ impl WorldView {
             next_session: AtomicU64::new(1),
             countdowns_shown: Mutex::new(HashSet::new()),
             online_characters: Mutex::new(HashSet::new()),
+            motion_flushes: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn note_motion_pending(&self, shard: ShardId, viewer: &Arc<Viewer>) {
+        if !viewer
+            .motion_pending
+            .flush_queued
+            .swap(true, Ordering::AcqRel)
+        {
+            self.motion_flushes
+                .lock()
+                .unwrap()
+                .entry(shard)
+                .or_default()
+                .push(viewer.clone());
+        }
+    }
+
+    pub(crate) fn take_motion_flushes(&self, shard: ShardId) -> Vec<Arc<Viewer>> {
+        self.motion_flushes
+            .lock()
+            .unwrap()
+            .remove(&shard)
+            .unwrap_or_default()
     }
 
     pub(crate) fn note_countdown(&self, character_guid: u64, shown: bool) {
@@ -507,6 +532,10 @@ impl WorldView {
 }
 
 pub(crate) fn arm_shard(view: Arc<WorldView>, coord: Coordinator, shard: ShardId) -> Result<()> {
+    let flush_view = view.clone();
+    coord.0.after_each_message(move || {
+        crate::codec::movement::subscriptions::flush_motion(&flush_view, shard)
+    })?;
     let owner = coord.clone();
     coord.0.on_pump(move |conn| {
         crate::stdb::relays::register_shard(view.clone(), owner, shard, &conn.db);
@@ -639,6 +668,7 @@ mod benilla_movement_tests {
     fn benilla_clients_observe_each_others_movement_within_aoi() {
         crate::world::tests::benilla_tests::two_clients_observe_movement(|view, row| {
             crate::codec::movement::subscriptions::motion(view, 0, row, &Default::default());
+            crate::codec::movement::subscriptions::flush_motion(view, 0);
         });
     }
 }

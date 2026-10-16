@@ -21,6 +21,7 @@ fn creature_observers_share_encoded_bodies_after_the_create_gate() {
     }
     let row = super::packet_tests::creature_spline(99, 0, 1000);
     creature_leg(&view, 0, &row);
+    flush_motion(&view, 0);
     let first = queued_job(&receivers[0]);
     let second = queued_job(&receivers[1]);
     assert!(queued_job(&receivers[2]).is_empty());

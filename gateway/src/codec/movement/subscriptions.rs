@@ -499,7 +499,7 @@ pub(crate) fn motion(
             viewer.tx.close();
             continue;
         }
-        maybe_queue_motion_flush(view, &viewer);
+        view.note_motion_pending(shard, &viewer);
     }
 }
 
@@ -524,15 +524,19 @@ pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSplin
             viewer.tx.close();
             continue;
         }
-        maybe_queue_motion_flush(view, &viewer);
+        view.note_motion_pending(shard, &viewer);
     }
 }
 
-pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) {
-    use std::sync::atomic::Ordering as AtOrd;
-    if viewer.motion_pending.flush_queued.swap(true, AtOrd::AcqRel) {
-        return;
+/// Queues one flush per viewer whose pending motion changed in the SDK message just applied.
+pub(crate) fn flush_motion(view: &WorldView, shard: ShardId) {
+    for viewer in view.take_motion_flushes(shard) {
+        queue_motion_flush(viewer);
     }
+}
+
+fn queue_motion_flush(viewer: Arc<Viewer>) {
+    use std::sync::atomic::Ordering as AtOrd;
     if crate::stdb::subscriptions::shed_motion_at_depth(viewer.tx.depth()) {
         crate::stdb::subscriptions::MOTION_DROPPED.fetch_add(1, Ordering::Relaxed);
         viewer
@@ -541,8 +545,7 @@ pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) 
             .store(false, AtOrd::Release);
         return;
     }
-    let viewer = viewer.clone();
-    enqueue(viewer.clone(), move |viewer| {
+    enqueue(viewer, move |viewer| {
         // Clear before draining so a racing upsert can queue another flush.
         viewer
             .motion_pending
