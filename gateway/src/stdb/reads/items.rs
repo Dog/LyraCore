@@ -1,5 +1,4 @@
 use anyhow::Result;
-use spacetimedb_sdk::Table;
 
 use super::super::bindings::*;
 use super::super::connection::Coordinator;
@@ -8,11 +7,9 @@ use lyracore_shared::item_property::client_enchantment_id;
 impl Coordinator {
     pub fn player_skills(&self, character_guid: u64) -> Result<Vec<(u32, u16, u16)>> {
         let guard = self.0.coord();
-        let db = &guard.conn.db;
-        Ok(db
-            .game_player_skill()
-            .iter()
-            .filter(|s| s.character_guid == character_guid)
+        Ok(guard
+            .skill_rows(character_guid)
+            .into_iter()
             .map(|s| (s.skill_line, s.current, s.max_rank))
             .collect())
     }
@@ -26,9 +23,9 @@ impl Coordinator {
     fn player_item_rows(&self, owner_guid: u64) -> Vec<crate::codec::ItemInstanceView> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
-        db.game_item_instance()
-            .iter()
-            .filter(|i| i.owner_guid == owner_guid)
+        guard
+            .item_rows(owner_guid)
+            .into_iter()
             .filter_map(|i| {
                 let tmpl = db.game_item_template().entry().find(&i.entry)?;
                 Some(crate::codec::ItemInstanceView {
@@ -44,15 +41,14 @@ impl Coordinator {
     /// Slot of `item_guid` when `owner_guid` holds it; another Character's item is `None`.
     pub fn item_slot_by_guid(&self, owner_guid: u64, item_guid: u64) -> Option<u8> {
         let guard = self.0.coord();
-        let slots: Vec<u8> = guard
+        guard
             .conn
             .db
             .game_item_instance()
-            .iter()
-            .filter(|i| i.guid == item_guid && i.owner_guid == owner_guid)
-            .map(|i| i.slot)
-            .collect();
-        slots.into_iter().next()
+            .guid()
+            .find(&item_guid)
+            .filter(|item| item.owner_guid == owner_guid)
+            .map(|item| item.slot)
     }
 }
 

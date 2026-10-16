@@ -11,6 +11,7 @@ use crate::stdb::views::entity_view;
 use crate::stdb::world_index::{CellKey, EntityLayer, SessionId, ShardId};
 use crate::stdb::world_view::*;
 use crate::stdb::Coordinator;
+use crate::stdb::LiveConn;
 use crate::world::Outbound;
 use anyhow::Result;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
@@ -39,7 +40,7 @@ pub(crate) fn build_peer_create(
         };
     let view = peer_entity_view(
         row,
-        projected_dynamic_flags(&coord.0.coord().conn.db, viewer_guid, row),
+        projected_dynamic_flags(&coord.0.coord(), viewer_guid, row),
         |guid| guild_projection_of(coord, guid),
     );
     let auras = world.auras.on_target(shard, row.guid);
@@ -151,9 +152,9 @@ pub(crate) fn peer_create_outbound(
 struct LootTagProjectionRows<'a> {
     tap: Option<&'a CreatureQuestTap>,
     tag_group: Option<&'a CreatureLootTagGroup>,
-    tag_members: &'a [CreatureQuestTapMember],
-    current_members: &'a [GroupMember],
-    corpse_eligible: &'a [CorpseLootEligible],
+    tag_member: bool,
+    current_member: bool,
+    corpse_eligible: bool,
 }
 
 fn viewer_relative_dynamic_flags(
@@ -164,11 +165,7 @@ fn viewer_relative_dynamic_flags(
     use lyracore_shared::constants::unit_dynamic_flags::{LOOTABLE, TAPPED_BY_PLAYER};
 
     if entity.dead {
-        return if rows
-            .corpse_eligible
-            .iter()
-            .any(|row| row.corpse_guid == entity.guid && row.eligible_guid == viewer_guid)
-        {
+        return if rows.corpse_eligible {
             entity.dynamic_flags
         } else {
             entity.dynamic_flags & !LOOTABLE
@@ -182,13 +179,7 @@ fn viewer_relative_dynamic_flags(
         .tag_group
         .filter(|group| group.creature_guid == entity.guid)
     {
-        Some(group) => {
-            rows.tag_members.iter().any(|member| {
-                member.creature_guid == entity.guid && member.character_guid == viewer_guid
-            }) && rows.current_members.iter().any(|member| {
-                member.character_guid == viewer_guid && member.group_id == group.group_id
-            })
-        }
+        Some(_) => rows.tag_member && rows.current_member,
         None => viewer_guid == tap.character_guid,
     };
     if entitled {
@@ -199,44 +190,38 @@ fn viewer_relative_dynamic_flags(
 }
 
 pub(crate) fn projected_dynamic_flags(
-    db: &RemoteTables,
+    live: &LiveConn,
     viewer_guid: u64,
     entity: &WorldEntity,
 ) -> u32 {
-    let tap = db
-        .game_creature_quest_tap()
-        .creature_guid()
-        .find(&entity.guid);
-    let tag_group = db
-        .game_creature_loot_tag_group()
-        .creature_guid()
-        .find(&entity.guid);
-    let tag_members: Vec<_> = db
-        .game_creature_quest_tap_member()
-        .iter()
-        .filter(|member| member.creature_guid == entity.guid)
-        .collect();
-    let current_members: Vec<_> = db
-        .game_group_member()
-        .iter()
-        .filter(|member| member.character_guid == viewer_guid)
-        .collect();
-    let corpse_eligible: Vec<_> = db
-        .game_corpse_loot_eligible()
-        .iter()
-        .filter(|eligible| eligible.corpse_guid == entity.guid)
-        .collect();
-    viewer_relative_dynamic_flags(
-        viewer_guid,
-        entity,
-        LootTagProjectionRows {
-            tap: tap.as_ref(),
-            tag_group: tag_group.as_ref(),
-            tag_members: &tag_members,
-            current_members: &current_members,
-            corpse_eligible: &corpse_eligible,
-        },
-    )
+    live.with_cache_snapshot(|| {
+        let db = &live.conn.db;
+        let tap = db
+            .game_creature_quest_tap()
+            .creature_guid()
+            .find(&entity.guid);
+        let tag_group = db
+            .game_creature_loot_tag_group()
+            .creature_guid()
+            .find(&entity.guid);
+        let loot_tags = live.loot_tags.read().unwrap();
+        viewer_relative_dynamic_flags(
+            viewer_guid,
+            entity,
+            LootTagProjectionRows {
+                tap: tap.as_ref(),
+                tag_group: tag_group.as_ref(),
+                tag_member: loot_tags.is_tap_member(entity.guid, viewer_guid),
+                current_member: tag_group.as_ref().is_some_and(|group| {
+                    live.party_memberships
+                        .read()
+                        .unwrap()
+                        .contains(viewer_guid, group.group_id)
+                }),
+                corpse_eligible: loot_tags.is_corpse_eligible(entity.guid, viewer_guid),
+            },
+        )
+    })
 }
 
 pub(crate) fn instance_relay_gate(row_instance_id: u64, viewer_instance_id: Option<u64>) -> bool {
@@ -398,7 +383,7 @@ pub(crate) fn relay_entity_update(
     }
     let dynamic_flags = {
         let guard = coord.0.coord();
-        projected_dynamic_flags(&guard.conn.db, viewer.self_guid, new)
+        projected_dynamic_flags(&guard, viewer.self_guid, new)
     };
     let mut out: Vec<Outbound> =
         entity_update_to_outbound_with_dynamic_flags(old, new, dynamic_flags)
@@ -479,7 +464,7 @@ pub(crate) fn loot_tag_flags_after_membership_change(
             Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(Box::new(
                 codec::build_dynamic_flags_values(
                     entity.guid,
-                    projected_dynamic_flags(&guard.conn.db, viewer.self_guid, &entity),
+                    projected_dynamic_flags(&guard, viewer.self_guid, &entity),
                 ),
             )))
         })
@@ -963,9 +948,17 @@ pub(crate) mod tests {
             LootTagProjectionRows {
                 tap,
                 tag_group,
-                tag_members,
-                current_members,
-                corpse_eligible,
+                tag_member: tag_members.iter().any(|member| {
+                    member.creature_guid == entity.guid && member.character_guid == viewer_guid
+                }),
+                current_member: tag_group.is_some_and(|group| {
+                    current_members.iter().any(|member| {
+                        member.character_guid == viewer_guid && member.group_id == group.group_id
+                    })
+                }),
+                corpse_eligible: corpse_eligible
+                    .iter()
+                    .any(|row| row.corpse_guid == entity.guid && row.eligible_guid == viewer_guid),
             },
         )
     }

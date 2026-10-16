@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use super::*;
+use crate::stdb::bindings::{ChatChannel, ChatChannelMember};
 
 #[derive(Default)]
 pub(crate) struct ChannelIndex {

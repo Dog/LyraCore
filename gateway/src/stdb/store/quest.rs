@@ -2,7 +2,7 @@ use anyhow::Result;
 use spacetimedb_sdk::Table;
 
 use crate::stdb::bindings::*;
-use crate::stdb::connection::call_reducer;
+use crate::stdb::connection::{call_reducer, LiveConn};
 use crate::stdb::reads::{build_quest_log_slots, quest_objectives_complete};
 use crate::stdb::Coordinator;
 use crate::world::{Actor, QuestActionStore};
@@ -11,10 +11,10 @@ impl QuestActionStore for Coordinator {
     fn item_start_quest(&self, owner_guid: u64, slot: u8) -> Option<(u64, u32)> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
-        let hit: Option<(u64, u32)> = db
-            .game_item_instance()
-            .iter()
-            .filter(|i| i.owner_guid == owner_guid && i.slot == slot)
+        let hit: Option<(u64, u32)> = guard
+            .item_rows(owner_guid)
+            .into_iter()
+            .filter(|i| i.slot == slot)
             .find_map(|i| {
                 db.game_item_template()
                     .entry()
@@ -52,11 +52,7 @@ impl QuestActionStore for Coordinator {
         let player_level = player.level;
         let race = (player.unit_bytes_0 & 0xFF) as u8;
         let class = ((player.unit_bytes_0 >> 8) & 0xFF) as u8;
-        let log: Vec<_> = db
-            .game_character_quest()
-            .iter()
-            .filter(|q| q.character_guid == player_guid)
-            .collect();
+        let log = guard.quest_rows(player_guid);
         let evals = match giver {
             Giver::Creature(entry) => db
                 .game_creature_quest()
@@ -64,7 +60,7 @@ impl QuestActionStore for Coordinator {
                 .filter(|r| r.creature_entry == entry)
                 .filter_map(|rel| {
                     eval_relation(
-                        db,
+                        &guard,
                         rel.quest_entry,
                         rel.role,
                         &log,
@@ -81,7 +77,7 @@ impl QuestActionStore for Coordinator {
                 .filter(|r| r.go_entry == entry)
                 .filter_map(|rel| {
                     eval_relation(
-                        db,
+                        &guard,
                         rel.quest_entry,
                         rel.role,
                         &log,
@@ -110,9 +106,7 @@ impl QuestActionStore for Coordinator {
         player_guid: u64,
     ) -> Result<Vec<crate::codec::update_mask::QuestLogSlot>> {
         let guard = self.0.coord();
-        let db = &guard.conn.db;
-        let quests: Vec<_> = db.game_character_quest().iter().collect();
-        Ok(build_quest_log_slots(db, &quests, player_guid))
+        Ok(build_quest_log_slots(&guard, player_guid))
     }
 
     fn push_quest(&self, actor: Actor, quest_id: u32) -> Result<()> {
@@ -224,7 +218,7 @@ pub(crate) fn quest_detail_view(
 
 #[allow(clippy::too_many_arguments)]
 fn eval_relation(
-    db: &RemoteTables,
+    live: &LiveConn,
     quest_entry: u32,
     role: u8,
     log: &[CharacterQuest],
@@ -234,10 +228,11 @@ fn eval_relation(
     class: u8,
 ) -> Option<crate::codec::GiverQuestEval> {
     use crate::codec::{GiverQuestEval, ROLE_START};
+    let db = &live.conn.db;
     let tmpl = db.game_quest_template().entry().find(&quest_entry)?;
     let logrow = log.iter().find(|q| q.quest_entry == quest_entry);
     let active = logrow.is_some_and(|q| !q.rewarded && !q.failed);
-    let complete = active && quest_objectives_complete(db, quest_entry, logrow, player_guid);
+    let complete = active && quest_objectives_complete(live, quest_entry, logrow, player_guid);
     let startable = role == ROLE_START
         && lyracore_shared::quest::acceptance(
             lyracore_shared::quest::AcceptanceRequirements {

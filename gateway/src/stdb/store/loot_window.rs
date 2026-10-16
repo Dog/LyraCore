@@ -147,16 +147,15 @@ fn viewer_in_raid(guard: &LiveConn, viewer_guid: u64) -> bool {
 
 fn viewer_needs_quest_item(guard: &LiveConn, viewer_guid: u64, item_entry: u32) -> bool {
     let db = &guard.conn.db;
-    let active: Vec<u32> = db
-        .game_character_quest()
-        .iter()
-        .filter(|quest| quest.character_guid == viewer_guid && !quest.rewarded)
+    let active: Vec<u32> = guard
+        .quest_rows(viewer_guid)
+        .into_iter()
+        .filter(|quest| !quest.rewarded)
         .map(|quest| quest.quest_entry)
         .collect();
-    let objective_table = db.game_quest_objective();
-    let objectives = objective_table
+    let objectives = active
         .iter()
-        .filter(|objective| active.contains(&objective.quest_entry))
+        .flat_map(|entry| guard.quest_objectives(*entry))
         .map(|objective| lyracore_shared::loot::QuestItemObjective {
             quest_entry: objective.quest_entry,
             quest_type: db
@@ -173,7 +172,7 @@ fn viewer_needs_quest_item(guard: &LiveConn, viewer_guid: u64, item_entry: u32) 
         &active,
         objectives,
         item_entry,
-        player_item_count(db, viewer_guid, item_entry),
+        player_item_count(guard, viewer_guid, item_entry),
     )
 }
 

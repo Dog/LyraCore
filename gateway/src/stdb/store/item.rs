@@ -5,7 +5,6 @@ use crate::stdb::bindings::*;
 use crate::stdb::connection::{call_reducer, classify, DurableFailure};
 use crate::stdb::Coordinator;
 use crate::world::{Actor, ItemActionResult, ItemActionStore, ReadableItem};
-use spacetimedb_sdk::Table;
 
 impl ItemActionStore for Coordinator {
     fn item_name(&self, entry: u32) -> Result<Option<String>> {
@@ -23,10 +22,10 @@ impl ItemActionStore for Coordinator {
     fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem> {
         let guard = self.0.coord();
         let db = &guard.conn.db;
-        let Some(item) = db
-            .game_item_instance()
-            .iter()
-            .find(|i| i.owner_guid == owner_guid && i.slot == slot)
+        let Some(item) = guard
+            .item_rows(owner_guid)
+            .into_iter()
+            .find(|i| i.slot == slot)
         else {
             return Ok(ReadableItem::Missing);
         };

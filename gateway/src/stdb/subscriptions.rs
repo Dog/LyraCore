@@ -421,8 +421,8 @@ impl Coordinator {
         {
             let guard = self.0.coord();
             let db = &guard.conn.db;
-            let eff = super::armor::effective_resistances(db, self_guid);
-            let pos = super::armor::aura_armor_positive(db, self_guid);
+            let eff = super::armor::effective_resistances(&guard, self_guid);
+            let pos = super::armor::aura_armor_positive(&guard, self_guid);
             let sheet = super::armor::sheet_stats(db, self_guid);
             drop(guard);
             let _ = tx.send(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(

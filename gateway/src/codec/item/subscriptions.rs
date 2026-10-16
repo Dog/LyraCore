@@ -4,10 +4,10 @@ use crate::stdb::reads::view_of_item_row;
 use crate::stdb::world_index::{EntityLayer, ShardId};
 use crate::stdb::world_view::*;
 use crate::stdb::Coordinator;
+use crate::stdb::LiveConn;
 use crate::world::Outbound;
 use lyracore_shared::item_property::client_enchantment_id;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
-use spacetimedb_sdk::Table;
 use std::sync::{Arc, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
@@ -111,7 +111,7 @@ pub(crate) fn trade_offer_extended(
 }
 
 pub(crate) fn item_gain_feedback(
-    db: &RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     slot: u8,
     entry: u32,
@@ -133,14 +133,13 @@ pub(crate) fn item_gain_feedback(
             random_property_id,
         )),
     ))];
-    let wanted = db.game_character_quest().iter().any(|q| {
-        q.character_guid == self_guid
-            && !q.rewarded
+    let wanted = live.quest_rows(self_guid).into_iter().any(|q| {
+        !q.rewarded
             && !q.failed
-            && db
-                .game_quest_objective()
-                .iter()
-                .any(|o| o.quest_entry == q.quest_entry && o.kind == 1 && o.target_entry == entry)
+            && live
+                .quest_objectives(q.quest_entry)
+                .into_iter()
+                .any(|o| o.kind == 1 && o.target_entry == entry)
     });
     if wanted {
         use wow_world_messages::vanilla::SMSG_QUESTUPDATE_ADD_ITEM;
@@ -155,11 +154,12 @@ pub(crate) fn item_gain_feedback(
 }
 
 pub(crate) fn item_instance_insert_outbound(
-    db: &RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     row: &ItemInstance,
     enchantment: u32,
 ) -> Vec<Outbound> {
+    let db = &live.conn.db;
     let mut out = Vec::new();
     let (max_durability, container_slots) = db
         .game_item_template()
@@ -194,10 +194,10 @@ pub(crate) fn item_instance_insert_outbound(
         )));
     }
     if let Some((bag_slot, slot_in_bag)) = codec::bag_content_parts(row.slot) {
-        if let Some(bag) = db
-            .game_item_instance()
-            .iter()
-            .find(|item| item.owner_guid == self_guid && item.slot == bag_slot)
+        if let Some(bag) = live
+            .item_rows(self_guid)
+            .into_iter()
+            .find(|item| item.slot == bag_slot)
         {
             let (opcode, body) =
                 codec::build_container_slot_values(bag.guid, slot_in_bag, row.guid);
@@ -206,7 +206,7 @@ pub(crate) fn item_instance_insert_outbound(
     }
     // Queue CREATE and inventory pointers together before gain or quest-completion feedback.
     out.extend(item_gain_feedback(
-        db,
+        live,
         self_guid,
         row.slot,
         row.entry,
@@ -215,13 +215,13 @@ pub(crate) fn item_instance_insert_outbound(
         row.random_property_id,
     ));
     if row.slot <= 18 {
-        append_item_armor_and_sheet(db, self_guid, &mut out);
+        append_item_armor_and_sheet(live, self_guid, &mut out);
     }
     out
 }
 
 pub(crate) fn item_instance_delete_outbound(
-    db: &RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     row: &ItemInstance,
 ) -> Vec<Outbound> {
@@ -239,10 +239,10 @@ pub(crate) fn item_instance_delete_outbound(
         )));
     }
     if let Some((bag_slot, slot_in_bag)) = codec::bag_content_parts(row.slot) {
-        if let Some(bag) = db
-            .game_item_instance()
-            .iter()
-            .find(|item| item.owner_guid == self_guid && item.slot == bag_slot)
+        if let Some(bag) = live
+            .item_rows(self_guid)
+            .into_iter()
+            .find(|item| item.slot == bag_slot)
         {
             let (opcode, body) = codec::build_container_slot_values(bag.guid, slot_in_bag, 0);
             out.push(Outbound::Raw { opcode, body });
@@ -252,25 +252,25 @@ pub(crate) fn item_instance_delete_outbound(
         codec::build_destroy_object(row.guid),
     )));
     if row.slot <= 18 {
-        append_item_armor_and_sheet(db, self_guid, &mut out);
+        append_item_armor_and_sheet(live, self_guid, &mut out);
     }
     out
 }
 
 pub(crate) fn item_instance_update_outbound(
-    db: &RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     old: &ItemInstance,
     row: &ItemInstance,
 ) -> Vec<Outbound> {
     let old_slot_is_empty = old.slot != row.slot
-        && !db
-            .game_item_instance()
-            .iter()
-            .any(|item| item.owner_guid == self_guid && item.slot == old.slot);
+        && !live
+            .item_rows(self_guid)
+            .into_iter()
+            .any(|item| item.slot == old.slot);
     let mut out = if row.slot == old.slot && row.stack_count > old.stack_count {
         item_gain_feedback(
-            db,
+            live,
             self_guid,
             row.slot,
             row.entry,
@@ -283,9 +283,9 @@ pub(crate) fn item_instance_update_outbound(
     };
     if old.slot != row.slot {
         append_final_item_slots(self_guid, old.slot, row.slot, &mut out, |slot| {
-            db.game_item_instance()
-                .iter()
-                .find(|item| item.owner_guid == self_guid && item.slot == slot)
+            live.item_rows(self_guid)
+                .into_iter()
+                .find(|item| item.slot == slot)
                 .map(|item| view_of_item_row(&item))
         });
     }
@@ -306,7 +306,7 @@ pub(crate) fn item_instance_update_outbound(
         || row.slot <= 18
             && ((old.durability == 0) != (row.durability == 0) || old.enchant_id != row.enchant_id)
     {
-        append_item_armor_and_sheet(db, self_guid, &mut out);
+        append_item_armor_and_sheet(live, self_guid, &mut out);
     }
     out
 }
@@ -377,11 +377,12 @@ pub(crate) fn append_final_item_slots(
 }
 
 pub(crate) fn append_item_armor_and_sheet(
-    db: &RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     out: &mut Vec<Outbound>,
 ) {
-    let resistances = crate::stdb::armor::effective_resistances(db, self_guid);
+    let db = &live.conn.db;
+    let resistances = crate::stdb::armor::effective_resistances(live, self_guid);
     out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
         Box::new(codec::build_resistance_values(self_guid, resistances)),
     )));
@@ -416,7 +417,7 @@ pub(crate) fn item_inserted(
         let enchantment = item_enchantment_word(&coord, &row);
         let guard = coord.0.coord();
         crate::codec::item::subscriptions::item_instance_insert_outbound(
-            &guard.conn.db,
+            &guard,
             viewer.self_guid,
             &row,
             enchantment,
@@ -448,7 +449,7 @@ pub(crate) fn item_updated(
     item_owner_job(view, shard, row.owner_guid, move |viewer| {
         let guard = coord.0.coord();
         crate::codec::item::subscriptions::item_instance_update_outbound(
-            &guard.conn.db,
+            &guard,
             viewer.self_guid,
             &old,
             &row,
@@ -467,7 +468,7 @@ pub(crate) fn item_deleted(
     item_owner_job(view, shard, row.owner_guid, move |viewer| {
         let guard = coord.0.coord();
         crate::codec::item::subscriptions::item_instance_delete_outbound(
-            &guard.conn.db,
+            &guard,
             viewer.self_guid,
             &row,
         )
@@ -483,11 +484,9 @@ pub(crate) fn item_slot_read(coord: &Coordinator) -> ItemSlotRead {
         coord
             .0
             .coord()
-            .conn
-            .db
-            .game_item_instance()
-            .iter()
-            .find(|item| item.owner_guid == owner_guid && item.slot == slot)
+            .item_rows(owner_guid)
+            .into_iter()
+            .find(|item| item.slot == slot)
             .map(|item| crate::stdb::reads::view_of_item_row(&item))
     })
 }

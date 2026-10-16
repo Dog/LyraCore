@@ -246,10 +246,10 @@ impl Coordinator {
             .map(character_view)
             .collect();
         for view in &mut views {
-            for item in db
-                .game_item_instance()
-                .iter()
-                .filter(|i| i.owner_guid == view.guid && i.slot <= 18)
+            for item in guard
+                .item_rows(view.guid)
+                .into_iter()
+                .filter(|i| i.slot <= 18)
             {
                 let Some(tmpl) = db.game_item_template().entry().find(&item.entry) else {
                     continue;
@@ -279,12 +279,12 @@ impl Coordinator {
 
     pub fn effective_armor(&self, guid: u64) -> u32 {
         let guard = self.0.coord();
-        super::super::armor::effective_armor(&guard.conn.db, guid)
+        super::super::armor::effective_armor(&guard, guid)
     }
 
     pub fn effective_magic_resistances(&self, guid: u64) -> [u32; 6] {
         let guard = self.0.coord();
-        super::super::armor::effective_magic_resistances(&guard.conn.db, guid)
+        super::super::armor::effective_magic_resistances(&guard, guid)
     }
 
     fn has_auction(&self, character_guid: u64) -> bool {

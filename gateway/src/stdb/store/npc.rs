@@ -152,9 +152,11 @@ impl NpcStore for Coordinator {
                 let Some(template) = db.game_quest_template().entry().find(&quest_entry) else {
                     return QuestState::Missing;
                 };
-                let Some(quest) = db.game_character_quest().iter().find(|quest| {
-                    quest.character_guid == character_guid && quest.quest_entry == quest_entry
-                }) else {
+                let Some(quest) = guard
+                    .quest_rows(character_guid)
+                    .into_iter()
+                    .find(|quest| quest.quest_entry == quest_entry)
+                else {
                     return QuestState::Absent;
                 };
                 if quest.rewarded {
@@ -166,7 +168,7 @@ impl NpcStore for Coordinator {
                 } else if quest.failed {
                     QuestState::Failed
                 } else if crate::stdb::reads::quest_objectives_complete(
-                    db,
+                    &guard,
                     quest_entry,
                     Some(&quest),
                     character_guid,

@@ -1,16 +1,17 @@
 use super::bindings::*;
-use spacetimedb_sdk::Table;
-use std::collections::HashMap;
+use super::connection::LiveConn;
 
 use lyracore_shared::{
     aura::AuraAmount,
     resistance::{self, ResistanceItem},
 };
 
-fn aura_values(db: &RemoteTables, guid: u64) -> Vec<AuraAmount> {
-    db.game_aura()
-        .iter()
-        .filter(move |a| a.target_guid == guid)
+fn aura_values(live: &LiveConn, guid: u64) -> Vec<AuraAmount> {
+    live.combat_reads
+        .read()
+        .unwrap()
+        .auras(&live.conn.db, guid)
+        .into_iter()
         .map(|a| AuraAmount {
             kind: a.eff_kind,
             parameter: a.eff_p_0,
@@ -46,81 +47,83 @@ pub(crate) fn sheet_stats(db: &RemoteTables, guid: u64) -> Option<crate::codec::
     })
 }
 
-pub(crate) fn aura_armor_positive(db: &RemoteTables, guid: u64) -> u32 {
-    resistance::positive_armor(aura_values(db, guid))
+pub(crate) fn aura_armor_positive(live: &LiveConn, guid: u64) -> u32 {
+    live.with_cache_snapshot(|| resistance::positive_armor(aura_values(live, guid)))
 }
 
 /// Descriptor order is armor, Holy, Fire, Nature, Frost, Shadow, Arcane.
-pub(crate) fn effective_resistances(db: &RemoteTables, guid: u64) -> [u32; 7] {
-    let base_armor = db
-        .game_world_entity()
-        .guid()
-        .find(&guid)
-        .map_or(0, |e| e.armor);
-    let auras = aura_values(db, guid);
-    let items: Vec<_> = db
-        .game_item_instance()
-        .iter()
-        .filter(|i| i.owner_guid == guid)
-        .filter_map(|item| {
-            let tmpl = db.game_item_template().entry().find(&item.entry)?;
-            let property = (item.random_property_id != 0)
-                .then(|| {
-                    db.game_item_random_property()
-                        .property_id()
-                        .find(&item.random_property_id)
+pub(crate) fn effective_resistances(live: &LiveConn, guid: u64) -> [u32; 7] {
+    live.with_cache_snapshot(|| {
+        let db = &live.conn.db;
+        let base_armor = db
+            .game_world_entity()
+            .guid()
+            .find(&guid)
+            .map_or(0, |e| e.armor);
+        let auras = aura_values(live, guid);
+        let items: Vec<_> = live
+            .inventory
+            .read()
+            .unwrap()
+            .items(db, guid)
+            .into_iter()
+            .filter_map(|item| {
+                let tmpl = db.game_item_template().entry().find(&item.entry)?;
+                let property = (item.random_property_id != 0)
+                    .then(|| {
+                        db.game_item_random_property()
+                            .property_id()
+                            .find(&item.random_property_id)
+                    })
+                    .flatten();
+                Some(ResistanceItem {
+                    slot: item.slot,
+                    max_durability: tmpl.max_durability,
+                    durability: item.durability,
+                    template: [
+                        tmpl.stat_armor,
+                        tmpl.holy_res,
+                        tmpl.fire_res,
+                        tmpl.nature_res,
+                        tmpl.frost_res,
+                        tmpl.shadow_res,
+                        tmpl.arcane_res,
+                    ],
+                    enchant_id: item.enchant_id,
+                    property_enchants: property
+                        .map_or([0; 3], |p| [p.enchant_id_1, p.enchant_id_2, p.enchant_id_3]),
                 })
-                .flatten();
-            Some(ResistanceItem {
-                slot: item.slot,
-                max_durability: tmpl.max_durability,
-                durability: item.durability,
-                template: [
-                    tmpl.stat_armor,
-                    tmpl.holy_res,
-                    tmpl.fire_res,
-                    tmpl.nature_res,
-                    tmpl.frost_res,
-                    tmpl.shadow_res,
-                    tmpl.arcane_res,
-                ],
-                enchant_id: item.enchant_id,
-                property_enchants: property
-                    .map_or([0; 3], |p| [p.enchant_id_1, p.enchant_id_2, p.enchant_id_3]),
             })
+            .collect();
+        std::array::from_fn(|index| {
+            let bonus = resistance::resistance_bonus(
+                resistance::SCHOOL_BITS[index],
+                auras.iter().copied(),
+                items.iter().copied(),
+                |id, kind| {
+                    lyracore_shared::item_property::enchant_stat(
+                        kind,
+                        u32::MAX,
+                        live.combat_reads
+                            .read()
+                            .unwrap()
+                            .enchantments(db, id)
+                            .into_iter()
+                            .map(|effect| (effect.kind, effect.amount, effect.school_mask)),
+                    )
+                },
+            );
+            resistance::effective_resistance(if index == 0 { base_armor } else { 0 }, bonus)
         })
-        .collect();
-    let mut enchantments = HashMap::<u32, Vec<(u8, i32, u32)>>::new();
-    for effect in db.game_item_enchantment().iter() {
-        enchantments.entry(effect.enchant_id).or_default().push((
-            effect.kind,
-            effect.amount,
-            effect.school_mask,
-        ));
-    }
-    std::array::from_fn(|index| {
-        let bonus = resistance::resistance_bonus(
-            resistance::SCHOOL_BITS[index],
-            auras.iter().copied(),
-            items.iter().copied(),
-            |id, kind| {
-                lyracore_shared::item_property::enchant_stat(
-                    kind,
-                    u32::MAX,
-                    enchantments.get(&id).into_iter().flatten().copied(),
-                )
-            },
-        );
-        resistance::effective_resistance(if index == 0 { base_armor } else { 0 }, bonus)
     })
 }
 
-pub(crate) fn effective_armor(db: &RemoteTables, guid: u64) -> u32 {
-    effective_resistances(db, guid)[0]
+pub(crate) fn effective_armor(live: &LiveConn, guid: u64) -> u32 {
+    effective_resistances(live, guid)[0]
 }
 
-pub(crate) fn effective_magic_resistances(db: &RemoteTables, guid: u64) -> [u32; 6] {
-    effective_resistances(db, guid)[1..]
+pub(crate) fn effective_magic_resistances(live: &LiveConn, guid: u64) -> [u32; 6] {
+    effective_resistances(live, guid)[1..]
         .try_into()
         .expect("the magic resistance slice has six schools")
 }
@@ -180,7 +183,7 @@ mod tests {
         shard.assert_sql("UPDATE game_aura SET eff_kind = 161, eff_p0 = 1, amount = 100, stacks = 3 WHERE target_guid = 1");
         assert!(poll_until(POLL_TIMEOUT, || {
             let guard = coordinator.0.coord();
-            aura_armor_positive(&guard.conn.db, 1) == 900
+            aura_armor_positive(&guard, 1) == 900
         }));
     }
 }

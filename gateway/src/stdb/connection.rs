@@ -49,6 +49,11 @@ pub(crate) struct LiveConn {
     pub(crate) guilds: Arc<RwLock<super::reads::GuildIndex>>,
     pub(crate) contacts: Arc<RwLock<super::reads::ContactIndex>>,
     pub(crate) character_names: Arc<RwLock<super::reads::CharacterNameIndex>>,
+    pub(crate) inventory: Arc<RwLock<super::reads::InventoryIndex>>,
+    pub(crate) quests: Arc<RwLock<super::reads::QuestIndex>>,
+    pub(crate) loot_tags: Arc<RwLock<super::reads::LootTagIndex>>,
+    pub(crate) combat_reads: Arc<RwLock<super::reads::CombatIndex>>,
+    cache_snapshot: Arc<RwLock<()>>,
     _sub: SubscriptionHandle,
 }
 
@@ -93,6 +98,12 @@ impl PartyMembershipIndex {
             .values()
             .next()
             .copied()
+    }
+
+    pub(crate) fn contains(&self, character_guid: u64, group_id: u64) -> bool {
+        self.by_character
+            .get(&character_guid)
+            .is_some_and(|rows| rows.values().any(|group| *group == group_id))
     }
 
     pub(crate) fn member_row_ids(&self, group_id: u64) -> Vec<u64> {
@@ -213,10 +224,63 @@ async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result
     }
 }
 
+async fn advance_cache_snapshot<T>(
+    snapshot: &RwLock<()>,
+    next: impl std::future::Future<Output = T>,
+) -> T {
+    let mut next = std::pin::pin!(next);
+    std::future::poll_fn(|context| {
+        let _updating = snapshot.write().unwrap();
+        std::future::Future::poll(next.as_mut(), context)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod cache_snapshot_tests {
+    use super::advance_cache_snapshot;
+    use std::future::Future;
+    use std::sync::RwLock;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn awaiting_a_message_leaves_the_cache_readable() {
+        let snapshot = RwLock::new(());
+        let mut next = std::pin::pin!(advance_cache_snapshot(
+            &snapshot,
+            std::future::pending::<()>(),
+        ));
+        std::future::poll_fn(|context| {
+            assert!(next.as_mut().poll(context).is_pending());
+            assert!(snapshot.try_read().is_ok());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_applied_cache_is_unreadable_until_all_index_callbacks_finish() {
+        let snapshot = RwLock::new(());
+        let cache = std::sync::atomic::AtomicU64::new(0);
+        let index = std::sync::atomic::AtomicU64::new(0);
+        let order = std::sync::atomic::Ordering::Relaxed;
+        advance_cache_snapshot(&snapshot, async {
+            cache.store(7, order);
+            assert!(snapshot.try_read().is_err());
+            index.store(7, order);
+        })
+        .await;
+        let _read = snapshot.read().unwrap();
+        assert_eq!(cache.load(order), 7);
+        assert_eq!(index.load(order), 7);
+    }
+}
+
 // SDK 2.7.1 drains pending registrations before the next message, preventing a snapshot gap.
 fn start_pump(
     conn: &Arc<DbConnection>,
     role: &str,
+    cache_snapshot: Arc<RwLock<()>>,
 ) -> Result<(
     std::thread::JoinHandle<()>,
     tokio::sync::mpsc::UnboundedSender<PumpCommand>,
@@ -231,7 +295,7 @@ fn start_pump(
         .name("stdb-pump".into())
         .spawn(move || {
             let result = runtime.block_on(pump_messages(conn.as_ref(), rx, || {
-                conn.advance_one_message_async()
+                advance_cache_snapshot(&cache_snapshot, conn.advance_one_message_async())
             }));
             if let Err(error) = result {
                 if !matches!(error, spacetimedb_sdk::Error::Disconnected) {
@@ -243,6 +307,12 @@ fn start_pump(
 }
 
 impl LiveConn {
+    // Store reads and queued Relay jobs only; SDK row callbacks hold the snapshot lock.
+    pub(crate) fn with_cache_snapshot<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _snapshot = self.cache_snapshot.read().unwrap();
+        read()
+    }
+
     pub(super) fn is_healthy(&self) -> bool {
         self.conn.is_active()
             && self._sub.is_active()
@@ -709,7 +779,8 @@ fn connect_subscribed(
         .map_err(|error| anyhow!("{role_label} build/connect failed: {error}"))?;
 
     let conn = Arc::new(conn);
-    let (pump, pump_commands) = start_pump(&conn, &role_label)?;
+    let cache_snapshot = Arc::new(RwLock::new(()));
+    let (pump, pump_commands) = start_pump(&conn, &role_label, cache_snapshot.clone())?;
     let party_memberships = Arc::new(RwLock::new(PartyMembershipIndex::default()));
     let inserted_memberships = party_memberships.clone();
     conn.db.game_group_member().on_insert(move |_ctx, row| {
@@ -733,6 +804,10 @@ fn connect_subscribed(
     let guilds = super::reads::watch_guilds(&conn);
     let contacts = super::reads::watch_contacts(&conn);
     let character_names = super::reads::watch_character_names(&conn);
+    let inventory = super::reads::watch_inventory(&conn);
+    let quests = super::reads::watch_quest(&conn);
+    let loot_tags = super::reads::watch_loot_tag(&conn);
+    let combat_reads = super::reads::watch_combat(&conn);
     let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
     let tx_err = tx.clone();
     let applied_commands = pump_commands.clone();
@@ -787,6 +862,11 @@ fn connect_subscribed(
         guilds,
         contacts,
         character_names,
+        inventory,
+        quests,
+        loot_tags,
+        combat_reads,
+        cache_snapshot,
         _sub: sub,
     })
 }

@@ -3,34 +3,29 @@ use crate::stdb::bindings::*;
 use crate::stdb::world_index::ShardId;
 use crate::stdb::world_view::*;
 use crate::stdb::Coordinator;
+use crate::stdb::LiveConn;
 use crate::world::Outbound;
-use spacetimedb_sdk::Table;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
-pub(crate) fn quest_log_outbound(
-    db: &crate::stdb::bindings::RemoteTables,
-    self_guid: u64,
-) -> Option<Outbound> {
+pub(crate) fn quest_log_outbound(live: &LiveConn, self_guid: u64) -> Option<Outbound> {
     if !crate::config::quest_log_fields_enabled() {
         return None;
     }
-    let quests: Vec<_> = db.game_character_quest().iter().collect();
-    let slots = crate::stdb::reads::build_quest_log_slots(db, &quests, self_guid);
+    let slots = crate::stdb::reads::build_quest_log_slots(live, self_guid);
     let mask = codec::update_mask::full_quest_log_mask(&slots);
     let (opcode, body) = codec::build_values_update_raw(self_guid, &mask);
     Some(Outbound::Raw { opcode, body })
 }
 
 pub(crate) fn quest_update_outbound(
-    db: &crate::stdb::bindings::RemoteTables,
+    live: &LiveConn,
     self_guid: u64,
     old: &CharacterQuest,
     row: &CharacterQuest,
 ) -> Vec<Outbound> {
-    let objectives: Vec<_> = db
-        .game_quest_objective()
-        .iter()
-        .filter(|objective| objective.quest_entry == row.quest_entry)
+    let objectives: Vec<_> = live
+        .quest_objectives(row.quest_entry)
+        .into_iter()
         .map(|objective| {
             (
                 objective.kind,
@@ -40,7 +35,7 @@ pub(crate) fn quest_update_outbound(
             )
         })
         .collect();
-    quest_update_packets(old, row, &objectives, quest_log_outbound(db, self_guid))
+    quest_update_packets(old, row, &objectives, quest_log_outbound(live, self_guid))
 }
 
 pub(crate) fn quest_update_feedback(
@@ -105,7 +100,7 @@ pub(crate) fn quest_inserted(
     let (coord, self_guid) = (coord.clone(), viewer.self_guid);
     enqueue(viewer.clone(), move |_| {
         let guard = coord.0.coord();
-        crate::codec::quest::subscriptions::quest_log_outbound(&guard.conn.db, self_guid)
+        crate::codec::quest::subscriptions::quest_log_outbound(&guard, self_guid)
             .into_iter()
             .collect()
     });
@@ -124,12 +119,7 @@ pub(crate) fn quest_updated(
     let (coord, self_guid, old, row) = (coord.clone(), viewer.self_guid, old.clone(), row.clone());
     enqueue(viewer.clone(), move |_| {
         let guard = coord.0.coord();
-        crate::codec::quest::subscriptions::quest_update_outbound(
-            &guard.conn.db,
-            self_guid,
-            &old,
-            &row,
-        )
+        crate::codec::quest::subscriptions::quest_update_outbound(&guard, self_guid, &old, &row)
     });
 }
 
@@ -145,7 +135,7 @@ pub(crate) fn quest_deleted(
     let (coord, self_guid) = (coord.clone(), viewer.self_guid);
     enqueue(viewer.clone(), move |_| {
         let guard = coord.0.coord();
-        crate::codec::quest::subscriptions::quest_log_outbound(&guard.conn.db, self_guid)
+        crate::codec::quest::subscriptions::quest_log_outbound(&guard, self_guid)
             .into_iter()
             .collect()
     });
@@ -182,10 +172,7 @@ fn quest_credit_granted(
     let (coord, quest_entry) = (coord.clone(), row.quest_entry);
     enqueue(viewer, move |viewer| {
         let guard = coord.0.coord();
-        event_credit_packets(
-            quest_entry,
-            quest_log_outbound(&guard.conn.db, viewer.self_guid),
-        )
+        event_credit_packets(quest_entry, quest_log_outbound(&guard, viewer.self_guid))
     });
 }
 
@@ -211,7 +198,7 @@ fn quest_credit_changed(
     let coord = coord.clone();
     enqueue(viewer, move |viewer| {
         let guard = coord.0.coord();
-        quest_log_outbound(&guard.conn.db, viewer.self_guid)
+        quest_log_outbound(&guard, viewer.self_guid)
             .into_iter()
             .collect()
     });
@@ -222,7 +209,7 @@ fn quest_requirements_changed(view: &WorldView, coord: &Coordinator, shard: Shar
         let coord = coord.clone();
         enqueue(viewer, move |viewer| {
             let guard = coord.0.coord();
-            quest_log_outbound(&guard.conn.db, viewer.self_guid)
+            quest_log_outbound(&guard, viewer.self_guid)
                 .into_iter()
                 .collect()
         });
