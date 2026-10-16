@@ -1,14 +1,17 @@
 use crate::accept::{classify_accept_error, AcceptBackoff, AcceptOutcome};
 use crate::codec::auth_session::{read_auth_session, CMSG_AUTH_SESSION_OPCODE};
-use crate::read_deadline::{
-    is_io_deadline, DeadlineClock, IoDeadline, PreAuthDeadline, WORLD_AUTH_DEADLINE,
-};
+use crate::read_deadline::WORLD_AUTH_DEADLINE;
+#[cfg(test)]
+use crate::read_deadline::{is_io_deadline, DeadlineClock, IoDeadline, PreAuthDeadline};
 use crate::stdb::PlayerSubscriptions;
 use crate::{codec, config::GatewayConfig, stdb::Coordinator};
 use anyhow::{anyhow, Result};
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, SendError, Sender};
+use std::sync::mpsc::SendError;
+#[cfg(test)]
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -25,9 +28,11 @@ use wow_world_messages::vanilla::{
 mod actor;
 mod chat_flood;
 mod coalesce;
+pub(crate) mod egress;
 mod entry;
 mod family;
 mod routing;
+mod transport;
 pub(crate) use family::{ProtocolFamily, ProtocolSession};
 use family::{ProtocolReply, ProtocolRequest, WorldSessionAction};
 pub(crate) mod guild_fee;
@@ -87,7 +92,7 @@ pub enum Outbound {
         opcode: u16,
         body: Vec<u8>,
     },
-    /// SDK advancement is serial per shard; defer encoding to each World Session's writer.
+    /// SDK advancement is serial per Shard; defer encoding to the bounded worker pool.
     Job(RelayJob),
 }
 
@@ -95,15 +100,23 @@ pub type RelayJob = Box<dyn FnOnce() -> Vec<Outbound> + Send>;
 
 pub const EGRESS_SHED_DEPTH: usize = 512;
 
-/// Blocking sends from SDK callbacks can deadlock the pump; keep this channel unbounded.
+/// SDK callbacks must never wait for a World Session to drain its queue.
 #[derive(Clone)]
 pub struct SessionTx {
-    tx: Sender<Outbound>,
+    tx: SessionSender,
     depth: Arc<AtomicUsize>,
     close_socket: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+#[derive(Clone)]
+enum SessionSender {
+    Async(egress::QueueSender),
+    #[cfg(test)]
+    Sync(Sender<Outbound>),
+}
+
 impl SessionTx {
+    #[cfg(test)]
     fn bind_socket<S: DuplexStream>(&mut self, socket: S) {
         let socket = std::sync::Mutex::new(socket);
         self.close_socket = Some(Arc::new(move || {
@@ -124,12 +137,14 @@ impl SessionTx {
 
     // Count before sending so depth cannot read low; undo the count if the send fails.
     pub fn send(&self, out: Outbound) -> std::result::Result<(), SendError<Outbound>> {
-        self.depth.fetch_add(1, Ordering::Relaxed);
-        match self.tx.send(out) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.depth.fetch_sub(1, Ordering::Relaxed);
-                Err(e)
+        match &self.tx {
+            SessionSender::Async(sender) => sender.send(out),
+            #[cfg(test)]
+            SessionSender::Sync(sender) => {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                sender.send(out).inspect_err(|_| {
+                    self.depth.fetch_sub(1, Ordering::Relaxed);
+                })
             }
         }
     }
@@ -144,12 +159,13 @@ impl SessionTx {
     }
 }
 
+#[cfg(test)]
 pub fn session_channel() -> (SessionTx, Receiver<Outbound>, Arc<AtomicUsize>) {
     let (tx, rx) = channel::<Outbound>();
     let depth = Arc::new(AtomicUsize::new(0));
     (
         SessionTx {
-            tx,
+            tx: SessionSender::Sync(tx),
             depth: depth.clone(),
             close_socket: None,
         },
@@ -167,11 +183,13 @@ impl SessionTx {
     }
 }
 
+#[cfg(test)]
 pub trait DuplexStream: Read + Write + IoDeadline + Send + Sized + 'static {
     fn try_clone(&self) -> std::io::Result<Self>;
     fn shutdown_both(&self) -> std::io::Result<()>;
 }
 
+#[cfg(test)]
 impl DuplexStream for std::net::TcpStream {
     fn try_clone(&self) -> std::io::Result<Self> {
         std::net::TcpStream::try_clone(self)
@@ -351,6 +369,7 @@ pub fn world_handshake_with_queue<S: Read + Write + IoDeadline>(
     world_handshake_with_queue_and_deadline(stream, store, queue, &mut deadline)
 }
 
+#[cfg(test)]
 fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: DeadlineClock>(
     stream: &mut S,
     store: Arc<dyn WorldStore>,
@@ -437,6 +456,7 @@ fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: Dead
     )))
 }
 
+#[cfg(test)]
 fn wait_for_admission<S: Write>(
     stream: &mut S,
     encrypt: &mut EncrypterHalf,
@@ -508,6 +528,7 @@ impl WriterTrace {
         });
     }
 
+    #[cfg(test)]
     fn record(&mut self, out: &Outbound) {
         match out {
             Outbound::One(m) => self.record_typed(m),
@@ -523,6 +544,7 @@ impl WriterTrace {
         }
     }
 
+    #[cfg(test)]
     fn record_typed(&mut self, m: &ServerOpcodeMessage) {
         let mut buf = Vec::new();
         if m.write_unencrypted_server(&mut buf).is_err() || buf.len() < 4 {
@@ -569,6 +591,7 @@ impl WriterTrace {
     }
 }
 
+#[cfg(test)]
 fn spawn_writer<S: DuplexStream>(
     mut wsock: S,
     mut encrypt: EncrypterHalf,
@@ -659,10 +682,12 @@ pub fn run_world_session<S: DuplexStream>(stream: S, store: Arc<dyn WorldStore>)
     run_world_session_with_queue(stream, store, &LoginQueue::unlimited())
 }
 
+#[cfg(test)]
 struct AdmissionSeat<'a> {
     queue: &'a LoginQueue,
 }
 
+#[cfg(test)]
 impl Drop for AdmissionSeat<'_> {
     fn drop(&mut self) {
         self.queue.depart();
@@ -679,6 +704,7 @@ pub fn run_world_session_with_queue<S: DuplexStream>(
     run_world_session_with_queue_and_deadline(stream, store, queue, &mut deadline)
 }
 
+#[cfg(test)]
 fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
     mut stream: S,
     store: Arc<dyn WorldStore>,
@@ -704,9 +730,7 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
     let writer = spawn_writer(wsock, encrypt, rx, depth, conn.account_id)?;
 
     let result = (|| -> Result<()> {
-        let mut addon_tokens: f32 = 20.0;
-        let mut addon_refill_at = std::time::Instant::now();
-        let mut addon_drop_logged_at: Option<std::time::Instant> = None;
+        let mut addon = AddonLimit::default();
         loop {
             let hdr = match conn.decrypt.read_and_decrypt_client_header(&mut stream) {
                 Ok(h) => h,
@@ -719,97 +743,7 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
             stream
                 .read_exact(&mut body)
                 .map_err(|e| anyhow!("world read error (body): {e}"))?;
-            if hdr.opcode == codec::addon::CMSG_MESSAGECHAT_OPCODE {
-                if let Some((chat_type, text)) = codec::addon::parse_addon_client_chat(&body) {
-                    if codec::addon::is_bridge_prefixed(&text) {
-                        let now = std::time::Instant::now();
-                        addon_tokens = (addon_tokens
-                            + now.duration_since(addon_refill_at).as_secs_f32() * 2.0)
-                            .min(20.0);
-                        addon_refill_at = now;
-                        if addon_tokens >= 1.0 {
-                            addon_tokens -= 1.0;
-                            handle_addon_message(&*conn.store.current(), &conn, &text)?;
-                        } else if addon_drop_logged_at
-                            .is_none_or(|t| now.duration_since(t).as_secs() >= 60)
-                        {
-                            addon_drop_logged_at = Some(now);
-                            log::warn!(
-                                "addon bridge: rate limit — dropping frames from account {}",
-                                conn.account_id
-                            );
-                        }
-                        continue;
-                    }
-                    if !codec::addon::typed_addon_chat_type(chat_type) {
-                        continue;
-                    }
-                }
-            }
-            if hdr.opcode == CMSG_AUCTION_LIST_ITEMS_OPCODE {
-                let request =
-                    decode_auction_browse(&body).map_err(|e| anyhow!("world read error: {e}"))?;
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::AuctionBrowse(request),
-                )?;
-                continue;
-            }
-            if hdr.opcode == CMSG_AUTH_SESSION_OPCODE {
-                return Err(anyhow!("world read error: CMSG_AUTH_SESSION after auth"));
-            }
-            if hdr.opcode == 0x0125 {
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::FactionAtWar(body),
-                )?;
-                continue;
-            }
-            if hdr.opcode == 0x0318 {
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::WatchedFaction(body),
-                )?;
-                continue;
-            }
-            if handlers::is_silent_movement_request(hdr.opcode)
-                || handlers::is_ignored_raw_request(hdr.opcode)
-            {
-                continue;
-            }
-            if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {
-                if matches!(conn.state, WorldState::InWorld(_)) {
-                    for reply in replies {
-                        send(&tx, reply)?;
-                    }
-                }
-                continue;
-            }
-            let msg = match codec::read_movement_client(hdr.opcode, &body)? {
-                Some(msg) => msg,
-                None => {
-                    let mut framed = Vec::with_capacity(6 + body.len());
-                    framed.extend_from_slice(&hdr.size.to_be_bytes());
-                    framed.extend_from_slice(&hdr.opcode.to_le_bytes());
-                    framed.extend_from_slice(&body);
-                    ClientOpcodeMessage::read_unencrypted(&mut std::io::Cursor::new(framed))
-                        .map_err(|e| anyhow!("world read error: {e}"))?
-                }
-            };
-            let store = conn.store.current();
-            dispatch(&tx, &*store, &mut conn, hdr.opcode, msg.into())?;
+            process_frame(&tx, &mut conn, &mut addon, hdr, body)?;
         }
     })();
 
@@ -828,6 +762,123 @@ fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
     // Release the seat exactly once, after the writer and Relays stop.
     drop(seat);
     result
+}
+
+struct AddonLimit {
+    tokens: f32,
+    refill_at: Instant,
+    drop_logged_at: Option<Instant>,
+}
+
+impl Default for AddonLimit {
+    fn default() -> Self {
+        Self {
+            tokens: 20.0,
+            refill_at: Instant::now(),
+            drop_logged_at: None,
+        }
+    }
+}
+
+fn process_frame(
+    tx: &SessionTx,
+    conn: &mut WorldConn,
+    addon: &mut AddonLimit,
+    hdr: wow_srp::vanilla_header::ClientHeader,
+    body: Vec<u8>,
+) -> Result<()> {
+    if hdr.opcode == codec::addon::CMSG_MESSAGECHAT_OPCODE {
+        if let Some((chat_type, text)) = codec::addon::parse_addon_client_chat(&body) {
+            if codec::addon::is_bridge_prefixed(&text) {
+                let now = std::time::Instant::now();
+                addon.tokens = (addon.tokens
+                    + now.duration_since(addon.refill_at).as_secs_f32() * 2.0)
+                    .min(20.0);
+                addon.refill_at = now;
+                if addon.tokens >= 1.0 {
+                    addon.tokens -= 1.0;
+                    handle_addon_message(&*conn.store.current(), conn, &text)?;
+                } else if addon
+                    .drop_logged_at
+                    .is_none_or(|t| now.duration_since(t).as_secs() >= 60)
+                {
+                    addon.drop_logged_at = Some(now);
+                    log::warn!(
+                        "addon bridge: dropping frames above the rate limit for account {}",
+                        conn.account_id
+                    );
+                }
+                return Ok(());
+            }
+            if !codec::addon::typed_addon_chat_type(chat_type) {
+                return Ok(());
+            }
+        }
+    }
+    if hdr.opcode == CMSG_AUCTION_LIST_ITEMS_OPCODE {
+        let request = decode_auction_browse(&body).map_err(|e| anyhow!("world read error: {e}"))?;
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::AuctionBrowse(request),
+        )?;
+        return Ok(());
+    }
+    if hdr.opcode == CMSG_AUTH_SESSION_OPCODE {
+        return Err(anyhow!("world read error: CMSG_AUTH_SESSION after auth"));
+    }
+    if hdr.opcode == 0x0125 {
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::FactionAtWar(body),
+        )?;
+        return Ok(());
+    }
+    if hdr.opcode == 0x0318 {
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::WatchedFaction(body),
+        )?;
+        return Ok(());
+    }
+    if handlers::is_silent_movement_request(hdr.opcode)
+        || handlers::is_ignored_raw_request(hdr.opcode)
+    {
+        return Ok(());
+    }
+    if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {
+        if matches!(conn.state, WorldState::InWorld(_)) {
+            for reply in replies {
+                send(tx, reply)?;
+            }
+        }
+        return Ok(());
+    }
+    let msg = match codec::read_movement_client(hdr.opcode, &body)? {
+        Some(msg) => msg,
+        None => {
+            let mut framed = Vec::with_capacity(6 + body.len());
+            framed.extend_from_slice(&hdr.size.to_be_bytes());
+            framed.extend_from_slice(&hdr.opcode.to_le_bytes());
+            framed.extend_from_slice(&body);
+            ClientOpcodeMessage::read_unencrypted(&mut std::io::Cursor::new(framed))
+                .map_err(|e| anyhow!("world read error: {e}"))?
+        }
+    };
+    let store = conn.store.current();
+    dispatch(tx, &*store, conn, hdr.opcode, msg.into())?;
+    Ok(())
 }
 
 fn is_game_master<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64) -> bool {
@@ -1171,6 +1222,11 @@ pub async fn run(
     });
     let mut backoff = AcceptBackoff::new();
     let mut capacity_was_full = false;
+    let connections = Arc::new(tokio::sync::Semaphore::new(
+        crate::config::world_connection_limit(),
+    ));
+    let actions = cfg.blocking_task_capacity.clone();
+    let encoders = crate::accept::BlockingTaskCapacity::new(crate::config::encoding_workers());
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(pair) => {
@@ -1190,9 +1246,8 @@ pub async fn run(
                     log::warn!(
                         "world accept failed ({e}); skipping this connection (consecutive={}, \
                          backing off {}ms). Players already in world are unaffected; if this is \
-                         EMFILE, the gateway is out of file descriptors — check for a leaked \
-                         per-account SDK connection (each account's cached connection releases at \
-                         session teardown).",
+                         EMFILE, the Gateway is out of file descriptors; inspect open sockets and \
+                         the configured World connection limit.",
                         backoff.consecutive(),
                         delay.as_millis()
                     );
@@ -1203,13 +1258,10 @@ pub async fn run(
                 }
             },
         };
-        let mut deadline = PreAuthDeadline::after(WORLD_AUTH_DEADLINE);
-        let Some(task_permit) = cfg.blocking_task_capacity.try_admit() else {
+        let deadline = tokio::time::Instant::now() + WORLD_AUTH_DEADLINE;
+        let Ok(connection_permit) = connections.clone().try_acquire_owned() else {
             if !capacity_was_full {
-                log::warn!(
-                    "world blocking-task capacity is full; rejecting new connections before they \
-                     enter the blocking-task queue"
-                );
+                log::warn!("world connection capacity is full; refusing new connections");
                 capacity_was_full = true;
             }
             continue;
@@ -1217,29 +1269,14 @@ pub async fn run(
         capacity_was_full = false;
         let coord = coordinator.clone();
         let queue = login_queue.clone();
-        let std_sock = match sock.into_std().and_then(|s| {
-            s.set_nonblocking(false)?;
-            Ok(s)
-        }) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("world connection {peer} could not be handed to a blocking task: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = deadline.arm(&std_sock) {
-            log::warn!("world connection {peer} could not arm its pre-auth watchdog: {e}");
-            continue;
-        }
-        tokio::task::spawn_blocking(move || {
-            let _task_permit = task_permit;
-            if let Err(e) = run_world_session_with_queue_and_deadline(
-                std_sock,
-                Arc::new(coord),
-                &queue,
-                &mut deadline,
-            ) {
-                log::warn!("world session {peer} ended: {e:#}");
+        let actions = actions.clone();
+        let encoders = encoders.clone();
+        tokio::spawn(async move {
+            let _connection_permit = connection_permit;
+            if let Err(error) =
+                transport::run_at(sock, Arc::new(coord), queue, actions, encoders, deadline).await
+            {
+                log::warn!("world session {peer} ended: {error:#}");
             }
         });
     }

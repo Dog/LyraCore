@@ -26,6 +26,19 @@ impl BlockingTaskCapacity {
             .map(|permit| BlockingTaskPermit { _permit: permit })
     }
 
+    pub(crate) async fn run<F, T>(&self, work: F) -> anyhow::Result<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.permits.clone().acquire_owned().await?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await?)
+    }
+
     #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
         self.permits.available_permits()

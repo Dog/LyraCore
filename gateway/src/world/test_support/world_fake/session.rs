@@ -13,6 +13,7 @@ pub(crate) struct SessionState {
     pub(crate) username: String,
     pub(crate) session: Option<WorldSession>,
     pub(crate) login_entity: Option<codec::EntityView>,
+    pub(crate) login_pause: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     pub(crate) moves: std::sync::Mutex<Vec<MoveRecord>>,
     pub(crate) move_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
     pub(crate) client_commands: std::sync::Mutex<Vec<(u64, String, String)>>,
@@ -54,6 +55,10 @@ impl SessionStore for WorldFake {
         entry: codec::WorldEntry,
     ) -> Result<codec::EntityView> {
         self.rec("player_login");
+        if let Some(pause) = &self.session.login_pause {
+            pause.0.wait();
+            pause.1.wait();
+        }
         self.session.login_entries.lock().unwrap().push(entry);
         let call = self
             .session
