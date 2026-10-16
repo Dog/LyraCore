@@ -67,6 +67,11 @@ CI runs every target in three parallel jobs with `--test-threads=4 --skip deadmi
 lethal_floor`. The Deadmines targets need the separately installed dungeons Package, and the
 `lethal_floor` ranged phase is flaky.
 
+CI runs `populated_old_module_upgrades_without_clearing` separately. It builds the Module at
+`44b04878f2050936faa61d6f087f3aa1a7a78a46`, sets `LYRACORE_TEST_BASELINE_WASM` to that Wasm,
+and publishes the current Module over the populated fixture without clearing it. Other durable
+runs must skip that test unless the baseline Wasm is available.
+
 `scripts/durable-test-targets.py` assigns targets by the durations in
 `.github/durable-test-seconds.json`. It includes every current target once and estimates 20 seconds
 for a new target. `JOB_SECONDS` reserves time for each job's builds, setup and Gateway checks.
