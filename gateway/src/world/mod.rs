@@ -769,6 +769,7 @@ pub async fn run(
         let mut idle_logged = false;
         let mut prev_sub = 0u64;
         let mut prev_recenters = 0u64;
+        let (mut prev_handoffs, mut prev_encoded) = (0u64, 0u64);
         let mut fan = crate::stdb::subscriptions::FanoutHealth::default();
         let mut prev_admitted = queuestat_queue.admitted_total();
         loop {
@@ -812,6 +813,17 @@ pub async fn run(
                 log::info!("MOTIONSTAT calls={c} sent={s} dropped={d} — relay went idle");
                 idle_logged = true;
             }
+            let handoffs = crate::accept::BLOCKING_HANDOFFS.load(Relaxed);
+            let encoded = egress::ENCODED_ENTRIES.load(Relaxed);
+            let (d_handoffs, d_encoded) = (handoffs - prev_handoffs, encoded - prev_encoded);
+            if d_handoffs > 0 {
+                log::info!(
+                    "HANDOFFSTAT blocking={:.1}/s encoded_entries={:.1}/s",
+                    d_handoffs as f64 / 10.0,
+                    d_encoded as f64 / 10.0,
+                );
+            }
+            (prev_handoffs, prev_encoded) = (handoffs, encoded);
             let recenters = crate::stdb::aoi::AOI_RECENTERS.load(Relaxed);
             let d_recenters = recenters.saturating_sub(prev_recenters);
             if d_recenters > 0 {

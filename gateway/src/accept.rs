@@ -1,9 +1,12 @@
 //! Before changing listener retries or capacity limits, read docs/accept-policy.md.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+pub(crate) static BLOCKING_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(crate) struct BlockingTaskCapacity {
@@ -32,6 +35,7 @@ impl BlockingTaskCapacity {
         T: Send + 'static,
     {
         let permit = self.permits.clone().acquire_owned().await?;
+        BLOCKING_HANDOFFS.fetch_add(1, Ordering::Relaxed);
         Ok(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work()
