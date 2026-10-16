@@ -224,7 +224,7 @@ fn cast_event_messages(row: &SpellCastEvent) -> Vec<(EventAudience, Outbound)> {
         return out;
     };
     if kind == SpellCastEventKind::Interrupt {
-        // SPELL_FAILURE must be caster-private or bystanders can lose their own cast state.
+        // Character SPELL_FAILURE is caster-private so bystanders keep their own cast state.
         let failure_audience = if is_creature_guid(row.caster_guid) {
             EventAudience::Everyone
         } else {

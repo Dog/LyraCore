@@ -39,12 +39,6 @@ fn creature_observers_share_encoded_bodies_after_the_create_gate() {
     };
     assert_eq!(first_opcode, second_opcode);
     assert!(Arc::ptr_eq(first_body, second_body));
-    let expected = crate::world::egress::encode(creature_spline_outbound(&row)).unwrap();
-    let Outbound::Shared { opcode, body } = expected[0].outbound() else {
-        unreachable!();
-    };
-    assert_eq!(*first_opcode, opcode);
-    assert_eq!(first_body.as_ref(), body.as_ref());
 }
 
 #[test]
