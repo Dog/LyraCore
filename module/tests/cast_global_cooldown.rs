@@ -2,7 +2,8 @@ mod support;
 
 use spacetimedb::Timestamp;
 use support::{
-    event_rows, poll_until, wait_for_event_rows, Row, Standalone, TableSubscription, POLL_TIMEOUT,
+    event_rows, fence_subscription, poll_until, subscribe_with_fence, wait_for_event_rows, Row,
+    Standalone, TableSubscription, POLL_TIMEOUT,
 };
 
 const WOLF: u64 = (0xF130_u64 << 48) | (51000_u64 << 24) | 1;
@@ -12,11 +13,12 @@ const ACTOR: &str = r#"{"guid":1,"ownership":null}"#;
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn fireball_can_be_cast_again_when_its_cast_bar_finishes() {
     let shard = fixture("fireball-global-cooldown", 2000, 1500, 0);
-    let casts = shard.subscribe(&[
-        "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133",
-    ]);
+    let casts = subscribe_with_fence(
+        &shard,
+        &["SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133"],
+    );
     cast_fireball(&shard);
-    let completed_at = timestamp(&completion(&casts), "created_at");
+    let completed_at = timestamp(&completion(&shard, &casts), "created_at");
     let ready_at = timestamp(&global_cooldown(&shard), "ready_at");
     assert!(
         ready_at <= completed_at,
@@ -35,9 +37,10 @@ fn fireball_can_be_cast_again_when_its_cast_bar_finishes() {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn a_short_cast_finishes_during_its_original_global_cooldown() {
     let shard = fixture("short-cast-global-cooldown", 500, 5000, 7000);
-    let casts = shard.subscribe(&[
-        "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133",
-    ]);
+    let casts = subscribe_with_fence(
+        &shard,
+        &["SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133"],
+    );
     cast_fireball(&shard);
     let started_at = timestamp(
         wait_for_event_rows(&casts, "game_spell_cast_event_live")
@@ -51,7 +54,7 @@ fn a_short_cast_finishes_during_its_original_global_cooldown() {
         timestamp(&original_cooldown, "ready_at"),
         started_at + 5_000_000
     );
-    let completed_at = timestamp(&completion(&casts), "created_at");
+    let completed_at = timestamp(&completion(&shard, &casts), "created_at");
     assert!(completed_at < timestamp(&original_cooldown, "ready_at"));
     assert_eq!(global_cooldown(&shard), original_cooldown);
     let spell_cooldown = shard.query_rows("SELECT * FROM game_spell_cd WHERE caster_guid = 1");
@@ -66,9 +69,10 @@ fn a_short_cast_finishes_during_its_original_global_cooldown() {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn an_instant_cast_still_starts_a_global_cooldown() {
     let shard = fixture("instant-cast-global-cooldown", 0, 5000, 0);
-    let casts = shard.subscribe(&[
-        "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133",
-    ]);
+    let casts = subscribe_with_fence(
+        &shard,
+        &["SELECT * FROM game_spell_cast_event_live WHERE caster_guid = 1 AND spell_id = 133"],
+    );
     cast_fireball(&shard);
     let launched_at = timestamp(
         &wait_for_event_rows(&casts, "game_spell_cast_event_live")[0],
@@ -135,18 +139,20 @@ fn cast_fireball(shard: &Standalone) {
     shard.assert_call("gw_cast_spell", &[ACTOR, "133", &WOLF.to_string()]);
 }
 
-fn completion(casts: &TableSubscription) -> Row {
-    let mut rows = Vec::new();
+fn completion(shard: &Standalone, casts: &TableSubscription) -> Row {
     assert!(
         poll_until(POLL_TIMEOUT, || {
-            rows = event_rows(casts, "game_spell_cast_event_live")
-                .into_iter()
-                .filter(|row| row["is_completion"] == "true")
-                .collect();
-            !rows.is_empty()
+            event_rows(casts, "game_spell_cast_event_live")
+                .iter()
+                .any(|row| row["is_completion"] == "true")
         }),
         "the timed cast did not launch"
     );
+    fence_subscription(shard, casts);
+    let mut rows: Vec<_> = event_rows(casts, "game_spell_cast_event_live")
+        .into_iter()
+        .filter(|row| row["is_completion"] == "true")
+        .collect();
     assert_eq!(rows.len(), 1);
     rows.remove(0)
 }

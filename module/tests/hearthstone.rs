@@ -2,7 +2,10 @@ mod support;
 
 use spacetimedb::Timestamp;
 use std::time::Duration;
-use support::{actor, event_rows, poll_until, wait_for_event_rows, Row, Standalone, POLL_TIMEOUT};
+use support::{
+    actor, event_rows, fence_subscription, poll_until, subscribe_with_fence, Row, Standalone,
+    POLL_TIMEOUT,
+};
 
 fn fixture(name: &str) -> Standalone {
     let mut shard = Standalone::start(name);
@@ -39,14 +42,17 @@ fn timestamp(row: &Row) -> i64 {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn hearthstone_recalls_to_the_bound_home_only_after_ten_seconds() {
     let shard = fixture("hearthstone-completion");
-    let casts =
-        shard.subscribe(&["SELECT * FROM game_spell_cast_event_live WHERE spell_id = 8690"]);
+    let casts = subscribe_with_fence(
+        &shard,
+        &["SELECT * FROM game_spell_cast_event_live WHERE spell_id = 8690"],
+    );
     let before = position(&shard);
     let inventory = items(&shard);
     use_hearthstone(&shard);
     assert_eq!(position(&shard), before);
     assert_eq!(items(&shard), inventory);
-    let started = wait_for_event_rows(&casts, "game_spell_cast_event_live");
+    fence_subscription(&shard, &casts);
+    let started = event_rows(&casts, "game_spell_cast_event_live");
     assert_eq!(started.len(), 1);
     assert_eq!(started[0]["cast_time_ms"], "10000");
     assert_eq!(

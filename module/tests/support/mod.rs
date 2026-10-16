@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lyracore_shared::spatial::{grid_cell, GRID_CELL_SIZE, MAP_COORD_MAX};
 pub use lyracore_test_support::*;
@@ -8,6 +9,41 @@ pub use lyracore_test_support::*;
 pub const LEG_YD: f32 = 20.0;
 
 pub type Row = BTreeMap<String, String>;
+
+const SUBSCRIPTION_MARKER: u64 = 509_9999;
+
+pub fn subscribe_with_fence(shard: &Standalone, queries: &[&str]) -> TableSubscription {
+    shard.assert_sql(&format!(
+        "DELETE FROM game_package_config WHERE id = {SUBSCRIPTION_MARKER}"
+    ));
+    shard.assert_sql(&format!(
+        "INSERT INTO game_package_config (id, package_name, key, value) \
+         VALUES ({SUBSCRIPTION_MARKER}, 'fixture.subscription', 'transaction', 'initial')"
+    ));
+    let marker_query =
+        format!("SELECT * FROM game_package_config WHERE id = {SUBSCRIPTION_MARKER}");
+    let mut queries = queries.to_vec();
+    queries.push(&marker_query);
+    shard.subscribe(&queries)
+}
+
+// A marker on the same stream proves all earlier committed updates reached the recorder.
+pub fn fence_subscription(shard: &Standalone, subscription: &TableSubscription) {
+    static NEXT_MARKER: AtomicU64 = AtomicU64::new(1);
+    let marker = NEXT_MARKER.fetch_add(1, Ordering::Relaxed).to_string();
+    shard.assert_sql(&format!(
+        "UPDATE game_package_config SET value = '{marker}' WHERE id = {SUBSCRIPTION_MARKER}"
+    ));
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            subscription
+                .inserts("game_package_config")
+                .iter()
+                .any(|row| row["id"] == SUBSCRIPTION_MARKER && row["value"] == marker)
+        }),
+        "the subscription did not receive transaction marker {marker}"
+    );
+}
 
 pub fn event_rows(subscription: &TableSubscription, table: &str) -> Vec<Row> {
     subscription

@@ -5,7 +5,7 @@ use lyracore_shared::spell::taxonomy::{E_ENERGIZE, E_SCRIPTED, T_SELF, T_TARGET_
 use std::collections::BTreeMap;
 
 use lyracore_shared::constants::unit_flags;
-use support::{event_rows, wait_for_event_rows, Standalone};
+use support::{event_rows, fence_subscription, subscribe_with_fence, Standalone};
 
 type SqlRow = BTreeMap<String, String>;
 
@@ -162,7 +162,7 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
     );
     let wolf = spawn_wolf(&standalone);
 
-    let casts = standalone.subscribe(&[&format!(
+    let casts = subscribe_with_fence(&standalone, &[&format!(
         "SELECT * FROM game_spell_cast_event_live WHERE caster_guid = {PLAYER} AND spell_id = {E_GATE_SPELL}"
     )]);
     let refused = standalone.call(
@@ -182,6 +182,7 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
         1000,
         "a refused cast spends nothing"
     );
+    fence_subscription(&standalone, &casts);
     assert!(event_rows(&casts, "game_spell_cast_event_live").is_empty());
 
     insert_script(
@@ -208,6 +209,7 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
         1000,
         "a refused cast spends nothing"
     );
+    fence_subscription(&standalone, &casts);
     assert!(event_rows(&casts, "game_spell_cast_event_live").is_empty());
 
     standalone.assert_sql(&format!(
@@ -222,10 +224,8 @@ fn a_missing_or_disabled_script_refuses_the_cast_before_any_cost_is_spent() {
         ],
     );
     assert_eq!(power(&standalone, PLAYER), 1000 - GATE_SPELL_COST);
-    assert_eq!(
-        wait_for_event_rows(&casts, "game_spell_cast_event_live").len(),
-        1
-    );
+    fence_subscription(&standalone, &casts);
+    assert_eq!(event_rows(&casts, "game_spell_cast_event_live").len(), 1);
 }
 
 #[test]
