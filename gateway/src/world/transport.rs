@@ -250,6 +250,13 @@ where
                     Err(error) => return Err(error),
                 }
             };
+            // Slice moves run on the reader task, so their handling must never wait on a reducer.
+            if lyracore_shared::opcodes::movement::is_slice_move(header.opcode) {
+                let mut conn = conn.lock().unwrap_or_else(|error| error.into_inner());
+                let mut addon = addon.lock().unwrap_or_else(|error| error.into_inner());
+                process_frame(&tx, &mut conn, &mut addon, header, body)?;
+                continue;
+            }
             let conn = conn.clone();
             let addon = addon.clone();
             let action_tx = tx.clone();
