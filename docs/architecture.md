@@ -357,7 +357,8 @@ One writer owns each session's header cipher and preserves FIFO order and contig
 It combines frames into writes of about 64 KiB.
 A supervisor retains cleanup ownership when its caller is cancelled. Accepted game actions finish
 before logout cleanup, so a delayed login cannot recreate a departed session after cleanup. A clean
-read EOF drains queued replies within the outbound age budget before returning the admission seat.
+read EOF drains direct replies from accepted actions within the outbound age budget before returning
+the admission seat. Cleanup invalidates queued viewer Relays, as it does during Transfer.
 
 Two related startup behaviours have no environment variable, because there is no case for turning
 them off:

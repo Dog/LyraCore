@@ -4,15 +4,11 @@ use super::handlers::{
 use super::party::PartyOutcome;
 use super::test_support::*;
 use super::*;
-use crate::read_deadline::{DeadlineClock, PreAuthDeadline};
 use lyracore_shared::group::{GroupKind, RaidSlot};
 use lyracore_shared::item::ItemRefusal;
 use lyracore_shared::loot::LootRefusal;
 use lyracore_shared::social::ContactRefusal;
-use std::cell::Cell;
-use std::io::Cursor;
 use std::os::unix::net::UnixStream;
-use std::rc::Rc;
 use wow_world_base::shared::friend_result_vanilla_tbc::FriendResult;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::{

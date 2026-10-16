@@ -1,10 +1,12 @@
 mod entry;
 mod family;
+mod socket;
 mod topology;
 mod world_fake;
 
 pub(crate) use self::entry::*;
 pub(crate) use self::family::*;
+pub(crate) use self::socket::*;
 pub(crate) use self::topology::*;
 pub(crate) use self::world_fake::*;
 

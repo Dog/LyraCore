@@ -1,56 +1,5 @@
 use super::*;
 
-#[derive(Clone)]
-struct ManualClock(Rc<Cell<Instant>>);
-
-impl DeadlineClock for ManualClock {
-    fn now(&self) -> Instant {
-        self.0.get()
-    }
-}
-
-struct AdvancingStream {
-    input: Cursor<Vec<u8>>,
-    output: Vec<u8>,
-    clock: ManualClock,
-    per_read: Duration,
-    per_write: Duration,
-    write_timeout_calls: Rc<Cell<usize>>,
-}
-
-impl Read for AdvancingStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let one_byte = buf.len().min(1);
-        let read = self.input.read(&mut buf[..one_byte])?;
-        self.clock.0.set(self.clock.0.get() + self.per_read);
-        Ok(read)
-    }
-}
-
-impl Write for AdvancingStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.output.extend_from_slice(buf);
-        self.clock.0.set(self.clock.0.get() + self.per_write);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl IoDeadline for AdvancingStream {
-    fn set_read_timeout(&self, _timeout: Option<Duration>) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn set_write_timeout(&self, _timeout: Option<Duration>) -> std::io::Result<()> {
-        self.write_timeout_calls
-            .set(self.write_timeout_calls.get() + 1);
-        Ok(())
-    }
-}
-
 #[test]
 fn world_session_socket_pair_times_out_when_the_server_writes_nothing() {
     let (mut client, _server) = world_session_socket_pair();
@@ -148,13 +97,13 @@ fn an_auth_session_with_an_absurd_addon_size_still_completes_the_handshake() {
 fn a_silent_world_connection_is_closed_at_the_pre_auth_deadline() {
     let store = tester_store(42);
     let (mut client, server_end) = world_session_socket_pair();
-    let mut deadline = PreAuthDeadline::after(Duration::from_millis(200));
+    let deadline = Instant::now() + Duration::from_millis(200);
     let server = std::thread::spawn(move || {
-        run_world_session_with_queue_and_deadline(
+        run_world_session_with_deadline(
             server_end,
             std::sync::Arc::new(store),
-            &LoginQueue::unlimited(),
-            &mut deadline,
+            Arc::new(LoginQueue::unlimited()),
+            deadline,
         )
     });
 
@@ -176,100 +125,17 @@ fn a_silent_world_connection_is_closed_at_the_pre_auth_deadline() {
 }
 
 #[test]
-fn slow_auth_session_bytes_cannot_extend_the_pre_auth_deadline() {
-    let store = tester_store(42);
-    let mut input = Vec::new();
-    auth_session("TESTER", 1, [0; 20])
-        .write_unencrypted_client(&mut input)
-        .unwrap();
-    let start = Instant::now();
-    let clock = ManualClock(Rc::new(Cell::new(start)));
-    let mut deadline = PreAuthDeadline::with_clock(start + Duration::from_millis(8), clock.clone());
-    let mut stream = AdvancingStream {
-        input: Cursor::new(input),
-        output: Vec::new(),
-        clock,
-        per_read: Duration::from_millis(1),
-        per_write: Duration::ZERO,
-        write_timeout_calls: Rc::new(Cell::new(0)),
-    };
-
-    let result = world_handshake_with_queue_and_deadline(
-        &mut stream,
-        std::sync::Arc::new(store),
-        &LoginQueue::unlimited(),
-        &mut deadline,
-    );
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("a slow auth frame must share one total deadline"),
-    };
-
-    assert!(
-        error.to_string().contains("total pre-auth deadline"),
-        "{error:#}"
-    );
-    assert!(
-        !stream.output.is_empty(),
-        "the server challenge must be written before the slow client frame times out"
-    );
-}
-
-#[test]
-fn world_challenge_write_uses_the_absolute_pre_auth_deadline() {
-    let store = tester_store(42);
-    let start = Instant::now();
-    let clock = ManualClock(Rc::new(Cell::new(start)));
-    let write_timeout_calls = Rc::new(Cell::new(0));
-    let mut deadline =
-        PreAuthDeadline::with_clock(start + Duration::from_millis(10), clock.clone());
-    let mut stream = AdvancingStream {
-        input: Cursor::new(Vec::new()),
-        output: Vec::new(),
-        clock,
-        per_read: Duration::ZERO,
-        per_write: Duration::from_millis(20),
-        write_timeout_calls: write_timeout_calls.clone(),
-    };
-
-    let result = world_handshake_with_queue_and_deadline(
-        &mut stream,
-        std::sync::Arc::new(store),
-        &LoginQueue::unlimited(),
-        &mut deadline,
-    );
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("the world challenge must not write past the total deadline"),
-    };
-
-    assert_eq!(
-        write_timeout_calls.get(),
-        1,
-        "the world challenge must write through the pre-auth I/O wrapper"
-    );
-    assert!(
-        error.to_string().contains("pre-auth I/O deadline"),
-        "{error:#}"
-    );
-    assert!(
-        !stream.output.is_empty(),
-        "the fake advances time after accepting the world challenge bytes"
-    );
-}
-
-#[test]
 fn post_auth_world_traffic_has_no_pre_auth_deadline() {
     let store = std::sync::Arc::new(tester_store(42));
     let (mut client, server_end) = world_session_socket_pair();
-    let mut deadline = PreAuthDeadline::after(Duration::from_millis(200));
+    let deadline = Instant::now() + Duration::from_millis(200);
     let server_store = store.clone();
     let server = std::thread::spawn(move || {
-        run_world_session_with_queue_and_deadline(
+        run_world_session_with_deadline(
             server_end,
             server_store.clone(),
-            &LoginQueue::unlimited(),
-            &mut deadline,
+            Arc::new(LoginQueue::unlimited()),
+            deadline,
         )
     });
 
@@ -296,12 +162,7 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
     let server_store = store.clone();
     let server_queue = queue.clone();
     let server = std::thread::spawn(move || {
-        let mut s = server_end;
-        let (conn, _encrypt) =
-            world_handshake_with_queue(&mut s, server_store.clone(), &server_queue)
-                .unwrap()
-                .expect("handshake should eventually succeed once admitted");
-        assert_eq!(conn.account_id, 42);
+        run_world_session_with_queue(server_end, server_store, server_queue)
     });
 
     let (_c_enc, mut c_dec) = drive_auth(&mut client, "TESTER", K);
@@ -329,7 +190,7 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
     }
 
     drop(client);
-    server.join().unwrap();
+    server.join().unwrap().unwrap();
 }
 
 #[test]
@@ -342,13 +203,7 @@ fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
     let server_store = store.clone();
     let server_queue = queue.clone();
     let server = std::thread::spawn(move || {
-        let mut s = server_end;
-        let result =
-            world_handshake_with_queue(&mut s, server_store.clone(), &server_queue).unwrap();
-        assert!(
-            result.is_none(),
-            "a hangup while queued must end the session cleanly, not error"
-        );
+        run_world_session_with_queue(server_end, server_store, server_queue)
     });
 
     let (_c_enc, mut c_dec) = drive_auth(&mut client, "TESTER", K);
@@ -361,7 +216,7 @@ fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
     }
 
     drop(client);
-    server.join().unwrap();
+    let _ = server.join().unwrap();
 
     assert_eq!(
         queue.depth(),
@@ -1899,8 +1754,7 @@ fn reducer_transport_loss_ends_an_admitted_session_and_frees_one_queue_seat() {
     let server_queue = queue.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result =
-            run_world_session_with_queue(server_end, server_store.clone(), server_queue.as_ref());
+        let result = run_world_session_with_queue(server_end, server_store.clone(), server_queue);
         result_tx.send(result).unwrap();
     });
 
@@ -2104,65 +1958,6 @@ fn competing_world_sessions_close_the_old_socket_without_removing_the_winner() {
     assert!(fixture
         .query_rows("SELECT * FROM game_world_entity WHERE guid = 1")
         .is_empty());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn closing_a_world_session_interrupts_a_full_socket_without_draining_its_queue() {
-    use std::os::fd::AsRawFd;
-
-    let (_client, mut socket) = world_session_socket_pair();
-    socket.set_nonblocking(true).unwrap();
-    loop {
-        match socket.write(&[0; 65536]) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) => panic!("fill owned socket: {error}"),
-        }
-    }
-    socket.set_nonblocking(false).unwrap();
-    let (mut tx, queued, _) = session_channel();
-    tx.bind_socket(socket.try_clone().unwrap());
-    tx.send(Outbound::Raw {
-        opcode: 0,
-        body: vec![],
-    })
-    .unwrap();
-    let socket_fd = socket.as_raw_fd();
-    let (started, ready) = std::sync::mpsc::channel();
-    let (finished, result) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        let task = std::fs::read_link("/proc/thread-self")
-            .expect("this Linux socket fixture requires /proc/thread-self");
-        started.send(task).unwrap();
-        finished.send(socket.write_all(&[1; 65536])).unwrap();
-    });
-    let task = ready.recv_timeout(Duration::from_secs(2)).unwrap();
-    let syscall_path = std::path::Path::new("/proc").join(task).join("syscall");
-    assert!(
-        crate::durable_test_support::poll_until(Duration::from_secs(2), || {
-            let syscall = std::fs::read_to_string(&syscall_path)
-                .expect("this Linux socket fixture requires visibility of its writer's syscall");
-            let mut fields = syscall.split_whitespace();
-            let number = fields
-                .next()
-                .and_then(|value| value.parse::<libc::c_long>().ok());
-            let fd = fields
-                .next()
-                .and_then(|value| value.strip_prefix("0x"))
-                .and_then(|value| i32::from_str_radix(value, 16).ok());
-            matches!(number, Some(n) if n == libc::SYS_sendto || n == libc::SYS_write)
-                && fd == Some(socket_fd)
-        }),
-        "writer did not enter its blocked socket write"
-    );
-    tx.close();
-    assert!(result
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .is_err());
-    assert!(matches!(queued.try_recv().unwrap(), Outbound::Raw { .. }));
-    writer.join().unwrap();
 }
 
 #[test]

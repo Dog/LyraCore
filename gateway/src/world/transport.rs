@@ -141,6 +141,7 @@ pub(super) async fn run_at<S>(
     queue: Arc<LoginQueue>,
     actions: BlockingTaskCapacity,
     encoders: BlockingTaskCapacity,
+    connection_permit: tokio::sync::OwnedSemaphorePermit,
     deadline: tokio::time::Instant,
 ) -> Result<()>
 where
@@ -155,9 +156,10 @@ where
     }
     let _stop_on_drop = StopOnDrop(stop);
     // The supervisor owns cleanup even if the caller drops its session future.
-    tokio::spawn(run_session(
-        stream, store, queue, actions, encoders, receiver, deadline,
-    ))
+    tokio::spawn(async move {
+        let _connection_permit = connection_permit;
+        run_session(stream, store, queue, actions, encoders, receiver, deadline).await
+    })
     .await?
 }
 
@@ -191,10 +193,17 @@ where
     let conn = Arc::new(Mutex::new(conn));
     let addon = Arc::new(Mutex::new(AddonLimit::default()));
     let (tx, receiver, mut closed) = egress::channel();
-    let (mut reader, writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
     let writer_close = tx.close_socket.clone();
+    let mut writer_stopped = stopped.clone();
+    let mut writer_closed = closed.clone();
     let mut writer_task = tokio::spawn(async move {
-        let result = egress::write(writer, encrypt, receiver, encoders, account_id).await;
+        let result = tokio::select! {
+            biased;
+            _ = writer_stopped.wait_for(|stop| *stop) => Ok(()),
+            _ = writer_closed.wait_for(|closed| *closed) => Ok(()),
+            result = egress::write(writer, encrypt, receiver, encoders, account_id) => result,
+        };
         if let Some(close) = writer_close {
             close();
         }
@@ -203,10 +212,16 @@ where
 
     let mut drain = true;
     let result = async {
+        let mut reader = reader;
         loop {
             let frame = async {
                 let mut bytes = [0; 6];
-                reader.read_exact(&mut bytes).await?;
+                if let Err(error) = reader.read_exact(&mut bytes).await {
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return Ok(None);
+                    }
+                    return Err(anyhow!(error).context("world read error (header)"));
+                }
                 let header = conn
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -219,30 +234,48 @@ where
                     )
                 })?;
                 let mut body = vec![0; length];
-                reader.read_exact(&mut body).await?;
-                Ok::<_, std::io::Error>((header, body))
+                reader
+                    .read_exact(&mut body)
+                    .await
+                    .map_err(|error| anyhow!(error).context("world read error (body)"))?;
+                Ok::<_, anyhow::Error>(Some((header, body)))
             };
             let (header, body) = tokio::select! {
                 biased;
                 _ = stopped.wait_for(|stop| *stop) => { drain = false; break; },
                 _ = closed.wait_for(|closed| *closed) => { drain = false; break; },
                 result = frame => match result {
-                    Ok(frame) => frame,
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(error) => return Err(error.into()),
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => return Err(error),
                 }
             };
             let conn = conn.clone();
             let addon = addon.clone();
-            let tx = tx.clone();
+            let action_tx = tx.clone();
             // Await accepted game work before cleanup so a late login cannot outlive its session.
-            actions
-                .run(move || {
-                    let mut conn = conn.lock().unwrap_or_else(|error| error.into_inner());
-                    let mut addon = addon.lock().unwrap_or_else(|error| error.into_inner());
-                    process_frame(&tx, &mut conn, &mut addon, header, body)
-                })
-                .await??;
+            let action = actions.run(move || {
+                let mut conn = conn.lock().unwrap_or_else(|error| error.into_inner());
+                let mut addon = addon.lock().unwrap_or_else(|error| error.into_inner());
+                process_frame(&action_tx, &mut conn, &mut addon, header, body)
+            });
+            tokio::pin!(action);
+            let finished = tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stop| *stop) => None,
+                _ = closed.wait_for(|closed| *closed) => None,
+                result = &mut action => Some(result),
+            };
+            match finished {
+                Some(result) => result??,
+                None => {
+                    drain = false;
+                    drop(reader);
+                    tx.close();
+                    writer_task.abort();
+                    return action.await?;
+                }
+            }
         }
         Ok::<_, anyhow::Error>(())
     }
@@ -300,14 +333,112 @@ where
         queue,
         actions,
         encoders,
+        Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned()?,
         tokio::time::Instant::now() + WORLD_AUTH_DEADLINE,
     )
     .await
 }
 
+#[cfg(all(test, unix))]
+pub(super) fn world_handshake(
+    stream: &mut std::os::unix::net::UnixStream,
+    store: Arc<dyn WorldStore>,
+) -> Result<Option<(WorldConn, EncrypterHalf)>> {
+    use super::test_support::TestSocket;
+    let socket = stream.try_clone()?;
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(async {
+            let mut socket = socket.into_async()?;
+            let Some((conn, mut encrypt)) = tokio::time::timeout(
+                WORLD_AUTH_DEADLINE,
+                authenticate(&mut socket, store, &BlockingTaskCapacity::new(1)),
+            )
+            .await??
+            else {
+                return Ok(None);
+            };
+            let _seat = admit(&mut socket, &mut encrypt, Arc::new(LoginQueue::unlimited())).await?;
+            Ok(Some((conn, encrypt)))
+        });
+    stream.set_nonblocking(false)?;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_auth_bytes_cannot_extend_the_total_deadline() {
+        use crate::world::test_support::{auth_session, tester_store};
+        use wow_world_messages::vanilla::ClientMessage;
+
+        let (mut client, server) = tokio::io::duplex(128);
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+        let session = tokio::spawn(run_at(
+            server,
+            Arc::new(tester_store(1)),
+            Arc::new(LoginQueue::unlimited()),
+            BlockingTaskCapacity::new(1),
+            BlockingTaskCapacity::new(1),
+            connections.clone().try_acquire_owned().unwrap(),
+            deadline,
+        ));
+        let mut challenge = [0; 8];
+        client.read_exact(&mut challenge).await.unwrap();
+        let mut frame = Vec::new();
+        auth_session("TESTER", 1, [0; 20])
+            .write_unencrypted_client(&mut frame)
+            .unwrap();
+        let length = frame.len();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let progress = sent.clone();
+        let sender = tokio::spawn(async move {
+            for byte in frame {
+                if client.write_all(&[byte]).await.is_err() {
+                    break;
+                }
+                progress.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let error = tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        sender.await.unwrap();
+        assert!(error.to_string().contains("total pre-auth deadline"));
+        assert!((1..length).contains(&sent.load(Ordering::Relaxed)));
+        assert_eq!(connections.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blocked_challenge_write_uses_the_total_deadline() {
+        use crate::world::test_support::tester_store;
+
+        let (_client, server) = tokio::io::duplex(1);
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let error = run_at(
+            server,
+            Arc::new(tester_store(1)),
+            Arc::new(LoginQueue::unlimited()),
+            BlockingTaskCapacity::new(1),
+            BlockingTaskCapacity::new(1),
+            connections.clone().try_acquire_owned().unwrap(),
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("total pre-auth deadline"));
+        assert_eq!(connections.available_permits(), 1);
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -515,12 +646,15 @@ mod tests {
         let (mut client, server) = world_session_socket_pair();
         server.set_nonblocking(true).unwrap();
         let server = tokio::net::UnixStream::from_std(server).unwrap();
-        let session = tokio::spawn(run(
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let session = tokio::spawn(run_at(
             server,
             store.clone(),
             queue.clone(),
             BlockingTaskCapacity::new(1),
             BlockingTaskCapacity::new(1),
+            connections.clone().try_acquire_owned().unwrap(),
+            tokio::time::Instant::now() + WORLD_AUTH_DEADLINE,
         ));
         let entered = pause.clone();
         let client = tokio::task::spawn_blocking(move || {
@@ -537,19 +671,109 @@ mod tests {
         .unwrap();
         session.abort();
         assert!(session.await.unwrap_err().is_cancelled());
-        assert_eq!(queue.active(), 1);
-        assert!(!store.session.logout_called.load(Ordering::Relaxed));
+        let active_before_cleanup = queue.active();
+        let permits_before_cleanup = connections.available_permits();
+        let logged_out_before_cleanup = store.session.logout_called.load(Ordering::Relaxed);
+        let closed = tokio::task::spawn_blocking(move || {
+            let mut client = client;
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            std::io::Read::read(&mut client, &mut [0])
+        })
+        .await
+        .unwrap();
         tokio::task::spawn_blocking(move || pause.1.wait())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while queue.active() != 0 {
+            while queue.active() != 0 || connections.available_permits() != 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap();
+        assert_eq!(active_before_cleanup, 1);
+        assert_eq!(permits_before_cleanup, 0);
+        assert!(!logged_out_before_cleanup);
+        assert_eq!(
+            closed.unwrap(),
+            0,
+            "cancel must close the socket before cleanup"
+        );
         assert!(store.session.logout_called.load(Ordering::Relaxed));
-        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_during_subscription_interrupts_the_socket_before_cleanup() {
+        use crate::world::test_support::{
+            client_handshake, quest_store, world_session_socket_pair, K,
+        };
+        use wow_world_messages::vanilla::{ClientMessage, CMSG_PLAYER_LOGIN};
+
+        let (entered, paused) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        let mut fake = quest_store();
+        fake.session.subscribe_pause = Some((entered, Mutex::new(release)));
+        let store = Arc::new(fake);
+        let queue = Arc::new(LoginQueue::new(1, 0));
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let (mut client, server) = world_session_socket_pair();
+        server.set_nonblocking(true).unwrap();
+        let session = tokio::spawn(run_at(
+            tokio::net::UnixStream::from_std(server).unwrap(),
+            store.clone(),
+            queue.clone(),
+            BlockingTaskCapacity::new(1),
+            BlockingTaskCapacity::new(1),
+            connections.clone().try_acquire_owned().unwrap(),
+            tokio::time::Instant::now() + WORLD_AUTH_DEADLINE,
+        ));
+        let (client, tx) = tokio::task::spawn_blocking(move || {
+            let (mut encrypt, _) = client_handshake(&mut client, "TESTER", K);
+            CMSG_PLAYER_LOGIN {
+                guid: wow_world_messages::Guid::new(1),
+            }
+            .write_encrypted_client(&mut client, &mut encrypt)
+            .unwrap();
+            let tx = paused.recv_timeout(Duration::from_secs(2)).unwrap();
+            (client, tx)
+        })
+        .await
+        .unwrap();
+        for _ in 0..16 {
+            tx.send(Outbound::Raw {
+                opcode: 0,
+                body: vec![0; 60_000],
+            })
+            .unwrap();
+        }
+        tx.close();
+        let closed = tokio::task::spawn_blocking(move || {
+            let mut client = client;
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            std::io::Read::read_to_end(&mut client, &mut Vec::new())
+        })
+        .await
+        .unwrap();
+        let active_before_cleanup = queue.active();
+        let permits_before_cleanup = connections.available_permits();
+        let logged_out_before_cleanup = store.session.logout_called.load(Ordering::Relaxed);
+        resume.send(()).unwrap();
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .unwrap()
+            .unwrap();
+        closed.expect("close must interrupt the socket while subscription is paused");
+        assert_eq!(active_before_cleanup, 1);
+        assert_eq!(permits_before_cleanup, 0);
+        assert!(!logged_out_before_cleanup);
+        assert_eq!(queue.active(), 0);
+        assert_eq!(connections.available_permits(), 1);
+        assert!(store.session.logout_called.load(Ordering::Relaxed));
     }
 }

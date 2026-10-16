@@ -181,12 +181,25 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut trace = crate::config::writer_trace_enabled().then(WriterTrace::new);
     let mut buffer = Vec::with_capacity(4096);
-    while let Some(first) = receiver.recv().await {
+    let mut pending = None;
+    loop {
+        let first = match pending.take() {
+            Some(first) => first,
+            None => match receiver.recv().await {
+                Some(first) => first,
+                None => break,
+            },
+        };
         let mut oldest = first.since;
         let mut batch = vec![first];
         while batch.len() < ENCODE_BATCH {
             match receiver.try_recv() {
                 Ok(next) => {
+                    // A Relay job can close the socket; write preceding packets before invoking it.
+                    if matches!(next.out, Some(Outbound::Job(_))) {
+                        pending = Some(next);
+                        break;
+                    }
                     oldest = oldest.min(next.since);
                     batch.push(next);
                 }
