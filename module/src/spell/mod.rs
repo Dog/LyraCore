@@ -91,12 +91,13 @@ pub use tables::{
     game_aura, game_aura_schedule, game_dynamic_object, game_ground_area,
     game_ground_area_schedule, game_pending_cast, game_pending_spell_impact,
     game_resurrect_request, game_school_lockout, game_self_resurrect_option, game_spell,
-    game_spell_cast_event, game_spell_cd, game_spell_cooldown, game_spell_effect,
-    game_spell_impact_event, game_spell_proc_event, game_spell_reagent, Aura, AuraSchedule,
-    DynamicObject, GroundArea, GroundAreaSchedule, PendingCast, PendingSpellImpact,
-    ResurrectRequest, SchoolLockout, SelfResurrectOption, Spell, SpellCastEvent, SpellCd,
-    SpellCooldown, SpellEffect, SpellImpactEvent, SpellProcEvent, SpellReagent, CAST_FAIL_NO_POWER,
-    CAST_MISS_MISS, CAST_MISS_NONE, CAST_MISS_RESIST,
+    game_spell_cast_event, game_spell_cast_event_live, game_spell_cd, game_spell_cooldown,
+    game_spell_effect, game_spell_impact_event, game_spell_impact_event_live,
+    game_spell_proc_event, game_spell_reagent, Aura, AuraSchedule, DynamicObject, GroundArea,
+    GroundAreaSchedule, PendingCast, PendingSpellImpact, ResurrectRequest, SchoolLockout,
+    SelfResurrectOption, Spell, SpellCastEvent, SpellCd, SpellCooldown, SpellEffect,
+    SpellImpactEvent, SpellProcEvent, SpellReagent, CAST_FAIL_NO_POWER, CAST_MISS_MISS,
+    CAST_MISS_NONE, CAST_MISS_RESIST,
 };
 
 pub(crate) use lyracore_shared::spell::taxonomy::{

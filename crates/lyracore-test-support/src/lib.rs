@@ -1,7 +1,9 @@
 mod module_wasm;
 pub mod source_scan;
+mod subscription;
 
 pub use module_wasm::{gateway_binary, module_bytes};
+pub use subscription::TableSubscription;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -266,6 +268,10 @@ impl Standalone {
         command.args(["call", "-s", &self.server, database, reducer, "--"]);
         command.args(args);
         command.output().expect("failed to call reducer")
+    }
+
+    pub fn subscribe(&self, queries: &[&str]) -> TableSubscription {
+        TableSubscription::start(self.command(), &self.server, &self.database, queries)
     }
 
     pub fn capture_updates(

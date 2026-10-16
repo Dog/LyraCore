@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lyracore_shared::spatial::{grid_cell, GRID_CELL_SIZE, MAP_COORD_MAX};
 pub use lyracore_test_support::*;
@@ -8,6 +9,81 @@ pub use lyracore_test_support::*;
 pub const LEG_YD: f32 = 20.0;
 
 pub type Row = BTreeMap<String, String>;
+
+const SUBSCRIPTION_MARKER: u64 = 509_9999;
+
+pub fn subscribe_with_fence(shard: &Standalone, queries: &[&str]) -> TableSubscription {
+    shard.assert_sql(&format!(
+        "DELETE FROM game_package_config WHERE id = {SUBSCRIPTION_MARKER}"
+    ));
+    shard.assert_sql(&format!(
+        "INSERT INTO game_package_config (id, package_name, key, value) \
+         VALUES ({SUBSCRIPTION_MARKER}, 'fixture.subscription', 'transaction', 'initial')"
+    ));
+    let marker_query =
+        format!("SELECT * FROM game_package_config WHERE id = {SUBSCRIPTION_MARKER}");
+    let mut queries = queries.to_vec();
+    queries.push(&marker_query);
+    shard.subscribe(&queries)
+}
+
+// A marker on the same stream proves all earlier committed updates reached the recorder.
+pub fn fence_subscription(shard: &Standalone, subscription: &TableSubscription) {
+    static NEXT_MARKER: AtomicU64 = AtomicU64::new(1);
+    let marker = NEXT_MARKER.fetch_add(1, Ordering::Relaxed).to_string();
+    shard.assert_sql(&format!(
+        "UPDATE game_package_config SET value = '{marker}' WHERE id = {SUBSCRIPTION_MARKER}"
+    ));
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            subscription
+                .inserts("game_package_config")
+                .iter()
+                .any(|row| row["id"] == SUBSCRIPTION_MARKER && row["value"] == marker)
+        }),
+        "the subscription did not receive transaction marker {marker}"
+    );
+}
+
+pub fn event_rows(subscription: &TableSubscription, table: &str) -> Vec<Row> {
+    subscription
+        .inserts(table)
+        .into_iter()
+        .map(|row| {
+            row.as_object()
+                .expect("event row is an object")
+                .iter()
+                .map(|(column, value)| {
+                    let value = if let Some(micros) =
+                        value["__timestamp_micros_since_unix_epoch__"].as_i64()
+                    {
+                        spacetimedb::Timestamp::from_micros_since_unix_epoch(micros)
+                            .to_rfc3339()
+                            .expect("event timestamp is representable")
+                    } else {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                    };
+                    (column.clone(), value)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub fn wait_for_event_rows(subscription: &TableSubscription, table: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            rows = event_rows(subscription, table);
+            !rows.is_empty()
+        }),
+        "no inserts arrived for {table}"
+    );
+    rows
+}
 
 pub fn number<T: std::str::FromStr>(row: &Row, column: &str) -> T {
     row[column]

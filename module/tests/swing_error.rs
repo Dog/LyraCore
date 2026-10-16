@@ -1,6 +1,6 @@
 mod support;
 
-use support::{number, poll_until, Row, Standalone, POLL_TIMEOUT};
+use support::{event_rows, number, poll_until, Row, Standalone, TableSubscription, POLL_TIMEOUT};
 
 const PLAYER: u64 = 1;
 const TEST_WOLF_ENTRY: u32 = 51000;
@@ -25,29 +25,37 @@ fn a_due_swing_records_out_of_range_and_bad_facing_and_a_landed_swing_clears_it(
         "UPDATE game_world_entity SET orientation = 0.0 WHERE guid = {PLAYER}"
     ));
 
+    let events = standalone.subscribe(&[
+        "SELECT * FROM game_combat_event_live WHERE attacker_guid = 1",
+        "SELECT * FROM game_melee_attack WHERE attacker_guid = 1",
+    ]);
     standalone.assert_call("debug_engage", &[&PLAYER.to_string(), &wolf.to_string()]);
-    wait_for_swing_error(&standalone, NOT_IN_RANGE);
+    wait_for_swing_error(&events, NOT_IN_RANGE);
     assert!(
-        own_swings(&standalone).is_empty(),
+        own_swings(&events).is_empty(),
         "an out-of-range swing must not land"
     );
 
     place(&standalone, wolf, x + 1.0, y);
     make_swing_due(&standalone);
     assert!(
-        poll_until(POLL_TIMEOUT, || !own_swings(&standalone).is_empty()),
+        poll_until(POLL_TIMEOUT, || !own_swings(&events).is_empty()),
         "the swing in reach never landed"
     );
-    wait_for_swing_error(&standalone, NONE);
+    wait_for_swing_error(&events, NONE);
 
     standalone.assert_sql(&format!(
         "UPDATE game_world_entity SET orientation = 3.14159 WHERE guid = {PLAYER}"
     ));
-    standalone.assert_sql("DELETE FROM game_combat_event");
+    drop(events);
+    let events = standalone.subscribe(&[
+        "SELECT * FROM game_combat_event_live WHERE attacker_guid = 1",
+        "SELECT * FROM game_melee_attack WHERE attacker_guid = 1",
+    ]);
     make_swing_due(&standalone);
-    wait_for_swing_error(&standalone, BAD_FACING);
+    wait_for_swing_error(&events, BAD_FACING);
     assert!(
-        own_swings(&standalone).is_empty(),
+        own_swings(&events).is_empty(),
         "a swing at a target behind the player must not land"
     );
 }
@@ -93,25 +101,20 @@ fn make_swing_due(standalone: &Standalone) {
     ));
 }
 
-fn swing_error(standalone: &Standalone) -> Option<u8> {
-    standalone
-        .query_rows(&format!(
-            "SELECT swing_error FROM game_melee_attack WHERE attacker_guid = {PLAYER}"
-        ))
+fn swing_error(events: &TableSubscription) -> Option<u8> {
+    event_rows(events, "game_melee_attack")
         .pop()
         .map(|row| number(&row, "swing_error"))
 }
 
-fn wait_for_swing_error(standalone: &Standalone, expected: u8) {
+fn wait_for_swing_error(events: &TableSubscription, expected: u8) {
     assert!(
-        poll_until(POLL_TIMEOUT, || swing_error(standalone) == Some(expected)),
+        poll_until(POLL_TIMEOUT, || swing_error(events) == Some(expected)),
         "the Swing Error must become {expected}, got {:?}",
-        swing_error(standalone)
+        swing_error(events)
     );
 }
 
-fn own_swings(standalone: &Standalone) -> Vec<Row> {
-    standalone.query_rows(&format!(
-        "SELECT damage FROM game_combat_event WHERE attacker_guid = {PLAYER}"
-    ))
+fn own_swings(events: &TableSubscription) -> Vec<Row> {
+    event_rows(events, "game_combat_event_live")
 }

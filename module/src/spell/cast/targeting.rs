@@ -408,7 +408,7 @@ pub(crate) fn aura_apply(
                 tracer_spell::AURA_SLOTS,
                 hdr.spell_id
             );
-            ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+            ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
                 is_interrupted: true,
                 ..SpellCastEvent::signal(
                     ctx,

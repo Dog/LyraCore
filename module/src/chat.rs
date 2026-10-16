@@ -11,6 +11,7 @@ pub const CHAT_EMOTE: u8 = lyracore_shared::chat::broadcast_chat::EMOTE;
 const MAX_CHAT_LEN: usize = 255;
 
 #[table(accessor = game_chat_event, public)]
+#[table(accessor = game_chat_event_live, public, event)]
 pub struct ChatEvent {
     #[primary_key]
     #[auto_inc]
@@ -123,7 +124,7 @@ fn write_chat_event(
             crate::terrain::zone_id_at(ctx, sender.map_id, sender.x, sender.y).unwrap_or(0);
         sender = ctx.db.game_world_entity().guid().update(sender);
     }
-    ctx.db.game_chat_event().insert(ChatEvent {
+    ctx.db.game_chat_event_live().insert(ChatEvent {
         id: 0,
         sender_guid: sender.guid,
         chat_type,
@@ -162,6 +163,7 @@ pub struct ChannelEvent {
     public,
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y]))
 )]
+#[table(accessor = game_emote_event_live, public, event)]
 pub struct EmoteEvent {
     #[primary_key]
     #[auto_inc]
@@ -193,7 +195,7 @@ pub(crate) fn apply_send_emote(
         return Err("dead players cannot emote".to_string());
     }
     let (map_id, instance_id, grid_x, grid_y) = crate::helpers::entity_addr(&sender);
-    ctx.db.game_emote_event().insert(EmoteEvent {
+    ctx.db.game_emote_event_live().insert(EmoteEvent {
         id: 0,
         sender_guid: sender.guid,
         text_emote,

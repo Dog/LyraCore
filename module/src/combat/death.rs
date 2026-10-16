@@ -3,12 +3,12 @@ use spacetimedb::{table, ReducerContext, Table, TimeDuration};
 #[cfg(feature = "debug_reducers")]
 use spacetimedb::ScheduleAt;
 
+#[cfg(feature = "debug_reducers")]
+use crate::game_corpse_loot;
 use crate::{
     game_aura, game_creature_spawn, game_creature_template, game_threat, game_world_entity,
     WorldEntity,
 };
-#[cfg(feature = "debug_reducers")]
-use crate::{game_corpse_loot, game_spell_cast_event};
 
 pub(crate) const RESPAWN_MICROS: i64 = 15_000_000;
 pub(crate) const CORPSE_DECAY_MICROS: i64 = 60_000_000;
@@ -293,48 +293,6 @@ pub fn debug_set_lethal_damage_floor_health_fixture(
     }
     creature.health = health;
     entities.guid().update(creature);
-    Ok(())
-}
-
-#[cfg(feature = "debug_reducers")]
-#[spacetimedb::reducer]
-pub fn debug_verify_ranged_lethal_damage_floor_fixture(
-    ctx: &ReducerContext,
-    attacker_guid: u64,
-    creature_guid: u64,
-    expected_health: u32,
-    expected_damage_log: u32,
-) -> Result<(), String> {
-    let creature = ctx
-        .db
-        .game_world_entity()
-        .guid()
-        .find(creature_guid)
-        .ok_or_else(|| "fixture ranged target is absent".to_string())?;
-    if creature.health != expected_health {
-        return Err(format!(
-            "fixture ranged health mismatch: actual={} expected={expected_health}",
-            creature.health
-        ));
-    }
-    let damage = ctx
-        .db
-        .game_spell_cast_event()
-        .iter()
-        .filter(|event| {
-            event.caster_guid == attacker_guid
-                && event.target_guid == creature_guid
-                && event.spell_id == 75
-                && event.is_proc_log
-        })
-        .map(|event| event.damage)
-        .max()
-        .unwrap_or(0);
-    if damage != expected_damage_log {
-        return Err(format!(
-            "fixture ranged damage log mismatch: actual={damage} expected={expected_damage_log}"
-        ));
-    }
     Ok(())
 }
 

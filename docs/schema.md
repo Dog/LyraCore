@@ -225,9 +225,9 @@ scan on a sharded realm silently returns a subset rather than erroring, and ever
 `module/src/tripwires.rs::partition_discipline_tripwire` against a whitelist that only ever shrinks.
 
 Six sibling tables carry the **identical** `(map_id, instance_id, grid_x, grid_y)` key so they can
-ride the same AOI box: `game_entity_motion`, `game_creature_spline`, `game_combat_event`,
-`game_spell_cast_event`, `game_spell_impact_event`, `game_emote_event`. `game_roll_event` keeps the
-same key, but nothing writes it: `/roll` is a Group Broadcast.
+ride the same AOI box: `game_entity_motion`, `game_creature_spline`, `game_combat_event_live`,
+`game_spell_cast_event_live`, `game_spell_impact_event_live`, `game_emote_event_live`.
+`game_roll_event` keeps the same key, but nothing writes it: `/roll` is a Group Broadcast.
 `game_gameobject`'s grid key is only three columns (no `instance_id`).
 
 ### `game_character` — the durable character (`module/src/character.rs:7`)
@@ -307,7 +307,7 @@ whose ownership has closed or expired can use null ownership.
 
 ### Chat (`module/src/chat.rs`, `module/src/realm_chat.rs`, `module/src/channel.rs`)
 
-`game_chat_event` is the public `[event]` row for one say, yell, `/e` or creature line on the
+`game_chat_event_live` is the public native event row for one say, yell, `/e` or creature line on the
 speaker's own Shard. The Gateway scopes it to listeners in range when it relays it. Only
 `apply_send_chat` (a Character) and `apply_send_chat_to` (EventAI) write it. A Character's line
 passes the language Gate first.

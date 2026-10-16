@@ -84,6 +84,38 @@ any line in §1 needs a human review before it ships, whoever or whatever wrote 
    realm-wide or partition-managing read, with a one-line justification, and delete budget as scans
    are replaced with helpers — a budget larger than the real count fails its own test.
 
+### Native Relay events
+
+Combat, spell cast, spell impact, Speech and emote notifications use native SpacetimeDB event
+tables. Each adds `_live` to its original table name, such as `game_combat_event_live`.
+The original `game_combat_event`, `game_spell_cast_event`, `game_spell_impact_event`,
+`game_chat_event` and `game_emote_event` remain ordinary tables with their published schemas.
+The two tables share each row type. The Module writes new notifications only to the native table.
+The event reaper expires rows left in the original table after an upgrade.
+
+SpacetimeDB refuses a change to an existing table's event flag. Keep the old declarations and
+their indexes when publishing this additive change. Stop the Gateway, publish the Module to
+every configured Shard, then start the matching Gateway. An old Gateway subscribes to the old
+names and will miss new notifications. Do not clear a Shard to make this migration apply.
+
+Native events reach connected subscribers through insert callbacks. They have no initial replay,
+cached rows, update callbacks or delete callbacks. The Gateway uses the same row fields, audience
+rules and packet rendering for the new tables. Cast notifications carry their start, completion
+or outcome in each row; the Relays do not read a retained event batch. A reconnect restores
+durable state and receives subsequent notifications. Events emitted during a Transport Loss
+are not replayed. Event inserts still enter the commit log, so this change does not replace
+history retention. See the [event table contract](https://spacetimedb.com/docs/tables/event-tables/).
+
+Keep `game_group_event` ordinary. `GroupEventCursor` reads the committed batch and sorts its ids
+before delivery. Keep `game_system_message_event` ordinary because login reads pending messages.
+Pending casts and impacts, Transfer Intent, party command intent and receipts, Mail, invitations
+and other durable work keep their current storage and completion rules.
+
+Durable tests observe notifications through subscriptions opened before the action. A SQL read
+after the action sees an empty native event table. The old debug reducer
+`debug_verify_ranged_lethal_damage_floor_fixture` was removed because it read retained cast logs.
+Its durable test now checks the subscribed damage event and the target's durable health.
+
 ## 2. Tooling gotchas (will silently mislead you)
 
 - **`spacetime sql` (2.5):** NO `ORDER BY`, NO `IN`/subqueries, NO `Timestamp`/`Identity` literal. A

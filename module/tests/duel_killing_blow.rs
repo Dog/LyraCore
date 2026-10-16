@@ -1,6 +1,6 @@
 mod support;
 
-use support::{number, poll_until, Standalone, POLL_TIMEOUT};
+use support::{number, poll_until, wait_for_event_rows, Standalone, POLL_TIMEOUT};
 
 const PLAYER: u64 = 1;
 const DUEL: u64 = 509_0001;
@@ -57,6 +57,10 @@ fn a_duel_ending_swing_is_no_killing_blow() {
         player["map_id"], player["instance_id"]
     ));
 
+    let events = standalone.subscribe(&[
+        &format!("SELECT * FROM game_combat_event_live WHERE attacker_guid = {PLAYER}"),
+        &format!("SELECT * FROM game_duel WHERE id = {DUEL}"),
+    ]);
     standalone.assert_call("debug_engage", &[&PLAYER.to_string(), &rival.to_string()]);
     // A swing may miss or be avoided, so keep making the next one due.
     assert!(
@@ -64,9 +68,10 @@ fn a_duel_ending_swing_is_no_killing_blow() {
             standalone.assert_sql(&format!(
                 "UPDATE game_melee_attack SET last_swing_ms = 1 WHERE attacker_guid = {PLAYER}"
             ));
-            standalone
-                .query_rows(&format!("SELECT id FROM game_duel WHERE id = {DUEL}"))
-                .is_empty()
+            events
+                .deletes("game_duel")
+                .iter()
+                .any(|row| row["id"] == DUEL)
         }),
         "no swing ended the Duel"
     );
@@ -78,9 +83,7 @@ fn a_duel_ending_swing_is_no_killing_blow() {
         .remove(0);
     assert_eq!(rival_row["dead"], "false", "the Duel loser must survive");
     assert_eq!(rival_row["health"], "1");
-    let swings = standalone.query_rows(&format!(
-        "SELECT killing_blow FROM game_combat_event WHERE attacker_guid = {PLAYER}"
-    ));
+    let swings = wait_for_event_rows(&events, "game_combat_event_live");
     assert!(!swings.is_empty(), "the Duel must have ended on a swing");
     assert!(
         swings.iter().all(|swing| swing["killing_blow"] == "false"),

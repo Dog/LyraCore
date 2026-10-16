@@ -45,6 +45,16 @@ pub(crate) mod character_owned_tripwire {
         ),
         (
             &[
+                "game_chat_event_live",
+                "game_combat_event_live",
+                "game_emote_event_live",
+                "game_spell_cast_event_live",
+                "game_spell_impact_event_live",
+            ],
+            "native Relay events discarded after their creating transaction",
+        ),
+        (
+            &[
                 "game_auction_notice",
                 "game_chat_channel_notice_event",
                 "game_chat_event",
@@ -402,18 +412,32 @@ pub(crate) mod character_owned_tripwire {
         String::from_utf8(code).expect("masking Rust source preserves UTF-8")
     }
 
-    pub(super) fn extract_tables(content: &str) -> Vec<(String, String)> {
+    pub(super) fn extract_tables(content: &str) -> Vec<(String, String, bool)> {
         let code = production_code(content);
         let mut out = Vec::new();
         let mut search_from = 0usize;
         while let Some(rel) = code[search_from..].find("#[table(") {
             let attr_start = search_from + rel;
             let attr_rest = &code[attr_start..];
-            let accessor = attr_rest
+            let attr_end = attr_rest.find(")]").expect("table attribute must close");
+            let attributes = &attr_rest["#[table(".len()..attr_end];
+            let mut depth = 0i32;
+            let is_event = attributes.split(',').any(|argument| {
+                let top_level = depth == 0;
+                for byte in argument.bytes() {
+                    match byte {
+                        b'(' | b'[' => depth += 1,
+                        b')' | b']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                top_level && argument.trim() == "event"
+            });
+            let accessor = attributes
                 .find("accessor")
-                .and_then(|i| attr_rest[i..].find('=').map(|eq| i + eq + 1))
+                .and_then(|i| attributes[i..].find('=').map(|eq| i + eq + 1))
                 .map(|name_start| {
-                    let name_rest = attr_rest[name_start..].trim_start();
+                    let name_rest = attributes[name_start..].trim_start();
                     let end = name_rest
                         .find(|c: char| !(c.is_alphanumeric() || c == '_'))
                         .unwrap_or(name_rest.len());
@@ -449,7 +473,7 @@ pub(crate) mod character_owned_tripwire {
             let body_end = body_end
                 .unwrap_or_else(|| panic!("unterminated struct body for accessor {accessor}"));
             let fields = after_struct[body_start..=body_end].to_string();
-            out.push((accessor, fields));
+            out.push((accessor, fields, is_event));
             search_from = attr_start + "#[table(".len();
         }
         out
@@ -535,7 +559,7 @@ pub(crate) mod character_owned_tripwire {
         let markers = character_owned_markers(content);
         extract_tables(content)
             .into_iter()
-            .filter_map(|(accessor, fields)| {
+            .filter_map(|(accessor, fields, _)| {
                 let guids = character_capable_guid_fields(&fields);
                 if guids.is_empty()
                     || NOT_CHARACTER_OWNED
@@ -730,7 +754,7 @@ pub(crate) mod character_owned_tripwire {
             }
             let content = fs::read_to_string(&file)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", file.display()));
-            for (accessor, fields) in extract_tables(&content) {
+            for (accessor, fields, _) in extract_tables(&content) {
                 if !character_capable_guid_fields(&fields).is_empty() {
                     candidates.push(accessor);
                 }
@@ -1251,12 +1275,13 @@ mod gc_reap_tripwire {
         let gc_code = super::character_owned_tripwire::production_code(gc_src);
         super::character_owned_tripwire::extract_tables(content)
             .into_iter()
-            .filter(|(accessor, fields)| {
-                is_ttl_shaped(fields)
+            .filter(|(accessor, fields, is_event)| {
+                !is_event
+                    && is_ttl_shaped(fields)
                     && !EXEMPT_ACCESSORS.contains(&accessor.as_str())
                     && !gc_reaps(&gc_code, accessor)
             })
-            .map(|(accessor, _)| accessor)
+            .map(|(accessor, _, _)| accessor)
             .collect()
     }
 
@@ -1279,7 +1304,7 @@ mod gc_reap_tripwire {
 
         assert!(
             missing.is_empty(),
-            "Invariant: every TTL-shaped event table is reaped in gc.rs.\n\
+            "Invariant: every ordinary TTL-shaped event table is reaped in gc.rs.\n\
              table(s) shaped `id: u64` PK + `created_at: Timestamp` — the TTL-reaped convention \
              every existing short-lived event table uses — with no reap in gc.rs: {missing:?}\n\n\
              A short-lived event table only stops growing without bound if something deletes its \
@@ -1305,6 +1330,26 @@ mod gc_reap_tripwire {
 
         let reaped = "fn reap(ctx: &ReducerContext) {\n    reap!(game_fixture_event);\n}\n";
         assert!(unreaped_tables(table, reaped).is_empty());
+    }
+
+    #[test]
+    fn only_a_native_event_attribute_exempts_a_table_from_gc() {
+        let source = r#"
+            #[table(accessor = game_legacy_event, public,
+                index(accessor = by_payload, btree(columns = [id, event, created_at])))]
+            #[table(accessor = game_native_event, public, event)]
+            pub struct Notification {
+                pub id: u64,
+                pub event: u8,
+                pub created_at: Timestamp,
+            }
+        "#;
+        assert_eq!(unreaped_tables(source, ""), ["game_legacy_event"]);
+        let ordinary = source.replace("public, event)", "public)");
+        assert_eq!(
+            unreaped_tables(&ordinary, ""),
+            ["game_legacy_event", "game_native_event"]
+        );
     }
 }
 

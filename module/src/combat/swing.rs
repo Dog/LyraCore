@@ -2,8 +2,8 @@ use spacetimedb::{reducer, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::spell::SpellCastEventKind;
 use crate::{
-    game_item_instance, game_item_template, game_spell, game_spell_cast_event, game_world_entity,
-    SpellCastEvent, WorldEntity,
+    game_item_instance, game_item_template, game_spell, game_spell_cast_event_live,
+    game_world_entity, SpellCastEvent, WorldEntity,
 };
 
 use super::*;
@@ -152,7 +152,7 @@ fn resolve_offhand_swing(
     let damage = final_damage(ctx, target_guid, dmg);
     let killing_blow = is_killing_blow(ctx, attacker_guid, &target, damage.amount);
 
-    ctx.db.game_combat_event().insert(CombatEvent {
+    ctx.db.game_combat_event_live().insert(CombatEvent {
         damage: damage.amount,
         hit_info,
         killing_blow,
@@ -412,7 +412,7 @@ fn fire_melee_swing(
     let attacker_guid = attacker.guid;
     let target_guid = target.guid;
     let entities = ctx.db.game_world_entity();
-    let events = ctx.db.game_combat_event();
+    let events = ctx.db.game_combat_event_live();
     let melee = ctx.db.game_melee_attack();
 
     let (mut rolled, hit_info, blocked) = roll_swing(ctx, attacker, target);
@@ -446,7 +446,7 @@ fn fire_melee_swing(
                 entities.guid().update(a);
                 swing_is_spell = true;
             } else {
-                ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+                ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
                     is_interrupted: true,
                     failure_reason: crate::spell::CAST_FAIL_NO_POWER,
                     ..SpellCastEvent::signal_at(
@@ -486,7 +486,7 @@ fn fire_melee_swing(
         ..CombatEvent::signal_at(ctx, attacker, target_guid)
     });
     if swing_is_spell {
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             target_guid,
             is_completion: true,
             damage: if queued_fired { projected_swing } else { 0 },
@@ -496,7 +496,7 @@ fn fire_melee_swing(
         });
     }
     if projected_seal > 0 {
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             target_guid,
             damage: projected_seal,
             school: 1,
@@ -620,7 +620,7 @@ fn fire_ranged_shot(
         AUTO_SHOT_PROJECTILE_SPEED
     };
     let travel_ms = crate::spell::projectile_travel_ms(dist_sq.sqrt(), speed);
-    ctx.db.game_combat_event().insert(CombatEvent {
+    ctx.db.game_combat_event_live().insert(CombatEvent {
         damage: 0,
         hit_info,
         ranged_spell_id,
@@ -680,7 +680,7 @@ pub fn ranged_impact(ctx: &ReducerContext, shot: RangedImpactSchedule) {
         Hit::weapon(HitSource::Ranged, false),
     );
     if damage.amount > 0 && shot.ranged_spell_id != 0 {
-        ctx.db.game_spell_cast_event().insert(SpellCastEvent {
+        ctx.db.game_spell_cast_event_live().insert(SpellCastEvent {
             target_guid: shot.target_guid,
             damage: damage.amount,
             is_crit: shot.is_crit,

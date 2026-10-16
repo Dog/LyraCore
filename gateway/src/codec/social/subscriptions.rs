@@ -1102,10 +1102,10 @@ crate::stdb::relays::declare_relays! {
         insert(Snapshot) => |context, _event, row| group_member_mirror_changed(&context.view, &context.coord, context.shard, row);
         delete(Snapshot) => |context, _event, row| group_member_mirror_changed(&context.view, &context.coord, context.shard, row);
     }
-    game_emote_event [false] {
+    game_emote_event_live [false] {
         insert(Snapshot) => |context, _event, row| emote_appeared(&context.view, &context.coord, context.shard, row);
     }
-    game_chat_event [false] {
+    game_chat_event_live [false] {
         insert(Snapshot) => |context, _event, row| chat_appeared(&context.view, &context.coord, context.shard, row);
     }
     game_group_event [true] {

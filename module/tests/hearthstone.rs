@@ -2,7 +2,10 @@ mod support;
 
 use spacetimedb::Timestamp;
 use std::time::Duration;
-use support::{actor, poll_until, Row, Standalone, POLL_TIMEOUT};
+use support::{
+    actor, event_rows, fence_subscription, poll_until, subscribe_with_fence, Row, Standalone,
+    POLL_TIMEOUT,
+};
 
 fn fixture(name: &str) -> Standalone {
     let mut shard = Standalone::start(name);
@@ -39,14 +42,17 @@ fn timestamp(row: &Row) -> i64 {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn hearthstone_recalls_to_the_bound_home_only_after_ten_seconds() {
     let shard = fixture("hearthstone-completion");
+    let casts = subscribe_with_fence(
+        &shard,
+        &["SELECT * FROM game_spell_cast_event_live WHERE spell_id = 8690"],
+    );
     let before = position(&shard);
     let inventory = items(&shard);
     use_hearthstone(&shard);
     assert_eq!(position(&shard), before);
     assert_eq!(items(&shard), inventory);
-    let started = shard.query_rows(
-        "SELECT created_at, cast_time_ms FROM game_spell_cast_event WHERE spell_id = 8690",
-    );
+    fence_subscription(&shard, &casts);
+    let started = event_rows(&casts, "game_spell_cast_event_live");
     assert_eq!(started.len(), 1);
     assert_eq!(started[0]["cast_time_ms"], "10000");
     assert_eq!(
@@ -56,7 +62,10 @@ fn hearthstone_recalls_to_the_bound_home_only_after_ten_seconds() {
     );
     let mut completed = Vec::new();
     assert!(poll_until(POLL_TIMEOUT, || {
-        completed = shard.query_rows("SELECT created_at FROM game_spell_cast_event WHERE spell_id = 8690 AND is_completion = true");
+        completed = event_rows(&casts, "game_spell_cast_event_live")
+            .into_iter()
+            .filter(|row| row["is_completion"] == "true")
+            .collect();
         !completed.is_empty()
     }));
     assert!(timestamp(&completed[0]) - timestamp(&started[0]) >= 10_000_000);

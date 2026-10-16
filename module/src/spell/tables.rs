@@ -199,6 +199,7 @@ pub(crate) enum SpellCastEventKind {
     public,
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y]))
 )]
+#[table(accessor = game_spell_cast_event_live, public, event)]
 pub struct SpellCastEvent {
     #[primary_key]
     #[auto_inc]
@@ -489,6 +490,7 @@ pub struct PendingSpellImpact {
     public,
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y]))
 )]
+#[table(accessor = game_spell_impact_event_live, public, event)]
 pub struct SpellImpactEvent {
     #[primary_key]
     #[auto_inc]

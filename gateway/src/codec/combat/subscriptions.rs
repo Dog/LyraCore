@@ -1139,7 +1139,7 @@ crate::stdb::relays::declare_relays! {
         insert(Snapshot) => |context, _event, row| dynobj_appeared(&context.view, context.shard, row);
         delete(Snapshot) => |context, _event, row| dynobj_vanished(&context.view, context.shard, row);
     }
-    game_combat_event [false] {
+    game_combat_event_live [false] {
         insert(Snapshot) => |context, _event, row| combat_event_appeared(&context.view, context.shard, row);
     }
     game_melee_attack [false] {
@@ -1147,10 +1147,10 @@ crate::stdb::relays::declare_relays! {
         update(Snapshot) => |context, _event, old, row| melee_updated(&context.view, context.shard, old, row);
         delete(Snapshot) => |context, _event, row| melee_disengaged(&context.view, context.shard, row);
     }
-    game_spell_cast_event [false] {
+    game_spell_cast_event_live [false] {
         insert(Snapshot) => |context, _event, row| cast_event_appeared(&context.view, context.shard, row);
     }
-    game_spell_impact_event [false] {
+    game_spell_impact_event_live [false] {
         insert(Snapshot) => |context, _event, row| impact_appeared(&context.view, context.shard, row);
     }
     game_aura [false] {
