@@ -625,7 +625,7 @@ impl FlightEndSink for CtxFlightEndSink<'_> {
         player.mount_display_id = cleared.mount_display_id;
         player.unit_flags = cleared.unit_flags;
         player.movement_flags = cleared.movement_flags;
-        self.ctx.db.game_world_entity().guid().update(player);
+        player.update(self.ctx);
     }
 
     fn project_character(
@@ -1000,7 +1000,7 @@ pub fn gw_activate_taxi(
         };
         ctx.db.game_active_taxi_flight().insert(flight);
         player.money = player_state.money;
-        ctx.db.game_world_entity().guid().update(player);
+        player.update(ctx);
         Ok(())
     })();
 
@@ -1062,7 +1062,7 @@ pub(crate) fn arm_taxi_flight(ctx: &ReducerContext, character_guid: u64) {
         .game_active_taxi_flight()
         .character_guid()
         .update(flight);
-    ctx.db.game_world_entity().guid().update(player);
+    player.update(ctx);
     write_passenger_spline(ctx, spline);
     ctx.db
         .game_taxi_flight_schedule()
@@ -1150,7 +1150,7 @@ pub fn advance_taxi_flight(ctx: &ReducerContext, schedule: TaxiFlightSchedule) {
     flight.current_node_index = position.point_index as u32;
     let spline = should_refresh_spline(previous_cell, (grid_x, grid_y), crossed_point)
         .then(|| remaining_spline(&flight, &player, &points, position, elapsed));
-    ctx.db.game_world_entity().guid().update(player);
+    player.update(ctx);
     ctx.db
         .game_active_taxi_flight()
         .character_guid()

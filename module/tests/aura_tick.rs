@@ -17,10 +17,10 @@ fn a_periodic_kill_commits_the_death_and_an_unrelated_heal() {
     standalone.assert_sql("DELETE FROM game_melee_schedule");
     standalone.assert_call("debug_spawn_player_entity", &[&CHARACTER.to_string()]);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 1, max_health = 1 WHERE guid = {WOLF}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 1, max_health = 1 WHERE guid = {WOLF}"
     ));
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 50, max_health = 100 WHERE guid = {CHARACTER}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 50, max_health = 100 WHERE guid = {CHARACTER}"
     ));
     assert_eq!(health(&standalone, WOLF), 1);
     standalone.assert_call(

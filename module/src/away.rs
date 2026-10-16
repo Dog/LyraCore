@@ -1,6 +1,5 @@
 use spacetimedb::{table, ReducerContext, Table};
 
-use crate::game_world_entity;
 use lyracore_shared::chat::chat_kind;
 use lyracore_shared::constants::player_flags;
 
@@ -74,7 +73,7 @@ pub(crate) fn apply_set_away(
     let character_guid = entity.guid;
     if change.player_flags != entity.player_flags {
         entity.player_flags = change.player_flags;
-        ctx.db.game_world_entity().guid().update(entity);
+        entity.update(ctx);
     }
     write_reply(ctx, character_guid, change.reply);
     Ok(())

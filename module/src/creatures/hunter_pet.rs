@@ -128,7 +128,7 @@ pub(crate) fn publish_hunter_pet_protocol(
         };
         if flags != live.unit_flags {
             live.unit_flags = flags;
-            ctx.db.game_world_entity().guid().update(live);
+            live.update(ctx);
         }
     }
     let row = HunterPetProtocol {

@@ -3,7 +3,7 @@ use spacetimedb::{reducer, table, ReducerContext, Table, Timestamp};
 
 use crate::game_item_instance;
 use crate::game_item_template;
-use crate::game_world_entity;
+
 use crate::items::ItemSnapshot;
 #[table(accessor = game_mail, public, index(accessor = by_recipient, btree(columns = [recipient_guid])))]
 pub struct Mail {
@@ -310,7 +310,7 @@ pub(crate) fn debit_purse(
         return Err(unaffordable.to_string());
     }
     payer.money -= copper;
-    ctx.db.game_world_entity().guid().update(payer);
+    payer.update(ctx);
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
@@ -423,7 +423,7 @@ pub(crate) fn apply_take_money(
     let mut taker = crate::helpers::acting_entity_by_guid(ctx, recipient_guid)
         .ok_or_else(|| lyracore_shared::mail::NOT_IN_WORLD.to_string())?;
     taker.money = credited(taker.money, money);
-    ctx.db.game_world_entity().guid().update(taker);
+    taker.update(ctx);
     clear_mail_money(ctx, mail_id);
     Ok(())
 }

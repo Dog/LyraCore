@@ -290,7 +290,7 @@ pub(crate) fn apply_relay_orientation(
         .filter(|entity| !entity.is_player() && !entity.dead)
         .ok_or_else(|| format!("relay facing subject {creature_guid} is unavailable"))?;
     creature.orientation = orientation;
-    entities.guid().update(creature);
+    creature.update(ctx);
     Ok(())
 }
 

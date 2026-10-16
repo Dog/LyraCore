@@ -1,7 +1,5 @@
 use spacetimedb::{table, ReducerContext, Table};
 
-#[cfg(feature = "debug_reducers")]
-use crate::game_world_entity;
 use crate::xp::XpEvent;
 use crate::{game_xp_event, WorldEntity};
 
@@ -92,6 +90,6 @@ pub fn debug_explore_at(
     if let Some(area) = crate::terrain::area_at(ctx, map_id, x, y) {
         check_area_exploration(ctx, &mut e, &area);
     }
-    ctx.db.game_world_entity().guid().update(e);
+    e.update(ctx);
     Ok(())
 }

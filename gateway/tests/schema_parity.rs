@@ -658,7 +658,7 @@ parity_test!(parity_game_world_entity, "game_world_entity", lyracore_module::Wor
     sheet_str_bonus, sheet_agi_bonus, sheet_sta_bonus, sheet_int_bonus, sheet_spi_bonus,
     sheet_ap_base, sheet_ap_mods, sheet_dmg_min, sheet_dmg_max, sheet_crit_bp, unit_bytes_2,
     bank_bag_slots, mount_display_id, zone_id, sheet_ranged_ap, sheet_ranged_dmg_min,
-    sheet_ranged_dmg_max,
+    sheet_ranged_dmg_max, regeneration_pending, combat_active, simulation_indexed,
 });
 parity_test!(parity_game_zone_weather, "game_zone_weather", lyracore_module::ZoneWeather, bindings::zone_weather_type::ZoneWeather, {
     zone_id, weather_type, intensity, changed_at_micros,

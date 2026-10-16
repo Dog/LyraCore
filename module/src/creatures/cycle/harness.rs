@@ -933,14 +933,20 @@ impl Scenario {
         started_micros: u64,
         dur_ms: u32,
     ) -> Self {
+        let partition = self
+            .creatures
+            .borrow()
+            .get(&guid)
+            .map(|creature| (creature.map_id, creature.instance_id))
+            .unwrap_or((MAP, INSTANCE));
         self.legs.borrow_mut().push(LegInFlight {
             guid,
             start,
             dest,
             started_micros,
             dur_ms,
-            map_id: MAP,
-            instance_id: INSTANCE,
+            map_id: partition.0,
+            instance_id: partition.1,
             mover_gone: !self.creatures.borrow().contains_key(&guid),
             waypoints: Vec::new(),
         });
@@ -1005,8 +1011,13 @@ impl MotionSink for Scenario {
             .contains(&leg.guid)
             .then(|| self.at(leg.guid).at)
     }
-    fn legs_in_flight(&self) -> Vec<LegInFlight> {
-        self.legs.borrow().clone()
+    fn legs_in_flight(&self, scope: &TickScope) -> Vec<LegInFlight> {
+        self.legs
+            .borrow()
+            .iter()
+            .filter(|leg| scope.covers(leg.instance_id))
+            .cloned()
+            .collect()
     }
     fn movement_suppressed(&self, guid: u64) -> bool {
         self.cc(guid).2
@@ -3119,6 +3130,32 @@ fn a_creature_mid_flight_moves_to_the_point_its_client_renders() {
         w.has_leg(WOLF),
         "a leg still in flight must keep playing; forgetting it strands the creature mid-route"
     );
+}
+
+#[test]
+fn a_dedicated_firing_advances_only_its_instance_splines() {
+    let start = p(0.0, 0.0, 10.0);
+    let dest = p(10.0, 0.0, 10.0);
+    let mut w = Scenario::new(HALF_WAY)
+        .creature(WOLF, start)
+        .in_instance(WOLF, DEDICATED)
+        .flying(WOLF, start, dest, 0, LEG_MS)
+        .creature(PACK_MATE, start)
+        .flying(PACK_MATE, start, dest, 0, LEG_MS);
+    let tick = w.tick(false, TickScope::Only(DEDICATED));
+    let outcome = run_cycle(&mut w, tick);
+    assert_eq!(w.at(WOLF).at, p(5.0, 0.0, 10.0));
+    assert_eq!(w.at(PACK_MATE).at, start);
+    assert_eq!(outcome.rows_visited[0], ("advance", 1));
+
+    let tick = w.tick(
+        false,
+        TickScope::from_rows(crate::creatures::GLOBAL_TICK_INSTANCE, [DEDICATED]),
+    );
+    let outcome = run_cycle(&mut w, tick);
+    assert_eq!(w.at(WOLF).at, p(5.0, 0.0, 10.0));
+    assert_eq!(w.at(PACK_MATE).at, p(5.0, 0.0, 10.0));
+    assert_eq!(outcome.rows_visited[0], ("advance", 1));
 }
 
 #[test]

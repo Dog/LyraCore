@@ -262,7 +262,7 @@ pub(crate) fn award_xp(
         rested_bonus: award - base,
     });
     grant_xp(ctx, &mut p, award);
-    entities.guid().update(p);
+    p.update(ctx);
 }
 
 pub(crate) fn grant_xp(ctx: &ReducerContext, p: &mut WorldEntity, amount: u32) {
@@ -336,7 +336,7 @@ pub(crate) fn grant_xp(ctx: &ReducerContext, p: &mut WorldEntity, amount: u32) {
         let entities = ctx.db.game_world_entity();
         if let Some(placeholder) = entities.guid().find(p.guid) {
             let moved = std::mem::replace(p, placeholder);
-            entities.guid().update(moved);
+            moved.update(ctx);
             crate::spell::recompute_sheet(ctx, p.guid);
             if let Some(fresh) = entities.guid().find(p.guid) {
                 *p = fresh;

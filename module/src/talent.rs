@@ -549,7 +549,7 @@ pub(crate) fn do_reset_talents(
     }
 
     entity.money = entity.money.saturating_sub(cost);
-    entities.guid().update(entity);
+    entity.update(ctx);
     character.respec_count += 1;
     chars.guid().update(character);
     Ok(cost)

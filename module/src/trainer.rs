@@ -478,7 +478,7 @@ pub(crate) fn apply_trainer_buy(
         Ok(()) => {
             caster.money = caster.money.saturating_sub(offered.cost);
             let owner = caster.owner_identity;
-            entities.guid().update(caster);
+            caster.update(ctx);
             match grant {
                 BuyGrant::Profession(line, cap) => {
                     crate::skill::learn_profession(ctx, caster_guid, owner, line, cap as u16)

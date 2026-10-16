@@ -29,10 +29,10 @@ fn damage_heal_and_energize_ticks_each_log_their_outcome() {
     standalone.assert_sql("DELETE FROM game_melee_schedule");
     standalone.assert_call("debug_spawn_player_entity", &[&CHARACTER.to_string()]);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 100, max_health = 100 WHERE guid = {WOLF}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 100, max_health = 100 WHERE guid = {WOLF}"
     ));
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 50, max_health = 100, power = 0, max_power = 100 \
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 50, max_health = 100, power = 0, max_power = 100 \
          WHERE guid = {CHARACTER}"
     ));
     let character = standalone
@@ -136,7 +136,7 @@ fn a_direct_energize_records_the_power_given_on_the_go() {
         (SELF_ENERGIZE as u64) << 2
     ));
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET power = 0, max_power = 100 WHERE guid = {CHARACTER}"
+        "UPDATE game_world_entity SET simulation_indexed = false, power = 0, max_power = 100 WHERE guid = {CHARACTER}"
     ));
     let character = standalone
         .query_rows(&format!(
@@ -206,7 +206,7 @@ fn a_resisted_spell_lands_none_of_its_effects_and_reports_the_resist() {
         "UPDATE game_world_entity SET level = 1 WHERE guid = {CHARACTER}"
     ));
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET level = 60, health = 100000, max_health = 100000 \
+        "UPDATE game_world_entity SET simulation_indexed = false, level = 60, health = 100000, max_health = 100000 \
          WHERE guid = {wolf}"
     ));
     standalone.assert_sql(&format!(

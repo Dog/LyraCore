@@ -63,7 +63,7 @@ fn an_e_line_is_one_universal_row_and_a_dead_or_creature_only_type_is_refused() 
     );
 
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET dead = true WHERE guid = {CHARACTER}"
+        "UPDATE game_world_entity SET simulation_indexed = false, dead = true WHERE guid = {CHARACTER}"
     ));
     refused(
         &standalone,

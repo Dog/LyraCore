@@ -115,7 +115,7 @@ pub(crate) struct CycleOutcome {
 }
 
 pub(crate) trait MotionSink {
-    fn legs_in_flight(&self) -> Vec<LegInFlight>;
+    fn legs_in_flight(&self, scope: &TickScope) -> Vec<LegInFlight>;
     fn path_obstruction(&self, leg: &LegInFlight, now_micros: u64) -> Option<Point>;
     fn movement_suppressed(&self, guid: u64) -> bool;
     fn commit_position(&mut self, guid: u64, at: Point, moved_ms: u32);
@@ -543,7 +543,7 @@ pub(crate) fn run_cycle<W: CreatureWorld>(w: &mut W, tick: TickContext) -> Cycle
 
 fn advance_legs<W: MotionSink>(w: &mut W, tick: &TickContext) -> usize {
     let mut visited = 0usize;
-    for leg in w.legs_in_flight() {
+    for leg in w.legs_in_flight(&tick.scope) {
         if leg.mover_gone {
             w.drop_leg(leg.guid);
             continue;

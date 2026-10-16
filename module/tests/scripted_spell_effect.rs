@@ -59,7 +59,7 @@ fn an_enabled_scripted_effect_heals_the_resolved_target_and_credits_xp_to_the_ca
     let wolf = spawn_wolf(&standalone);
     prevent_scheduled_regeneration(&standalone, wolf);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 50, max_health = 1000 WHERE guid = {wolf}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 50, max_health = 1000 WHERE guid = {wolf}"
     ));
     let xp_before = xp(&standalone, PLAYER);
 
@@ -115,7 +115,7 @@ fn a_scripted_effect_with_script_id_zero_stays_the_vanilla_no_op() {
     let wolf = spawn_wolf(&standalone);
     prevent_scheduled_regeneration(&standalone, wolf);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 50, max_health = 1000 WHERE guid = {wolf}"
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 50, max_health = 1000 WHERE guid = {wolf}"
     ));
     let xp_before = xp(&standalone, PLAYER);
 
@@ -274,7 +274,7 @@ fn a_failing_scripted_effect_discards_only_its_own_staged_effects() {
     let wolf = spawn_wolf(&standalone);
     prevent_scheduled_regeneration(&standalone, wolf);
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET health = 100, max_health = 100000 WHERE guid = {wolf}",
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 100, max_health = 100000 WHERE guid = {wolf}",
     ));
 
     standalone.assert_call(
@@ -378,7 +378,7 @@ fn prevent_scheduled_regeneration(standalone: &Standalone, guid: u64) {
         .parse::<u32>()
         .expect("unit flags are a number");
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_flags = {}, combat_until_ms = {} WHERE guid = {guid}",
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_flags = {}, combat_until_ms = {} WHERE guid = {guid}",
         flags | unit_flags::IN_COMBAT,
         u64::MAX,
     ));

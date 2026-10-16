@@ -119,7 +119,7 @@ fn direct_pools_and_regeneration_follow_working_equipment() {
     shard.assert_sql(
         "UPDATE game_item_instance SET durability = 70 WHERE owner_guid = 1 AND slot = 15",
     );
-    shard.assert_sql("UPDATE game_world_entity SET health = 100, max_health = 100000, power = 100, max_power = 100000, spirit = 30, mana_regen_paused_until_ms = 0 WHERE guid = 1");
+    shard.assert_sql("UPDATE game_world_entity SET simulation_indexed = false, health = 100, max_health = 100000, power = 100, max_power = 100000, spirit = 30, mana_regen_paused_until_ms = 0 WHERE guid = 1");
     assert!(
         poll_until(POLL_TIMEOUT, || {
             let row = world_row(&shard);
@@ -128,7 +128,7 @@ fn direct_pools_and_regeneration_follow_working_equipment() {
         "the scheduled regeneration pass did not apply the expected health and mana"
     );
 
-    shard.assert_sql("UPDATE game_world_entity SET power = 100, mana_regen_paused_until_ms = 9999999999999 WHERE guid = 1");
+    shard.assert_sql("UPDATE game_world_entity SET simulation_indexed = false, power = 100, mana_regen_paused_until_ms = 9999999999999 WHERE guid = 1");
     assert!(
         poll_until(POLL_TIMEOUT, || world_row(&shard)["power"] == "108"),
         "flat mana regeneration stopped during the five-second rule"
@@ -141,7 +141,7 @@ fn direct_pools_and_regeneration_follow_working_equipment() {
         .unwrap()["guid"]
         .clone();
     shard.assert_sql(
-        "UPDATE game_world_entity SET health = 100, power = 100000, godmode = true WHERE guid = 1",
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 100, power = 100000, godmode = true WHERE guid = 1",
     );
     shard.assert_call("debug_engage", &[&wolf, "1"]);
     assert!(
@@ -285,7 +285,7 @@ fn spell_power_selects_school_and_healing_power_only_affects_heals() {
     shard.assert_sql("INSERT INTO game_spell (spell_id,name,power_type,cost,cast_time_ms,gcd_ms,cooldown_ms,range_yd,duration_ms,school_mask,dispel_type,mechanic,max_stacks,aura_interrupt,attributes,spell_level,max_level,is_negative,cast_flags,stances,family_name,family_flags,proc_flags,proc_chance,proc_charges) VALUES (5090233,'Stat fixture heal',0,0,0,0,0,40,0,2,0,0,0,0,0,1,0,false,0,0,0,0,0,0,0)");
     shard.assert_sql("INSERT INTO game_spell_effect (id,spell_id,effect_index,kind,base_points,die_sides,per_level,period_ms,target,radius_yd,chain_targets,trigger_spell,effect_mechanic,p0,p0_kind,p1,script_id,enters_combat) VALUES (20360932,5090233,0,2,100,0,0.0,0,0,0.0,0,0,0,0,0,0,0,false)");
     shard
-        .assert_sql("UPDATE game_world_entity SET health = 100, max_health = 10000 WHERE guid = 1");
+        .assert_sql("UPDATE game_world_entity SET simulation_indexed = false, health = 100, max_health = 10000 WHERE guid = 1");
     shard.assert_call("debug_cast_at", &["1", "5090233", "1"]);
     let healed: u32 = world_row(&shard)["health"].parse().unwrap();
     assert_eq!(
@@ -322,7 +322,7 @@ fn weapon_damage_uses_the_selected_main_off_and_ranged_item() {
         .unwrap()["guid"]
         .clone();
     shard.assert_sql(&format!(
-        "UPDATE game_world_entity SET armor = 0, health = 100000, max_health = 100000 WHERE guid = {wolf}"
+        "UPDATE game_world_entity SET simulation_indexed = false, armor = 0, health = 100000, max_health = 100000 WHERE guid = {wolf}"
     ));
     shard.assert_call("debug_compute_swing", &["1", &wolf]);
     let main = readout(&shard, "swing");
@@ -349,7 +349,7 @@ fn weapon_damage_uses_the_selected_main_off_and_ranged_item() {
         "UPDATE game_item_template SET inventory_type = 22, subclass = 7 WHERE entry = {ITEM}"
     ));
     shard.assert_sql("UPDATE game_item_instance SET slot = 16, durability = 70 WHERE owner_guid = 1 AND slot = 17");
-    shard.assert_sql("UPDATE game_world_entity SET strength = 0, agility = 0, health = 100000, max_health = 100000 WHERE guid = 1");
+    shard.assert_sql("UPDATE game_world_entity SET simulation_indexed = false, strength = 0, agility = 0, health = 100000, max_health = 100000 WHERE guid = 1");
     let swings = shard.subscribe(&["SELECT * FROM game_combat_event_live WHERE attacker_guid = 1"]);
     shard.assert_call("debug_engage", &["1", &wolf]);
     assert!(

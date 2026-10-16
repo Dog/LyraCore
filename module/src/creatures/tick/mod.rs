@@ -2,8 +2,8 @@ use lyracore_shared::spatial;
 use spacetimedb::{log, reducer, table, ReducerContext, ScheduleAt, Table, Timestamp};
 
 use crate::{
-    game_aura, game_creature_ai_state, game_entity_motion, game_melee_attack,
-    game_sessionless_action_consent, game_world_entity, WorldEntity,
+    game_creature_ai_state, game_entity_motion, game_melee_attack, game_sessionless_action_consent,
+    game_world_entity, WorldEntity,
 };
 
 use super::*;
@@ -36,6 +36,7 @@ pub struct CreatureMoveEvent {
 #[table(
     accessor = game_creature_spline,
     public,
+    index(accessor = by_instance, btree(columns = [instance_id])),
     index(accessor = by_grid, btree(columns = [map_id, instance_id, grid_x, grid_y])),
     // AOI subscriptions require three equality columns in SpacetimeDB 2.7.1.
     index(accessor = by_cell, btree(columns = [map_id, instance_id, cell]))
@@ -109,22 +110,15 @@ pub fn tick_creatures(ctx: &ReducerContext, schedule: CreatureMoveSchedule) {
         sense_secs: sense_period_secs_for_interval(interval_micros),
         scope,
     };
-    let (sense, global, scope_label) = (
-        tick.sense,
-        tick.scope.runs_global_passes(),
-        scope_label(&tick.scope),
-    );
+    let (sense, scope_label) = (tick.sense, scope_label(&tick.scope));
 
     let outcome = crate::creatures::cycle::run(ctx, tick);
 
-    if global {
-        log_active_cell_stats(ctx, outcome.awake);
-        log_narrowed_pass_stats(ctx);
-    }
     log_pass_stats(
         ctx,
         &scope_label,
         sense,
+        outcome.awake,
         &outcome.rows_visited,
         interval_micros,
     );
@@ -137,11 +131,9 @@ fn active_cell_radius(ctx: &ReducerContext) -> f32 {
 
     let templates = ctx.db.game_creature_template();
     let cutoff = crate::creatures::ai::aggro_override_cutoff(visible);
-    if templates.by_aggro_range().filter(cutoff..).next().is_none() {
-        return visible;
-    }
     let template_aggro_max = templates
-        .iter()
+        .by_aggro_range()
+        .filter(cutoff..)
         .map(|t| t.aggro_range as f32)
         .fold(0.0_f32, f32::max);
     combat_active_radius(template_aggro_max).max(visible)
@@ -162,14 +154,20 @@ pub(crate) fn active_cell_creatures(
     let mut in_combat: Vec<u64> = Vec::new();
 
     if sense {
-        let global = scope.runs_global_passes();
-        for e in entities.iter() {
-            if e.owner_guid != 0 {
-                pets.push(e.guid);
-            }
-            if global && e.unit_flags & lyracore_shared::constants::unit_flags::IN_COMBAT != 0 {
-                in_combat.push(e.guid);
-            }
+        pets.extend(
+            entities
+                .by_owner_guid()
+                .filter(1u64..)
+                .filter(|entity| scope.covers(entity.instance_id))
+                .map(|entity| entity.guid),
+        );
+        if scope.runs_global_passes() {
+            in_combat.extend(
+                entities
+                    .by_combat_active()
+                    .filter(true)
+                    .map(|entity| entity.guid),
+            );
         }
     }
 
@@ -235,39 +233,6 @@ pub(crate) struct TickSweep {
     pub(crate) in_combat: Vec<u64>,
 }
 
-fn log_active_cell_stats(ctx: &ReducerContext, awake: usize) {
-    let us = ctx.timestamp.to_micros_since_unix_epoch();
-    if us.rem_euclid(ACTIVE_CELL_LOG_PERIOD_MICROS) >= MOVE_TICK_MICROS {
-        return;
-    }
-    let total = ctx
-        .db
-        .game_world_entity()
-        .iter()
-        .filter(|e| !e.is_player())
-        .count();
-    log::info!("tick_creatures active-cell: {awake}/{total} creatures visited this tick");
-}
-
-fn log_narrowed_pass_stats(ctx: &ReducerContext) {
-    let us = ctx.timestamp.to_micros_since_unix_epoch();
-    if us.rem_euclid(ACTIVE_CELL_LOG_PERIOD_MICROS) >= MOVE_TICK_MICROS {
-        return;
-    }
-    let total_all = ctx.db.game_world_entity().iter().count();
-    let melee_rows = ctx.db.game_melee_attack().iter().count();
-    let fear_rows = ctx
-        .db
-        .game_aura()
-        .iter()
-        .filter(|a| a.eff_kind == crate::spell::A_CONTROL && a.eff_p0 == crate::spell::M_FEAR)
-        .count();
-    log::info!(
-        "tick_creatures narrowed passes: cast/rout visit {melee_rows} melee rows, \
-         fear visits {fear_rows} aura rows, vs {total_all} entities in the full catalogue"
-    );
-}
-
 fn scope_label(scope: &TickScope) -> String {
     match scope {
         TickScope::CatchAll { dedicated } => {
@@ -281,6 +246,7 @@ fn log_pass_stats(
     ctx: &ReducerContext,
     scope_label: &str,
     sense: bool,
+    awake: usize,
     rows_visited: &[(&'static str, u64)],
     interval_micros: i64,
 ) {
@@ -294,7 +260,7 @@ fn log_pass_stats(
         .collect::<Vec<_>>()
         .join(" ");
     log::info!(
-        "tick_creatures pass rows-visited: scope={scope_label} sense={sense} {body} (*=full-table scan, scales with world not instances)"
+        "tick_creatures pass rows-visited: scope={scope_label} sense={sense} awake={awake} {body} (*=global pass)"
     );
 }
 
@@ -410,7 +376,7 @@ pub(crate) fn emit_creature_path(
     }
     if length <= 0.0 {
         stop_where_rendered(ctx, &mut mover);
-        ctx.db.game_world_entity().guid().update(mover);
+        mover.update(ctx);
         return;
     }
     let speed = if run { speeds::RUN } else { speeds::WALK };
@@ -439,7 +405,7 @@ pub(crate) fn emit_creature_path(
     }
     mover.orientation = (points[0].1 - mover.y).atan2(points[0].0 - mover.x);
     mover.last_move_ms = now_ms(ctx);
-    ctx.db.game_world_entity().guid().update(mover);
+    mover.update(ctx);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,7 +444,7 @@ pub(crate) fn emit_creature_leg(
     if set_leg_ends {
         e.leg_ends_ms = now_ms + duration_ms;
     }
-    ctx.db.game_world_entity().guid().update(e);
+    e.update(ctx);
 }
 
 pub(crate) fn stop_where_rendered(ctx: &ReducerContext, mover: &mut WorldEntity) {

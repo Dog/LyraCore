@@ -259,11 +259,11 @@ pub(crate) fn apply_gm_command(
     match cmd {
         GmCommand::Speed(mult) => {
             caller.run_speed_mult_bp = (mult * 10_000.0).round() as u32;
-            entities.guid().update(caller);
+            caller.update(ctx);
         }
         GmCommand::God(explicit) => {
             caller.godmode = explicit.unwrap_or(!caller.godmode);
-            entities.guid().update(caller);
+            caller.update(ctx);
         }
         GmCommand::XpRate(mult) => {
             let cfg = ctx.db.game_world_config();
@@ -280,7 +280,7 @@ pub(crate) fn apply_gm_command(
         GmCommand::Money(copper) => {
             let guid = caller.guid;
             caller.money = copper;
-            entities.guid().update(caller);
+            caller.update(ctx);
             let chars = ctx.db.game_character();
             if let Some(mut c) = chars.guid().find(guid) {
                 c.money = copper;
@@ -290,7 +290,7 @@ pub(crate) fn apply_gm_command(
         GmCommand::Heal => {
             caller.health = caller.max_health;
             caller.power = caller.max_power;
-            entities.guid().update(caller);
+            caller.update(ctx);
         }
         GmCommand::Gps => {
             return Err(format!(

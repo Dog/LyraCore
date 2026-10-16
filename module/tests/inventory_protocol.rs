@@ -32,7 +32,9 @@ fn inventory_changes_preserve_accepted_trade_items() {
         "UPDATE game_world_entity SET x = 100, y = 100, z = 100, money = 100 WHERE guid = {other}"
     ));
     shard.assert_sql("UPDATE game_world_entity SET money = 0 WHERE guid = 1");
-    shard.assert_sql("UPDATE game_world_entity SET health = 1 WHERE guid = 1");
+    shard.assert_sql(
+        "UPDATE game_world_entity SET simulation_indexed = false, health = 1 WHERE guid = 1",
+    );
     shard.assert_call("debug_grant_item", &["1", "5090052", "15"]);
     shard.assert_call("debug_split_item", &["1", "23", "5", "24"]);
     shard.assert_call("debug_grant_item", &["1", "5090050", "1"]);
@@ -87,7 +89,9 @@ fn inventory_changes_preserve_accepted_trade_items() {
     shard.assert_sql("UPDATE game_spell_reagent SET item_entry = 5090054 WHERE id = 40721368");
     shard.assert_sql("INSERT INTO game_spell_reagent (id,spell_id,item_entry,count) VALUES (40721369,5090171,5090052,1)");
     shard.assert_sql("DELETE FROM game_creature_move_schedule");
-    shard.assert_sql("UPDATE game_world_entity SET power = 100 WHERE guid = 1");
+    shard.assert_sql(
+        "UPDATE game_world_entity SET simulation_indexed = false, power = 100 WHERE guid = 1",
+    );
     let before_craft = shard.query_rows("SELECT * FROM game_item_instance");
     shard.assert_call("debug_begin_cast", &["1", "5090171", "1"]);
     assert_eq!(

@@ -139,7 +139,6 @@ fn refreshed_pet_health(
 }
 
 fn refresh_live_level(ctx: &ReducerContext, pet: &HunterPet, level: u32) {
-    let entities = ctx.db.game_world_entity();
     let Some(mut live) = super::pet_of(ctx, pet.owner_guid) else {
         return;
     };
@@ -153,7 +152,7 @@ fn refresh_live_level(ctx: &ReducerContext, pet: &HunterPet, level: u32) {
         .find(pet.creature_entry)
     else {
         live.level = level;
-        entities.guid().update(live);
+        live.update(ctx);
         return;
     };
     let base_health = super::scale_health_for_rank(template.health, template.rank);
@@ -167,7 +166,7 @@ fn refresh_live_level(ctx: &ReducerContext, pet: &HunterPet, level: u32) {
     live.level = level;
     live.health = health;
     live.max_health = max_health;
-    entities.guid().update(live);
+    live.update(ctx);
 }
 
 fn eligible_live_pet(pet_id: u64, kind: super::PetKind, dead: bool) -> bool {

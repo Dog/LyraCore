@@ -100,8 +100,8 @@ pub enum RayFlavor {
 }
 
 // Triangles span cells, so choose the globally nearest hit across every crossed cell.
-pub fn cast_ray(
-    fetch: &mut impl FnMut(u16, u16) -> Option<Vec<VmapTri>>,
+pub fn cast_ray<T: AsRef<[VmapTri]>>(
+    fetch: &mut impl FnMut(u16, u16) -> Option<T>,
     a: [f32; 3],
     b: [f32; 3],
     flavor: RayFlavor,
@@ -111,8 +111,8 @@ pub fn cast_ray(
     nearest_hit(fetch, a, b, want).map(|(t, _)| point_at(a, b, t))
 }
 
-pub fn cast_floor(
-    fetch: &mut impl FnMut(u16, u16) -> Option<Vec<VmapTri>>,
+pub fn cast_floor<T: AsRef<[VmapTri]>>(
+    fetch: &mut impl FnMut(u16, u16) -> Option<T>,
     a: [f32; 3],
     b: [f32; 3],
 ) -> Option<[f32; 3]> {
@@ -134,8 +134,8 @@ pub fn supports_walking(normal: [f32; 3], up: [f32; 3]) -> bool {
         && alignment * alignment >= 50.0f32.to_radians().cos().powi(2) * lengths_squared
 }
 
-fn nearest_hit(
-    fetch: &mut impl FnMut(u16, u16) -> Option<Vec<VmapTri>>,
+fn nearest_hit<T: AsRef<[VmapTri]>>(
+    fetch: &mut impl FnMut(u16, u16) -> Option<T>,
     a: [f32; 3],
     b: [f32; 3],
     want: impl Fn(&VmapTri) -> bool,
@@ -145,7 +145,7 @@ fn nearest_hit(
         let Some(tris) = fetch(cx, cy) else {
             continue;
         };
-        for t in &tris {
+        for t in tris.as_ref() {
             if !want(t) {
                 continue;
             }
@@ -176,8 +176,8 @@ pub fn group_is_indoor(mogp_flags: u32) -> bool {
 
 pub const AREA_PROBE_DOWN_YD: f32 = 10.0;
 
-pub fn cast_ray_area(
-    fetch: &mut impl FnMut(u16, u16) -> Option<Vec<VmapTri>>,
+pub fn cast_ray_area<T: AsRef<[VmapTri]>>(
+    fetch: &mut impl FnMut(u16, u16) -> Option<T>,
     a: [f32; 3],
     b: [f32; 3],
 ) -> Option<AreaInfo> {
@@ -386,7 +386,7 @@ mod tests {
         let bottom = [0.25, 0.25, 0.0];
         let mut fetch = |_, _| Some(vec![tri(5.0, class), tri(10.0, TriClass::M2)]);
         assert!((cast_floor(&mut fetch, top, bottom).unwrap()[2] - 10.0).abs() < 0.001);
-        assert!(cast_floor(&mut |_, _| None, top, bottom).is_none());
+        assert!(cast_floor(&mut |_, _| None::<Vec<VmapTri>>, top, bottom).is_none());
     }
 
     #[test]
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn a_probe_with_no_wmo_geometry_in_range_finds_no_area() {
-        let mut fetch = |_fx: u16, _fy: u16| None;
+        let mut fetch = |_fx: u16, _fy: u16| None::<Vec<VmapTri>>;
         assert_eq!(
             cast_ray_area(&mut fetch, [0.0, 0.0, 15.0], [0.0, 0.0, -5.0]),
             None

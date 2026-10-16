@@ -837,7 +837,7 @@ pub(crate) fn request_turn_in_quest(
         });
         crate::xp::grant_xp(ctx, &mut player, xp);
     }
-    entities.guid().update(player);
+    player.update(ctx);
 
     crate::reputation::grant_reputation(
         ctx,
@@ -918,7 +918,7 @@ pub fn debug_stage_choice_reward_fixture(
     giver.grid_x = grid_x;
     giver.grid_y = grid_y;
     giver.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
-    entities.insert(giver);
+    giver.insert(ctx);
 
     let templates = ctx.db.game_item_template();
     for entry in [
@@ -1049,7 +1049,7 @@ pub fn debug_stage_choice_reward_fixture(
     player.next_level_xp = crate::xp::xp_to_next_level(1);
     player.money = 0;
     let owner_identity = player.owner_identity;
-    entities.guid().update(player);
+    player.update(ctx);
     crate::items::grant_item(ctx, CHOICE_FIXTURE_PLAYER, CHOICE_FIXTURE_OBJECTIVE_ITEM, 8)?;
     if fill_inventory {
         crate::items::grant_item(ctx, CHOICE_FIXTURE_PLAYER, CHOICE_FIXTURE_FILLER, 15)?;
@@ -1311,14 +1311,14 @@ pub fn debug_verify_eventai_quest_credit_fixture(ctx: &ReducerContext) -> Result
     player.grid_y = grid_y;
     player.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
     let fixture_owner = player.owner_identity;
-    entities.guid().update(player);
+    player.update(ctx);
 
     let mut member = entities
         .guid()
         .find(EVENTAI_CREDIT_FIXTURE_PLAYER)
         .ok_or_else(|| "EventAI credit fixture player disappeared".to_string())?;
     member.guid = EVENTAI_CREDIT_FIXTURE_MEMBER;
-    entities.insert(member);
+    member.insert(ctx);
     let mut distant_member = entities
         .guid()
         .find(EVENTAI_CREDIT_FIXTURE_PLAYER)
@@ -1329,13 +1329,13 @@ pub fn debug_verify_eventai_quest_credit_fixture(ctx: &ReducerContext) -> Result
     distant_member.grid_x = grid_x;
     distant_member.grid_y = grid_y;
     distant_member.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
-    entities.insert(distant_member);
+    distant_member.insert(ctx);
     let mut beneficiary = entities
         .guid()
         .find(EVENTAI_CREDIT_FIXTURE_PLAYER)
         .ok_or_else(|| "EventAI credit fixture player disappeared".to_string())?;
     beneficiary.guid = EVENTAI_CREDIT_FIXTURE_BENEFICIARY;
-    entities.insert(beneficiary);
+    beneficiary.insert(ctx);
 
     let groups = ctx.db.game_group();
     groups.group_id().delete(EVENTAI_CREDIT_FIXTURE_GROUP);
@@ -1590,7 +1590,7 @@ pub fn debug_verify_eventai_quest_credit_fixture(ctx: &ReducerContext) -> Result
     tapped_player.grid_x = grid_x;
     tapped_player.grid_y = grid_y;
     tapped_player.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
-    entities.guid().update(tapped_player);
+    tapped_player.update(ctx);
     if apply_eventai_credit(ctx, kill_request, &fallback_context) != QuestCreditOutcome::Refused
         || eventai_credit_fixture_count(
             ctx,
@@ -1776,7 +1776,7 @@ pub fn debug_verify_raid_quest_credit_fixture(ctx: &ReducerContext) -> Result<()
             .find(RQC_PLAYER)
             .ok_or_else(|| "raid quest credit fixture player disappeared".to_string())?;
         clone.guid = guid;
-        entities.insert(clone);
+        clone.insert(ctx);
     }
 
     groups.insert(crate::Group {

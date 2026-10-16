@@ -96,6 +96,22 @@ dedicated Instance firings must not repeat them. The
 [decay](../module/src/creatures/tick/lifecycle.rs) arms a future respawn deadline to prevent a corpse
 from returning in the same firing.
 
+Simulation candidates come from maintained WorldEntity predicates. Entity insert/update methods stamp
+`regeneration_pending`, `combat_active` and `simulation_indexed` in the same transaction as the game
+fields. A migrated row defaults to `simulation_indexed=false`. Each creature firing backfills at most
+512 rows through an index. Creature phases pause until all rows have current predicates; other
+scheduled reducers and ordinary gameplay continue. The upgrade pause grows with the existing entity
+count, so test it on an isolated copy of the target Shard before rollout. Rows whose health and power
+need no regeneration leave the work set; Rage stays pending until depleted. Pet sensing uses the owner
+index, Character snapshots use the entry index, and dedicated Instance firings advance only that
+Instance's splines. The phase order stays unchanged.
+Operator SQL that changes health, power, death or combat flags must also set
+`simulation_indexed=false`; ordinary reducer writes stamp these predicates automatically.
+
+Creature firings reuse decoded static collision cells within the firing, keyed by generation and cell.
+The cache holds at most 128 cells or 4 MiB of triangles. Dynamic GameObject colliders remain fresh.
+Uncached queries keep owned triangle vectors, and no cache persists across reducer transactions.
+
 #### Navigation legs
 
 The [shared leg search](../crates/lyracore-shared/src/nav.rs) plans short movement legs. Callers

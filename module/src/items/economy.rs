@@ -182,7 +182,7 @@ pub(crate) fn apply_buy_bank_slot(
     let owned = player.bank_bag_slots;
     player.player_bytes_2 =
         lyracore_shared::packing::with_bank_bag_slots(player.player_bytes_2, owned);
-    ctx.db.game_world_entity().guid().update(player);
+    player.update(ctx);
     BuyBankSlotOutcome::Bought { price, owned }
 }
 
@@ -218,7 +218,6 @@ pub(crate) fn apply_item_sell(
         "target is not a vendor",
         "sell",
     )?;
-    let entities = ctx.db.game_world_entity();
     let instances = ctx.db.game_item_instance();
     let inst =
         item_in_slot(ctx, player_guid, slot).ok_or_else(|| format!("no item in slot {slot}"))?;
@@ -244,7 +243,7 @@ pub(crate) fn apply_item_sell(
     }
     let earned = sell_value(tmpl.sell_price, inst.stack_count);
     player.money = player.money.saturating_add(earned);
-    entities.guid().update(player);
+    player.update(ctx);
     let buyback_tab = ctx.db.game_character_buyback();
     let mut old: Vec<BuybackEntry> = buyback_tab.by_player_guid().filter(&player_guid).collect();
     old.sort_by_key(|e| e.id);
@@ -279,7 +278,6 @@ pub(crate) fn apply_buyback_item(
         "target is not a vendor",
         "use buyback",
     )?;
-    let entities = ctx.db.game_world_entity();
     let buyback_tab = ctx.db.game_character_buyback();
     let entries: Vec<BuybackEntry> = buyback_tab.by_player_guid().filter(&player_guid).collect();
     let ordered_ids = buyback_newest_first(entries.iter().map(|e| e.id).collect());
@@ -299,7 +297,7 @@ pub(crate) fn apply_buyback_item(
     }
     let owner_identity = player.owner_identity;
     player.money -= entry.price;
-    entities.guid().update(player);
+    player.update(ctx);
     let tmpl = ctx
         .db
         .game_item_template()
@@ -364,7 +362,7 @@ pub(crate) fn apply_buy_item(
     // Propagate storage failure so the reducer rolls back the debit.
     player.money = player.money.saturating_sub(cost);
     let owner_identity = player.owner_identity;
-    ctx.db.game_world_entity().guid().update(player);
+    player.update(ctx);
     store_item(ctx, player_guid, owner_identity, &tmpl, count, false, None)
 }
 
@@ -407,7 +405,6 @@ pub(crate) fn apply_player_repair(
         "target cannot repair",
         "repair",
     )?;
-    let entities = ctx.db.game_world_entity();
     let instances = ctx.db.game_item_instance();
     let templates = ctx.db.game_item_template();
 
@@ -445,7 +442,7 @@ pub(crate) fn apply_player_repair(
     }
     // Debit and repair must commit in the same transaction.
     player.money -= total_cost;
-    entities.guid().update(player);
+    player.update(ctx);
     for (mut inst, max_dur) in to_repair {
         inst.durability = max_dur;
         instances.guid().update(inst);

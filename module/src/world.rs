@@ -9,6 +9,9 @@ use crate::{
     game_character, game_character_buyback, game_corpse, game_creature_spline, game_instance,
 };
 
+mod simulation;
+pub(crate) use simulation::backfill_simulation;
+
 #[table(accessor = game_world_state_name)]
 pub struct WorldStateName {
     #[primary_key]
@@ -92,7 +95,11 @@ pub(crate) fn clear_relay_world_states_for_instance(ctx: &ReducerContext, instan
     index(accessor = by_cell, btree(columns = [map_id, instance_id, cell])),
     index(accessor = by_cell_entry, btree(columns = [map_id, instance_id, cell, entry])),
     index(accessor = by_owner, btree(columns = [owner_identity])),
-    index(accessor = by_entry, btree(columns = [entry]))
+    index(accessor = by_entry, btree(columns = [entry])),
+    index(accessor = by_owner_guid, btree(columns = [owner_guid])),
+    index(accessor = by_regeneration_pending, btree(columns = [regeneration_pending])),
+    index(accessor = by_combat_active, btree(columns = [combat_active])),
+    index(accessor = by_simulation_indexed, btree(columns = [simulation_indexed]))
 )]
 pub struct WorldEntity {
     #[primary_key]
@@ -232,6 +239,12 @@ pub struct WorldEntity {
     pub sheet_ranged_dmg_min: u32,
     #[default(0)]
     pub sheet_ranged_dmg_max: u32,
+    #[default(false)]
+    pub regeneration_pending: bool,
+    #[default(false)]
+    pub combat_active: bool,
+    #[default(false)]
+    pub simulation_indexed: bool,
 }
 
 impl WorldEntity {
@@ -462,7 +475,7 @@ pub(crate) fn teleport_player(
         if let Some(zone) = destination_zone {
             e.zone_id = zone;
         }
-        entities.guid().update(e);
+        e.update(ctx);
     }
 
     if !crate::mount::mount_cast_allowed_here(ctx, map_id, x, y, z) {
@@ -666,7 +679,7 @@ pub(crate) fn apply_player_login(
         entity.unit_bytes_1 = unit_bytes_1;
     }
     crate::away::at_world_entry(ctx, &mut entity, entry);
-    entities.insert(entity);
+    entity.insert(ctx);
     crate::ghost::restore(ctx, character_guid);
     crate::spell::recompute_display(ctx, character_guid);
     crate::taxi::arm_taxi_flight(ctx, character_guid);
@@ -879,8 +892,6 @@ pub(crate) fn apply_movement_update(
             spacetimedb::log::info!("MOVEMENT_ENTRIES total={n}");
         }
     }
-    let entities = ctx.db.game_world_entity();
-
     if mover.dead && mover.player_flags & lyracore_shared::constants::player_flags::GHOST == 0 {
         return Ok(());
     }
@@ -982,7 +993,7 @@ pub(crate) fn apply_movement_update(
     );
 
     if plan.persist_entity {
-        entities.guid().update(mover);
+        mover.update(ctx);
     }
     if plan.fall_lethal {
         crate::combat::kill_player(ctx, mover_guid, mover_guid);
@@ -1027,7 +1038,7 @@ pub(crate) fn apply_set_target(
     target_guid: u64,
 ) -> Result<(), String> {
     player.target_guid = target_guid;
-    ctx.db.game_world_entity().guid().update(player);
+    player.update(ctx);
     Ok(())
 }
 
@@ -1122,7 +1133,7 @@ pub(crate) fn do_repop(ctx: &ReducerContext, guid: u64) -> Result<(), String> {
     let player_guid = player.guid;
     let (death_x, death_y, death_map_id, death_race) =
         (player.x, player.y, player.map_id, player.race());
-    entities.guid().update(player);
+    player.update(ctx);
     crate::ghost::restore(ctx, player_guid);
 
     crate::creatures::despawn_pets(ctx, player_guid);
@@ -1175,7 +1186,7 @@ pub(crate) fn apply_set_sheathed(
         return Ok(());
     }
     actor.unit_bytes_2 = packed;
-    ctx.db.game_world_entity().guid().update(actor);
+    actor.update(ctx);
     Ok(())
 }
 
@@ -1198,7 +1209,7 @@ pub(crate) fn apply_set_stand_state(
         return Ok(());
     }
     actor.unit_bytes_1 = packed;
-    ctx.db.game_world_entity().guid().update(actor);
+    actor.update(ctx);
     Ok(())
 }
 
@@ -1217,7 +1228,7 @@ pub(crate) fn stand_up_on_damage(ctx: &ReducerContext, target_guid: u64) {
         return;
     }
     target.unit_bytes_1 &= !0xFF;
-    entities.guid().update(target);
+    target.update(ctx);
 }
 
 pub const RESURRECTION_SICKNESS_SPELL: u32 = 15007;
@@ -1240,7 +1251,7 @@ pub(crate) fn do_spirit_healer_res(ctx: &ReducerContext, guid: u64) -> Result<()
     let player_level = player.level;
     player.health = health;
     player.power = power;
-    entities.guid().update(player);
+    player.update(ctx);
     crate::ghost::finish_resurrection(ctx, guid);
     if player_level >= 11 {
         crate::spell::apply_spell_auras(ctx, RESURRECTION_SICKNESS_SPELL, guid, 1, 1);

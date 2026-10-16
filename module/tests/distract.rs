@@ -221,7 +221,7 @@ fn assert_refused(output: &std::process::Output, reason: &str) {
 fn hold_in_combat(shard: &Standalone, guid: u64) {
     let flags: u32 = number(&entity(shard, guid), "unit_flags");
     shard.assert_sql(&format!(
-        "UPDATE game_world_entity SET unit_flags = {}, combat_until_ms = {} WHERE guid = {guid}",
+        "UPDATE game_world_entity SET simulation_indexed = false, unit_flags = {}, combat_until_ms = {} WHERE guid = {guid}",
         flags | unit_flags::IN_COMBAT,
         u64::MAX,
     ));

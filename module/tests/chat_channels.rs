@@ -458,7 +458,9 @@ fn channel_speech_follows_the_members_flags_not_the_speakers_health() {
     op(&realm, &actor("2"), JOIN, "Raiders", "", HUMAN);
 
     realm.assert_call("debug_spawn_player_entity", &["1"]);
-    realm.assert_sql("UPDATE game_world_entity SET dead = true WHERE guid = 1");
+    realm.assert_sql(
+        "UPDATE game_world_entity SET simulation_indexed = false, dead = true WHERE guid = 1",
+    );
     let owner_line = inserted(&realm, LINES, "game_realm_chat_event", || {
         realm.assert_call(
             "realm_chat",

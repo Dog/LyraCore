@@ -2,8 +2,6 @@ use spacetimedb::{table, ReducerContext, Table, Timestamp};
 
 use lyracore_shared::packing::unpack4;
 
-use crate::game_world_entity;
-
 pub const HIGHGUID_CORPSE: u64 = 0xF101;
 
 pub(crate) fn corpse_guid_for(owner_guid: u64) -> u64 {
@@ -91,7 +89,6 @@ pub(crate) fn apply_reclaim_corpse(
     mut player: crate::WorldEntity,
 ) -> Result<(), String> {
     use lyracore_shared::constants::player_flags;
-    let entities = ctx.db.game_world_entity();
     let corpses = ctx.db.game_corpse();
 
     if !player.dead || player.player_flags & player_flags::GHOST == 0 {
@@ -128,7 +125,7 @@ pub(crate) fn apply_reclaim_corpse(
 
     player.health = (player.max_health / 2).max(1);
     let player_guid = player.guid;
-    entities.guid().update(player);
+    player.update(ctx);
     crate::ghost::finish_resurrection(ctx, player_guid);
     Ok(())
 }

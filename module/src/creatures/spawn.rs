@@ -458,7 +458,7 @@ pub(crate) fn insert_creature_entity(ctx: &spacetimedb::ReducerContext, mut enti
         y: entity.y,
         z: entity.z,
     };
-    ctx.db.game_world_entity().insert(entity);
+    entity.insert(ctx);
     // Fire after insertion because handlers may resolve the creature by guid.
     crate::hooks::fire_on_creature_spawn(ctx, &payload);
 }
@@ -557,6 +557,9 @@ pub(crate) fn build_creature_entity(
         sheet_ranged_ap: 0,
         sheet_ranged_dmg_min: 0,
         sheet_ranged_dmg_max: 0,
+        regeneration_pending: false,
+        combat_active: false,
+        simulation_indexed: false,
     }
 }
 
@@ -678,6 +681,9 @@ pub(crate) fn build_player_entity(
         sheet_ranged_ap: 0,
         sheet_ranged_dmg_min: 0,
         sheet_ranged_dmg_max: 0,
+        regeneration_pending: false,
+        combat_active: false,
+        simulation_indexed: false,
     };
     if let Some(flight) = ctx
         .db

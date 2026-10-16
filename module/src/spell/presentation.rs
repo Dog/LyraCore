@@ -22,6 +22,6 @@ pub(crate) fn recompute_display(ctx: &ReducerContext, guid: u64) {
         .unwrap_or(entity.native_display_id);
     if entity.display_id != display {
         entity.display_id = display;
-        ctx.db.game_world_entity().guid().update(entity);
+        entity.update(ctx);
     }
 }

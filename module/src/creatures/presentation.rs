@@ -146,7 +146,7 @@ pub(crate) fn apply_eventai_instruction(
         return false;
     };
     project(ctx, &mut entity, &base, &state);
-    entities.guid().update(entity);
+    entity.update(ctx);
     if table.creature_guid().find(creature_guid).is_some() {
         table.creature_guid().update(state);
     } else {
@@ -234,7 +234,7 @@ pub(crate) fn clear_relay_temporary_faction(ctx: &ReducerContext, creature_guid:
         return;
     };
     project(ctx, &mut entity, &base, &state);
-    entities.guid().update(entity);
+    entity.update(ctx);
     table.creature_guid().update(state);
 }
 
@@ -250,7 +250,7 @@ pub(crate) fn apply_relay_stand_state(
         .filter(|entity| !entity.is_player())
         .ok_or_else(|| format!("relay stand-state subject {creature_guid} is unavailable"))?;
     entity.unit_bytes_1 = (entity.unit_bytes_1 & !0xFF) | u32::from(stand_state);
-    entities.guid().update(entity);
+    entity.update(ctx);
     Ok(())
 }
 
@@ -309,7 +309,7 @@ pub(crate) fn update_template_from_relay(
     entity.unit_flags = template.unit_flags | in_combat;
     entity.base_attack_time_ms = template.base_attack_time_ms;
     entity.armor = template.armor;
-    entities.guid().update(entity);
+    entity.update(ctx);
     let _ = crate::creatures::set_creature_gossip_menu(ctx, creature_guid, None);
     Ok(())
 }
@@ -338,7 +338,7 @@ pub(crate) fn apply_relay_npc_flags(
         .filter(|entity| !entity.is_player())
         .ok_or_else(|| format!("relay NPC-flag subject {creature_guid} is unavailable"))?;
     entity.npc_flags = apply_relay_flags(entity.npc_flags, flags, operation);
-    entities.guid().update(entity);
+    entity.update(ctx);
     Ok(())
 }
 
@@ -431,7 +431,7 @@ fn clear_if(
         return;
     };
     restore_base(&mut entity, &base);
-    entities.guid().update(entity);
+    entity.update(ctx);
 }
 
 fn project(

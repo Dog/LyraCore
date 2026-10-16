@@ -2,7 +2,6 @@ use spacetimedb::{log, reducer, table, ReducerContext, ScheduleAt, Table, TimeDu
 
 use lyracore_shared::mail::RewardHeader;
 
-use crate::game_world_entity;
 use crate::helpers::require_operator;
 use crate::mail::game_mail;
 
@@ -340,7 +339,7 @@ impl FenceSink for CtxDb<'_> {
     fn debit_purse(&mut self, sender_guid: u64, amount: u32) {
         if let Some(mut e) = crate::helpers::acting_entity_by_guid(self.ctx, sender_guid) {
             e.money = e.money.saturating_sub(amount);
-            self.ctx.db.game_world_entity().guid().update(e);
+            e.update(self.ctx);
         }
     }
     fn detach_item(
@@ -376,7 +375,7 @@ impl PayoutSink for CtxDb<'_> {
             return false;
         };
         e.money = crate::mail::credited(e.money, amount);
-        self.ctx.db.game_world_entity().guid().update(e);
+        e.update(self.ctx);
         true
     }
     fn grant_item(

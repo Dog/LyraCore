@@ -605,7 +605,7 @@ pub(crate) fn move_to_point(
     let dist = (dx * dx + dy * dy).sqrt();
     if dist <= f32::EPSILON {
         crate::creatures::tick::stop_where_rendered(ctx, &mut e);
-        entities.guid().update(e);
+        e.update(ctx);
         return Ok(());
     }
     crate::creatures::tick::emit_move_spline(
@@ -621,7 +621,7 @@ pub(crate) fn move_to_point(
         (e.grid_x, e.grid_y),
     );
     e.last_move_ms = crate::creatures::tick::now_ms(ctx);
-    entities.guid().update(e);
+    e.update(ctx);
     Ok(())
 }
 

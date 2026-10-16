@@ -136,7 +136,7 @@ pub(crate) fn skin_corpse(
     crate::skill::gain_profession_skill(ctx, looter_guid, crate::skill::skill_line::SKINNING, 1, 0);
 
     corpse.skinned = true;
-    entities.guid().update(corpse);
+    corpse.update(ctx);
     Ok(())
 }
 

@@ -179,7 +179,7 @@ pub(crate) fn do_resurrect_response(
                 let pct = req.points.clamp(1, 100) as u32;
                 t.health = revive_amount(t.max_health, req.points);
                 t.power = t.max_power.saturating_mul(pct) / 100;
-                ctx.db.game_world_entity().guid().update(t);
+                t.update(ctx);
                 crate::ghost::finish_resurrection(ctx, target_guid);
             }
         }
@@ -196,7 +196,7 @@ pub(crate) fn do_cancel_cast(
     if caster.next_swing_spell != 0 {
         let mut c = caster;
         c.next_swing_spell = 0;
-        ctx.db.game_world_entity().guid().update(c);
+        c.update(ctx);
     }
     Ok(())
 }
@@ -562,7 +562,7 @@ fn flush_pool(
     for (&guid, &value) in pool {
         if let Some(mut target) = entities.guid().find(guid) {
             set(&mut target, value);
-            entities.guid().update(target);
+            target.update(ctx);
         }
     }
 }

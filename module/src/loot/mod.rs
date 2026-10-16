@@ -656,7 +656,7 @@ pub(crate) fn apply_loot_money(
 
     let amount = corpse.money;
     corpse.money = 0;
-    entities.guid().update(corpse);
+    corpse.update(ctx);
 
     let recipients = corpse_eligible_recipients(ctx, target_guid);
     let grouped = money_is_grouped(&recipients);
@@ -673,7 +673,7 @@ pub(crate) fn apply_loot_money(
             credit_purse(ctx, recipient_guid, share);
         }
     }
-    entities.guid().update(looter);
+    looter.update(ctx);
 
     if grouped {
         for &(recipient_guid, share) in &shares {
@@ -699,7 +699,7 @@ fn credit_purse(ctx: &ReducerContext, recipient_guid: u64, share: u32) {
     let entities = ctx.db.game_world_entity();
     if let Some(mut e) = entities.guid().find(recipient_guid) {
         e.money = e.money.saturating_add(share);
-        entities.guid().update(e);
+        e.update(ctx);
         return;
     }
     crate::transfer::defer_money_delta(ctx, recipient_guid, share);
@@ -759,7 +759,7 @@ pub(crate) fn refresh_lootable(ctx: &ReducerContext, corpse_guid: u64) {
     };
     if corpse.dynamic_flags & flag != want {
         corpse.dynamic_flags = (corpse.dynamic_flags & !flag) | want;
-        entities.guid().update(corpse);
+        corpse.update(ctx);
     }
 }
 

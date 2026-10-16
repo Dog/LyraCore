@@ -1198,7 +1198,7 @@ fn walkable_floor(
                 rows.iter()
                     .copied()
                     .filter(|tri| matches!(tri.class, TriClass::Wmo { .. }))
-                    .collect()
+                    .collect::<Vec<_>>()
             })
         },
         top,

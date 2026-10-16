@@ -47,7 +47,23 @@ jobs:
           args=()
           for target in "${targets[@]}"; do args+=(--test "$target"); done
           echo "targets: ${targets[*]}"
-          cargo test -p lyracore-module "${args[@]}" -- --ignored --test-threads=4 --skip deadmines --skip lethal_floor
+          cargo test -p lyracore-module "${args[@]}" -- --ignored --test-threads=4 --skip deadmines --skip lethal_floor --skip populated_old_module_upgrades_without_clearing
+
+      - name: Check out the populated-upgrade baseline
+        if: matrix.shard == 2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 44b04878f2050936faa61d6f087f3aa1a7a78a46
+          path: .lyracore-upgrade-baseline
+          persist-credentials: false
+
+      - name: Verify the populated Module upgrade
+        if: matrix.shard == 2
+        run: |
+          baseline_target="$RUNNER_TEMP/lyracore-upgrade-baseline-target"
+          cargo build --manifest-path .lyracore-upgrade-baseline/Cargo.toml --target-dir "$baseline_target" --release --target wasm32-unknown-unknown -p lyracore-module --features=debug_reducers,package_test_fixture
+          export LYRACORE_TEST_BASELINE_WASM="$baseline_target/wasm32-unknown-unknown/release/lyracore_module.wasm"
+          cargo test -p lyracore-module --test additive_upgrade populated_old_module_upgrades_without_clearing -- --ignored --exact --test-threads=1
 
       - name: Run the single-shard auction Refusal regression
         if: matrix.shard == 0

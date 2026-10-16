@@ -137,7 +137,7 @@ pub fn debug_set_health(ctx: &ReducerContext, guid: u64, health: u32) -> Result<
     if clamped > 0 {
         e.health = clamped;
         let was_dead = e.dead;
-        entities.guid().update(e);
+        e.update(ctx);
         if was_dead {
             crate::ghost::finish_resurrection(ctx, guid);
         }
@@ -258,7 +258,7 @@ pub fn debug_spawn_player_entity(ctx: &ReducerContext, character_guid: u64) -> R
 
     let entity = crate::creatures::build_player_entity(ctx, &character, character.owner_identity);
     let (level, max_health) = (entity.level, entity.max_health);
-    entities.insert(entity);
+    entity.insert(ctx);
     crate::mount::restore_mount_on_rebuild(ctx, character_guid);
     log::info!(
         "debug_spawn_player_entity: materialized player guid {character_guid} (lvl {level}, hp {max_health})"
@@ -783,7 +783,7 @@ pub fn debug_engage(
     let entities = ctx.db.game_world_entity();
     if let Some(mut e) = entities.guid().find(attacker_guid) {
         e.target_guid = target_guid;
-        entities.guid().update(e);
+        e.update(ctx);
     }
     Ok(())
 }
@@ -1276,7 +1276,7 @@ pub fn debug_backfill_cell_ids(ctx: &ReducerContext) -> Result<(), String> {
     for guid in stale {
         if let Some(mut e) = entities.guid().find(guid) {
             e.cell = spatial::grid_cell_id(e.grid_x, e.grid_y);
-            entities.guid().update(e);
+            e.update(ctx);
         }
     }
 
@@ -1345,7 +1345,7 @@ pub fn debug_regrid(ctx: &ReducerContext) -> Result<(), String> {
             e.grid_x = gx;
             e.grid_y = gy;
             e.cell = lyracore_shared::spatial::grid_cell_id(gx, gy);
-            entities.guid().update(e);
+            e.update(ctx);
         }
     }
     log::info!("debug_regrid: re-stamped {n} entities at the current GRID_CELL_SIZE");
@@ -1558,7 +1558,7 @@ pub fn debug_set_money(
     let entities = ctx.db.game_world_entity();
     if let Some(mut e) = entities.guid().find(character_guid) {
         e.money = copper;
-        entities.guid().update(e);
+        e.update(ctx);
     }
     Ok(())
 }
@@ -1574,7 +1574,7 @@ pub fn debug_set_power(ctx: &ReducerContext, guid: u64, power: u32) -> Result<()
         e.max_power = power;
     }
     e.power = power;
-    entities.guid().update(e);
+    e.update(ctx);
     Ok(())
 }
 

@@ -143,7 +143,7 @@ mod fixture {
         giver.grid_x = grid_x;
         giver.grid_y = grid_y;
         giver.cell = lyracore_shared::spatial::grid_cell_id(grid_x, grid_y);
-        entities.insert(giver);
+        giver.insert(ctx);
 
         let templates = ctx.db.game_mail_template();
         let loot = ctx.db.game_mail_loot();

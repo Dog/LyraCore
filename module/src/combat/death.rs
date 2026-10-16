@@ -203,7 +203,7 @@ pub fn debug_stage_lethal_damage_floor_fixture(
     }
     creature.health = 10;
     creature.stance = 1;
-    entities.guid().update(creature);
+    creature.update(ctx);
     let definition_revision = crate::creatures::current_definition_revision(ctx, creature_guid);
     if definition_revision.value == 0
         || !set_lethal_damage_floor(ctx, creature_guid, definition_revision.value, true)
@@ -292,7 +292,7 @@ pub fn debug_set_lethal_damage_floor_health_fixture(
         return Err("fixture health must keep the creature alive".to_string());
     }
     creature.health = health;
-    entities.guid().update(creature);
+    creature.update(ctx);
     Ok(())
 }
 
@@ -493,7 +493,7 @@ fn kill_creature_with_attribution(
     roll_corpse_loot(ctx, &mut target, target_guid, entitlement.as_ref());
     target.health = 0;
     target.dead = true;
-    entities.guid().update(target);
+    target.update(ctx);
     crate::creatures::begin_death_dispatch(ctx, target_guid, killer);
     // Snapshot threat before disengage clears the ledger used by death hooks.
     let threat_snapshot: Vec<(u64, i64)> = ctx
@@ -519,7 +519,7 @@ fn kill_creature_with_attribution(
         if !is_engaged(ctx, killer_guid) {
             if let Some(mut k) = entities.guid().find(killer_guid) {
                 k.combat_until_ms = (ctx.timestamp.to_micros_since_unix_epoch() / 1000) as u64;
-                entities.guid().update(k);
+                k.update(ctx);
             }
         }
     }
@@ -656,7 +656,7 @@ pub(crate) fn kill_player(ctx: &ReducerContext, victim_guid: u64, killer_guid: u
     victim.health = 0;
     victim.dead = true;
     victim.combat_until_ms = (ctx.timestamp.to_micros_since_unix_epoch() / 1000) as u64;
-    entities.guid().update(victim);
+    victim.update(ctx);
     let killer = (killer_guid != 0).then_some(killer_guid);
     crate::creatures::begin_death_dispatch(ctx, victim_guid, killer);
     disengage(ctx, victim_guid);
@@ -842,7 +842,7 @@ pub(crate) fn apply_hit(
             if is_rage_user(a) {
                 if let Some(mut fresh) = entities.guid().find(attacker_guid) {
                     fresh.power = (fresh.power + rage_from_damage(dmg, true)).min(fresh.max_power);
-                    entities.guid().update(fresh);
+                    fresh.update(ctx);
                 }
             }
             if attacker_is_player && !target_is_player {
@@ -853,7 +853,7 @@ pub(crate) fn apply_hit(
 
     if is_lethal(target.health, dmg) && duel_takes_lethal_hit(ctx, attacker_guid, &target) {
         target.health = 1;
-        entities.guid().update(target);
+        target.update(ctx);
         if let Some(duel) = crate::duel::active_duel_between(ctx, attacker_guid, target_guid) {
             crate::duel::complete_duel(
                 ctx,
@@ -897,7 +897,7 @@ pub(crate) fn apply_hit(
     if weapon && is_rage_user(&target) {
         target.power = (target.power + rage_from_damage(dmg, false)).min(target.max_power);
     }
-    entities.guid().update(target);
+    target.update(ctx);
     if damage.lethal_prevented {
         commit_death_prevention(ctx, target_guid, attacker_guid);
     }

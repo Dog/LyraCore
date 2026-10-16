@@ -1070,7 +1070,7 @@ pub fn debug_stage_eventai_revision_fixture(
         .ok_or_else(|| format!("fixture target does not exist: {target_guid}"))?;
     target.health = 100_000;
     target.max_health = 100_000;
-    entities.guid().update(target);
+    target.update(ctx);
 
     let fights = ctx.db.game_melee_attack();
     if let Some(mut fight) = fights.attacker_guid().find(creature_guid) {

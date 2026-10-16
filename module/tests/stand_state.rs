@@ -62,7 +62,7 @@ fn a_player_sits_and_stands_but_cannot_pick_a_server_state() {
     assert_eq!(unit_bytes_1(&standalone), upper_bytes, "standing");
 
     standalone.assert_sql(&format!(
-        "UPDATE game_world_entity SET dead = true WHERE guid = {CHARACTER}"
+        "UPDATE game_world_entity SET simulation_indexed = false, dead = true WHERE guid = {CHARACTER}"
     ));
     set_stand_state(&standalone, "1");
     assert_eq!(unit_bytes_1(&standalone), upper_bytes | 1, "a ghost sits");

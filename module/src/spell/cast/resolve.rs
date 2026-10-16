@@ -86,7 +86,7 @@ pub(crate) fn resolve_cast_at_typed(
         if hdr.power_type == lyracore_shared::packing::power_type::MANA {
             caster.mana_regen_paused_until_ms = now_ms + 5000;
         }
-        ctx.db.game_world_entity().guid().update(caster);
+        caster.update(ctx);
     }
 
     // Dismount after charging power so the stale caster cannot overwrite the Mount Projection.
