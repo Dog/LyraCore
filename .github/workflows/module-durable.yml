@@ -88,6 +88,7 @@ jobs:
           cargo test -p lyracore-gateway --bin lyracore-gateway stdb::reads::indexed_durable_tests -- --ignored --test-threads=1
           cargo test -p lyracore-gateway --bin lyracore-gateway stdb::subscription_scope_durable_tests -- --ignored --test-threads=1
           cargo test -p lyracore-gateway --bin lyracore-gateway stdb::world_view::item_durable_tests::live_worn_item_insert_enchant_and_delete_reach_a_nearby_peer -- --ignored --exact
+          cargo test -p lyracore-gateway --bin lyracore-gateway stdb::world_view::observer_durable_tests -- --ignored --test-threads=1
 
       - name: Run Benilla against private Module instances
         if: matrix.shard == 0

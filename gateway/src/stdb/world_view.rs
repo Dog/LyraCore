@@ -630,6 +630,9 @@ mod relay_bench;
 #[cfg(test)]
 mod item_durable_tests;
 
+#[cfg(test)]
+mod observer_durable_tests;
+
 #[cfg(all(test, unix))]
 mod benilla_movement_tests {
     #[test]
