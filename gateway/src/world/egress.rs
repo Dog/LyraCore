@@ -2,7 +2,7 @@ use super::{Outbound, SessionSender, SessionTx, WriterTrace};
 use crate::accept::BlockingTaskCapacity;
 use anyhow::{anyhow, bail, Result};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc::SendError, Arc};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -15,6 +15,8 @@ const JOB_RESERVATION: usize = 4 * 1024;
 pub(super) const MAX_AGE: Duration = Duration::from_secs(10);
 const WRITE_BYTES: usize = 64 * 1024;
 const ENCODE_BATCH: usize = 32;
+
+pub(crate) static ENCODED_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(super) struct QueueSender {
@@ -217,6 +219,7 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
                 Err(_) => break,
             }
         }
+        ENCODED_ENTRIES.fetch_add(batch.len() as u64, Ordering::Relaxed);
         let deadline = tokio::time::Instant::from_std(oldest + MAX_AGE);
         if tokio::time::Instant::now() >= deadline {
             bail!("World Session outbound queue exceeded age limit");
