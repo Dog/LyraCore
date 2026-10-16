@@ -97,7 +97,16 @@ fn assert_scope(shard: &Standalone, realm: &Coordinator, mixed_role: bool) {
         assert_eq!(cached, if mixed_role { durable } else { 0 }, "{table}");
     }
     let live = realm.0.coord();
-    assert!(live.conn.db.game_faction_template().iter().next().is_some());
+    assert_eq!(
+        live.conn
+            .db
+            .game_faction_template()
+            .id()
+            .find(&5090104)
+            .unwrap()
+            .faction,
+        7
+    );
     assert_eq!(
         live.conn
             .db
@@ -176,7 +185,7 @@ fn assert_retained_store_reads(
 
 fn verify_subscription_scope(mixed_role: bool) {
     let _topology = TopologyEnv::install(mixed_role);
-    let mut shard = Standalone::start("subscription-scope");
+    let mut shard = Standalone::start_persistent("subscription-scope");
     shard.publish_module();
     shard.publish_named_module_bytes(REALM, module_bytes());
     shard.assert_call("claim_operator", &[]);
@@ -188,6 +197,7 @@ fn verify_subscription_scope(mixed_role: bool) {
     shard.assert_call_database(REALM, "debug_stage_auction_buyout_fixture", &[]);
     shard.assert_sql("UPDATE game_item_template SET name = 'World Blade' WHERE entry = 5090050");
     shard.assert_sql_database(REALM, "UPDATE game_item_template SET name = 'Scope Blade', max_durability = 77 WHERE entry = 5090050");
+    shard.assert_sql_database(REALM, "INSERT INTO game_faction_template (id,faction,faction_group,friend_group,enemy_group,enemy_0,enemy_1,enemy_2,enemy_3,friend_0,friend_1,friend_2,friend_3) VALUES (5090104,7,0,0,0,0,0,0,0,0,0,0,0)");
     shard.assert_sql_database(REALM, "INSERT INTO game_item_random_property (property_id,enchant_id_1,enchant_id_2,enchant_id_3,suffix) VALUES (5090101,5090103,0,0,'of the Fixture')");
     shard.assert_sql_database(REALM, "INSERT INTO game_item_enchantment (id,enchant_id,effect_index,kind,amount,spell_id,school_mask) VALUES (1303066368,5090103,0,14,7,0,0)");
     let cfg = GatewayConfig {
@@ -204,8 +214,8 @@ fn verify_subscription_scope(mixed_role: bool) {
     let realm = world.realm_core().unwrap();
     assert_eq!(realm.shard_name(), REALM);
     assert_eq!(
-        world.shard_for(1, 0).unwrap().shard_name() == REALM,
-        mixed_role
+        world.shard_for(1, 0).as_ref().map(Coordinator::shard_name),
+        mixed_role.then_some(REALM)
     );
     assert!(catalogue_counts(&world).iter().all(|(_, count)| *count > 0));
     assert_scope(&shard, &realm, mixed_role);
