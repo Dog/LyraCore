@@ -111,7 +111,7 @@ fn stone_messages(outbound: Vec<Outbound>) -> Vec<ServerOpcodeMessage> {
             Outbound::One(msg) => messages.push(msg),
             Outbound::Batch(batch) => messages.extend(batch),
             Outbound::Job(job) => messages.extend(stone_messages(job())),
-            Outbound::Raw { .. } => {}
+            Outbound::Raw { .. } | Outbound::Shared { .. } => {}
         }
     }
     messages.retain(|msg| {

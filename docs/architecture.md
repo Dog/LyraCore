@@ -351,10 +351,13 @@ encoding. Compression stays on encoding workers. Each encoded projection and com
 also limited to 4 MiB.
 These are queue and encoded-output limits, not an exact bound on arbitrary captured Rust objects.
 A queue entry has ten seconds to finish encoding and writing. Exceeding a limit closes the session;
-critical packets are not silently discarded. Movement keeps its existing coalescing and shedding.
+critical packets are not silently discarded. Movement keeps its existing coalescing and shedding. Its
+pending Character and creature collections also cap each viewer at 4,096 movers and 2 MiB of estimated
+row storage per collection. Overflow closes the session.
 
 One writer owns each session's header cipher and preserves FIFO order and contiguous entry batches.
-It combines frames into writes of about 64 KiB.
+It combines frames into writes of about 64 KiB. Common movement and combat payloads share immutable
+encoded bodies across observers; visibility and private-recipient checks still run per viewer.
 A supervisor retains cleanup ownership when its caller is cancelled. Accepted game actions finish
 before logout cleanup, so a delayed login cannot recreate a departed session after cleanup. A clean
 read EOF drains direct replies from accepted actions within the outbound age budget before returning

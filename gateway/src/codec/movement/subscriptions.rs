@@ -8,7 +8,7 @@ use anyhow::Result;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::Vector3d;
@@ -51,6 +51,7 @@ pub(crate) fn teleport_event_outbound(row: &TeleportEvent) -> Vec<Outbound> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn motion_outbound(
     created: &Mutex<HashSet<u64>>,
     self_guid: u64,
@@ -60,9 +61,16 @@ pub(crate) fn motion_outbound(
     if row.guid == self_guid || !created.lock().unwrap().contains(&row.guid) {
         return Vec::new();
     }
+    let out = movement_outbound(row);
+    if !out.is_empty() {
+        MOTION_SENT.fetch_add(1, Ordering::Relaxed);
+    }
+    out
+}
+
+fn movement_outbound(row: &EntityMotion) -> Vec<Outbound> {
     match codec::build_movement_relay_raw(row.opcode as u32, row.guid, &row.movement_info) {
         Some((opcode, body)) => {
-            MOTION_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             vec![Outbound::Raw { opcode, body }]
         }
         None if lyracore_shared::opcodes::movement::is_relayed_move(row.opcode as u32) => {
@@ -269,6 +277,10 @@ pub(crate) fn creature_leg_outbound(
     if !created.lock().unwrap().contains(&row.guid) {
         return Vec::new();
     }
+    creature_spline_outbound(row)
+}
+
+fn creature_spline_outbound(row: &CreatureSpline) -> Vec<Outbound> {
     let start = Vector3d {
         x: row.sx,
         y: row.sy,
@@ -390,6 +402,77 @@ pub(crate) fn unix_now_micros() -> u64 {
     micros.min(u128::from(u64::MAX)) as u64
 }
 
+pub(crate) struct MotionRows<T> {
+    rows: std::collections::HashMap<u64, (Arc<SharedMotion<T>>, usize)>,
+    bytes: usize,
+}
+
+impl<T> Default for MotionRows<T> {
+    fn default() -> Self {
+        Self {
+            rows: Default::default(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<T> MotionRows<T> {
+    fn insert(&mut self, guid: u64, row: Arc<SharedMotion<T>>, bytes: usize) -> bool {
+        let previous = self.rows.get(&guid).map_or(0, |(_, bytes)| *bytes);
+        let next = self.bytes.saturating_sub(previous).saturating_add(bytes);
+        if next > 2 * 1024 * 1024 || (previous == 0 && self.rows.len() >= 4096) {
+            return false;
+        }
+        self.rows.insert(guid, (row, bytes));
+        self.bytes = next;
+        true
+    }
+
+    fn drain(&mut self) -> Vec<Arc<SharedMotion<T>>> {
+        self.bytes = 0;
+        self.rows.drain().map(|(_, (row, _))| row).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+pub(crate) struct SharedMotion<T> {
+    pub(crate) row: T,
+    packets: OnceLock<std::result::Result<Vec<crate::world::egress::Packet>, String>>,
+}
+
+impl<T> SharedMotion<T> {
+    fn new(row: T) -> Self {
+        Self {
+            row,
+            packets: OnceLock::new(),
+        }
+    }
+
+    fn outbound(
+        &self,
+        tx: &crate::world::SessionTx,
+        project: impl FnOnce(&T) -> Vec<Outbound>,
+    ) -> Vec<Outbound> {
+        match self.packets.get_or_init(|| {
+            crate::world::egress::encode(project(&self.row)).map_err(|error| error.to_string())
+        }) {
+            Ok(packets) => packets
+                .iter()
+                .map(crate::world::egress::Packet::outbound)
+                .collect(),
+            Err(error) => {
+                log::warn!("movement Relay encoding failed: {error}");
+                tx.close();
+                Vec::new()
+            }
+        }
+    }
+}
+
 pub(crate) fn motion(
     view: &WorldView,
     shard: ShardId,
@@ -398,32 +481,49 @@ pub(crate) fn motion(
 ) {
     delivery.received();
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
-    let row = Arc::new(row.clone());
+    let guid = row.guid;
+    let bytes = std::mem::size_of::<EntityMotion>() + row.movement_info.len() + 64;
+    let row = Arc::new(SharedMotion::new(row.clone()));
     // Never echo a Character's movement to its own client; it fights position authority.
     for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        if viewer.self_guid == row.guid {
+        if viewer.self_guid == guid {
             continue;
         }
-        viewer
+        if !viewer
             .motion_pending
             .entity
             .lock()
             .unwrap()
-            .insert(row.guid, row.clone());
+            .insert(guid, row.clone(), bytes)
+        {
+            viewer.tx.close();
+            continue;
+        }
         maybe_queue_motion_flush(view, &viewer);
     }
 }
 
 pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSpline) {
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
-    let row = Arc::new(row.clone());
+    let guid = row.guid;
+    let bytes = std::mem::size_of::<CreatureSpline>()
+        + 64
+        + row
+            .path
+            .as_ref()
+            .map_or(0, |path| std::mem::size_of_val(path.points.as_slice()));
+    let row = Arc::new(SharedMotion::new(row.clone()));
     for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        viewer
+        if !viewer
             .motion_pending
             .creature
             .lock()
             .unwrap()
-            .insert(row.guid, row.clone());
+            .insert(guid, row.clone(), bytes)
+        {
+            viewer.tx.close();
+            continue;
+        }
         maybe_queue_motion_flush(view, &viewer);
     }
 }
@@ -448,26 +548,31 @@ pub(crate) fn maybe_queue_motion_flush(_view: &WorldView, viewer: &Arc<Viewer>) 
             .motion_pending
             .flush_queued
             .store(false, AtOrd::Release);
-        let moves: Vec<Arc<EntityMotion>> = {
+        let moves: Vec<Arc<SharedMotion<EntityMotion>>> = {
             let mut m = viewer.motion_pending.entity.lock().unwrap();
-            m.drain().map(|(_, r)| r).collect()
+            m.drain()
         };
-        let legs: Vec<Arc<CreatureSpline>> = {
+        let legs: Vec<Arc<SharedMotion<CreatureSpline>>> = {
             let mut m = viewer.motion_pending.creature.lock().unwrap();
-            m.drain().map(|(_, r)| r).collect()
+            m.drain()
         };
         let mut out = Vec::new();
-        for row in moves {
-            out.extend(crate::codec::movement::subscriptions::motion_outbound(
-                &viewer.created,
-                viewer.self_guid,
-                &row,
-            ));
+        for movement in moves {
+            MOTION_CALLS.fetch_add(1, Ordering::Relaxed);
+            if movement.row.guid != viewer.self_guid
+                && viewer.created.lock().unwrap().contains(&movement.row.guid)
+            {
+                let packets = movement.outbound(&viewer.tx, movement_outbound);
+                if !packets.is_empty() {
+                    MOTION_SENT.fetch_add(1, Ordering::Relaxed);
+                }
+                out.extend(packets);
+            }
         }
-        for row in legs {
-            out.extend(
-                crate::codec::movement::subscriptions::creature_leg_outbound(&viewer.created, &row),
-            );
+        for leg in legs {
+            if viewer.created.lock().unwrap().contains(&leg.row.guid) {
+                out.extend(leg.outbound(&viewer.tx, creature_spline_outbound));
+            }
         }
         out
     });

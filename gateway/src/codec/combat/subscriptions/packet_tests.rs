@@ -1,11 +1,193 @@
 use super::*;
 use crate::stdb::bindings::{CombatEvent, SpellCastEvent};
+use crate::stdb::world_view::test_support::{queued_job, registered_viewer};
 use crate::world::Outbound;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
 const BYSTANDER: u64 = 99;
+
+fn shared_packets(out: &[Outbound]) -> Vec<(u16, &Arc<[u8]>)> {
+    out.iter()
+        .map(|out| match out {
+            Outbound::Shared { opcode, body } => (*opcode, body),
+            _ => panic!("a notification Relay must share encoded packet bodies"),
+        })
+        .collect()
+}
+
+#[test]
+fn swing_bodies_are_shared_after_each_viewers_create_gate_and_the_kill_line_stays_private() {
+    let view = WorldView::new(true);
+    let row = CombatEvent {
+        killing_blow: true,
+        ..swing_event()
+    };
+    let (source, source_rx) = registered_viewer(&view, 0, row.attacker_guid);
+    let (peer, peer_rx) = registered_viewer(&view, 0, BYSTANDER);
+    let (_, hidden_rx) = registered_viewer(&view, 0, BYSTANDER + 1);
+    source.created.lock().unwrap().insert(row.attacker_guid);
+    peer.created.lock().unwrap().insert(row.attacker_guid);
+
+    combat_event_appeared(&view, 0, &row);
+    assert!(queued_job(&hidden_rx).is_empty());
+    let source_out = queued_job(&source_rx);
+    let peer_out = queued_job(&peer_rx);
+    let source_packets = shared_packets(&source_out);
+    let peer_packets = shared_packets(&peer_out);
+    assert_eq!(
+        source_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x014a, 0x0144, 0x01f5]
+    );
+    assert_eq!(
+        peer_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x014a, 0x0144]
+    );
+    for (source_packet, peer_packet) in source_packets.iter().zip(peer_packets) {
+        assert!(Arc::ptr_eq(source_packet.1, peer_packet.1));
+    }
+}
+
+#[test]
+fn a_timed_cast_shares_go_and_damage_bodies_after_the_casters_private_result() {
+    let view = WorldView::new(true);
+    let row = SpellCastEvent {
+        is_completion: true,
+        damage: 23,
+        ..spell_cast_event(2)
+    };
+    let (_, source_rx) = registered_viewer(&view, 0, row.caster_guid);
+    let (_, peer_rx) = registered_viewer(&view, 0, BYSTANDER);
+
+    cast_event_appeared(&view, 0, &row);
+    let source_out = queued_job(&source_rx);
+    let peer_out = queued_job(&peer_rx);
+    let source_packets = shared_packets(&source_out);
+    let peer_packets = shared_packets(&peer_out);
+    assert_eq!(
+        source_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x0130, 0x0132, 0x0250]
+    );
+    assert_eq!(
+        peer_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x0132, 0x0250]
+    );
+    for (source_packet, peer_packet) in source_packets.iter().skip(1).zip(peer_packets) {
+        assert!(Arc::ptr_eq(source_packet.1, peer_packet.1));
+    }
+}
+
+#[test]
+fn a_shared_interruption_keeps_caster_failure_and_observer_teardown_separate() {
+    let view = WorldView::new(true);
+    let row = interrupted_cast(78, NO_POWER_CODE);
+    let (_, source_rx) = registered_viewer(&view, 0, row.caster_guid);
+    let (_, peer_rx) = registered_viewer(&view, 0, BYSTANDER);
+    let (_, other_rx) = registered_viewer(&view, 0, BYSTANDER + 1);
+
+    cast_event_appeared(&view, 0, &row);
+    let source_out = queued_job(&source_rx);
+    let peer_out = queued_job(&peer_rx);
+    let other_out = queued_job(&other_rx);
+    let source_packets = shared_packets(&source_out);
+    let peer_packets = shared_packets(&peer_out);
+    let other_packets = shared_packets(&other_out);
+    assert_eq!(
+        source_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x0133, 0x0130]
+    );
+    assert_eq!(source_packets[1].1.as_ref(), &[78, 0, 0, 0, 0x02, 0x4d]);
+    assert_eq!(
+        peer_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x02a6]
+    );
+    assert!(Arc::ptr_eq(peer_packets[0].1, other_packets[0].1));
+}
+
+#[test]
+fn the_instant_caster_skips_repeated_launch_packets_but_shares_the_cooldown() {
+    let view = WorldView::new(true);
+    let row = SpellCastEvent {
+        client_initiated: true,
+        miss_info: 2,
+        cooldown_ms: 5000,
+        ..spell_cast_event(2)
+    };
+    let (_, source_rx) = registered_viewer(&view, 0, row.caster_guid);
+    let (_, peer_rx) = registered_viewer(&view, 0, BYSTANDER);
+
+    cast_event_appeared(&view, 0, &row);
+    let source_out = queued_job(&source_rx);
+    let peer_out = queued_job(&peer_rx);
+    let source_packets = shared_packets(&source_out);
+    let peer_packets = shared_packets(&peer_out);
+    assert_eq!(
+        source_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [codec::SMSG_SPELLLOGMISS_OPCODE, 0x0134]
+    );
+    assert_eq!(
+        peer_packets
+            .iter()
+            .map(|(opcode, _)| *opcode)
+            .collect::<Vec<_>>(),
+        [0x0131, 0x0132, 0x0134]
+    );
+    assert!(Arc::ptr_eq(source_packets[1].1, peer_packets[2].1));
+}
+
+#[test]
+fn spell_impact_viewers_share_the_damage_body() {
+    let view = WorldView::new(true);
+    let row = SpellImpactEvent {
+        id: 1,
+        caster_guid: 7,
+        target_guid: 11,
+        spell_id: 133,
+        created_at: spacetimedb_sdk::Timestamp::UNIX_EPOCH,
+        damage: 23,
+        school: 2,
+        is_crit: false,
+        resisted: 0,
+        absorbed: 0,
+        map_id: 0,
+        instance_id: 0,
+        grid_x: 0,
+        grid_y: 0,
+    };
+    let (_, source_rx) = registered_viewer(&view, 0, row.caster_guid);
+    let (_, peer_rx) = registered_viewer(&view, 0, BYSTANDER);
+    impact_appeared(&view, 0, &row);
+    let source_out = queued_job(&source_rx);
+    let peer_out = queued_job(&peer_rx);
+    let source_packets = shared_packets(&source_out);
+    let peer_packets = shared_packets(&peer_out);
+    assert_eq!(source_packets.len(), 1);
+    assert_eq!(source_packets[0].0, 0x0250);
+    assert_eq!(peer_packets.len(), 1);
+    assert!(Arc::ptr_eq(source_packets[0].1, peer_packets[0].1));
+}
 
 fn swing_event() -> CombatEvent {
     CombatEvent {

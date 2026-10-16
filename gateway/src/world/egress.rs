@@ -105,6 +105,7 @@ pub(super) fn channel() -> (SessionTx, mpsc::Receiver<Queued>, watch::Receiver<b
 fn queued_bytes(out: &Outbound) -> io::Result<usize> {
     match out {
         Outbound::Raw { body, .. } => Ok(4 + body.len()),
+        Outbound::Shared { body, .. } => Ok(4 + body.len()),
         Outbound::Batch(messages) => messages
             .len()
             .checked_mul(JOB_RESERVATION)
@@ -118,6 +119,15 @@ fn queued_bytes(out: &Outbound) -> io::Result<usize> {
 pub(crate) struct Packet {
     opcode: u16,
     body: Arc<[u8]>,
+}
+
+impl Packet {
+    pub(crate) fn outbound(&self) -> Outbound {
+        Outbound::Shared {
+            opcode: self.opcode,
+            body: self.body.clone(),
+        }
+    }
 }
 
 pub(crate) fn encode(outbound: Vec<Outbound>) -> io::Result<Vec<Packet>> {
@@ -166,6 +176,7 @@ pub(crate) fn encode(outbound: Vec<Outbound>) -> io::Result<Vec<Packet>> {
                 }
                 add(opcode, body.into())?;
             }
+            Outbound::Shared { opcode, body } => add(opcode, body)?,
             Outbound::Job(_) => return Err(io::Error::other("nested Relay job")),
         }
     }
@@ -309,6 +320,15 @@ mod tests {
             drop(receiver.recv().await);
             assert_eq!(tx.depth(), 0);
         }
+    }
+
+    #[test]
+    fn oversized_shared_packets_are_refused_before_encryption() {
+        assert!(encode(vec![Outbound::Shared {
+            opcode: 1,
+            body: vec![0; u16::MAX as usize].into()
+        }])
+        .is_err());
     }
 
     #[tokio::test]

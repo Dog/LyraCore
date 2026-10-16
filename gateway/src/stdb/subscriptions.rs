@@ -1045,6 +1045,7 @@ mod tests {
                 v.len()
             ),
             Outbound::Job(_) => panic!("peer motion must be encoded by the time it is queued"),
+            Outbound::Shared { .. } => panic!("direct motion helper returns a raw packet"),
         }
         assert!(rx.try_recv().is_err(), "exactly one packet per motion row");
     }

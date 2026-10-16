@@ -67,7 +67,7 @@ fn teleport_relay_rejects_a_map_id_the_client_enum_does_not_know() {
     assert!(build_teleport_relay(false, 7, u32::MAX, 0.0, 0.0, 0.0, 0.0).is_err());
 }
 
-fn creature_spline(guid: u64, start_micros: u64, dur_ms: u32) -> CreatureSpline {
+pub(super) fn creature_spline(guid: u64, start_micros: u64, dur_ms: u32) -> CreatureSpline {
     CreatureSpline {
         guid,
         start_micros,
