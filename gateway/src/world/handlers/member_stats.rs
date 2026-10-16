@@ -25,7 +25,7 @@ pub(crate) enum MemberSnapshot {
     Live(Box<MemberStatsView>),
 }
 
-/// Only writer jobs may change these snapshots, in the same order as client packets.
+/// Writer jobs update these snapshots in client packet order; clearing them only forces a resend.
 #[derive(Clone, Default)]
 pub(crate) struct MemberStatsRecord(Arc<Mutex<HashMap<u64, MemberSnapshot>>>);
 

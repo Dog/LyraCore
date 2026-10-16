@@ -22,6 +22,13 @@ pub(super) fn spawn_member_stats_relay(coordinator: Coordinator) -> std::thread:
 
 fn queue_member_stats<St: MemberStatsStore + Clone + 'static>(view: &WorldView, store: &St) {
     for viewer in view.all_viewers() {
+        if store
+            .group_mates(viewer.self_guid)
+            .is_ok_and(|mates| mates.is_empty())
+        {
+            viewer.member_stats.forget_all();
+            continue;
+        }
         let store = store.clone();
         world_view::enqueue(viewer, move |viewer| viewer_member_stats(&store, &viewer));
     }
@@ -87,6 +94,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Ungrouped;
+
+    impl MemberStatsStore for Ungrouped {
+        fn group_mates(&self, _self_guid: u64) -> Result<Vec<u64>> {
+            Ok(Vec::new())
+        }
+
+        fn member_presence(&self, _guid: u64) -> Result<MemberPresence> {
+            Ok(MemberPresence::Offline)
+        }
+    }
+
     fn viewer(tx: SessionTx) -> Arc<Viewer> {
         Arc::new(Viewer {
             active: std::sync::atomic::AtomicBool::new(true),
@@ -133,6 +153,25 @@ mod tests {
             [Outbound::Raw { opcode: 0x007E, .. }]
         ));
         assert!(viewer.member_stats.lock().contains_key(&MATE));
+    }
+
+    #[test]
+    fn an_ungrouped_viewer_gets_no_job_and_forgets_its_old_mates() {
+        let view = WorldView::new(true);
+        let (tx, rx) = SessionTx::with_depth(0);
+        let viewer = viewer(tx);
+        view.add_viewer_on_shard(viewer.clone(), CellKey::at(0, 0, 0, 0), 0);
+        queue_member_stats(&view, &TwoMemberParty);
+        let Ok(Outbound::Job(job)) = rx.try_recv() else {
+            panic!("a grouped viewer gets a job");
+        };
+        job();
+        assert!(viewer.member_stats.lock().contains_key(&MATE));
+
+        queue_member_stats(&view, &Ungrouped);
+
+        assert!(rx.try_recv().is_err());
+        assert!(viewer.member_stats.lock().is_empty());
     }
 
     #[test]
