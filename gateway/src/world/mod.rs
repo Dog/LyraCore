@@ -1,14 +1,15 @@
 use crate::accept::{classify_accept_error, AcceptBackoff, AcceptOutcome};
 use crate::codec::auth_session::{read_auth_session, CMSG_AUTH_SESSION_OPCODE};
-use crate::read_deadline::{
-    is_io_deadline, DeadlineClock, IoDeadline, PreAuthDeadline, WORLD_AUTH_DEADLINE,
-};
+use crate::read_deadline::WORLD_AUTH_DEADLINE;
 use crate::stdb::PlayerSubscriptions;
 use crate::{codec, config::GatewayConfig, stdb::Coordinator};
 use anyhow::{anyhow, Result};
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, SendError, Sender};
+use std::sync::mpsc::SendError;
+#[cfg(test)]
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -25,9 +26,11 @@ use wow_world_messages::vanilla::{
 mod actor;
 mod chat_flood;
 mod coalesce;
+pub(crate) mod egress;
 mod entry;
 mod family;
 mod routing;
+mod transport;
 pub(crate) use family::{ProtocolFamily, ProtocolSession};
 use family::{ProtocolReply, ProtocolRequest, WorldSessionAction};
 pub(crate) mod guild_fee;
@@ -87,7 +90,7 @@ pub enum Outbound {
         opcode: u16,
         body: Vec<u8>,
     },
-    /// SDK advancement is serial per shard; defer encoding to each World Session's writer.
+    /// SDK advancement is serial per Shard; defer encoding to the bounded worker pool.
     Job(RelayJob),
 }
 
@@ -95,27 +98,22 @@ pub type RelayJob = Box<dyn FnOnce() -> Vec<Outbound> + Send>;
 
 pub const EGRESS_SHED_DEPTH: usize = 512;
 
-/// Blocking sends from SDK callbacks can deadlock the pump; keep this channel unbounded.
+/// SDK callbacks must never wait for a World Session to drain its queue.
 #[derive(Clone)]
 pub struct SessionTx {
-    tx: Sender<Outbound>,
+    tx: SessionSender,
     depth: Arc<AtomicUsize>,
     close_socket: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-impl SessionTx {
-    fn bind_socket<S: DuplexStream>(&mut self, socket: S) {
-        let socket = std::sync::Mutex::new(socket);
-        self.close_socket = Some(Arc::new(move || {
-            let socket = socket
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Err(error) = socket.shutdown_both() {
-                log::warn!("World Session socket shutdown failed: {error}");
-            }
-        }));
-    }
+#[derive(Clone)]
+enum SessionSender {
+    Async(egress::QueueSender),
+    #[cfg(test)]
+    Sync(Sender<Outbound>),
+}
 
+impl SessionTx {
     pub(crate) fn close(&self) {
         if let Some(close) = &self.close_socket {
             close();
@@ -124,12 +122,14 @@ impl SessionTx {
 
     // Count before sending so depth cannot read low; undo the count if the send fails.
     pub fn send(&self, out: Outbound) -> std::result::Result<(), SendError<Outbound>> {
-        self.depth.fetch_add(1, Ordering::Relaxed);
-        match self.tx.send(out) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.depth.fetch_sub(1, Ordering::Relaxed);
-                Err(e)
+        match &self.tx {
+            SessionSender::Async(sender) => sender.send(out),
+            #[cfg(test)]
+            SessionSender::Sync(sender) => {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                sender.send(out).inspect_err(|_| {
+                    self.depth.fetch_sub(1, Ordering::Relaxed);
+                })
             }
         }
     }
@@ -144,12 +144,13 @@ impl SessionTx {
     }
 }
 
+#[cfg(test)]
 pub fn session_channel() -> (SessionTx, Receiver<Outbound>, Arc<AtomicUsize>) {
     let (tx, rx) = channel::<Outbound>();
     let depth = Arc::new(AtomicUsize::new(0));
     (
         SessionTx {
-            tx,
+            tx: SessionSender::Sync(tx),
             depth: depth.clone(),
             close_socket: None,
         },
@@ -164,30 +165,6 @@ impl SessionTx {
         let (tx, rx, d) = session_channel();
         d.store(depth, Ordering::Relaxed);
         (tx, rx)
-    }
-}
-
-pub trait DuplexStream: Read + Write + IoDeadline + Send + Sized + 'static {
-    fn try_clone(&self) -> std::io::Result<Self>;
-    fn shutdown_both(&self) -> std::io::Result<()>;
-}
-
-impl DuplexStream for std::net::TcpStream {
-    fn try_clone(&self) -> std::io::Result<Self> {
-        std::net::TcpStream::try_clone(self)
-    }
-    fn shutdown_both(&self) -> std::io::Result<()> {
-        self.shutdown(std::net::Shutdown::Both)
-    }
-}
-
-#[cfg(all(test, unix))]
-impl DuplexStream for std::os::unix::net::UnixStream {
-    fn try_clone(&self) -> std::io::Result<Self> {
-        std::os::unix::net::UnixStream::try_clone(self)
-    }
-    fn shutdown_both(&self) -> std::io::Result<()> {
-        self.shutdown(std::net::Shutdown::Both)
     }
 }
 
@@ -333,141 +310,6 @@ const QUEUE_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const QUEUE_RESEND_INTERVAL: Duration = Duration::from_millis(50);
 
-#[cfg(test)]
-pub fn world_handshake<S: Read + Write + IoDeadline>(
-    stream: &mut S,
-    store: Arc<dyn WorldStore>,
-) -> Result<Option<(WorldConn, EncrypterHalf)>> {
-    world_handshake_with_queue(stream, store, &LoginQueue::unlimited())
-}
-
-#[cfg(test)]
-pub fn world_handshake_with_queue<S: Read + Write + IoDeadline>(
-    stream: &mut S,
-    store: Arc<dyn WorldStore>,
-    queue: &LoginQueue,
-) -> Result<Option<(WorldConn, EncrypterHalf)>> {
-    let mut deadline = PreAuthDeadline::after(WORLD_AUTH_DEADLINE);
-    world_handshake_with_queue_and_deadline(stream, store, queue, &mut deadline)
-}
-
-fn world_handshake_with_queue_and_deadline<S: Read + Write + IoDeadline, C: DeadlineClock>(
-    stream: &mut S,
-    store: Arc<dyn WorldStore>,
-    queue: &LoginQueue,
-    deadline: &mut PreAuthDeadline<C>,
-) -> Result<Option<(WorldConn, EncrypterHalf)>> {
-    let seed = ProofSeed::new();
-    let server_seed = seed.seed();
-    SMSG_AUTH_CHALLENGE { server_seed }.write_unencrypted_server(&mut deadline.io(stream))?;
-
-    let session = match read_auth_session(&mut deadline.io(stream)) {
-        Ok(claim) => claim,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) if is_io_deadline(&e) => {
-            return Err(anyhow!(
-                "no CMSG_AUTH_SESSION before the total pre-auth deadline"
-            ));
-        }
-        Err(e) => return Err(anyhow!("world auth read error: {e}")),
-    };
-
-    let username = session.username.to_uppercase();
-    let Some(WorldSession {
-        account_id,
-        session_key,
-    }) = store.lookup_session(&username)?
-    else {
-        SMSG_AUTH_RESPONSE::AuthUnknownAccount
-            .write_unencrypted_server(&mut deadline.io(stream))?;
-        return Ok(None);
-    };
-
-    let ns = NormalizedString::new(&username).map_err(|e| anyhow!("bad username: {e}"))?;
-    let crypto = match seed.into_server_header_crypto(
-        &ns,
-        session_key,
-        session.client_proof,
-        session.client_seed,
-    ) {
-        Ok(c) => c,
-        Err(_) => {
-            SMSG_AUTH_RESPONSE::AuthFailed.write_unencrypted_server(&mut deadline.io(stream))?;
-            return Ok(None);
-        }
-    };
-    let (mut encrypt, decrypt) = crypto.split();
-
-    deadline
-        .finish(stream)
-        .map_err(|e| anyhow!("clear world pre-auth I/O deadline: {e}"))?;
-
-    if let Admission::Queued(ticket) = queue.request() {
-        if !wait_for_admission(&mut *stream, &mut encrypt, queue, ticket)? {
-            queue.cancel(ticket);
-            return Ok(None);
-        }
-    }
-
-    if let Err(e) = (SMSG_AUTH_RESPONSE::AuthOk {
-        billing_flags: 0,
-        billing_rested: 0,
-        billing_time: 0,
-    })
-    .write_encrypted_server(&mut *stream, &mut encrypt)
-    {
-        queue.depart();
-        return Err(anyhow!("world auth write error (AUTH_OK): {e}"));
-    }
-
-    Ok(Some((
-        WorldConn {
-            session_claim: None,
-            protocol: ProtocolSession::new(account_id, username),
-            decrypt,
-            move_coalesce: CoalesceState::default(),
-            unavailable_notices: Default::default(),
-            store: RoutedStore::new(store),
-            session_key: Some(session_key),
-            guild_signed_on: None,
-            move_desync_drops: 0,
-            chat_flood: Default::default(),
-        },
-        encrypt,
-    )))
-}
-
-fn wait_for_admission<S: Write>(
-    stream: &mut S,
-    encrypt: &mut EncrypterHalf,
-    queue: &LoginQueue,
-    ticket: login_queue::Ticket,
-) -> Result<bool> {
-    let mut last_sent: Option<(Instant, usize)> = None;
-    loop {
-        let Some(position) = queue.position(ticket) else {
-            return Ok(true);
-        };
-        let due = match last_sent {
-            None => true,
-            Some((_, sent_position)) if sent_position != position => true,
-            Some((at, _)) => at.elapsed() >= QUEUE_RESEND_INTERVAL,
-        };
-        if due {
-            let sent = (SMSG_AUTH_RESPONSE::AuthWaitQueue {
-                queue_position: position as u32,
-            })
-            .write_encrypted_server(&mut *stream, encrypt);
-            if let Err(e) = sent {
-                log::debug!("world: queued connection hung up at position {position}: {e}");
-                return Ok(false);
-            }
-            last_sent = Some((Instant::now(), position));
-        }
-        std::thread::sleep(QUEUE_POLL_INTERVAL);
-    }
-}
-
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -508,31 +350,6 @@ impl WriterTrace {
         });
     }
 
-    fn record(&mut self, out: &Outbound) {
-        match out {
-            Outbound::One(m) => self.record_typed(m),
-            Outbound::Batch(v) => {
-                for m in v {
-                    self.record_typed(m);
-                }
-            }
-            Outbound::Raw { opcode, body } => {
-                self.push(*opcode, (2 + body.len()) as u16, fnv1a64(body));
-            }
-            Outbound::Job(_) => {}
-        }
-    }
-
-    fn record_typed(&mut self, m: &ServerOpcodeMessage) {
-        let mut buf = Vec::new();
-        if m.write_unencrypted_server(&mut buf).is_err() || buf.len() < 4 {
-            return;
-        }
-        let size = u16::from_be_bytes([buf[0], buf[1]]);
-        let opcode = u16::from_le_bytes([buf[2], buf[3]]);
-        self.push(opcode, size, fnv1a64(&buf[4..]));
-    }
-
     fn dump(&self, account_id: u64, reason: &str) {
         self.dump_to(
             std::path::Path::new("/tmp/gw-writer-crash"),
@@ -569,265 +386,121 @@ impl WriterTrace {
     }
 }
 
-fn spawn_writer<S: DuplexStream>(
-    mut wsock: S,
-    mut encrypt: EncrypterHalf,
-    rx: Receiver<Outbound>,
-    depth: Arc<AtomicUsize>,
-    account_id: u64,
-) -> Result<std::thread::JoinHandle<()>> {
-    let trace_enabled = crate::config::writer_trace_enabled();
-    std::thread::Builder::new()
-.name("world-writer".into())
-.spawn(move || {
-            let mut trace = trace_enabled.then(WriterTrace::new);
-            while let Ok(out) = rx.recv() {
-                depth.fetch_sub(1, Ordering::Relaxed);
-
-                let batch: Vec<Outbound> = match out {
-                    Outbound::Job(job) => {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
-                            Ok(items) => items,
-                            Err(_) => {
-                                log::error!(
-                                    "world writer: a deferred relay job PANICKED for account \
-                                     {account_id} — contained (this session keeps running), but \
-                                     the packet(s) it would have produced were lost"
-                                );
-                                Vec::new()
-                            }
-                        }
-                    }
-                    other => vec![other],
-                };
-                for out in batch {
-                if let Some(t) = trace.as_mut() {
-                    t.record(&out);
-                }
-                let res = match out {
-                    Outbound::One(m) => {
-                        log::debug!("OUT {m}");
-                        m.write_encrypted_server(&mut wsock, &mut encrypt)
-                    }
-                    Outbound::Batch(v) => v.into_iter().try_for_each(|m| {
-                        log::debug!("OUT {m}");
-                        m.write_encrypted_server(&mut wsock, &mut encrypt)
-                    }),
-                    Outbound::Job(_) => Ok(()),
-                    Outbound::Raw { opcode, body } => {
-                        log::debug!("OUT RAW opcode=0x{opcode:04X} ({} body bytes)", body.len());
-                        for v in packet_lint::lint_raw(opcode, &body) {
-                            log::error!("packet-lint VIOLATION opcode=0x{opcode:04X}: {v}");
-                        }
-                        // Size counts the two-byte opcode and body, excluding itself.
-                        if body.len() > u16::MAX as usize - 2 {
-                            log::error!(
-                                "packet-lint VIOLATION opcode=0x{opcode:04X}: raw body is {} bytes — \
-                                 exceeds the u16 frame-size field and would silently wrap (a stream-\
-                                 desync class); refusing to send and ending the session instead of \
-                                 corrupting the stream",
-                                body.len()
-                            );
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "raw outbound body exceeds u16 frame size",
-                            ))
-                        } else {
-                            let size = (2 + body.len()) as u16;
-                            encrypt
-.write_encrypted_server_header(&mut wsock, size, opcode)
-.and_then(|()| wsock.write_all(&body))
-                        }
-                    }
-                };
-                if let Err(e) = res {
-                    log::debug!("world writer stopping: {e}");
-                    if let Some(t) = trace.as_ref() {
-                        t.dump(account_id, &e.to_string());
-                    }
-                    let _ = wsock.shutdown_both();
-                    return;
-                }
-                }
-            }
-        })
-.map_err(|e| anyhow!("spawn world writer thread for account {account_id}: {e}"))
+struct AddonLimit {
+    tokens: f32,
+    refill_at: Instant,
+    drop_logged_at: Option<Instant>,
 }
 
-#[cfg(test)]
-pub fn run_world_session<S: DuplexStream>(stream: S, store: Arc<dyn WorldStore>) -> Result<()> {
-    run_world_session_with_queue(stream, store, &LoginQueue::unlimited())
-}
-
-struct AdmissionSeat<'a> {
-    queue: &'a LoginQueue,
-}
-
-impl Drop for AdmissionSeat<'_> {
-    fn drop(&mut self) {
-        self.queue.depart();
-    }
-}
-
-#[cfg(test)]
-pub fn run_world_session_with_queue<S: DuplexStream>(
-    stream: S,
-    store: Arc<dyn WorldStore>,
-    queue: &LoginQueue,
-) -> Result<()> {
-    let mut deadline = PreAuthDeadline::after(WORLD_AUTH_DEADLINE);
-    run_world_session_with_queue_and_deadline(stream, store, queue, &mut deadline)
-}
-
-fn run_world_session_with_queue_and_deadline<S: DuplexStream, C: DeadlineClock>(
-    mut stream: S,
-    store: Arc<dyn WorldStore>,
-    queue: &LoginQueue,
-    deadline: &mut PreAuthDeadline<C>,
-) -> Result<()> {
-    let Some((mut conn, encrypt)) =
-        world_handshake_with_queue_and_deadline(&mut stream, store, queue, deadline)?
-    else {
-        return Ok(());
-    };
-    let seat = AdmissionSeat { queue };
-
-    let wsock = stream
-        .try_clone()
-        .map_err(|e| anyhow!("clone world socket for writer: {e}"))?;
-    let (mut tx, rx, depth) = session_channel();
-    tx.bind_socket(
-        stream
-            .try_clone()
-            .map_err(|error| anyhow!("clone World Session shutdown socket: {error}"))?,
-    );
-    let writer = spawn_writer(wsock, encrypt, rx, depth, conn.account_id)?;
-
-    let result = (|| -> Result<()> {
-        let mut addon_tokens: f32 = 20.0;
-        let mut addon_refill_at = std::time::Instant::now();
-        let mut addon_drop_logged_at: Option<std::time::Instant> = None;
-        loop {
-            let hdr = match conn.decrypt.read_and_decrypt_client_header(&mut stream) {
-                Ok(h) => h,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(anyhow!("world read error: {e}")),
-            };
-            // Client size counts the four-byte opcode and body.
-            let body_len = (hdr.size as usize).saturating_sub(4);
-            let mut body = vec![0u8; body_len];
-            stream
-                .read_exact(&mut body)
-                .map_err(|e| anyhow!("world read error (body): {e}"))?;
-            if hdr.opcode == codec::addon::CMSG_MESSAGECHAT_OPCODE {
-                if let Some((chat_type, text)) = codec::addon::parse_addon_client_chat(&body) {
-                    if codec::addon::is_bridge_prefixed(&text) {
-                        let now = std::time::Instant::now();
-                        addon_tokens = (addon_tokens
-                            + now.duration_since(addon_refill_at).as_secs_f32() * 2.0)
-                            .min(20.0);
-                        addon_refill_at = now;
-                        if addon_tokens >= 1.0 {
-                            addon_tokens -= 1.0;
-                            handle_addon_message(&*conn.store.current(), &conn, &text)?;
-                        } else if addon_drop_logged_at
-                            .is_none_or(|t| now.duration_since(t).as_secs() >= 60)
-                        {
-                            addon_drop_logged_at = Some(now);
-                            log::warn!(
-                                "addon bridge: rate limit — dropping frames from account {}",
-                                conn.account_id
-                            );
-                        }
-                        continue;
-                    }
-                    if !codec::addon::typed_addon_chat_type(chat_type) {
-                        continue;
-                    }
-                }
-            }
-            if hdr.opcode == CMSG_AUCTION_LIST_ITEMS_OPCODE {
-                let request =
-                    decode_auction_browse(&body).map_err(|e| anyhow!("world read error: {e}"))?;
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::AuctionBrowse(request),
-                )?;
-                continue;
-            }
-            if hdr.opcode == CMSG_AUTH_SESSION_OPCODE {
-                return Err(anyhow!("world read error: CMSG_AUTH_SESSION after auth"));
-            }
-            if hdr.opcode == 0x0125 {
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::FactionAtWar(body),
-                )?;
-                continue;
-            }
-            if hdr.opcode == 0x0318 {
-                let store = conn.store.current();
-                dispatch(
-                    &tx,
-                    &*store,
-                    &mut conn,
-                    hdr.opcode,
-                    ProtocolRequest::WatchedFaction(body),
-                )?;
-                continue;
-            }
-            if handlers::is_silent_movement_request(hdr.opcode)
-                || handlers::is_ignored_raw_request(hdr.opcode)
-            {
-                continue;
-            }
-            if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {
-                if matches!(conn.state, WorldState::InWorld(_)) {
-                    for reply in replies {
-                        send(&tx, reply)?;
-                    }
-                }
-                continue;
-            }
-            let msg = match codec::read_movement_client(hdr.opcode, &body)? {
-                Some(msg) => msg,
-                None => {
-                    let mut framed = Vec::with_capacity(6 + body.len());
-                    framed.extend_from_slice(&hdr.size.to_be_bytes());
-                    framed.extend_from_slice(&hdr.opcode.to_le_bytes());
-                    framed.extend_from_slice(&body);
-                    ClientOpcodeMessage::read_unencrypted(&mut std::io::Cursor::new(framed))
-                        .map_err(|e| anyhow!("world read error: {e}"))?
-                }
-            };
-            let store = conn.store.current();
-            dispatch(&tx, &*store, &mut conn, hdr.opcode, msg.into())?;
+impl Default for AddonLimit {
+    fn default() -> Self {
+        Self {
+            tokens: 20.0,
+            refill_at: Instant::now(),
+            drop_logged_at: None,
         }
-    })();
-
-    log::debug!(
-        "world: movement coalescing account={} received={} forwarded={}",
-        conn.account_id,
-        conn.move_coalesce.received(),
-        conn.move_coalesce.forwarded(),
-    );
-
-    if let Err(e) = conn.leave_world() {
-        log::warn!("logout for account {} failed: {e:#}", conn.account_id);
     }
-    drop(tx);
-    let _ = writer.join();
-    // Release the seat exactly once, after the writer and Relays stop.
-    drop(seat);
-    result
+}
+
+fn process_frame(
+    tx: &SessionTx,
+    conn: &mut WorldConn,
+    addon: &mut AddonLimit,
+    hdr: wow_srp::vanilla_header::ClientHeader,
+    body: Vec<u8>,
+) -> Result<()> {
+    if hdr.opcode == codec::addon::CMSG_MESSAGECHAT_OPCODE {
+        if let Some((chat_type, text)) = codec::addon::parse_addon_client_chat(&body) {
+            if codec::addon::is_bridge_prefixed(&text) {
+                let now = std::time::Instant::now();
+                addon.tokens = (addon.tokens
+                    + now.duration_since(addon.refill_at).as_secs_f32() * 2.0)
+                    .min(20.0);
+                addon.refill_at = now;
+                if addon.tokens >= 1.0 {
+                    addon.tokens -= 1.0;
+                    handle_addon_message(&*conn.store.current(), conn, &text)?;
+                } else if addon
+                    .drop_logged_at
+                    .is_none_or(|t| now.duration_since(t).as_secs() >= 60)
+                {
+                    addon.drop_logged_at = Some(now);
+                    log::warn!(
+                        "addon bridge: dropping frames above the rate limit for account {}",
+                        conn.account_id
+                    );
+                }
+                return Ok(());
+            }
+            if !codec::addon::typed_addon_chat_type(chat_type) {
+                return Ok(());
+            }
+        }
+    }
+    if hdr.opcode == CMSG_AUCTION_LIST_ITEMS_OPCODE {
+        let request = decode_auction_browse(&body).map_err(|e| anyhow!("world read error: {e}"))?;
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::AuctionBrowse(request),
+        )?;
+        return Ok(());
+    }
+    if hdr.opcode == CMSG_AUTH_SESSION_OPCODE {
+        return Err(anyhow!("world read error: CMSG_AUTH_SESSION after auth"));
+    }
+    if hdr.opcode == 0x0125 {
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::FactionAtWar(body),
+        )?;
+        return Ok(());
+    }
+    if hdr.opcode == 0x0318 {
+        let store = conn.store.current();
+        dispatch(
+            tx,
+            &*store,
+            conn,
+            hdr.opcode,
+            ProtocolRequest::WatchedFaction(body),
+        )?;
+        return Ok(());
+    }
+    if handlers::is_silent_movement_request(hdr.opcode)
+        || handlers::is_ignored_raw_request(hdr.opcode)
+    {
+        return Ok(());
+    }
+    if let Some(replies) = handlers::raw_unavailable_outbound(hdr.opcode, &body)? {
+        if matches!(conn.state, WorldState::InWorld(_)) {
+            for reply in replies {
+                send(tx, reply)?;
+            }
+        }
+        return Ok(());
+    }
+    let msg = match codec::read_movement_client(hdr.opcode, &body)? {
+        Some(msg) => msg,
+        None => {
+            let mut framed = Vec::with_capacity(6 + body.len());
+            framed.extend_from_slice(&hdr.size.to_be_bytes());
+            framed.extend_from_slice(&hdr.opcode.to_le_bytes());
+            framed.extend_from_slice(&body);
+            ClientOpcodeMessage::read_unencrypted(&mut std::io::Cursor::new(framed))
+                .map_err(|e| anyhow!("world read error: {e}"))?
+        }
+    };
+    let store = conn.store.current();
+    dispatch(tx, &*store, conn, hdr.opcode, msg.into())?;
+    Ok(())
 }
 
 fn is_game_master<St: ChatActionStore + ?Sized>(store: &St, character_guid: u64) -> bool {
@@ -1171,6 +844,11 @@ pub async fn run(
     });
     let mut backoff = AcceptBackoff::new();
     let mut capacity_was_full = false;
+    let connections = Arc::new(tokio::sync::Semaphore::new(
+        crate::config::world_connection_limit(),
+    ));
+    let actions = cfg.blocking_task_capacity.clone();
+    let encoders = crate::accept::BlockingTaskCapacity::new(crate::config::encoding_workers());
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(pair) => {
@@ -1190,9 +868,8 @@ pub async fn run(
                     log::warn!(
                         "world accept failed ({e}); skipping this connection (consecutive={}, \
                          backing off {}ms). Players already in world are unaffected; if this is \
-                         EMFILE, the gateway is out of file descriptors — check for a leaked \
-                         per-account SDK connection (each account's cached connection releases at \
-                         session teardown).",
+                         EMFILE, the Gateway is out of file descriptors; inspect open sockets and \
+                         the configured World connection limit.",
                         backoff.consecutive(),
                         delay.as_millis()
                     );
@@ -1203,13 +880,10 @@ pub async fn run(
                 }
             },
         };
-        let mut deadline = PreAuthDeadline::after(WORLD_AUTH_DEADLINE);
-        let Some(task_permit) = cfg.blocking_task_capacity.try_admit() else {
+        let deadline = tokio::time::Instant::now() + WORLD_AUTH_DEADLINE;
+        let Ok(connection_permit) = connections.clone().try_acquire_owned() else {
             if !capacity_was_full {
-                log::warn!(
-                    "world blocking-task capacity is full; rejecting new connections before they \
-                     enter the blocking-task queue"
-                );
+                log::warn!("world connection capacity is full; refusing new connections");
                 capacity_was_full = true;
             }
             continue;
@@ -1217,29 +891,21 @@ pub async fn run(
         capacity_was_full = false;
         let coord = coordinator.clone();
         let queue = login_queue.clone();
-        let std_sock = match sock.into_std().and_then(|s| {
-            s.set_nonblocking(false)?;
-            Ok(s)
-        }) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("world connection {peer} could not be handed to a blocking task: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = deadline.arm(&std_sock) {
-            log::warn!("world connection {peer} could not arm its pre-auth watchdog: {e}");
-            continue;
-        }
-        tokio::task::spawn_blocking(move || {
-            let _task_permit = task_permit;
-            if let Err(e) = run_world_session_with_queue_and_deadline(
-                std_sock,
+        let actions = actions.clone();
+        let encoders = encoders.clone();
+        tokio::spawn(async move {
+            if let Err(error) = transport::run_at(
+                sock,
                 Arc::new(coord),
-                &queue,
-                &mut deadline,
-            ) {
-                log::warn!("world session {peer} ended: {e:#}");
+                queue,
+                actions,
+                encoders,
+                connection_permit,
+                deadline,
+            )
+            .await
+            {
+                log::warn!("world session {peer} ended: {error:#}");
             }
         });
     }
@@ -1247,5 +913,9 @@ pub async fn run(
 
 #[cfg(all(test, unix))]
 mod test_support;
+#[cfg(all(test, unix))]
+pub(crate) use test_support::run_world_session;
+#[cfg(all(test, unix))]
+use transport::world_handshake;
 #[cfg(all(test, unix))]
 pub(crate) mod tests;

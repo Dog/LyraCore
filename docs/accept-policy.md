@@ -21,5 +21,9 @@ a non-stream socket, cannot apply to a `TcpListener` created by `bind`. `EPERM` 
 refusal for one connection and also retries. `EMFILE` reports descriptor exhaustion and must leave
 existing sessions alive while capacity recovers.
 
-A shared non-waiting capacity limit keeps accepted sockets out of Tokio's unbounded blocking-task
-queue. Holding the permit for the connection's work makes the limit cover the resource it protects.
+Logon handshakes use a non-waiting permit limit before entering Tokio's blocking executor.
+World sockets use asynchronous tasks and a separate accepted-connection limit,
+`LYRACORE_MAX_WORLD_CONNECTIONS`. Each World Session submits at most one game action at a time
+through the bounded worker pool shared with logon. Relay encoding has its own bounded pool.
+Permits cover submitted and running work and return on completion or unwinding. Idle World Sessions
+and authenticated queue waits hold no worker permit.

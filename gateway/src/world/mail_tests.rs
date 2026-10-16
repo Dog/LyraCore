@@ -4285,7 +4285,7 @@ fn a_mail_poll_after_realm_core_loss_ends_the_admitted_world_session() {
         let queue = queue.clone();
         std::thread::spawn(move || {
             finished
-                .send(run_world_session_with_queue(socket, store, &queue))
+                .send(run_world_session_with_queue(socket, store, queue))
                 .unwrap();
         })
     };

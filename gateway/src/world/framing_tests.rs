@@ -174,7 +174,7 @@ fn a_session_ending_in_a_framing_error_still_gives_its_seat_back() {
     let (mut client, server_end) = world_session_socket_pair();
     let server_queue = queue.clone();
     let server = std::thread::spawn(move || {
-        run_world_session_with_queue(server_end, store.clone(), &server_queue)
+        run_world_session_with_queue(server_end, store.clone(), server_queue)
     });
     let (mut c_enc, _c_dec) = client_handshake(&mut client, "TESTER", K);
     assert_eq!(
@@ -214,7 +214,7 @@ fn a_session_that_dies_in_world_still_deletes_the_players_entity() {
     let server_store = store.clone();
     let server_queue = queue.clone();
     let server = std::thread::spawn(move || {
-        run_world_session_with_queue(server_end, server_store.clone(), &server_queue)
+        run_world_session_with_queue(server_end, server_store.clone(), server_queue)
     });
     let (mut c_enc, mut c_dec) = client_handshake(&mut client, "TESTER", K);
 

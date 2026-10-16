@@ -95,9 +95,24 @@ impl LoginQueue {
             .map(|i| i + 1)
     }
 
+    #[cfg(test)]
     pub fn cancel(&self, ticket: Ticket) {
         let mut s = self.state.lock().unwrap();
         s.waiting.retain(|w| w.ticket != ticket);
+    }
+
+    pub(super) fn cancel_or_depart(&self, ticket: Ticket) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state
+            .waiting
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+        {
+            state.waiting.remove(index);
+        } else {
+            state.active = state.active.saturating_sub(1);
+            self.drain_locked(&mut state);
+        }
     }
 
     pub fn depart(&self) {

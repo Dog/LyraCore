@@ -311,58 +311,62 @@ gateway's environment. Omit one and you get a **working-looking single-database 
 | `LYRACORE_AOI` | AOI-scoped subscriptions | **on** (`=0` disables) | — |
 | `LYRACORE_QUEST_LOG` | quest-log descriptor fields | **on** | — |
 | `LYRACORE_MAX_SESSIONS` / `LYRACORE_ADMIT_CONCURRENCY` | Established World Sessions / queued admissions per tick, per Gateway process. Divide the intended realm-wide limit by the Gateway count. | Unset or `0` = unlimited | Malformed values stop serving startup before Coordinator connection or listener binding. Surrounding whitespace is allowed; signs, separators, empty values and overflow are refused. Provision mode does not use these limits. |
-| `LYRACORE_MAX_BLOCKING_THREADS` | tokio blocking-pool cap — **the real ceiling on concurrent players** (see below) | `512` (tokio's own default) | malformed **or zero** falls back to `512`; the resolved value is logged at startup |
+| `LYRACORE_MAX_BLOCKING_THREADS` | Blocking game actions, logon handshakes and Relay encoding | `512` | Malformed or zero falls back to `512`; startup logs the resolved value. |
+| `LYRACORE_MAX_WORLD_CONNECTIONS` | All accepted World sockets, including pre-auth and queued clients | `16384` | Malformed or zero falls back to `16384`; excess sockets close at accept. |
 | `LYRACORE_LOAD_SAMPLE_SECS` | shard load sampling cadence | `30` | — |
 | `LYRACORE_METRICS_DB_IDS` | `<shard>=<hex-identity-prefix>` map for `/v1/metrics` | `""` | warns loudly at startup; occupancy unmeasured |
 | `LYRACORE_WRITER_TRACE` | per-session writer black-box ring | off | — |
 | `LYRACORE_TRANSFER_ABORT_AFTER` | crash-injection harness (aborts a named transfer step) | unset | an unknown step name logs an error and nothing fires |
 | `LYRACORE_PROFILE_SECS` | `--features dhat-heap` builds only | `120` | — |
 
-Budget three client socket descriptors per World Session: reader, writer and ownership-loss
-shutdown handle. Add the database sockets for its subscribed Shards and reserve headroom for
-listeners, handshakes and Coordinator connections when setting `LYRACORE_MAX_SESSIONS`.
+Each World Session uses one client socket descriptor. Add the shared Coordinator and call-pipe
+sockets, listeners and logon handshakes when setting descriptor limits.
 
-Two non-`LYRACORE_` variables matter: `RUST_LOG` (consumed by `env_logger` in `gateway/src/main.rs`)
-and `MALLOC_ARENA_MAX` (glibc, not the binary — worth ~4× RSS per connection).
+`RUST_LOG` controls logging through `env_logger`. `MALLOC_ARENA_MAX` controls glibc allocation arenas.
 
-### `LYRACORE_MAX_BLOCKING_THREADS`, and the two limits above it (#451)
+### World Session concurrency and limits
 
-Both listeners hand admitted sockets to `spawn_blocking` because the `wow_login_messages` and
-`wow_world_messages` codecs use blocking `std::io`. A **World Session holds its blocking thread for
-the session's entire life**. So the blocking-pool cap is the seat count shared between live World
-Sessions and in-flight logon handshakes. It was Tokio's inherited default of 512 until #451,
-configured by nothing and reported by nothing.
+World socket reads, writes and authenticated login-queue waits use asynchronous tasks. An idle
+World Session holds no blocking worker. Each session submits one game action at a time to a bounded
+pool shared with logon handshakes. Store interfaces remain synchronous, including Durable Request
+completion waits. The pool bounds those active waits independently of connected player count.
 
-That mattered because a full pool does not refuse: `spawn_blocking` **queues**. Before #410, a
-socket could be accepted and then wait without a bound for a blocking thread, retaining its file
-descriptor and sitting ahead of later logins. Both listeners now share a non-waiting capacity with
-the same size as the pool. A connection that cannot take a permit is closed before its task is
-submitted, and each task holds its permit through normal return or unwinding. This bounds submitted
-plus running connection tasks at the configured pool size. Measured 2026-08-07 on an 8-core/15 GB
-container, 600 clients offered:
+Relay encoding has a separate permit pool, capped at eight workers and one quarter of
+`LYRACORE_MAX_BLOCKING_THREADS`, with a minimum of one. Both pools use Tokio's blocking executor.
+This reserves encoding capacity when game actions await database completion. A one-thread executor
+still serializes both kinds of work. No capacity measurement for this implementation is recorded yet.
 
-| `max_blocking_threads` | seated | failed |
-|---|---|---|
-| 512 (tokio default) | 477 | 123 |
-| 4096 | 535 | 65 |
+The World listener bounds accepted sockets independently through `LYRACORE_MAX_WORLD_CONNECTIONS`.
+`LYRACORE_MAX_SESSIONS` controls admitted players and the authenticated queue. Neither value is a
+measured player capacity. Logon still refuses a new handshake when it cannot obtain a worker permit.
 
-477 rather than a clean 512 because logon handshakes draw from the same pool. Raising it is worth
-about 58 sessions on that host. (The next ceiling this section used to name — per-player
-connection setup — is gone with the per-player connections themselves, #483.)
+Pre-auth has a total deadline of ten seconds for logon and fifteen seconds for World. The World budget
+includes socket reads, writes and the session lookup in one asynchronous timeout, then ends before the
+authenticated queue. Queue writes have their own timeout. A queue seat returns on cancellation,
+including when admission races with cancellation.
 
-Each admitted socket also starts one absolute pre-auth I/O deadline at accept: 10 seconds for
-logon and 15 seconds for world. Blocking reads and writes receive only the remaining time. An
-async watchdog closes the socket at the same instant even when its task has not started. Successful
-proof cancels the watchdog and clears both socket timeouts. World does this before the login queue,
-so an authenticated queue wait does not spend the pre-auth budget.
+Each World Session has a non-waiting outbound queue capped at 2,048 entries and a 4 MiB reservation
+budget. Raw frames reserve their wire size; each typed frame and deferred Relay job reserves 4 KiB until
+encoding. Compression stays on encoding workers. Each encoded projection and combined write batch is
+also limited to 4 MiB.
+These are queue and encoded-output limits, not an exact bound on arbitrary captured Rust objects.
+A queue entry has ten seconds to finish encoding and writing. Exceeding a limit closes the session;
+critical packets are not silently discarded. Movement keeps its existing coalescing and shedding.
+
+One writer owns each session's header cipher and preserves FIFO order and contiguous entry batches.
+It combines frames into writes of about 64 KiB.
+A supervisor retains cleanup ownership when its caller is cancelled. Accepted game actions finish
+before logout cleanup, so a delayed login cannot recreate a departed session after cleanup. A clean
+read EOF drains direct replies from accepted actions within the outbound age budget before returning
+the admission seat. Cleanup invalidates queued viewer Relays, as it does during Transfer.
 
 Two related startup behaviours have no environment variable, because there is no case for turning
 them off:
 
 - **`RLIMIT_NOFILE` soft is raised to hard** before the runtime is built (`gateway/src/fd_limit.rs`).
   A stock Docker container is soft 1024 / hard 524288, and #447 died at ~200 sessions with
-  `Too many open files (os error 24)` against 512× of unclaimed headroom. A live session costs 3–5
-  descriptors. Failure logs and continues — it never blocks startup.
+  `Too many open files (os error 24)` against 512× of unclaimed headroom. World Sessions now use one
+  client descriptor each. Failure logs and continues — it never blocks startup.
 - **A transient `accept(2)` errno costs one connection, not the realm** (`gateway/src/accept.rs`).
   `EMFILE`, `ENFILE`, `ECONNABORTED`, `EINTR`, `ENOBUFS`, `ENOMEM` and every unenumerated errno are
   logged and skipped, with a backoff that settles at one attempt per second under sustained

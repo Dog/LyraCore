@@ -32,9 +32,8 @@ fn main() -> Result<()> {
     let max_blocking_threads = config::max_blocking_threads();
     log::info!(
         "tokio blocking pool: max_blocking_threads={max_blocking_threads} \
-         (LYRACORE_MAX_BLOCKING_THREADS; default {}). One world session holds one thread for its \
-         entire life, shared with in-flight logon handshakes. Excess connection tasks are rejected \
-         before the blocking-task queue.",
+         (LYRACORE_MAX_BLOCKING_THREADS; default {}). World Session socket I/O is asynchronous. \
+         Game actions, Relay encoding and logon handshakes use bounded blocking work.",
         config::DEFAULT_MAX_BLOCKING_THREADS
     );
 

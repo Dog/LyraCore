@@ -48,9 +48,25 @@ impl GatewayConfig {
             module_name: get("LYRACORE_DATABASE", "lyracore"),
             coordinator_token: std::env::var("LYRACORE_COORDINATOR_TOKEN").ok(),
             gateway_id: get("LYRACORE_GATEWAY_ID", &default_gateway_id),
-            blocking_task_capacity: BlockingTaskCapacity::new(max_blocking_threads()),
+            blocking_task_capacity: BlockingTaskCapacity::new(
+                max_blocking_threads()
+                    .saturating_sub(encoding_workers())
+                    .max(1),
+            ),
         }
     }
+}
+
+pub(crate) fn encoding_workers() -> usize {
+    (max_blocking_threads() / 4).clamp(1, 8)
+}
+
+pub(crate) fn world_connection_limit() -> usize {
+    std::env::var("LYRACORE_MAX_WORLD_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0 && *limit <= tokio::sync::Semaphore::MAX_PERMITS)
+        .unwrap_or(16_384)
 }
 
 pub const INSTANCE_BUCKETS: u64 = 8;
@@ -431,7 +447,7 @@ pub fn max_blocking_threads() -> usize {
 pub fn max_blocking_threads_from_env(raw: Option<&str>) -> usize {
     raw.map(str::trim)
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+        .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
         .unwrap_or(DEFAULT_MAX_BLOCKING_THREADS)
 }
 

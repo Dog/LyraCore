@@ -13,6 +13,11 @@ pub(crate) struct SessionState {
     pub(crate) username: String,
     pub(crate) session: Option<WorldSession>,
     pub(crate) login_entity: Option<codec::EntityView>,
+    pub(crate) login_pause: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+    pub(crate) subscribe_pause: Option<(
+        std::sync::mpsc::Sender<SessionTx>,
+        std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    )>,
     pub(crate) moves: std::sync::Mutex<Vec<MoveRecord>>,
     pub(crate) move_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
     pub(crate) client_commands: std::sync::Mutex<Vec<(u64, String, String)>>,
@@ -54,6 +59,10 @@ impl SessionStore for WorldFake {
         entry: codec::WorldEntry,
     ) -> Result<codec::EntityView> {
         self.rec("player_login");
+        if let Some(pause) = &self.session.login_pause {
+            pause.0.wait();
+            pause.1.wait();
+        }
         self.session.login_entries.lock().unwrap().push(entry);
         let call = self
             .session
@@ -112,6 +121,14 @@ impl SessionStore for WorldFake {
             arrival.y,
         ));
         *self.session.session_depth.lock().unwrap() = Some(tx.depth_handle());
+        if let Some((entered, resume)) = &self.session.subscribe_pause {
+            entered.send(tx.clone()).unwrap();
+            resume
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
         if self.session.turn_in_reward_item.is_some() {
             *self.session.turn_in_tx.lock().unwrap() = Some(tx.clone());
         }

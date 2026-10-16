@@ -26,8 +26,7 @@ fn movement_burst_over_a_real_cipher(n: usize) {
         .join()
         .expect("server handshake thread must not panic");
 
-    let (tx, rx, depth) = session_channel();
-    let writer = spawn_writer(s, encrypt, rx, depth, 1).expect("spawn the writer thread");
+    let (tx, writer) = start_writer(s, encrypt);
 
     // Read concurrently with the writer; joining first deadlocks once the socket buffer fills.
     let reader = std::thread::spawn(move || {
@@ -52,6 +51,9 @@ fn movement_burst_over_a_real_cipher(n: usize) {
     });
 
     for i in 0..n {
+        while tx.depth() >= 128 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let guid = 0x1000_0000_0000_0000u64 + i as u64;
         let start = wow_world_messages::vanilla::Vector3d {
             x: -8938.0 + i as f32,
@@ -94,7 +96,8 @@ fn movement_burst_over_a_real_cipher(n: usize) {
     drop(tx);
     writer
         .join()
-        .expect("writer thread must not panic under a movement burst");
+        .expect("writer thread must not panic under a movement burst")
+        .expect("movement frames must reach the client");
     let (monster_moves, heartbeats) = reader.join().expect("reader thread must not panic");
 
     assert_eq!(
@@ -112,89 +115,6 @@ fn writer_thread_survives_movement_bursts_from_100_to_500_movers_without_desync(
     for n in [100usize, 150, 300, 500] {
         movement_burst_over_a_real_cipher(n);
     }
-}
-
-#[test]
-fn writer_trace_records_the_typed_path_opcode_and_size() {
-    let m = codec::build_monster_move(
-        0xF130_0000_0000_0001,
-        wow_world_messages::vanilla::Vector3d {
-            x: -8938.0,
-            y: -131.0,
-            z: 83.5,
-        },
-        wow_world_messages::vanilla::Vector3d {
-            x: -8900.0,
-            y: -100.0,
-            z: 82.4,
-        },
-        500,
-        1,
-        true,
-    );
-    let msg = ServerOpcodeMessage::SMSG_MONSTER_MOVE(Box::new(m));
-    let mut plain = Vec::new();
-    msg.write_unencrypted_server(&mut plain).unwrap();
-    let expected_size = u16::from_be_bytes([plain[0], plain[1]]);
-    let expected_opcode = u16::from_le_bytes([plain[2], plain[3]]);
-    let expected_checksum = fnv1a64(&plain[4..]);
-
-    let mut trace = WriterTrace::new();
-    trace.record(&Outbound::One(msg));
-
-    assert_eq!(
-        trace.ring.len(),
-        1,
-        "one Outbound::One must record exactly one frame"
-    );
-    let entry = trace.ring[0];
-    assert_eq!(entry.opcode, expected_opcode);
-    assert_eq!(entry.size, expected_size);
-    assert_eq!(entry.checksum, expected_checksum);
-}
-
-#[test]
-fn writer_trace_expands_a_batch_into_one_entry_per_message() {
-    let make = |i: u32| {
-        let m = codec::build_monster_move(
-            0x2000_0000_0000_0000 + i as u64,
-            wow_world_messages::vanilla::Vector3d {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            wow_world_messages::vanilla::Vector3d {
-                x: 1.0,
-                y: 1.0,
-                z: 1.0,
-            },
-            100,
-            i + 1,
-            false,
-        );
-        ServerOpcodeMessage::SMSG_MONSTER_MOVE(Box::new(m))
-    };
-    let mut trace = WriterTrace::new();
-    trace.record(&Outbound::Batch(vec![make(0), make(1), make(2)]));
-    assert_eq!(
-        trace.ring.len(),
-        3,
-        "a 3-message Batch must expand to 3 traced frames"
-    );
-}
-
-#[test]
-fn writer_trace_records_the_raw_path_verbatim() {
-    let body = vec![0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
-    let mut trace = WriterTrace::new();
-    trace.record(&Outbound::Raw {
-        opcode: 0x00EE,
-        body: body.clone(),
-    });
-    let entry = trace.ring[0];
-    assert_eq!(entry.opcode, 0x00EE);
-    assert_eq!(entry.size, 2 + body.len() as u16);
-    assert_eq!(entry.checksum, fnv1a64(&body));
 }
 
 #[test]
@@ -273,8 +193,7 @@ fn oversized_raw_body_ends_the_session_instead_of_wrapping_the_size_field() {
         .join()
         .expect("server handshake thread must not panic");
 
-    let (tx, rx, depth) = session_channel();
-    let writer = spawn_writer(s, encrypt, rx, depth, 1).expect("spawn the writer thread");
+    let (tx, writer) = start_writer(s, encrypt);
 
     let oversized_body = vec![0xABu8; u16::MAX as usize];
     tx.send(Outbound::Raw {
@@ -286,7 +205,8 @@ fn oversized_raw_body_ends_the_session_instead_of_wrapping_the_size_field() {
 
     writer
         .join()
-        .expect("the writer thread must not panic on an oversized raw body");
+        .expect("the writer thread must not panic on an oversized raw body")
+        .expect_err("oversized bodies must end the writer");
 
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec) {
         Err(_) => {}
@@ -323,8 +243,7 @@ fn combat_cast_burst_over_a_real_cipher(n: usize) {
         .join()
         .expect("server handshake thread must not panic");
 
-    let (tx, rx, depth) = session_channel();
-    let writer = spawn_writer(s, encrypt, rx, depth, 1).expect("spawn the writer thread");
+    let (tx, writer) = start_writer(s, encrypt);
 
     const SPELL_ID: u32 = 133;
     const BOSS_GUID: u64 = 0xF130_0000_0000_0001;
@@ -364,6 +283,9 @@ fn combat_cast_burst_over_a_real_cipher(n: usize) {
     });
 
     for i in 0..n {
+        while tx.depth() >= 128 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let caster = 0x1000_0000_0000_0000u64 + i as u64;
         let damage = 40 + (i as u32 % 60);
 
@@ -431,7 +353,8 @@ fn combat_cast_burst_over_a_real_cipher(n: usize) {
     drop(tx);
     writer
         .join()
-        .expect("writer thread must not panic under a combat+cast burst");
+        .expect("writer thread must not panic under a combat+cast burst")
+        .expect("combat frames must reach the client");
     let (starts, goes, damage_logs, cooldowns, swings, heartbeats) =
         reader.join().expect("reader thread must not panic");
 
