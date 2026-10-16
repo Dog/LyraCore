@@ -112,8 +112,8 @@ impl ExplorationReplay {
 
 #[derive(Default)]
 pub(crate) struct MotionPending {
-    pub(crate) entity: Mutex<HashMap<u64, Arc<EntityMotion>>>,
-    pub(crate) creature: Mutex<HashMap<u64, Arc<CreatureSpline>>>,
+    pub(crate) entity: Mutex<crate::codec::movement::subscriptions::MotionRows<EntityMotion>>,
+    pub(crate) creature: Mutex<crate::codec::movement::subscriptions::MotionRows<CreatureSpline>>,
     /// Clear before draining so a racing upsert can queue its own flush.
     pub(crate) flush_queued: std::sync::atomic::AtomicBool,
 }

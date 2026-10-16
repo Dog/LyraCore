@@ -10,7 +10,7 @@ use crate::world::Outbound;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
 use spacetimedb_sdk::Table;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
 pub(crate) use lyracore_shared::spell::taxonomy::A_STEALTH;
@@ -31,7 +31,68 @@ pub(crate) fn stealth_action(is_insert: bool, post_change_count: usize) -> Steal
     }
 }
 
-pub(crate) fn combat_event_outbound(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventAudience {
+    Everyone,
+    Source,
+    Peers,
+}
+
+impl EventAudience {
+    fn includes(self, is_source: bool) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::Source => is_source,
+            Self::Peers => !is_source,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SharedEventPackets(
+    OnceLock<std::io::Result<Vec<(EventAudience, crate::world::egress::Packet)>>>,
+);
+
+impl SharedEventPackets {
+    fn outbound(
+        &self,
+        viewer: &Viewer,
+        source_guid: u64,
+        messages: impl FnOnce() -> Vec<(EventAudience, Outbound)>,
+    ) -> Vec<Outbound> {
+        let encoded = self.0.get_or_init(|| {
+            let mut packets = Vec::new();
+            for (audience, message) in messages() {
+                match crate::world::egress::encode(vec![message]) {
+                    Ok(encoded) => {
+                        packets.extend(encoded.into_iter().map(|packet| (audience, packet)))
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Relay packet encoding failed for source {source_guid}: {error}"
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(packets)
+        });
+        match encoded {
+            Ok(packets) => packets
+                .iter()
+                .filter(|(audience, _)| audience.includes(viewer.self_guid == source_guid))
+                .map(|(_, packet)| packet.outbound())
+                .collect(),
+            Err(_) => {
+                viewer.tx.close();
+                Vec::new()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn combat_event_outbound(
     created: &Mutex<HashSet<u64>>,
     self_guid: u64,
     row: &CombatEvent,
@@ -39,6 +100,14 @@ pub(crate) fn combat_event_outbound(
     if !created.lock().unwrap().contains(&row.attacker_guid) {
         return Vec::new();
     }
+    combat_event_messages(row)
+        .into_iter()
+        .filter(|(audience, _)| audience.includes(self_guid == row.attacker_guid))
+        .map(|(_, out)| out)
+        .collect()
+}
+
+fn combat_event_messages(row: &CombatEvent) -> Vec<(EventAudience, Outbound)> {
     let mut out = Vec::new();
     // A ranged launch uses SPELL_GO; ATTACKERSTATEUPDATE would animate a melee swing.
     if row.ranged_spell_id != 0 {
@@ -56,9 +125,10 @@ pub(crate) fn combat_event_outbound(
             ammo,
             miss,
         );
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(Box::new(
-            go,
-        ))));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(Box::new(go))),
+        ));
     } else if !row.spell_swing {
         let m = codec::build_attacker_state_update(
             row.attacker_guid,
@@ -68,25 +138,30 @@ pub(crate) fn combat_event_outbound(
             row.blocked_amount,
             0,
         );
-        out.push(Outbound::One(
-            ServerOpcodeMessage::SMSG_ATTACKERSTATEUPDATE(Box::new(m)),
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_ATTACKERSTATEUPDATE(Box::new(m))),
         ));
     }
     if row.killing_blow && row.ranged_spell_id == 0 {
         let stop = codec::build_attack_stop(row.attacker_guid, row.target_guid);
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_ATTACKSTOP(
-            Box::new(stop),
-        )));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_ATTACKSTOP(Box::new(stop))),
+        ));
     }
     // Killer only; docs/benilla-compatibility.md "Combat feedback" lists the missing audiences.
-    if row.killing_blow && row.attacker_guid == self_guid && !is_creature_guid(self_guid) {
+    if row.killing_blow && !is_creature_guid(row.attacker_guid) {
         use wow_world_messages::vanilla::SMSG_PARTYKILLLOG;
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_PARTYKILLLOG(
-            Box::new(SMSG_PARTYKILLLOG {
-                player_with_killing_blow: wow_world_messages::Guid::new(row.attacker_guid),
-                victim: wow_world_messages::Guid::new(row.target_guid),
-            }),
-        )));
+        out.push((
+            EventAudience::Source,
+            Outbound::One(ServerOpcodeMessage::SMSG_PARTYKILLLOG(Box::new(
+                SMSG_PARTYKILLLOG {
+                    player_with_killing_blow: wow_world_messages::Guid::new(row.attacker_guid),
+                    victim: wow_world_messages::Guid::new(row.target_guid),
+                },
+            ))),
+        ));
     }
     out
 }
@@ -134,40 +209,59 @@ pub(crate) fn melee_disengage_outbound(self_guid: u64, row: &MeleeAttack) -> Vec
     ))]
 }
 
-pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<Outbound> {
+#[cfg(test)]
+fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<Outbound> {
+    cast_event_messages(row)
+        .into_iter()
+        .filter(|(audience, _)| audience.includes(self_guid == row.caster_guid))
+        .map(|(_, out)| out)
+        .collect()
+}
+
+fn cast_event_messages(row: &SpellCastEvent) -> Vec<(EventAudience, Outbound)> {
     let mut out = Vec::new();
     let Some(kind) = SpellCastEventKind::decode(row) else {
         return out;
     };
     if kind == SpellCastEventKind::Interrupt {
-        // SPELL_FAILURE must be caster-private or bystanders can lose their own cast state.
-        if is_creature_guid(row.caster_guid) || row.caster_guid == self_guid {
-            let m = codec::build_spell_failure(row.caster_guid, row.spell_id);
-            out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILURE(
-                Box::new(m),
-            )));
+        // Character SPELL_FAILURE is caster-private so bystanders keep their own cast state.
+        let failure_audience = if is_creature_guid(row.caster_guid) {
+            EventAudience::Everyone
         } else {
-            let m = codec::build_spell_failed_other(row.caster_guid, row.spell_id);
-            out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILED_OTHER(
-                Box::new(m),
-            )));
+            EventAudience::Source
+        };
+        out.push((
+            failure_audience,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILURE(Box::new(
+                codec::build_spell_failure(row.caster_guid, row.spell_id),
+            ))),
+        ));
+        if failure_audience == EventAudience::Source {
+            out.push((
+                EventAudience::Peers,
+                Outbound::One(ServerOpcodeMessage::SMSG_SPELL_FAILED_OTHER(Box::new(
+                    codec::build_spell_failed_other(row.caster_guid, row.spell_id),
+                ))),
+            ));
         }
         // Teardown must precede the failed cast result to clear both cast and melee-spell state.
-        if row.caster_guid == self_guid {
-            if let Some(reason) = codec::cast_failure_reason_for_code(row.failure_reason) {
-                out.push(Outbound::Raw {
+        if let Some(reason) = codec::cast_failure_reason_for_code(row.failure_reason) {
+            out.push((
+                EventAudience::Source,
+                Outbound::Raw {
                     opcode: 0x0130,
                     body: codec::build_cast_result_failed(row.spell_id, reason),
-                });
-            }
+                },
+            ));
         }
         return out;
     }
     if kind == SpellCastEventKind::Pushback {
         let m = codec::build_spell_delayed(row.caster_guid, row.delay_ms);
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_DELAYED(
-            Box::new(m),
-        )));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_DELAYED(Box::new(m))),
+        ));
         return out;
     }
     if kind == SpellCastEventKind::ProcLog {
@@ -182,78 +276,95 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
                 row.resisted,
                 row.absorbed,
             );
-            out.push(Outbound::One(
-                ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(log)),
+            out.push((
+                EventAudience::Everyone,
+                Outbound::One(ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(
+                    log,
+                ))),
             ));
         }
         return out;
     }
     if kind == SpellCastEventKind::PeriodicLog {
-        out.extend(periodic_log_outbound(row));
+        out.extend(periodic_log_outbound(row).map(|out| (EventAudience::Everyone, out)));
         return out;
     }
     if kind == SpellCastEventKind::Start {
         let start =
             codec::build_spell_start(row.caster_guid, row.spell_id, row.cast_time_ms, 0, None);
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(
-            Box::new(start),
-        )));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(Box::new(start))),
+        ));
         return out;
     }
-    let caster_synced_instant = row.client_initiated && row.caster_guid == self_guid;
-    if !caster_synced_instant {
-        if !row.is_completion {
-            let start = codec::build_spell_start(row.caster_guid, row.spell_id, 0, 0, None);
-            out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(
-                Box::new(start),
-            )));
-        }
-        // Timed completions need caster-only CAST_RESULT before GO; instant casts already sent it.
-        if row.is_completion && row.caster_guid == self_guid {
-            out.push(Outbound::Raw {
+    let launch_audience = if row.client_initiated {
+        EventAudience::Peers
+    } else {
+        EventAudience::Everyone
+    };
+    if !row.is_completion {
+        let start = codec::build_spell_start(row.caster_guid, row.spell_id, 0, 0, None);
+        out.push((
+            launch_audience,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_START(Box::new(start))),
+        ));
+    }
+    // Timed completions need caster-only CAST_RESULT before GO; instant casts already sent it.
+    if row.is_completion && !row.client_initiated {
+        out.push((
+            EventAudience::Source,
+            Outbound::Raw {
                 opcode: 0x0130,
                 body: codec::build_cast_result_ok(row.spell_id),
-            });
-        }
-        let mut go = codec::build_spell_go(row.caster_guid, row.spell_id, row.target_guid, None);
-        if row.is_completion && row.damage == 0 {
-            use wow_world_messages::vanilla::{SpellMiss, SpellMissInfo};
-            let miss_info = match row.swing_hit_info {
-                2 => Some(SpellMissInfo::Miss),
-                3 => Some(SpellMissInfo::Dodge),
-                4 => Some(SpellMissInfo::Parry),
-                _ => None,
-            };
-            if let Some(mi) = miss_info {
-                go.hits.clear();
-                go.misses = vec![SpellMiss {
-                    target: wow_world_messages::Guid::new(row.target_guid),
-                    miss_info: mi,
-                }];
-            }
-        }
-        if let Some(mi) = cast_miss_info(row.miss_info) {
-            use wow_world_messages::vanilla::SpellMiss;
+            },
+        ));
+    }
+    let mut go = codec::build_spell_go(row.caster_guid, row.spell_id, row.target_guid, None);
+    if row.is_completion && row.damage == 0 {
+        use wow_world_messages::vanilla::{SpellMiss, SpellMissInfo};
+        let miss_info = match row.swing_hit_info {
+            2 => Some(SpellMissInfo::Miss),
+            3 => Some(SpellMissInfo::Dodge),
+            4 => Some(SpellMissInfo::Parry),
+            _ => None,
+        };
+        if let Some(mi) = miss_info {
             go.hits.clear();
             go.misses = vec![SpellMiss {
                 target: wow_world_messages::Guid::new(row.target_guid),
                 miss_info: mi,
             }];
         }
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(Box::new(
-            go,
-        ))));
-    } else if let Some(mi) = cast_miss_info(row.miss_info) {
-        // The cast handler already sent this caster a GO listing the target as hit.
-        out.push(Outbound::Raw {
-            opcode: codec::SMSG_SPELLLOGMISS_OPCODE,
-            body: codec::build_spell_log_miss(
-                row.caster_guid,
-                row.spell_id,
-                row.target_guid,
-                mi.as_int(),
-            ),
-        });
+    }
+    if let Some(mi) = cast_miss_info(row.miss_info) {
+        use wow_world_messages::vanilla::SpellMiss;
+        go.hits.clear();
+        go.misses = vec![SpellMiss {
+            target: wow_world_messages::Guid::new(row.target_guid),
+            miss_info: mi,
+        }];
+    }
+    out.push((
+        launch_audience,
+        Outbound::One(ServerOpcodeMessage::SMSG_SPELL_GO(Box::new(go))),
+    ));
+    if row.client_initiated {
+        if let Some(mi) = cast_miss_info(row.miss_info) {
+            // The cast handler already sent this caster a GO listing the target as hit.
+            out.push((
+                EventAudience::Source,
+                Outbound::Raw {
+                    opcode: codec::SMSG_SPELLLOGMISS_OPCODE,
+                    body: codec::build_spell_log_miss(
+                        row.caster_guid,
+                        row.spell_id,
+                        row.target_guid,
+                        mi.as_int(),
+                    ),
+                },
+            ));
+        }
     }
 
     if row.damage > 0 {
@@ -267,43 +378,53 @@ pub(crate) fn cast_event_outbound(self_guid: u64, row: &SpellCastEvent) -> Vec<O
             row.resisted,
             row.absorbed,
         );
-        out.push(Outbound::One(
-            ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(log)),
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELLNONMELEEDAMAGELOG(Box::new(
+                log,
+            ))),
         ));
     }
     if row.healed > 0 {
         use wow_world_messages::vanilla::SMSG_SPELLHEALLOG;
         use wow_world_messages::Guid;
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELLHEALLOG(
-            Box::new(SMSG_SPELLHEALLOG {
-                victim: Guid::new(row.target_guid),
-                caster: Guid::new(row.caster_guid),
-                id: row.spell_id,
-                damage: row.healed,
-                critical: row.is_crit,
-            }),
-        )));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELLHEALLOG(Box::new(
+                SMSG_SPELLHEALLOG {
+                    victim: Guid::new(row.target_guid),
+                    caster: Guid::new(row.caster_guid),
+                    id: row.spell_id,
+                    damage: row.healed,
+                    critical: row.is_crit,
+                },
+            ))),
+        ));
     }
 
     if row.energized > 0 {
-        out.push(Outbound::Raw {
-            opcode: codec::SMSG_SPELLENERGIZELOG_OPCODE,
-            body: codec::build_spell_energize_log(
-                row.target_guid,
-                row.caster_guid,
-                row.spell_id,
-                row.power_type,
-                row.energized,
-            ),
-        });
+        out.push((
+            EventAudience::Everyone,
+            Outbound::Raw {
+                opcode: codec::SMSG_SPELLENERGIZELOG_OPCODE,
+                body: codec::build_spell_energize_log(
+                    row.target_guid,
+                    row.caster_guid,
+                    row.spell_id,
+                    row.power_type,
+                    row.energized,
+                ),
+            },
+        ));
     }
 
     // SMSG_SPELL_GO releases pending casts. A zero-duration cooldown can leave the button stuck.
     if row.cooldown_ms > 0 {
         let cd = codec::build_spell_cooldown(row.caster_guid, row.spell_id, row.cooldown_ms);
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_SPELL_COOLDOWN(
-            Box::new(cd),
-        )));
+        out.push((
+            EventAudience::Everyone,
+            Outbound::One(ServerOpcodeMessage::SMSG_SPELL_COOLDOWN(Box::new(cd))),
+        ));
     }
     out
 }
@@ -912,14 +1033,14 @@ pub(crate) fn combat_audience(
 
 pub(crate) fn combat_event_appeared(view: &WorldView, shard: ShardId, row: &CombatEvent) {
     let row = Arc::new(row.clone());
+    let packets = Arc::new(SharedEventPackets::default());
     for viewer in combat_audience(view, shard, &row) {
-        let row = row.clone();
+        let (row, packets) = (row.clone(), packets.clone());
         enqueue(viewer.clone(), move |viewer| {
-            crate::codec::combat::subscriptions::combat_event_outbound(
-                &viewer.created,
-                viewer.self_guid,
-                &row,
-            )
+            if !viewer.created.lock().unwrap().contains(&row.attacker_guid) {
+                return Vec::new();
+            }
+            packets.outbound(&viewer, row.attacker_guid, || combat_event_messages(&row))
         });
     }
 }
@@ -1100,11 +1221,11 @@ pub(crate) fn cast_audience(
 
 pub(crate) fn cast_event_appeared(view: &WorldView, shard: ShardId, row: &SpellCastEvent) {
     let row = Arc::new(row.clone());
+    let packets = Arc::new(SharedEventPackets::default());
     for viewer in cast_audience(view, shard, &row) {
-        let row = row.clone();
-        let self_guid = viewer.self_guid;
-        enqueue(viewer.clone(), move |_| {
-            crate::codec::combat::subscriptions::cast_event_outbound(self_guid, &row)
+        let (row, packets) = (row.clone(), packets.clone());
+        enqueue(viewer.clone(), move |viewer| {
+            packets.outbound(&viewer, row.caster_guid, || cast_event_messages(&row))
         });
     }
 }
@@ -1125,10 +1246,16 @@ pub(crate) fn impact_audience(
 
 pub(crate) fn impact_appeared(view: &WorldView, shard: ShardId, row: &SpellImpactEvent) {
     let row = Arc::new(row.clone());
+    let packets = Arc::new(SharedEventPackets::default());
     for viewer in impact_audience(view, shard, &row) {
-        let row = row.clone();
-        enqueue(viewer.clone(), move |_| {
-            crate::codec::combat::subscriptions::impact_event_outbound(&row)
+        let (row, packets) = (row.clone(), packets.clone());
+        enqueue(viewer.clone(), move |viewer| {
+            packets.outbound(&viewer, row.caster_guid, || {
+                impact_event_outbound(&row)
+                    .into_iter()
+                    .map(|out| (EventAudience::Everyone, out))
+                    .collect()
+            })
         });
     }
 }

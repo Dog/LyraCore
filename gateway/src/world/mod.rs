@@ -90,6 +90,10 @@ pub enum Outbound {
         opcode: u16,
         body: Vec<u8>,
     },
+    Shared {
+        opcode: u16,
+        body: Arc<[u8]>,
+    },
     /// SDK advancement is serial per Shard; defer encoding to the bounded worker pool.
     Job(RelayJob),
 }
