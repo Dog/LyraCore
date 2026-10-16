@@ -24,3 +24,6 @@ pub use subscriptions::PlayerSubscriptions;
 pub use views::{AccountRow, RealmRow};
 
 pub(crate) mod relays;
+
+#[cfg(test)]
+mod subscription_scope_durable_tests;
