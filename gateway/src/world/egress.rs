@@ -11,7 +11,9 @@ use wow_srp::vanilla_header::EncrypterHalf;
 
 const QUEUE_ITEMS: usize = 2048;
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
-const JOB_RESERVATION: usize = 4 * 1024;
+const TYPED_RESERVATION: usize = 4 * 1024;
+// A queued Relay Job holds shared rows; its encoded size is checked when it runs.
+const JOB_RESERVATION: usize = 256;
 pub(super) const MAX_AGE: Duration = Duration::from_secs(10);
 const WRITE_BYTES: usize = 64 * 1024;
 const ENCODE_BATCH: usize = 32;
@@ -40,25 +42,36 @@ impl Drop for Queued {
 }
 
 impl QueueSender {
+    fn close(&self, reason: &str) {
+        if !self.closed.send_replace(true) {
+            log::warn!(
+                "World Session outbound queue closed: reason={reason} queued_items={} reserved_bytes={}",
+                self.depth.load(Ordering::Relaxed),
+                self.bytes.load(Ordering::Relaxed),
+            );
+        }
+    }
+
     pub(super) fn send(&self, out: Outbound) -> std::result::Result<(), SendError<Outbound>> {
         let reservation = match queued_bytes(&out) {
             Ok(bytes) => bytes.max(1),
-            Err(error) => {
-                log::warn!("World Session outbound reservation failed: {error}");
-                self.closed.send_replace(true);
+            Err(_) => {
+                self.close("reservation_overflow");
                 return Err(SendError(out));
             }
         };
-        if *self.closed.borrow()
-            || self
-                .bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    used.checked_add(reservation)
-                        .filter(|next| *next <= QUEUE_BYTES)
-                })
-                .is_err()
+        if *self.closed.borrow() {
+            return Err(SendError(out));
+        }
+        if self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(reservation)
+                    .filter(|next| *next <= QUEUE_BYTES)
+            })
+            .is_err()
         {
-            self.closed.send_replace(true);
+            self.close("byte_capacity");
             return Err(SendError(out));
         }
         self.depth.fetch_add(1, Ordering::Relaxed);
@@ -70,7 +83,10 @@ impl QueueSender {
             depth: self.depth.clone(),
         };
         self.sender.try_send(queued).map_err(|error| {
-            self.closed.send_replace(true);
+            self.close(match &error {
+                mpsc::error::TrySendError::Full(_) => "item_capacity",
+                mpsc::error::TrySendError::Closed(_) => "receiver_closed",
+            });
             let mut queued = error.into_inner();
             SendError(
                 queued
@@ -108,10 +124,11 @@ fn queued_bytes(out: &Outbound) -> io::Result<usize> {
         Outbound::Shared { body, .. } => Ok(4 + body.len()),
         Outbound::Batch(messages) => messages
             .len()
-            .checked_mul(JOB_RESERVATION)
+            .checked_mul(TYPED_RESERVATION)
             .ok_or_else(|| io::Error::other("outbound reservation overflow")),
         // Typed compression and deferred projections run only on encoding workers.
-        Outbound::One(_) | Outbound::Job(_) => Ok(JOB_RESERVATION),
+        Outbound::One(_) => Ok(TYPED_RESERVATION),
+        Outbound::Job(_) => Ok(JOB_RESERVATION),
     }
 }
 
@@ -299,7 +316,7 @@ mod tests {
     #[test]
     fn deferred_jobs_cannot_grow_the_queue_without_bound() {
         let (tx, _receiver, closed) = channel();
-        for _ in 0..QUEUE_BYTES / JOB_RESERVATION {
+        for _ in 0..QUEUE_ITEMS {
             tx.send(Outbound::Job(Box::new(Vec::new)))
                 .unwrap_or_else(|_| panic!("within budget"));
         }
