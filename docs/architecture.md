@@ -477,12 +477,15 @@ verbs go through the module's operator-gated `gw_*` surface with the actor named
 per-player connection exists anywhere (#483; the account's "bound identity" is now the derived
 `synthetic_owner_identity`, minted by no connection and presented by no client).
 
-A coordinator connection subscribes a base list of literal `SELECT * FROM <table>` queries, plus
-the sharded tables when more than one database is configured (`coordinator_queries` in
-`connection.rs`). The sharded tables are conditional
-because **a subscription to a table the deployed module does not have fails to apply**, which would
-fail the whole gateway — so a gateway restarted before a module republish must not ask for the
-sharded tables.
+A Coordinator subscribes literal table queries and the Relay table declarations in
+`gateway/src/stdb/connection.rs`. Multi-database configurations also subscribe the Shard control
+tables. A dedicated Realm-core connection omits 30 world catalogues, including creatures, spells,
+quests and taxi routes. It retains item catalogues needed by Mail and auctions, faction relationships,
+and every dynamic, control and Relay table. If Realm-core also hosts a configured World Shard, it
+keeps the full query set. Idle World Shards keep their subscriptions. Reconnect preserves the role.
+
+Publish a Module that contains the required tables before starting this Gateway. An unknown table
+causes subscription setup to fail; it does not produce an empty optional cache.
 
 ### 5.2 Area of interest — default on
 
