@@ -41,3 +41,6 @@ pub(in crate::stdb) fn player_item_count(
             .map(|item| (item.slot, item.entry, item.stack_count)),
     )
 }
+
+#[cfg(test)]
+mod indexed_durable_tests;
