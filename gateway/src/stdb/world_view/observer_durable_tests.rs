@@ -95,7 +95,7 @@ fn drain(viewer: &Viewer, rx: &Receiver<Outbound>) -> (usize, Vec<Outbound>) {
     for outbound in rx.try_iter() {
         viewer.tx.depth_handle().fetch_sub(1, Ordering::Relaxed);
         match outbound {
-            Outbound::Job(job) => {
+            Outbound::Job(job) | Outbound::Motion(job) => {
                 jobs += 1;
                 packets.extend(job());
             }

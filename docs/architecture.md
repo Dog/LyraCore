@@ -348,8 +348,9 @@ including when admission races with cancellation.
 Each World Session has a non-waiting outbound queue with a 4 MiB reservation budget, capped at 16,384
 entries. Raw frames reserve their wire size, each typed frame reserves 4 KiB and each deferred Relay Job
 reserves 256 bytes until encoding. Compression stays on encoding workers. Each encoded projection is
-also limited to 4 MiB. The writer encodes up to 32 entries per blocking hand-off; entries after 4 MiB of
-encoded output move to its next batch.
+also limited to 4 MiB. The writer encodes up to 32 entries per batch; entries after 4 MiB of encoded
+output move to its next batch. A batch with a typed message or a general Relay Job uses a blocking
+hand-off. A batch of movement flushes and encoded packets encodes on the writer task.
 These are queue and encoded-output limits, not an exact bound on arbitrary captured Rust objects.
 A queue entry has ten seconds to finish encoding and writing. Exceeding a limit closes the session;
 critical packets are not silently discarded. Movement keeps its existing coalescing and shedding. Its

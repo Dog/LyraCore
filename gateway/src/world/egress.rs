@@ -130,9 +130,9 @@ fn queued_bytes(out: &Outbound) -> io::Result<usize> {
             .len()
             .checked_mul(TYPED_RESERVATION)
             .ok_or_else(|| io::Error::other("outbound reservation overflow")),
-        // Typed compression and deferred projections run only on encoding workers.
+        // Typed compression runs only on encoding workers.
         Outbound::One(_) => Ok(TYPED_RESERVATION),
-        Outbound::Job(_) => Ok(JOB_RESERVATION),
+        Outbound::Job(_) | Outbound::Motion(_) => Ok(JOB_RESERVATION),
     }
 }
 
@@ -198,14 +198,47 @@ pub(crate) fn encode(outbound: Vec<Outbound>) -> io::Result<Vec<Packet>> {
                 add(opcode, body.into())?;
             }
             Outbound::Shared { opcode, body } => add(opcode, body)?,
-            Outbound::Job(_) => return Err(io::Error::other("nested Relay job")),
+            Outbound::Job(_) | Outbound::Motion(_) => {
+                return Err(io::Error::other("nested Relay job"))
+            }
         }
     }
     Ok(packets)
 }
 
 fn is_job(queued: &Queued) -> bool {
-    matches!(queued.out, Some(Outbound::Job(_)))
+    matches!(queued.out, Some(Outbound::Job(_) | Outbound::Motion(_)))
+}
+
+/// Typed messages and general Relay Jobs can be slow or block; they run on an encoding worker.
+fn needs_worker(queued: &Queued) -> bool {
+    matches!(
+        queued.out,
+        Some(Outbound::Job(_) | Outbound::One(_) | Outbound::Batch(_))
+    )
+}
+
+/// Encodes entries in order until the session closes or the batch reaches the byte limit.
+fn encode_entries(batch: &mut [Queued], closed: &watch::Receiver<bool>) -> Result<Vec<Packet>> {
+    let mut frames = Vec::new();
+    let mut total = 0usize;
+    for queued in batch {
+        if *closed.borrow() || total >= QUEUE_BYTES {
+            break;
+        }
+        let outbound = match queued.out.take() {
+            Some(Outbound::Job(job) | Outbound::Motion(job)) => job(),
+            Some(other) => vec![other],
+            None => bail!("World Session queue entry consumed twice"),
+        };
+        let packets = encode(outbound)?;
+        total += packets
+            .iter()
+            .map(|packet| 4 + packet.body.len())
+            .sum::<usize>();
+        frames.extend(packets);
+    }
+    Ok(frames)
 }
 
 pub(super) async fn write<W: AsyncWrite + Unpin>(
@@ -249,42 +282,31 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
             bail!("World Session outbound queue exceeded age limit");
         }
         crate::stage_timing::QUEUE_WAIT.record(oldest.elapsed());
-        let job_closed = closed.clone();
-        let submitted = Instant::now();
-        let encoded = tokio::time::timeout_at(deadline, async {
-            let permit = workers.acquire().await?;
-            let acquired = Instant::now();
-            crate::stage_timing::ENCODER_PERMIT_WAIT.record(acquired - submitted);
-            permit
-                .run(move || {
-                    let encoding = Instant::now();
-                    crate::stage_timing::ENCODER_DISPATCH.record(encoding - acquired);
-                    let mut frames = Vec::new();
-                    let mut total = 0usize;
-                    for queued in &mut batch {
-                        if *job_closed.borrow() || total >= QUEUE_BYTES {
-                            break;
-                        }
-                        let outbound = match queued.out.take() {
-                            Some(Outbound::Job(job)) => job(),
-                            Some(other) => vec![other],
-                            None => bail!("World Session queue entry consumed twice"),
-                        };
-                        let packets = encode(outbound)?;
-                        total += packets
-                            .iter()
-                            .map(|packet| 4 + packet.body.len())
-                            .sum::<usize>();
-                        frames.extend(packets);
-                    }
-                    crate::stage_timing::ENCODE.record(encoding.elapsed());
-                    Ok::<_, anyhow::Error>((batch, frames))
-                })
-                .await
-        })
-        .await
-        .map_err(|_| anyhow!("World Session outbound queue exceeded age limit"))???;
-        let (batch, frames) = encoded;
+        let (batch, frames) = if batch.iter().any(needs_worker) {
+            let job_closed = closed.clone();
+            let submitted = Instant::now();
+            tokio::time::timeout_at(deadline, async {
+                let permit = workers.acquire().await?;
+                let acquired = Instant::now();
+                crate::stage_timing::ENCODER_PERMIT_WAIT.record(acquired - submitted);
+                permit
+                    .run(move || {
+                        let encoding = Instant::now();
+                        crate::stage_timing::ENCODER_DISPATCH.record(encoding - acquired);
+                        let frames = encode_entries(&mut batch, &job_closed)?;
+                        crate::stage_timing::ENCODE.record(encoding.elapsed());
+                        Ok::<_, anyhow::Error>((batch, frames))
+                    })
+                    .await
+            })
+            .await
+            .map_err(|_| anyhow!("World Session outbound queue exceeded age limit"))???
+        } else {
+            let encoding = Instant::now();
+            let frames = encode_entries(&mut batch, &closed)?;
+            crate::stage_timing::INLINE_ENCODE.record(encoding.elapsed());
+            (batch, frames)
+        };
         if *closed.borrow() {
             return Ok(());
         }
@@ -456,6 +478,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ran.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn movement_flushes_and_encoded_packets_need_no_encoding_worker() {
+        let (tx, receiver, closed) = channel();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let flushed = ran.clone();
+        tx.send(Outbound::Motion(Box::new(move || {
+            flushed.fetch_add(1, Ordering::Relaxed);
+            vec![Outbound::Shared {
+                opcode: 0x00ee,
+                body: vec![0; 8].into(),
+            }]
+        })))
+        .unwrap_or_else(|_| panic!("within budget"));
+        tx.send(Outbound::Shared {
+            opcode: 0x00ee,
+            body: vec![0; 8].into(),
+        })
+        .unwrap_or_else(|_| panic!("within budget"));
+        drop(tx);
+        let encoders = BlockingTaskCapacity::new(1);
+        let _busy = encoders.try_admit().expect("the only encoder permit");
+        let (_, crypto) = wow_srp::vanilla_header::ProofSeed::new().into_client_header_crypto(
+            &wow_srp::normalized_string::NormalizedString::new("TESTER").unwrap(),
+            super::super::test_support::K,
+            0,
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write(
+                tokio::io::sink(),
+                crypto.split().0,
+                receiver,
+                closed,
+                encoders.clone(),
+                1,
+            ),
+        )
+        .await
+        .expect("the writer must not wait for an encoder permit")
+        .unwrap();
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

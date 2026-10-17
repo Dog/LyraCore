@@ -46,7 +46,7 @@ impl Drop for TopologyEnv {
 
 fn worn_values(outbound: Outbound, heard: &mut Vec<(u32, u32, u32)>) {
     let message = match outbound {
-        Outbound::Job(job) => {
+        Outbound::Job(job) | Outbound::Motion(job) => {
             for message in job() {
                 worn_values(message, heard);
             }

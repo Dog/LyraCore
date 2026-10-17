@@ -34,7 +34,7 @@ pub(crate) fn outbound_messages(outbound: Vec<Outbound>) -> Vec<ServerOpcodeMess
             Outbound::Raw { opcode, .. } | Outbound::Shared { opcode, .. } => {
                 panic!("unexpected raw packet {opcode:#06x}")
             }
-            Outbound::Job(_) => panic!("unexpected deferred relay job"),
+            Outbound::Job(_) | Outbound::Motion(_) => panic!("unexpected deferred relay job"),
         }
     }
     sent

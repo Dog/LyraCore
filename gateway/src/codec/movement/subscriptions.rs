@@ -545,7 +545,9 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
             .store(false, AtOrd::Release);
         return;
     }
-    enqueue(viewer, move |viewer| {
+    // The writer runs this flush inline; it must not wait on a lock held across an SDK message.
+    let tx = viewer.tx.clone();
+    let flush = crate::stdb::world_view::viewer_job(viewer, move |viewer| {
         // Clear before draining so a racing upsert can queue another flush.
         viewer
             .motion_pending
@@ -579,6 +581,7 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
         }
         out
     });
+    let _ = tx.send(Outbound::Motion(flush));
 }
 
 pub(crate) fn teleport_appeared(view: &WorldView, shard: ShardId, row: &TeleportEvent) {

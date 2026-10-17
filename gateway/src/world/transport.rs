@@ -199,16 +199,22 @@ where
     let mut writer_closed = closed.clone();
     let closed_for_writer = closed.clone();
     let mut writer_task = tokio::spawn(async move {
-        let result = tokio::select! {
+        // Movement flushes run on this task, so close the socket even if it unwinds.
+        struct CloseOnDrop(Option<Arc<dyn Fn() + Send + Sync>>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                if let Some(close) = &self.0 {
+                    close();
+                }
+            }
+        }
+        let _close = CloseOnDrop(writer_close);
+        tokio::select! {
             biased;
             _ = writer_stopped.wait_for(|stop| *stop) => Ok(()),
             _ = writer_closed.wait_for(|closed| *closed) => Ok(()),
             result = egress::write(writer, encrypt, receiver, closed_for_writer, encoders, account_id) => result,
-        };
-        if let Some(close) = writer_close {
-            close();
         }
-        result
     });
 
     let mut drain = true;
@@ -318,8 +324,12 @@ where
         }
     };
     result?;
-    if let Ok(result) = writer_result {
-        result?;
+    match writer_result {
+        Ok(result) => result?,
+        Err(error) if error.is_panic() => {
+            log::error!("World Session writer for account {account_id} panicked: {error}")
+        }
+        Err(_) => {}
     }
     Ok(())
 }

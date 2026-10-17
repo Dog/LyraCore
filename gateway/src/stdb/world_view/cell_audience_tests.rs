@@ -1328,7 +1328,7 @@ fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
     motion(&view, 0, &latest, &batch.delivery);
     flush_motion(&view, 0);
 
-    assert!(matches!(rx.try_recv().unwrap(), Outbound::Job(_)));
+    assert!(matches!(rx.try_recv().unwrap(), Outbound::Motion(_)));
     assert!(rx.try_recv().is_err());
     let delta = batch.delivery.snapshot().since(before);
     assert_eq!(delta.queued, 172);
@@ -1356,7 +1356,7 @@ fn motion_rows_in_one_message_queue_one_flush_after_the_message() {
 
     flush_motion(&view, 0);
 
-    let Outbound::Job(job) = rx.try_recv().unwrap() else {
+    let Outbound::Motion(job) = rx.try_recv().unwrap() else {
         panic!("one flush Job");
     };
     assert!(rx.try_recv().is_err());

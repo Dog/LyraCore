@@ -96,6 +96,8 @@ pub enum Outbound {
     },
     /// SDK advancement is serial per Shard; defer encoding to the bounded worker pool.
     Job(RelayJob),
+    /// A movement flush; it takes no lock held across an SDK message, so the writer runs it inline.
+    Motion(RelayJob),
 }
 
 pub type RelayJob = Box<dyn FnOnce() -> Vec<Outbound> + Send>;

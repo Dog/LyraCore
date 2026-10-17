@@ -54,7 +54,7 @@ pub(crate) fn viewer_in_zone(
 
 pub(crate) fn queued_job(rx: &Receiver<Outbound>) -> Vec<Outbound> {
     match rx.try_recv().expect("one addressed writer job") {
-        Outbound::Job(job) => job(),
+        Outbound::Job(job) | Outbound::Motion(job) => job(),
         _ => panic!("shared owner dispatch must enqueue packet work as a writer job"),
     }
 }
