@@ -114,7 +114,8 @@ impl ExplorationReplay {
 pub(crate) struct MotionPending {
     pub(crate) entity: Mutex<crate::codec::movement::subscriptions::MotionRows<EntityMotion>>,
     pub(crate) creature: Mutex<crate::codec::movement::subscriptions::MotionRows<CreatureSpline>>,
-    /// Clear before draining so a racing upsert can queue its own flush.
+    pub(crate) batches: Mutex<Vec<crate::codec::movement::subscriptions::ViewerMotion>>,
+    /// Clear before draining so a racing batch can queue its own flush.
     pub(crate) flush_queued: std::sync::atomic::AtomicBool,
 }
 
@@ -273,7 +274,8 @@ pub(crate) struct WorldView {
     next_session: AtomicU64,
     countdowns_shown: Mutex<HashSet<u64>>,
     online_characters: Mutex<HashSet<u64>>,
-    motion_flushes: Mutex<HashMap<ShardId, Vec<Arc<Viewer>>>>,
+    pub(crate) staged_motion:
+        Mutex<HashMap<ShardId, crate::codec::movement::subscriptions::MotionStage>>,
 }
 
 impl WorldView {
@@ -286,29 +288,8 @@ impl WorldView {
             next_session: AtomicU64::new(1),
             countdowns_shown: Mutex::new(HashSet::new()),
             online_characters: Mutex::new(HashSet::new()),
-            motion_flushes: Mutex::new(HashMap::new()),
+            staged_motion: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub(crate) fn note_motion_pending(&self, shard: ShardId, viewer: &Arc<Viewer>) {
-        let flush_queued = &viewer.motion_pending.flush_queued;
-        // A load first keeps the shared cache line clean when a flush is already queued.
-        if !flush_queued.load(Ordering::Acquire) && !flush_queued.swap(true, Ordering::AcqRel) {
-            self.motion_flushes
-                .lock()
-                .unwrap()
-                .entry(shard)
-                .or_default()
-                .push(viewer.clone());
-        }
-    }
-
-    pub(crate) fn take_motion_flushes(&self, shard: ShardId) -> Vec<Arc<Viewer>> {
-        self.motion_flushes
-            .lock()
-            .unwrap()
-            .remove(&shard)
-            .unwrap_or_default()
     }
 
     pub(crate) fn note_countdown(&self, character_guid: u64, shown: bool) {

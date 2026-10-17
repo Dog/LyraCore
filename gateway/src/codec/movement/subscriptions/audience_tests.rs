@@ -43,6 +43,29 @@ fn creature_observers_share_encoded_bodies_after_the_create_gate() {
 }
 
 #[test]
+fn a_viewer_receives_only_staged_rows_inside_its_audience_box() {
+    let view = WorldView::new(true);
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    viewer.created.lock().unwrap().extend([98, 99]);
+    view.add_viewer_on_shard(viewer, CellKey::at(0, 0, 0, 0), 0);
+    let near = super::packet_tests::creature_spline(99, 0, 1000);
+    let mut far = super::packet_tests::creature_spline(98, 0, 1000);
+    far.grid_x = 6;
+
+    creature_leg(&view, 0, &near);
+    creature_leg(&view, 0, &far);
+    flush_motion(&view, 0);
+
+    let packets = queued_job(&rx);
+    assert_eq!(packets.len(), 1, "only the nearby creature's path is sent");
+    assert!(
+        rx.try_recv().is_err(),
+        "one flush for the whole SDK message"
+    );
+}
+
+#[test]
 fn pending_motion_replaces_existing_rows_without_spending_the_budget_twice() {
     let mut pending = MotionRows::default();
     let row = Arc::new(SharedMotion::new(()));
