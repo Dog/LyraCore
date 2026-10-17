@@ -274,7 +274,7 @@ impl SyntheticRealm {
         for rx in &self.queues {
             while let Ok(out) = rx.try_recv() {
                 match out {
-                    Outbound::Job(job) => {
+                    Outbound::Job(job) | Outbound::Motion(job) => {
                         jobs += 1;
                         packets += job().len();
                     }

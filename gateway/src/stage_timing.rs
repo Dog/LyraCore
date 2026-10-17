@@ -57,17 +57,20 @@ pub(crate) static ENCODER_PERMIT_WAIT: StageTiming = StageTiming::new();
 /// From holding an encoder permit to the blocking worker starting the batch.
 pub(crate) static ENCODER_DISPATCH: StageTiming = StageTiming::new();
 pub(crate) static ENCODE: StageTiming = StageTiming::new();
+/// Encoding a batch of movement flushes and encoded packets on the writer task.
+pub(crate) static INLINE_ENCODE: StageTiming = StageTiming::new();
 pub(crate) static SOCKET_WRITE: StageTiming = StageTiming::new();
 /// Cache reads that found a Shard's snapshot locked by its pump, and how long they waited.
 pub(crate) static SNAPSHOT_WAIT: StageTiming = StageTiming::new();
 
 pub(crate) fn log_line() -> String {
     format!(
-        "STAGESTAT {} {} {} {} {} {}",
+        "STAGESTAT {} {} {} {} {} {} {}",
         QUEUE_WAIT.take().field("queue_wait"),
         ENCODER_PERMIT_WAIT.take().field("encoder_permit_wait"),
         ENCODER_DISPATCH.take().field("encoder_dispatch"),
         ENCODE.take().field("encode"),
+        INLINE_ENCODE.take().field("inline_encode"),
         SOCKET_WRITE.take().field("write"),
         SNAPSHOT_WAIT.take().field("snapshot_wait"),
     )

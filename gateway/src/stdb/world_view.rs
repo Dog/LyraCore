@@ -1308,12 +1308,19 @@ pub(crate) fn enqueue(
     job: impl FnOnce(Arc<Viewer>) -> Vec<Outbound> + Send + 'static,
 ) {
     let tx = viewer.tx.clone();
-    let _ = tx.send(Outbound::Job(Box::new(move || {
+    let _ = tx.send(Outbound::Job(viewer_job(viewer, job)));
+}
+
+pub(crate) fn viewer_job(
+    viewer: Arc<Viewer>,
+    job: impl FnOnce(Arc<Viewer>) -> Vec<Outbound> + Send + 'static,
+) -> crate::world::RelayJob {
+    Box::new(move || {
         if !viewer.active.load(Ordering::Acquire) {
             return Vec::new();
         }
         job(viewer)
-    })));
+    })
 }
 
 pub(crate) fn recenter(view: &Arc<WorldView>, viewer: &Arc<Viewer>, map_id: u32, x: f32, y: f32) {
