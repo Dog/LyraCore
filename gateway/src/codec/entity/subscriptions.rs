@@ -188,11 +188,20 @@ fn viewer_relative_dynamic_flags(
     }
 }
 
+/// Creature taps and loot tags project per viewer; a living or unlootable Character never does.
+fn loot_projection_applies(entity: &WorldEntity) -> bool {
+    use lyracore_shared::constants::{type_mask::PLAYER_BIT, unit_dynamic_flags::LOOTABLE};
+    entity.type_mask & PLAYER_BIT == 0 || (entity.dead && entity.dynamic_flags & LOOTABLE != 0)
+}
+
 pub(crate) fn projected_dynamic_flags(
     live: &LiveConn,
     viewer_guid: u64,
     entity: &WorldEntity,
 ) -> u32 {
+    if !loot_projection_applies(entity) {
+        return entity.dynamic_flags;
+    }
     live.with_cache_snapshot(|| {
         let db = &live.conn.db;
         let tap = db
@@ -941,6 +950,18 @@ pub(crate) mod tests {
             regeneration_pending: false,
             simulation_indexed: false,
         }
+    }
+
+    #[test]
+    fn only_creatures_and_lootable_character_corpses_need_the_loot_projection() {
+        use lyracore_shared::constants::unit_dynamic_flags::LOOTABLE;
+        let mut character = player_entity();
+        assert!(!loot_projection_applies(&character));
+        character.dead = true;
+        assert!(!loot_projection_applies(&character));
+        character.dynamic_flags |= LOOTABLE;
+        assert!(loot_projection_applies(&character));
+        assert!(loot_projection_applies(&creature_entity()));
     }
 
     pub(crate) fn creature_entity() -> WorldEntity {
