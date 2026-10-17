@@ -132,8 +132,37 @@ impl WorldIndex {
         shard: ShardId,
         owner_guid: u64,
     ) -> Option<CellKey> {
+        Self::upsert_locked(&mut self.lock(), layer, guid, key, shard, owner_guid)
+    }
+
+    /// Upserts like `upsert_entity`; a cell change also returns the viewers around the old cell.
+    /// One lock covers both, so no viewer recenter falls between the move and the read.
+    pub fn upsert_entity_with_old_audience(
+        &self,
+        layer: EntityLayer,
+        guid: u64,
+        key: CellKey,
+        shard: ShardId,
+        owner_guid: u64,
+    ) -> (Option<CellKey>, Vec<SessionId>) {
         let mut inner = self.lock();
-        let entities = Self::layer_mut(&mut inner, layer);
+        let previous = Self::upsert_locked(&mut inner, layer, guid, key, shard, owner_guid);
+        let old_audience = match previous {
+            Some(old) if old != key => self.viewers_within_locked(&inner, old, BOX_HALF_SPAN),
+            _ => Vec::new(),
+        };
+        (previous, old_audience)
+    }
+
+    fn upsert_locked(
+        inner: &mut Inner,
+        layer: EntityLayer,
+        guid: u64,
+        key: CellKey,
+        shard: ShardId,
+        owner_guid: u64,
+    ) -> Option<CellKey> {
+        let entities = Self::layer_mut(inner, layer);
         let previous = entities
             .entity_cell
             .insert(guid, (key, shard, owner_guid))
@@ -292,7 +321,10 @@ impl WorldIndex {
     }
 
     pub fn viewers_within(&self, key: CellKey, half_span: i32) -> Vec<SessionId> {
-        let inner = self.lock();
+        self.viewers_within_locked(&self.lock(), key, half_span)
+    }
+
+    fn viewers_within_locked(&self, inner: &Inner, key: CellKey, half_span: i32) -> Vec<SessionId> {
         if !self.cell_scoped {
             let partition = key.partition();
             return inner
@@ -415,6 +447,24 @@ impl WorldIndex {
 mod tests {
     use super::*;
     use crate::stdb::aoi::box_queries;
+
+    #[test]
+    fn a_cell_change_reports_the_viewers_around_the_old_cell() {
+        let index = WorldIndex::new(true);
+        let (old, new) = (CellKey::at(0, 0, 0, 0), CellKey::at(0, 0, 1, 0));
+        index.add_viewer(1, CellKey::at(0, 0, -2, 0));
+        index.add_viewer(2, CellKey::at(0, 0, 3, 0));
+        index.upsert_entity(EntityLayer::WorldEntity, 9, old, 0, 0);
+
+        let (previous, mut audience) =
+            index.upsert_entity_with_old_audience(EntityLayer::WorldEntity, 9, new, 0, 0);
+        audience.sort_unstable();
+        assert_eq!((previous, audience), (Some(old), vec![1]));
+
+        let (_, unmoved) =
+            index.upsert_entity_with_old_audience(EntityLayer::WorldEntity, 9, new, 0, 0);
+        assert!(unmoved.is_empty());
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Row {

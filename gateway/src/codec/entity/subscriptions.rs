@@ -14,7 +14,6 @@ use crate::stdb::Coordinator;
 use crate::stdb::LiveConn;
 use crate::world::Outbound;
 use anyhow::Result;
-use lyracore_shared::spatial::BOX_HALF_SPAN;
 use spacetimedb_sdk::Table;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -650,7 +649,7 @@ pub(crate) fn entity_changed(
     new: &WorldEntity,
 ) {
     let key = entity_key(new);
-    let previous = view.spatial.upsert_entity(
+    let (previous, old_audience) = view.spatial.upsert_entity_with_old_audience(
         EntityLayer::WorldEntity,
         new.guid,
         key,
@@ -658,20 +657,21 @@ pub(crate) fn entity_changed(
         new.owner_guid,
     );
     let new_recipients = view.world_entity_recipients(shard, new.guid, key);
-    if let Some(old_key) = previous {
-        if old_key != key {
-            let still: HashSet<SessionId> = new_recipients.iter().copied().collect();
-            for viewer in view.cell_audience(shard, Some(old_key), BOX_HALF_SPAN, &[]) {
-                if !still.contains(&viewer.session) {
-                    destroy_job(view, viewer.session, new.guid, new.owner_guid);
-                }
+    let crossed = previous.is_some_and(|old_key| old_key != key);
+    let mut stayed = HashSet::new();
+    if crossed {
+        let still: HashSet<SessionId> = new_recipients.iter().copied().collect();
+        for viewer in view.viewers_on_shard_of(shard, old_audience) {
+            if still.contains(&viewer.session) {
+                stayed.insert(viewer.session);
+            } else {
+                destroy_job(view, viewer.session, new.guid, new.owner_guid);
             }
         }
     }
     let descriptors_changed = entity_descriptors_changed(old, new);
-    // A cell crossing must retain re-entry behind an already queued DESTROY.
     let lifecycle_changed =
-        previous != Some(key) || old.npc_flags != new.npc_flags || old.owner_guid != new.owner_guid;
+        previous.is_none() || old.npc_flags != new.npc_flags || old.owner_guid != new.owner_guid;
     let old = Arc::new(old.clone());
     let new = Arc::new(new.clone());
     for session in new_recipients {
@@ -679,9 +679,12 @@ pub(crate) fn entity_changed(
             continue;
         };
         let owner_died_or_revived = viewer.self_guid == new.guid && old.dead != new.dead;
+        // A viewer entering the audience must queue its re-entry behind any queued DESTROY.
+        let entered = crossed && !stayed.contains(&session);
         if !descriptors_changed
             && !owner_died_or_revived
             && !lifecycle_changed
+            && !entered
             && (viewer.self_guid == new.guid || viewer.created.lock().unwrap().contains(&new.guid))
         {
             continue;

@@ -79,6 +79,15 @@ pub(crate) fn registered_viewer(
     shard: usize,
     self_guid: u64,
 ) -> (Arc<Viewer>, Receiver<Outbound>) {
+    registered_viewer_at(view, shard, self_guid, CellKey::at(0, 0, 0, 0))
+}
+
+pub(crate) fn registered_viewer_at(
+    view: &WorldView,
+    shard: usize,
+    self_guid: u64,
+    cell: CellKey,
+) -> (Arc<Viewer>, Receiver<Outbound>) {
     let (tx, rx) = SessionTx::with_depth(0);
     let viewer = viewer_with_tx(
         view.next_session_id(),
@@ -86,7 +95,7 @@ pub(crate) fn registered_viewer(
         identity(self_guid as u8),
         tx,
     );
-    view.add_viewer_on_shard(viewer.clone(), CellKey::at(0, 0, 0, 0), shard);
+    view.add_viewer_on_shard(viewer.clone(), cell, shard);
     (viewer, rx)
 }
 

@@ -170,6 +170,26 @@ fn movement_reentry_stays_ordered_after_a_queued_destroy() {
 
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn a_cell_crossing_queues_work_only_for_viewers_entering_the_audience() {
+    let realm = ObserverRealm::start();
+    let view = realm.coord.world_view();
+    let (nearby, nearby_rx) = realm.viewer(2);
+    let (distant, distant_rx) =
+        test_support::registered_viewer_at(&view, 0, 3, CellKey::at(0, 0, 3, 0));
+    distant.created.lock().unwrap().insert(1);
+    let old = realm.entity();
+    let mut crossed = old.clone();
+    crossed.grid_x = 1;
+    crossed.x = 60.0;
+
+    entity_changed(&view, 0, &old, &crossed);
+
+    assert_eq!(drain(&nearby, &nearby_rx).0, 0);
+    assert_eq!(drain(&distant, &distant_rx).0, 1);
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn health_changes_still_reach_each_observer() {
     let realm = ObserverRealm::start();
     let view = realm.coord.world_view();
