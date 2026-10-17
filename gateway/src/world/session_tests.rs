@@ -1513,12 +1513,13 @@ fn the_writer_drains_the_egress_depth_back_to_zero_b2() {
         .unwrap()
         .clone()
         .expect("the session must have handed its egress handle to subscribe_player_events");
-    assert_eq!(
-        depth.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "the login sequence has been fully read by the client, so the writer must have decremented \
-         the egress depth for every item it wrote — a depth that only climbs makes every session \
-         shed peer movement forever once it passes EGRESS_SHED_DEPTH"
+    // The writer releases each entry just after its socket write, so the client can read first.
+    assert!(
+        crate::durable_test_support::poll_until(std::time::Duration::from_secs(5), || {
+            depth.load(std::sync::atomic::Ordering::Relaxed) == 0
+        }),
+        "the writer must decrement the egress depth for every item it wrote — a depth that only \
+         climbs makes every session shed peer movement forever once it passes EGRESS_SHED_DEPTH"
     );
     drop(client);
     let _ = server.join();
