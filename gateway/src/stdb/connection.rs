@@ -238,8 +238,13 @@ async fn advance_cache_snapshot<T>(
 ) -> T {
     let mut next = std::pin::pin!(next);
     std::future::poll_fn(|context| {
+        let started = std::time::Instant::now();
         let _updating = snapshot.write().unwrap();
-        std::future::Future::poll(next.as_mut(), context)
+        let poll = std::future::Future::poll(next.as_mut(), context);
+        if poll.is_ready() {
+            crate::stage_timing::SDK_MESSAGE.record(started.elapsed());
+        }
+        poll
     })
     .await
 }

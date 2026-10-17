@@ -824,6 +824,10 @@ pub async fn run(
                 );
             }
             (prev_handoffs, prev_encoded) = (handoffs, encoded);
+            let stages = crate::stage_timing::log_line();
+            if d_encoded > 0 {
+                log::info!("{stages}");
+            }
             let recenters = crate::stdb::aoi::AOI_RECENTERS.load(Relaxed);
             let d_recenters = recenters.saturating_sub(prev_recenters);
             if d_recenters > 0 {

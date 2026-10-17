@@ -247,10 +247,14 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
         if tokio::time::Instant::now() >= deadline {
             bail!("World Session outbound queue exceeded age limit");
         }
+        crate::stage_timing::QUEUE_WAIT.record(oldest.elapsed());
         let job_closed = closed.clone();
+        let submitted = Instant::now();
         let encoded = tokio::time::timeout_at(
             deadline,
             workers.run(move || {
+                let encoding = Instant::now();
+                crate::stage_timing::ENCODER_WAIT.record(encoding - submitted);
                 let mut frames = Vec::new();
                 let mut total = 0usize;
                 for queued in &mut batch {
@@ -269,6 +273,7 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
                         .sum::<usize>();
                     frames.extend(packets);
                 }
+                crate::stage_timing::ENCODE.record(encoding.elapsed());
                 Ok::<_, anyhow::Error>((batch, frames))
             }),
         )
@@ -286,6 +291,7 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
         if tokio::time::Instant::now() >= deadline {
             bail!("World Session outbound encoding exceeded age limit");
         }
+        let wrote = !frames.is_empty();
         buffer.clear();
         let result = async {
             for frame in frames {
@@ -312,8 +318,12 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
             }
             Ok::<_, io::Error>(())
         };
-        let result = tokio::time::timeout_at(deadline, result)
-            .await
+        let writing = Instant::now();
+        let result = tokio::time::timeout_at(deadline, result).await;
+        if wrote {
+            crate::stage_timing::SOCKET_WRITE.record(writing.elapsed());
+        }
+        let result = result
             .map_err(|_| anyhow!("World Session outbound write exceeded age limit"))
             .and_then(|result| result.map_err(Into::into));
         if let Err(error) = result {
