@@ -291,11 +291,9 @@ impl WorldView {
     }
 
     pub(crate) fn note_motion_pending(&self, shard: ShardId, viewer: &Arc<Viewer>) {
-        if !viewer
-            .motion_pending
-            .flush_queued
-            .swap(true, Ordering::AcqRel)
-        {
+        let flush_queued = &viewer.motion_pending.flush_queued;
+        // A load first keeps the shared cache line clean when a flush is already queued.
+        if !flush_queued.load(Ordering::Acquire) && !flush_queued.swap(true, Ordering::AcqRel) {
             self.motion_flushes
                 .lock()
                 .unwrap()
