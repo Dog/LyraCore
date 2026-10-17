@@ -28,12 +28,7 @@ pub(crate) fn build_peer_create(
 ) -> Option<Vec<Outbound>> {
     let inv: Vec<codec::ItemInstanceView> =
         if row.type_mask & lyracore_shared::constants::type_mask::PLAYER_BIT != 0 {
-            coord
-                .player_items(row.guid)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|i| i.slot <= 18)
-                .collect()
+            coord.0.coord().equipped_items(row.guid)
         } else {
             Vec::new()
         };

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use spacetimedb_sdk::{Table, TableWithPrimaryKey};
@@ -16,6 +16,14 @@ impl LiveConn {
         })
     }
 
+    /// Equipped items for a peer CREATE; reads only the index, never the Shard snapshot.
+    pub(crate) fn equipped_items(
+        &self,
+        character_guid: u64,
+    ) -> Vec<crate::codec::ItemInstanceView> {
+        self.inventory.read().unwrap().equipped(character_guid)
+    }
+
     pub(crate) fn skill_rows(&self, character_guid: u64) -> Vec<PlayerSkill> {
         self.with_cache_snapshot(|| {
             self.inventory
@@ -26,9 +34,12 @@ impl LiveConn {
     }
 }
 
+const LAST_EQUIPMENT_SLOT: u8 = 18;
+
 #[derive(Default)]
 pub(crate) struct InventoryIndex {
     items: HashMap<u64, BTreeSet<u64>>,
+    equipped: HashMap<u64, BTreeMap<u64, crate::codec::ItemInstanceView>>,
     skills: HashMap<u64, BTreeSet<u64>>,
 }
 
@@ -38,6 +49,12 @@ impl InventoryIndex {
             .entry(row.owner_guid)
             .or_default()
             .insert(row.guid);
+        if row.slot <= LAST_EQUIPMENT_SLOT {
+            self.equipped
+                .entry(row.owner_guid)
+                .or_default()
+                .insert(row.guid, super::items::view_of_item_row(row));
+        }
     }
 
     fn remove_items(&mut self, row: &ItemInstance) {
@@ -47,6 +64,21 @@ impl InventoryIndex {
                 self.items.remove(&row.owner_guid);
             }
         }
+        if let Some(equipped) = self.equipped.get_mut(&row.owner_guid) {
+            equipped.remove(&row.guid);
+            if equipped.is_empty() {
+                self.equipped.remove(&row.owner_guid);
+            }
+        }
+    }
+
+    fn equipped(&self, character_guid: u64) -> Vec<crate::codec::ItemInstanceView> {
+        self.equipped
+            .get(&character_guid)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn item_guids(&self, character_guid: u64) -> Vec<u64> {
@@ -156,6 +188,25 @@ mod tests {
             random_property_id: 0,
             item_text_id: 0,
         }
+    }
+
+    #[test]
+    fn equipped_items_follow_moves_in_and_out_of_equipment_slots() {
+        let mut index = InventoryIndex::default();
+        let bagged = item(1, 7);
+        let mut worn = item(2, 7);
+        worn.slot = 4;
+        index.insert_items(&bagged);
+        index.insert_items(&worn);
+        let slots: Vec<u8> = index.equipped(7).iter().map(|item| item.slot).collect();
+        assert_eq!(slots, [4]);
+
+        let mut unequipped = worn.clone();
+        unequipped.slot = 24;
+        index.remove_items(&worn);
+        index.insert_items(&unequipped);
+        assert!(index.equipped(7).is_empty());
+        assert_eq!(index.item_guids(7), [1, 2]);
     }
 
     fn skill(id: u64, character_guid: u64) -> PlayerSkill {
