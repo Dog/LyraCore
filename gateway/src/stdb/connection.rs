@@ -234,6 +234,7 @@ async fn pump_messages<C, E, F: std::future::Future<Output = std::result::Result
 
 async fn advance_cache_snapshot<T>(
     snapshot: &RwLock<()>,
+    timing: &crate::stage_timing::PumpTiming,
     next: impl std::future::Future<Output = T>,
 ) -> T {
     let mut next = std::pin::pin!(next);
@@ -242,7 +243,7 @@ async fn advance_cache_snapshot<T>(
         let _updating = snapshot.write().unwrap();
         let poll = std::future::Future::poll(next.as_mut(), context);
         if poll.is_ready() {
-            crate::stage_timing::SDK_MESSAGE.record(started.elapsed());
+            timing.record_message(started);
         }
         poll
     })
@@ -259,8 +260,10 @@ mod cache_snapshot_tests {
     #[tokio::test]
     async fn awaiting_a_message_leaves_the_cache_readable() {
         let snapshot = RwLock::new(());
+        let timing = crate::stage_timing::pump_timing("test");
         let mut next = std::pin::pin!(advance_cache_snapshot(
             &snapshot,
+            &timing,
             std::future::pending::<()>(),
         ));
         std::future::poll_fn(|context| {
@@ -277,11 +280,15 @@ mod cache_snapshot_tests {
         let cache = std::sync::atomic::AtomicU64::new(0);
         let index = std::sync::atomic::AtomicU64::new(0);
         let order = std::sync::atomic::Ordering::Relaxed;
-        advance_cache_snapshot(&snapshot, async {
-            cache.store(7, order);
-            assert!(snapshot.try_read().is_err());
-            index.store(7, order);
-        })
+        advance_cache_snapshot(
+            &snapshot,
+            &crate::stage_timing::pump_timing("test"),
+            async {
+                cache.store(7, order);
+                assert!(snapshot.try_read().is_err());
+                index.store(7, order);
+            },
+        )
         .await;
         let _read = snapshot.read().unwrap();
         assert_eq!(cache.load(order), 7);
@@ -307,8 +314,9 @@ fn start_pump(
     let thread = std::thread::Builder::new()
         .name("stdb-pump".into())
         .spawn(move || {
+            let timing = crate::stage_timing::pump_timing(&role);
             let result = runtime.block_on(pump_messages(conn.as_ref(), rx, || {
-                advance_cache_snapshot(&cache_snapshot, conn.advance_one_message_async())
+                advance_cache_snapshot(&cache_snapshot, &timing, conn.advance_one_message_async())
             }));
             if let Err(error) = result {
                 if !matches!(error, spacetimedb_sdk::Error::Disconnected) {
@@ -322,7 +330,16 @@ fn start_pump(
 impl LiveConn {
     // Store reads and queued Relay jobs only; SDK row callbacks hold the snapshot lock.
     pub(crate) fn with_cache_snapshot<T>(&self, read: impl FnOnce() -> T) -> T {
-        let _snapshot = self.cache_snapshot.read().unwrap();
+        let _snapshot = match self.cache_snapshot.try_read() {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let waiting = std::time::Instant::now();
+                let snapshot = self.cache_snapshot.read().unwrap();
+                crate::stage_timing::SNAPSHOT_WAIT.record(waiting.elapsed());
+                snapshot
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => self.cache_snapshot.read().unwrap(),
+        };
         read()
     }
 
@@ -707,9 +724,14 @@ impl CoordinatorInner {
 
     /// Runs `hook` after each SDK message applies its row callbacks; replaces any earlier hook.
     pub(crate) fn after_each_message(&self, hook: impl Fn() + Send + 'static) -> Result<()> {
+        let timing = crate::stage_timing::pump_timing(&coordinator_role_label(&self.db_name));
         self.coord()
             .pump_commands
-            .send(PumpCommand::AfterMessage(Box::new(hook)))
+            .send(PumpCommand::AfterMessage(Box::new(move || {
+                let started = std::time::Instant::now();
+                hook();
+                timing.record_hook(started.elapsed());
+            })))
             .map_err(|_| anyhow!("{} Coordinator pump is stopped", self.db_name))
     }
 

@@ -34,13 +34,12 @@ impl BlockingTaskCapacity {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.acquire().await?.run(work).await
+    }
+
+    pub(crate) async fn acquire(&self) -> anyhow::Result<BlockingTaskPermit> {
         let permit = self.permits.clone().acquire_owned().await?;
-        BLOCKING_HANDOFFS.fetch_add(1, Ordering::Relaxed);
-        Ok(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        })
-        .await?)
+        Ok(BlockingTaskPermit { _permit: permit })
     }
 
     #[cfg(test)]
@@ -51,6 +50,22 @@ impl BlockingTaskCapacity {
 
 pub(crate) struct BlockingTaskPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+impl BlockingTaskPermit {
+    /// Runs `work` on Tokio's blocking pool and releases the permit when it finishes.
+    pub(crate) async fn run<F, T>(self, work: F) -> anyhow::Result<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        BLOCKING_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = self;
+            work()
+        })
+        .await?)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
