@@ -10,6 +10,7 @@ mod movement_batch_metrics;
 mod provision_cli;
 mod read_deadline;
 mod realm_core;
+mod stage_timing;
 mod stdb;
 mod world;
 
