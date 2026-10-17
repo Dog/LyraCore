@@ -508,14 +508,25 @@ impl WorldView {
         let mut sessions = key
             .map(|key| self.spatial.viewers_within(key, half_span))
             .unwrap_or_default();
-        let registry = self.viewers.read().unwrap();
-        for owner in owners {
-            if let Some(session) = registry.session_of_owner.get(owner) {
-                if !sessions.contains(session) {
-                    sessions.push(*session);
+        {
+            let registry = self.viewers.read().unwrap();
+            for owner in owners {
+                if let Some(session) = registry.session_of_owner.get(owner) {
+                    if !sessions.contains(session) {
+                        sessions.push(*session);
+                    }
                 }
             }
         }
+        self.viewers_on_shard_of(shard, sessions)
+    }
+
+    pub(crate) fn viewers_on_shard_of(
+        &self,
+        shard: ShardId,
+        sessions: Vec<SessionId>,
+    ) -> Vec<Arc<Viewer>> {
+        let registry = self.viewers.read().unwrap();
         sessions
             .into_iter()
             .filter_map(|session| registry.by_session.get(&session))
