@@ -414,6 +414,10 @@ pub fn admit_concurrency() -> anyhow::Result<usize> {
     admission_limit("LYRACORE_ADMIT_CONCURRENCY")
 }
 
+pub fn max_entering() -> anyhow::Result<usize> {
+    admission_limit("LYRACORE_MAX_ENTERING")
+}
+
 fn admission_limit(name: &str) -> anyhow::Result<usize> {
     parse_admission_limit(name, std::env::var_os(name).as_deref())
 }

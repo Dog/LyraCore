@@ -310,7 +310,7 @@ gateway's environment. Omit one and you get a **working-looking single-database 
 | `LYRACORE_LOGON_BIND` / `LYRACORE_WORLD_BIND` | listener binds | `0.0.0.0:3724` / `0.0.0.0:8085` | loud |
 | `LYRACORE_AOI` | AOI-scoped subscriptions | **on** (`=0` disables) | — |
 | `LYRACORE_QUEST_LOG` | quest-log descriptor fields | **on** | — |
-| `LYRACORE_MAX_SESSIONS` / `LYRACORE_ADMIT_CONCURRENCY` | Established World Sessions / queued admissions per tick, per Gateway process. Divide the intended realm-wide limit by the Gateway count. | Unset or `0` = unlimited | Malformed values stop serving startup before Coordinator connection or listener binding. Surrounding whitespace is allowed; signs, separators, empty values and overflow are refused. Provision mode does not use these limits. |
+| `LYRACORE_MAX_SESSIONS` / `LYRACORE_ADMIT_CONCURRENCY` / `LYRACORE_MAX_ENTERING` | Established World Sessions / queued admissions per tick / admitted World Sessions still entering the world, per Gateway process. Divide the intended realm-wide limit by the Gateway count. | Unset or `0` = unlimited | Malformed values stop serving startup before Coordinator connection or listener binding. Surrounding whitespace is allowed; signs, separators, empty values and overflow are refused. Provision mode does not use these limits. |
 | `LYRACORE_MAX_BLOCKING_THREADS` | Blocking game actions, logon handshakes and Relay encoding | `512` | Malformed or zero falls back to `512`; startup logs the resolved value. |
 | `LYRACORE_MAX_WORLD_CONNECTIONS` | All accepted World sockets, including pre-auth and queued clients | `16384` | Malformed or zero falls back to `16384`; excess sockets close at accept. |
 | `LYRACORE_LOAD_SAMPLE_SECS` | shard load sampling cadence | `30` | — |
@@ -337,8 +337,11 @@ This reserves encoding capacity when game actions await database completion. A o
 still serializes both kinds of work. No capacity measurement for this implementation is recorded yet.
 
 The World listener bounds accepted sockets independently through `LYRACORE_MAX_WORLD_CONNECTIONS`.
-`LYRACORE_MAX_SESSIONS` controls admitted players and the authenticated queue. Neither value is a
-measured player capacity. Logon still refuses a new handshake when it cannot obtain a worker permit.
+`LYRACORE_MAX_SESSIONS` controls admitted players and the authenticated queue. `LYRACORE_MAX_ENTERING`
+limits how many admitted sessions are entering the world at once. A session leaves that state when the
+writer reaches its first world view, when it ends, or after 20 seconds. Later arrivals wait in the Login
+Queue with their position. None of these values is a measured player capacity. Logon still refuses a
+new handshake when it cannot obtain a worker permit.
 
 Pre-auth has a total deadline of ten seconds for logon and fifteen seconds for World. The World budget
 includes socket reads, writes and the session lookup in one asynchronous timeout, then ends before the

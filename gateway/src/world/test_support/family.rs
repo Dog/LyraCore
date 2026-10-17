@@ -22,6 +22,7 @@ pub(crate) fn in_world_conn(account_id: u64, self_guid: u64) -> WorldConn {
         guild_signed_on: None,
         move_desync_drops: 0,
         chat_flood: Default::default(),
+        entering: None,
     }
 }
 

@@ -156,7 +156,7 @@ fn post_auth_world_traffic_has_no_pre_auth_deadline() {
 fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
     let store = std::sync::Arc::new(tester_store(42));
     let queue = std::sync::Arc::new(LoginQueue::new(1, 0));
-    assert_eq!(queue.request(), Admission::Admitted);
+    assert!(matches!(queue.request(), Admission::Admitted(_)));
 
     let (mut client, server_end) = world_session_socket_pair();
     let server_store = store.clone();
@@ -197,7 +197,7 @@ fn queued_handshake_sends_wait_queue_then_admits_once_a_seat_frees() {
 fn disconnecting_while_queued_leaves_the_line_without_taking_a_seat() {
     let store = std::sync::Arc::new(tester_store(7));
     let queue = std::sync::Arc::new(LoginQueue::new(1, 0));
-    assert_eq!(queue.request(), Admission::Admitted);
+    assert!(matches!(queue.request(), Admission::Admitted(_)));
 
     let (mut client, server_end) = world_session_socket_pair();
     let server_store = store.clone();
@@ -1796,9 +1796,8 @@ fn reducer_transport_loss_ends_an_admitted_session_and_frees_one_queue_seat() {
         "teardown still attempts leave-world cleanup"
     );
     assert_eq!(queue.active(), 0, "the ended session released its seat");
-    assert_eq!(
-        queue.request(),
-        Admission::Admitted,
+    assert!(
+        matches!(queue.request(), Admission::Admitted(_)),
         "one replacement session is admitted"
     );
     assert!(
