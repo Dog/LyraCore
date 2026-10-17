@@ -6,7 +6,7 @@ use crate::stdb::world_view::*;
 use crate::world::Outbound;
 use anyhow::Result;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -481,31 +481,20 @@ pub(crate) fn motion(
 ) {
     delivery.received();
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
-    let guid = row.guid;
     let bytes = std::mem::size_of::<EntityMotion>() + row.movement_info.len() + 64;
     let row = Arc::new(SharedMotion::new(row.clone()));
-    // Never echo a Character's movement to its own client; it fights position authority.
-    for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        if viewer.self_guid == guid {
-            continue;
-        }
-        if !viewer
-            .motion_pending
-            .entity
-            .lock()
-            .unwrap()
-            .insert(guid, row.clone(), bytes)
-        {
-            viewer.tx.close();
-            continue;
-        }
-        view.note_motion_pending(shard, &viewer);
-    }
+    stage(view, shard, key, |batch, cell| {
+        batch.entity.push(StagedRow {
+            cell,
+            guid: row.row.guid,
+            bytes,
+            row,
+        })
+    });
 }
 
 pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSpline) {
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
-    let guid = row.guid;
     let bytes = std::mem::size_of::<CreatureSpline>()
         + 64
         + row
@@ -513,32 +502,138 @@ pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSplin
             .as_ref()
             .map_or(0, |path| std::mem::size_of_val(path.points.as_slice()));
     let row = Arc::new(SharedMotion::new(row.clone()));
-    for viewer in view.cell_audience(shard, Some(key), BOX_HALF_SPAN, &[]) {
-        if !viewer
-            .motion_pending
-            .creature
-            .lock()
-            .unwrap()
-            .insert(guid, row.clone(), bytes)
-        {
+    stage(view, shard, key, |batch, cell| {
+        batch.creature.push(StagedRow {
+            cell,
+            guid: row.row.guid,
+            bytes,
+            row,
+        })
+    });
+}
+
+/// Movement and creature path rows from one SDK message, shared by every nearby viewer.
+#[derive(Default)]
+pub(crate) struct MotionBatch {
+    cells: Vec<CellKey>,
+    entity: Vec<StagedRow<EntityMotion>>,
+    creature: Vec<StagedRow<CreatureSpline>>,
+}
+
+struct StagedRow<T> {
+    cell: usize,
+    guid: u64,
+    bytes: usize,
+    row: Arc<SharedMotion<T>>,
+}
+
+#[derive(Default)]
+pub(crate) struct MotionStage {
+    cells: HashMap<CellKey, usize>,
+    batch: MotionBatch,
+}
+
+/// One staged batch and the indexes of its cells inside this viewer's audience box.
+pub(crate) struct ViewerMotion {
+    batch: Arc<MotionBatch>,
+    cells: Vec<usize>,
+}
+
+// Fold pending batches into the coalesced rows when a writer falls this far behind; each
+// pending batch keeps its whole SDK message alive.
+const MAX_PENDING_BATCHES: usize = 16;
+
+fn stage(
+    view: &WorldView,
+    shard: ShardId,
+    key: CellKey,
+    push: impl FnOnce(&mut MotionBatch, usize),
+) {
+    let mut staged = view.staged_motion.lock().unwrap();
+    let stage = staged.entry(shard).or_default();
+    let next = stage.cells.len();
+    let cell = *stage.cells.entry(key).or_insert(next);
+    if cell == next {
+        stage.batch.cells.push(key);
+    }
+    push(&mut stage.batch, cell);
+}
+
+/// Hands the SDK message's staged rows to each nearby viewer and queues one flush per viewer.
+pub(crate) fn flush_motion(view: &WorldView, shard: ShardId) {
+    let Some(stage) = view.staged_motion.lock().unwrap().remove(&shard) else {
+        return;
+    };
+    let batch = Arc::new(stage.batch);
+    let mut audience: HashMap<u64, (Arc<Viewer>, Vec<usize>)> = HashMap::new();
+    for (index, cell) in batch.cells.iter().enumerate() {
+        for viewer in view.cell_audience(shard, Some(*cell), BOX_HALF_SPAN, &[]) {
+            audience
+                .entry(viewer.session)
+                .or_insert_with(|| (viewer.clone(), Vec::new()))
+                .1
+                .push(index);
+        }
+    }
+    for (viewer, cells) in audience.into_values() {
+        let behind = {
+            let mut batches = viewer.motion_pending.batches.lock().unwrap();
+            batches.push(ViewerMotion {
+                batch: batch.clone(),
+                cells,
+            });
+            batches.len() > MAX_PENDING_BATCHES
+        };
+        if behind && !fold_batches(&viewer) {
             viewer.tx.close();
             continue;
         }
-        view.note_motion_pending(shard, &viewer);
+        let flush_queued = &viewer.motion_pending.flush_queued;
+        // A load first keeps the shared cache line clean when a flush is already queued.
+        if !flush_queued.load(Ordering::Acquire) && !flush_queued.swap(true, Ordering::AcqRel) {
+            queue_motion_flush(viewer);
+        }
     }
 }
 
-/// Queues one flush per viewer whose pending motion changed in the SDK message just applied.
-pub(crate) fn flush_motion(view: &WorldView, shard: ShardId) {
-    for viewer in view.take_motion_flushes(shard) {
-        queue_motion_flush(viewer);
+/// Returns false when the coalesced rows would exceed their bounds.
+fn fold_batches(viewer: &Viewer) -> bool {
+    // Hold the rows while taking the batches so a concurrent fold cannot reorder them.
+    let mut entity = viewer.motion_pending.entity.lock().unwrap();
+    let mut creature = viewer.motion_pending.creature.lock().unwrap();
+    let batches = std::mem::take(&mut *viewer.motion_pending.batches.lock().unwrap());
+    for ViewerMotion { batch, cells } in batches {
+        let mut nearby = vec![false; batch.cells.len()];
+        for cell in cells {
+            nearby[cell] = true;
+        }
+        for staged in &batch.entity {
+            // Never echo a Character's movement to its own client; it fights position authority.
+            if nearby[staged.cell]
+                && staged.guid != viewer.self_guid
+                && !entity.insert(staged.guid, staged.row.clone(), staged.bytes)
+            {
+                return false;
+            }
+        }
+        for staged in &batch.creature {
+            if nearby[staged.cell]
+                && !creature.insert(staged.guid, staged.row.clone(), staged.bytes)
+            {
+                return false;
+            }
+        }
     }
+    true
 }
 
 fn queue_motion_flush(viewer: Arc<Viewer>) {
     use std::sync::atomic::Ordering as AtOrd;
     if crate::stdb::subscriptions::shed_motion_at_depth(viewer.tx.depth()) {
         crate::stdb::subscriptions::MOTION_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !fold_batches(&viewer) {
+            viewer.tx.close();
+        }
         viewer
             .motion_pending
             .flush_queued
@@ -548,11 +643,15 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
     // The writer runs this flush inline; it must not wait on a lock held across an SDK message.
     let tx = viewer.tx.clone();
     let flush = crate::stdb::world_view::viewer_job(viewer, move |viewer| {
-        // Clear before draining so a racing upsert can queue another flush.
+        // Clear before draining so a racing batch can queue another flush.
         viewer
             .motion_pending
             .flush_queued
             .store(false, AtOrd::Release);
+        if !fold_batches(&viewer) {
+            viewer.tx.close();
+            return Vec::new();
+        }
         let moves: Vec<Arc<SharedMotion<EntityMotion>>> = {
             let mut m = viewer.motion_pending.entity.lock().unwrap();
             m.drain()
@@ -561,12 +660,10 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
             let mut m = viewer.motion_pending.creature.lock().unwrap();
             m.drain()
         };
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(moves.len() + legs.len());
         for movement in moves {
             MOTION_CALLS.fetch_add(1, Ordering::Relaxed);
-            if movement.row.guid != viewer.self_guid
-                && viewer.created.lock().unwrap().contains(&movement.row.guid)
-            {
+            if viewer.created.lock().unwrap().contains(&movement.row.guid) {
                 let packets = movement.outbound(&viewer.tx, movement_outbound);
                 if !packets.is_empty() {
                     MOTION_SENT.fetch_add(1, Ordering::Relaxed);
