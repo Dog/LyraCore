@@ -345,10 +345,11 @@ includes socket reads, writes and the session lookup in one asynchronous timeout
 authenticated queue. Queue writes have their own timeout. A queue seat returns on cancellation,
 including when admission races with cancellation.
 
-Each World Session has a non-waiting outbound queue capped at 2,048 entries and a 4 MiB reservation
-budget. Raw frames reserve their wire size; each typed frame and deferred Relay job reserves 4 KiB until
-encoding. Compression stays on encoding workers. Each encoded projection and combined write batch is
-also limited to 4 MiB.
+Each World Session has a non-waiting outbound queue with a 4 MiB reservation budget, capped at 16,384
+entries. Raw frames reserve their wire size, each typed frame reserves 4 KiB and each deferred Relay Job
+reserves 256 bytes until encoding. Compression stays on encoding workers. Each encoded projection is
+also limited to 4 MiB. The writer encodes up to 32 entries per blocking hand-off; entries after 4 MiB of
+encoded output move to its next batch.
 These are queue and encoded-output limits, not an exact bound on arbitrary captured Rust objects.
 A queue entry has ten seconds to finish encoding and writing. Exceeding a limit closes the session;
 critical packets are not silently discarded. Movement keeps its existing coalescing and shedding. Its

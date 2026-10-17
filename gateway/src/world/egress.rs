@@ -10,11 +10,12 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use wow_srp::vanilla_header::EncrypterHalf;
 
-const QUEUE_ITEMS: usize = 2048;
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const TYPED_RESERVATION: usize = 4 * 1024;
 // A queued Relay Job holds shared rows; its encoded size is checked when it runs.
 const JOB_RESERVATION: usize = 256;
+// The byte budget, not the entry count, bounds a queue of Relay Jobs.
+const QUEUE_ITEMS: usize = QUEUE_BYTES / JOB_RESERVATION;
 pub(super) const MAX_AGE: Duration = Duration::from_secs(10);
 const WRITE_BYTES: usize = 64 * 1024;
 const ENCODE_BATCH: usize = 32;
