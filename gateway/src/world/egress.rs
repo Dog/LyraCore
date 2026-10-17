@@ -251,33 +251,37 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
         crate::stage_timing::QUEUE_WAIT.record(oldest.elapsed());
         let job_closed = closed.clone();
         let submitted = Instant::now();
-        let encoded = tokio::time::timeout_at(
-            deadline,
-            workers.run(move || {
-                let encoding = Instant::now();
-                crate::stage_timing::ENCODER_WAIT.record(encoding - submitted);
-                let mut frames = Vec::new();
-                let mut total = 0usize;
-                for queued in &mut batch {
-                    if *job_closed.borrow() || total >= QUEUE_BYTES {
-                        break;
+        let encoded = tokio::time::timeout_at(deadline, async {
+            let permit = workers.acquire().await?;
+            let acquired = Instant::now();
+            crate::stage_timing::ENCODER_PERMIT_WAIT.record(acquired - submitted);
+            permit
+                .run(move || {
+                    let encoding = Instant::now();
+                    crate::stage_timing::ENCODER_DISPATCH.record(encoding - acquired);
+                    let mut frames = Vec::new();
+                    let mut total = 0usize;
+                    for queued in &mut batch {
+                        if *job_closed.borrow() || total >= QUEUE_BYTES {
+                            break;
+                        }
+                        let outbound = match queued.out.take() {
+                            Some(Outbound::Job(job)) => job(),
+                            Some(other) => vec![other],
+                            None => bail!("World Session queue entry consumed twice"),
+                        };
+                        let packets = encode(outbound)?;
+                        total += packets
+                            .iter()
+                            .map(|packet| 4 + packet.body.len())
+                            .sum::<usize>();
+                        frames.extend(packets);
                     }
-                    let outbound = match queued.out.take() {
-                        Some(Outbound::Job(job)) => job(),
-                        Some(other) => vec![other],
-                        None => bail!("World Session queue entry consumed twice"),
-                    };
-                    let packets = encode(outbound)?;
-                    total += packets
-                        .iter()
-                        .map(|packet| 4 + packet.body.len())
-                        .sum::<usize>();
-                    frames.extend(packets);
-                }
-                crate::stage_timing::ENCODE.record(encoding.elapsed());
-                Ok::<_, anyhow::Error>((batch, frames))
-            }),
-        )
+                    crate::stage_timing::ENCODE.record(encoding.elapsed());
+                    Ok::<_, anyhow::Error>((batch, frames))
+                })
+                .await
+        })
         .await
         .map_err(|_| anyhow!("World Session outbound queue exceeded age limit"))???;
         let (batch, frames) = encoded;
