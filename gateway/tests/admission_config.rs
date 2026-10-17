@@ -14,7 +14,11 @@ fn gateway() -> Command {
 
 #[test]
 fn malformed_admission_limits_fail_before_connecting() {
-    for name in ["LYRACORE_MAX_SESSIONS", "LYRACORE_ADMIT_CONCURRENCY"] {
+    for name in [
+        "LYRACORE_MAX_SESSIONS",
+        "LYRACORE_ADMIT_CONCURRENCY",
+        "LYRACORE_MAX_ENTERING",
+    ] {
         let output = gateway().env(name, "1,000").output().unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8(output.stderr).unwrap();

@@ -25,7 +25,7 @@ A World of Warcraft 1.12.1 server. Game state lives in SpacetimeDB; the gateway 
 
 **I** [Idle Bot](#sharding-and-transfer) · [Import Family](#packages) · [Instance Pool](#realm-topology) · [Instance Removal](#sharding-and-transfer) · [Instance Vmap Slice](#realm-topology) · [Invocation](#runtime-scripts) · [Item Exchange](#procs) · [Item Text](#mail)
 
-**L** [Land Mount](#mounts) · [Lethal Damage Floor](#creature-ai) · [Letter Copy](#mail) · [Logon Limiter](#accounts-characters-and-sessions) · [Loot Release](#loot) · [Loot Roll](#loot) · [Loot Roll Promotion](#loot) · [Loot Roll Promotion Receipt](#loot) · [Loot Source](#loot) · [Loot Tag](#loot) · [Loot Window](#loot)
+**L** [Land Mount](#mounts) · [Lethal Damage Floor](#creature-ai) · [Letter Copy](#mail) · [Login Queue](#accounts-characters-and-sessions) · [Logon Limiter](#accounts-characters-and-sessions) · [Loot Release](#loot) · [Loot Roll](#loot) · [Loot Roll Promotion](#loot) · [Loot Roll Promotion Receipt](#loot) · [Loot Source](#loot) · [Loot Tag](#loot) · [Loot Window](#loot)
 
 **M** [Mail](#mail) · [Mail Arrival](#mail) · [Mail Expiry](#mail) · [Mail Sender](#mail) · [Mail Template](#mail) · [Mail Timer](#mail) · [Meeting Stone](#meeting-stones) · [Meeting Stone Queue](#meeting-stones) · [Member Stats](#sharding-and-transfer) · [Module](#realm-topology) · [Mount Projection](#mounts) · [Movement Intent](#creature-ai)
 
@@ -244,6 +244,11 @@ The Module's record that an Account is logged in on a Character.
 **World Session**:
 The Gateway's per-connection loop for one client on the world port.
 _Avoid_: session (unqualified, when meaning the connection)
+
+**Login Queue**:
+The Gateway's line of authenticated World Sessions waiting for admission. The vanilla client shows
+its position. A full realm, or too many sessions still entering the world, keeps new arrivals in it.
+_Avoid_: wait list, login line
 
 **Account Claim**:
 Realm-core's time-limited ownership of an Account by one World Session. A live claim refuses a

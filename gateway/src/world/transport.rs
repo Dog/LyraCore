@@ -5,14 +5,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 struct Seat {
     queue: Arc<LoginQueue>,
-    queued: Option<login_queue::Ticket>,
+    ticket: login_queue::Ticket,
+    queued: bool,
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        match self.queued {
-            Some(ticket) => self.queue.cancel_or_depart(ticket),
-            None => self.queue.depart(),
+        if self.queued {
+            self.queue.cancel_or_depart(self.ticket);
+        } else {
+            self.queue.finish_entering(self.ticket);
+            self.queue.depart();
         }
     }
 }
@@ -91,6 +94,7 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             guild_signed_on: None,
             move_desync_drops: 0,
             chat_flood: Default::default(),
+            entering: None,
         },
         encrypt,
     )))
@@ -101,12 +105,16 @@ async fn admit<S: AsyncWrite + Unpin>(
     encrypt: &mut EncrypterHalf,
     queue: Arc<LoginQueue>,
 ) -> Result<Seat> {
-    let mut seat = Seat {
-        queued: None,
-        queue,
+    let (ticket, queued) = match queue.request() {
+        Admission::Admitted(ticket) => (ticket, false),
+        Admission::Queued(ticket) => (ticket, true),
     };
-    if let Admission::Queued(ticket) = seat.queue.request() {
-        seat.queued = Some(ticket);
+    let mut seat = Seat {
+        queue,
+        ticket,
+        queued,
+    };
+    if queued {
         let mut last_sent: Option<(Instant, usize)> = None;
         while let Some(position) = seat.queue.position(ticket) {
             if last_sent.is_none_or(|(at, previous)| {
@@ -122,7 +130,7 @@ async fn admit<S: AsyncWrite + Unpin>(
             }
             tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
         }
-        seat.queued = None;
+        seat.queued = false;
     }
     let mut frame = Vec::new();
     (SMSG_AUTH_RESPONSE::AuthOk {
@@ -181,14 +189,15 @@ where
         result = tokio::time::timeout_at(deadline, authenticate(&mut stream, store, &actions)) =>
             result.map_err(|_| anyhow!("no CMSG_AUTH_SESSION before the total pre-auth deadline"))??,
     };
-    let Some((conn, mut encrypt)) = authenticated else {
+    let Some((mut conn, mut encrypt)) = authenticated else {
         return Ok(());
     };
-    let _seat = tokio::select! {
+    let seat = tokio::select! {
         biased;
         _ = stopped.wait_for(|stop| *stop) => return Ok(()),
         result = admit(&mut stream, &mut encrypt, queue) => result?,
     };
+    conn.entering = Some(login_queue::EntrySlot::new(seat.queue.clone(), seat.ticket));
     let account_id = conn.account_id;
     let conn = Arc::new(Mutex::new(conn));
     let addon = Arc::new(Mutex::new(AddonLimit::default()));
@@ -522,13 +531,14 @@ mod tests {
     #[test]
     fn cancellation_after_queue_admission_returns_the_promoted_seat() {
         let queue = Arc::new(LoginQueue::new(1, 0));
-        assert_eq!(queue.request(), Admission::Admitted);
+        assert!(matches!(queue.request(), Admission::Admitted(_)));
         let Admission::Queued(ticket) = queue.request() else {
             panic!("queue is full");
         };
         let seat = Seat {
             queue: queue.clone(),
-            queued: Some(ticket),
+            ticket,
+            queued: true,
         };
         queue.depart();
         assert_eq!(queue.active(), 1);
@@ -539,13 +549,14 @@ mod tests {
     #[test]
     fn cancellation_before_admission_leaves_the_current_player_seated() {
         let queue = Arc::new(LoginQueue::new(1, 0));
-        assert_eq!(queue.request(), Admission::Admitted);
+        assert!(matches!(queue.request(), Admission::Admitted(_)));
         let Admission::Queued(ticket) = queue.request() else {
             panic!("queue is full");
         };
         drop(Seat {
             queue: queue.clone(),
-            queued: Some(ticket),
+            ticket,
+            queued: true,
         });
         assert_eq!(queue.active(), 1);
         assert_eq!(queue.depth(), 0);

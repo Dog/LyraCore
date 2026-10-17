@@ -208,6 +208,16 @@ fn enter_world(
         };
         send(tx, Outbound::Job(Box::new(forget)))?;
     }
+    if let Some(slot) = conn.entering.take() {
+        // The writer runs this after the initial world view, then frees the slot for the next waiter.
+        send(
+            tx,
+            Outbound::Job(Box::new(move || {
+                drop(slot);
+                Vec::new()
+            })),
+        )?;
+    }
     conn.state = WorldState::InWorld(InWorld {
         self_guid: character_guid,
         subs,

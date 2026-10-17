@@ -224,6 +224,7 @@ pub struct WorldConn {
     guild_signed_on: Option<u64>,
     move_desync_drops: u32,
     chat_flood: chat_flood::ChatFloodLimiter,
+    entering: Option<login_queue::EntrySlot>,
 }
 
 impl std::ops::Deref for WorldConn {
@@ -748,19 +749,23 @@ pub async fn run(
     let listener = TcpListener::bind(&cfg.world_bind).await?;
     log::info!("world listening on {}", cfg.world_bind);
 
-    if login_queue.max_sessions() > 0 {
+    let limit = |value: usize| {
+        if value == 0 {
+            "unlimited".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    if login_queue.max_sessions() > 0 || login_queue.max_entering() > 0 {
         log::info!(
-            "world: login queue ARMED — max_sessions={} admit_concurrency={}",
-            login_queue.max_sessions(),
-            if login_queue.admit_concurrency() == 0 {
-                "unlimited".to_string()
-            } else {
-                login_queue.admit_concurrency().to_string()
-            }
+            "world: login queue ARMED — max_sessions={} admit_concurrency={} max_entering={}",
+            limit(login_queue.max_sessions()),
+            limit(login_queue.admit_concurrency()),
+            limit(login_queue.max_entering()),
         );
     } else {
         log::info!(
-            "world: login queue disabled (LYRACORE_MAX_SESSIONS unset/0) — unlimited admission"
+            "world: login queue disabled (LYRACORE_MAX_SESSIONS and LYRACORE_MAX_ENTERING unset/0) — unlimited admission"
         );
     }
 
@@ -783,9 +788,10 @@ pub async fn run(
                 let admitted_per_s = admitted.saturating_sub(prev_admitted) as f64 / 10.0;
                 let oldest = queuestat_queue.oldest_wait().unwrap_or_default();
                 log::info!(
-                    "QUEUESTAT depth={depth} admitted={admitted} (+{:.1}/s) active={} oldest_wait={:.1}s",
+                    "QUEUESTAT depth={depth} admitted={admitted} (+{:.1}/s) active={} entering={} oldest_wait={:.1}s",
                     admitted_per_s,
                     queuestat_queue.active(),
+                    queuestat_queue.entering(),
                     oldest.as_secs_f64(),
                 );
             }

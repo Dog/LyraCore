@@ -198,9 +198,8 @@ fn a_session_ending_in_a_framing_error_still_gives_its_seat_back() {
         "the seat must be released on the ERROR path too — otherwise every malformed frame \
          permanently shrinks the realm's capacity by one"
     );
-    assert_eq!(
-        queue.request(),
-        Admission::Admitted,
+    assert!(
+        matches!(queue.request(), Admission::Admitted(_)),
         "and the freed seat must be immediately usable by the next login"
     );
 }

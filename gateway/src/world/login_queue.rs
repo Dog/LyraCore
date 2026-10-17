@@ -1,15 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const ADMIT_TICK: Duration = Duration::from_secs(1);
+/// An admitted session that never finishes entering the world frees its entering slot after this.
+const ENTERING_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub type Ticket = u64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission {
-    Admitted,
+    Admitted(Ticket),
     Queued(Ticket),
 }
 
@@ -21,6 +23,7 @@ struct Waiter {
 struct State {
     active: usize,
     waiting: VecDeque<Waiter>,
+    entering: HashMap<Ticket, Instant>,
     next_ticket: Ticket,
     tick_started: Instant,
     admitted_this_tick: usize,
@@ -29,24 +32,38 @@ struct State {
 pub struct LoginQueue {
     max_sessions: usize,
     admit_concurrency: usize,
+    max_entering: usize,
     tick: Duration,
     state: Mutex<State>,
     admitted_total: AtomicU64,
 }
 
 impl LoginQueue {
+    #[cfg(test)]
     pub fn new(max_sessions: usize, admit_concurrency: usize) -> Self {
         Self::with_tick(max_sessions, admit_concurrency, ADMIT_TICK)
     }
 
+    #[cfg(test)]
     pub fn with_tick(max_sessions: usize, admit_concurrency: usize, tick: Duration) -> Self {
+        Self::with_entry_gate(max_sessions, admit_concurrency, 0, tick)
+    }
+
+    pub fn with_entry_gate(
+        max_sessions: usize,
+        admit_concurrency: usize,
+        max_entering: usize,
+        tick: Duration,
+    ) -> Self {
         Self {
             max_sessions,
             admit_concurrency,
+            max_entering,
             tick,
             state: Mutex::new(State {
                 active: 0,
                 waiting: VecDeque::new(),
+                entering: HashMap::new(),
                 next_ticket: 0,
                 tick_started: Instant::now(),
                 admitted_this_tick: 0,
@@ -61,24 +78,39 @@ impl LoginQueue {
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self::new(
+        Ok(Self::with_entry_gate(
             crate::config::max_sessions()?,
             crate::config::admit_concurrency()?,
+            crate::config::max_entering()?,
+            ADMIT_TICK,
         ))
     }
 
+    fn gated(&self) -> bool {
+        self.max_sessions > 0 || self.max_entering > 0
+    }
+
+    fn has_room(&self, s: &State) -> bool {
+        (self.max_sessions == 0 || s.active < self.max_sessions)
+            && (self.max_entering == 0 || s.entering.len() < self.max_entering)
+    }
+
     pub fn request(&self) -> Admission {
-        if self.max_sessions == 0 {
-            return Admission::Admitted;
-        }
         let mut s = self.state.lock().unwrap();
-        if s.waiting.is_empty() && s.active < self.max_sessions {
-            s.active += 1;
-            self.admitted_total.fetch_add(1, Ordering::Relaxed);
-            return Admission::Admitted;
-        }
         let ticket = s.next_ticket;
         s.next_ticket += 1;
+        if !self.gated() {
+            return Admission::Admitted(ticket);
+        }
+        self.expire_entering(&mut s);
+        if s.waiting.is_empty() && self.has_room(&s) {
+            s.active += 1;
+            if self.max_entering > 0 {
+                s.entering.insert(ticket, Instant::now());
+            }
+            self.admitted_total.fetch_add(1, Ordering::Relaxed);
+            return Admission::Admitted(ticket);
+        }
         s.waiting.push_back(Waiter {
             ticket,
             queued_at: Instant::now(),
@@ -111,17 +143,33 @@ impl LoginQueue {
             state.waiting.remove(index);
         } else {
             state.active = state.active.saturating_sub(1);
+            state.entering.remove(&ticket);
             self.drain_locked(&mut state);
         }
     }
 
     pub fn depart(&self) {
-        if self.max_sessions == 0 {
+        if !self.gated() {
             return;
         }
         let mut s = self.state.lock().unwrap();
         s.active = s.active.saturating_sub(1);
         self.drain_locked(&mut s);
+    }
+
+    /// Frees `ticket`'s entering slot; repeats and unknown tickets are no-ops.
+    pub fn finish_entering(&self, ticket: Ticket) {
+        let mut s = self.state.lock().unwrap();
+        if s.entering.remove(&ticket).is_some() {
+            self.drain_locked(&mut s);
+        }
+    }
+
+    fn expire_entering(&self, s: &mut State) {
+        if self.max_entering > 0 {
+            s.entering
+                .retain(|_, admitted| admitted.elapsed() < ENTERING_TIMEOUT);
+        }
     }
 
     pub fn tick(&self) {
@@ -137,17 +185,21 @@ impl LoginQueue {
                 s.admitted_this_tick = 0;
             }
         }
+        self.expire_entering(s);
         loop {
-            if s.active >= self.max_sessions {
+            if !self.has_room(s) {
                 break;
             }
             if self.admit_concurrency > 0 && s.admitted_this_tick >= self.admit_concurrency {
                 break;
             }
-            let Some(_front) = s.waiting.pop_front() else {
+            let Some(front) = s.waiting.pop_front() else {
                 break;
             };
             s.active += 1;
+            if self.max_entering > 0 {
+                s.entering.insert(front.ticket, Instant::now());
+            }
             s.admitted_this_tick += 1;
             self.admitted_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -159,6 +211,10 @@ impl LoginQueue {
 
     pub fn active(&self) -> usize {
         self.state.lock().unwrap().active
+    }
+
+    pub fn entering(&self) -> usize {
+        self.state.lock().unwrap().entering.len()
     }
 
     pub fn oldest_wait(&self) -> Option<Duration> {
@@ -176,6 +232,28 @@ impl LoginQueue {
 
     pub fn admit_concurrency(&self) -> usize {
         self.admit_concurrency
+    }
+
+    pub fn max_entering(&self) -> usize {
+        self.max_entering
+    }
+}
+
+/// Holds an admitted session's entering slot; dropping it frees the slot for the next waiter.
+pub(crate) struct EntrySlot {
+    queue: std::sync::Arc<LoginQueue>,
+    ticket: Ticket,
+}
+
+impl EntrySlot {
+    pub(crate) fn new(queue: std::sync::Arc<LoginQueue>, ticket: Ticket) -> Self {
+        Self { queue, ticket }
+    }
+}
+
+impl Drop for EntrySlot {
+    fn drop(&mut self) {
+        self.queue.finish_entering(self.ticket);
     }
 }
 
@@ -195,7 +273,7 @@ mod tests {
                 let q = q.clone();
                 let admitted = admitted.clone();
                 std::thread::spawn(move || {
-                    if q.request() == Admission::Admitted {
+                    if matches!(q.request(), Admission::Admitted(_)) {
                         admitted.fetch_add(1, Ordering::Relaxed);
                     }
                 })
@@ -233,7 +311,10 @@ mod tests {
         let q = LoginQueue::new(3, 0);
         for round in 0..2 {
             for _ in 0..3 {
-                assert_eq!(q.request(), Admission::Admitted, "round {round}");
+                assert!(
+                    matches!(q.request(), Admission::Admitted(_)),
+                    "round {round}"
+                );
             }
             assert_eq!(q.active(), 3);
             let Admission::Queued(t) = q.request() else {
@@ -257,7 +338,7 @@ mod tests {
     #[test]
     fn releasing_a_seat_more_often_than_it_was_taken_never_underflows_the_cap() {
         let q = LoginQueue::new(2, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         q.depart();
         q.depart();
         q.depart();
@@ -267,16 +348,16 @@ mod tests {
             "an extra release must clamp at zero, not wrap to usize::MAX — a wrapped counter makes \
              `active < max_sessions` false forever and every subsequent login queues behind nothing"
         );
-        assert_eq!(q.request(), Admission::Admitted);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         assert!(matches!(q.request(), Admission::Queued(_)));
     }
 
     #[test]
-    fn the_unlimited_queue_takes_no_lock_and_keeps_no_ledger_on_departure() {
+    fn the_unlimited_queue_keeps_no_ledger_on_departure() {
         let q = LoginQueue::unlimited();
         for _ in 0..100 {
-            assert_eq!(q.request(), Admission::Admitted);
+            assert!(matches!(q.request(), Admission::Admitted(_)));
             q.depart();
         }
         assert_eq!(q.active(), 0);
@@ -291,7 +372,7 @@ mod tests {
     #[test]
     fn tick_drains_the_line_into_free_capacity_without_any_other_event() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         let Admission::Queued(t) = q.request() else {
             panic!("the second arrival must queue behind the one seat");
         };
@@ -343,9 +424,49 @@ mod tests {
     }
 
     #[test]
+    fn a_full_entry_gate_queues_arrivals_until_an_entering_session_finishes() {
+        let q = LoginQueue::with_entry_gate(0, 0, 2, ADMIT_TICK);
+        let Admission::Admitted(first) = q.request() else {
+            panic!("the first arrival enters");
+        };
+        assert!(matches!(q.request(), Admission::Admitted(_)));
+        let Admission::Queued(third) = q.request() else {
+            panic!("a third arrival waits while two are entering");
+        };
+        assert_eq!(q.position(third), Some(1));
+
+        q.finish_entering(first);
+        q.finish_entering(first);
+
+        assert_eq!(q.position(third), None, "the waiter is admitted");
+        assert_eq!(q.entering(), 2);
+        assert_eq!(q.active(), 3, "finishing entry keeps the session seated");
+    }
+
+    #[test]
+    fn a_promoted_waiter_that_leaves_frees_its_entering_slot() {
+        let q = LoginQueue::with_entry_gate(0, 0, 1, ADMIT_TICK);
+        let Admission::Admitted(first) = q.request() else {
+            panic!("the first arrival enters");
+        };
+        let Admission::Queued(second) = q.request() else {
+            panic!("the second arrival waits");
+        };
+        q.finish_entering(first);
+        assert_eq!(q.position(second), None);
+
+        q.cancel_or_depart(second);
+
+        assert_eq!(q.entering(), 0);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
+    }
+
+    #[test]
     fn a_cancelled_tickets_number_is_never_handed_out_again() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        let Admission::Admitted(seated) = q.request() else {
+            panic!("the first arrival takes the seat");
+        };
 
         let mut seen = Vec::new();
         for _ in 0..5 {
@@ -361,7 +482,7 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![0, 1, 2, 3, 4],
+            (seated + 1..seated + 6).collect::<Vec<_>>(),
             "tickets must be strictly increasing, never recycled from cancellations"
         );
         assert_eq!(q.depth(), 0, "every one of them left the line");
@@ -371,7 +492,7 @@ mod tests {
     fn oldest_wait_is_none_when_nobody_is_in_line() {
         let q = LoginQueue::new(1, 0);
         assert_eq!(q.oldest_wait(), None, "an empty queue has no oldest waiter");
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         assert_eq!(
             q.oldest_wait(),
             None,
@@ -393,7 +514,7 @@ mod tests {
     fn unlimited_never_queues_regardless_of_volume() {
         let q = LoginQueue::unlimited();
         for _ in 0..1000 {
-            assert_eq!(q.request(), Admission::Admitted);
+            assert!(matches!(q.request(), Admission::Admitted(_)));
         }
         assert_eq!(q.depth(), 0);
         assert_eq!(q.active(), 0);
@@ -402,14 +523,14 @@ mod tests {
     #[test]
     fn cap_zero_is_the_unlimited_shape_too() {
         let q = LoginQueue::new(0, 5);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         assert_eq!(q.depth(), 0);
     }
 
     #[test]
     fn fifo_order_and_positions() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
 
         let Admission::Queued(a) = q.request() else {
             panic!("expected A to queue")
@@ -430,7 +551,7 @@ mod tests {
     #[test]
     fn position_updates_on_admission_in_fifo_order() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
 
         let Admission::Queued(a) = q.request() else {
             panic!()
@@ -467,7 +588,7 @@ mod tests {
     #[test]
     fn disconnect_while_queued_just_leaves_the_line() {
         let q = LoginQueue::new(1, 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
 
         let Admission::Queued(a) = q.request() else {
             panic!()
@@ -510,7 +631,7 @@ mod tests {
 
     fn fill_to_capacity(q: &LoginQueue, cap: usize) {
         for _ in 0..cap {
-            assert_eq!(q.request(), Admission::Admitted);
+            assert!(matches!(q.request(), Admission::Admitted(_)));
         }
         assert_eq!(q.active(), cap);
     }
@@ -581,7 +702,7 @@ mod tests {
     fn oldest_wait_reports_the_front_of_the_line() {
         let q = LoginQueue::new(1, 0);
         assert!(q.oldest_wait().is_none(), "nobody waiting yet");
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         assert!(
             q.oldest_wait().is_none(),
             "the one session is active, not waiting"
@@ -599,7 +720,7 @@ mod tests {
     fn admitted_total_counts_both_immediate_and_drained_admissions() {
         let q = LoginQueue::new(1, 0);
         assert_eq!(q.admitted_total(), 0);
-        assert_eq!(q.request(), Admission::Admitted);
+        assert!(matches!(q.request(), Admission::Admitted(_)));
         assert_eq!(q.admitted_total(), 1);
 
         let Admission::Queued(a) = q.request() else {
