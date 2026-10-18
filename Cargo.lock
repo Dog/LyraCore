@@ -1835,6 +1835,7 @@ dependencies = [
  "lyracore-module",
  "lyracore-shared",
  "lyracore-test-support",
+ "rustc-hash",
  "serde",
  "serde_json",
  "spacetimedb-lib",

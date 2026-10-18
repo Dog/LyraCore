@@ -6,7 +6,8 @@ use crate::stdb::world_view::*;
 use crate::world::Outbound;
 use anyhow::Result;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -403,7 +404,7 @@ pub(crate) fn unix_now_micros() -> u64 {
 }
 
 pub(crate) struct MotionRows<T> {
-    rows: std::collections::HashMap<u64, (Arc<SharedMotion<T>>, usize)>,
+    rows: FxHashMap<u64, (Arc<SharedMotion<T>>, usize)>,
     bytes: usize,
 }
 
@@ -529,7 +530,7 @@ struct StagedRow<T> {
 
 #[derive(Default)]
 pub(crate) struct MotionStage {
-    cells: HashMap<CellKey, usize>,
+    cells: FxHashMap<CellKey, usize>,
     batch: MotionBatch,
 }
 
@@ -565,7 +566,7 @@ pub(crate) fn flush_motion(view: &Arc<WorldView>, shard: ShardId) {
         return;
     };
     let batch = Arc::new(stage.batch);
-    let mut audience: HashMap<u64, (Arc<Viewer>, Vec<usize>)> = HashMap::new();
+    let mut audience: FxHashMap<u64, (Arc<Viewer>, Vec<usize>)> = FxHashMap::default();
     for (index, cell) in batch.cells.iter().enumerate() {
         for viewer in view.cell_audience(shard, Some(*cell), BOX_HALF_SPAN, &[]) {
             audience
