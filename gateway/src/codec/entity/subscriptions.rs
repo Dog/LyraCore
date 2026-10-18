@@ -660,8 +660,26 @@ pub(crate) fn entity_changed(
         shard,
         new.owner_guid,
     );
-    let new_recipients = view.world_entity_recipients(shard, new.guid, key);
     let crossed = previous.is_some_and(|old_key| old_key != key);
+    let descriptors_changed = entity_descriptors_changed(old, new);
+    let lifecycle_changed =
+        previous.is_none() || old.npc_flags != new.npc_flags || old.owner_guid != new.owner_guid;
+    // Same-cell updates skip unshown viewers; a moving entity's flush offers their CREATE.
+    if !crossed && !descriptors_changed && !lifecycle_changed {
+        if old.dead != new.dead {
+            if let Some(owner) = view.viewer_of_owner_on_shard(shard, OwnerGuid(new.guid)) {
+                update_job(
+                    view,
+                    shard,
+                    owner.session,
+                    &Arc::new(old.clone()),
+                    &Arc::new(new.clone()),
+                );
+            }
+        }
+        return;
+    }
+    let new_recipients = view.world_entity_recipients(shard, new.guid, key);
     let mut stayed = HashSet::new();
     if crossed {
         let still: HashSet<SessionId> = new_recipients.iter().copied().collect();
@@ -673,9 +691,6 @@ pub(crate) fn entity_changed(
             }
         }
     }
-    let descriptors_changed = entity_descriptors_changed(old, new);
-    let lifecycle_changed =
-        previous.is_none() || old.npc_flags != new.npc_flags || old.owner_guid != new.owner_guid;
     let old = Arc::new(old.clone());
     let new = Arc::new(new.clone());
     for session in new_recipients {
@@ -782,6 +797,40 @@ pub(crate) fn offer_create_job(
         crate::codec::entity::subscriptions::offer_peer_create_for(
             &coord, &view, shard, &viewer, &row,
         )
+    });
+}
+
+/// Offers a peer CREATE of `guid` to `viewer` if it is still in range and not shown yet.
+pub(crate) fn offer_missing_create(
+    view: &Arc<WorldView>,
+    shard: ShardId,
+    viewer: Arc<Viewer>,
+    guid: u64,
+) {
+    let view = view.clone();
+    enqueue(viewer, move |viewer| {
+        let Some(coord) = view.shard(shard) else {
+            return Vec::new();
+        };
+        // The flush ran earlier; a DESTROY queued since then must not be undone out of range.
+        if viewer.created.lock().unwrap().contains(&guid)
+            || !view
+                .spatial
+                .can_see(EntityLayer::WorldEntity, viewer.session, guid)
+        {
+            return Vec::new();
+        }
+        let row = coord
+            .0
+            .coord()
+            .conn
+            .db
+            .game_world_entity()
+            .guid()
+            .find(&guid);
+        row.map_or_else(Vec::new, |row| {
+            offer_peer_create_for(&coord, &view, shard, &viewer, &row)
+        })
     });
 }
 

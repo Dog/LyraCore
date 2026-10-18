@@ -327,7 +327,7 @@ fn benilla_failed_transfer_reports_reason_without_a_destination_map() {
 
 pub(crate) struct MovementWorld {
     view: Arc<crate::stdb::world_view::WorldView>,
-    relay: fn(&crate::stdb::world_view::WorldView, &crate::stdb::bindings::EntityMotion),
+    relay: fn(&Arc<crate::stdb::world_view::WorldView>, &crate::stdb::bindings::EntityMotion),
     positions: Mutex<std::collections::BTreeMap<u64, wow_world_messages::vanilla::MovementInfo>>,
 }
 
@@ -361,7 +361,7 @@ impl MovementWorld {
 }
 
 pub(crate) fn two_clients_observe_movement(
-    relay: fn(&crate::stdb::world_view::WorldView, &crate::stdb::bindings::EntityMotion),
+    relay: fn(&Arc<crate::stdb::world_view::WorldView>, &crate::stdb::bindings::EntityMotion),
 ) {
     use crate::codec;
     use crate::stdb::world_view::{OwnerGuid, WorldView};
