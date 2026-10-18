@@ -1314,7 +1314,7 @@ fn healthy_motion_without_a_peer_does_not_report_stopped_delivery() {
 
 #[test]
 fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
-    let view = WorldView::new(true);
+    let view = Arc::new(WorldView::new(true));
     let batch = super::super::movement_batch::MovementBatch::new();
     let (tx, rx) = SessionTx::with_depth(0);
     let peer = viewer(1, PLAYER_BASE + 1, tx);
@@ -1338,7 +1338,7 @@ fn motion_delivery_counts_coalesced_rows_before_a_stalled_peer_writer() {
 
 #[test]
 fn motion_rows_in_one_message_queue_one_flush_after_the_message() {
-    let view = WorldView::new(true);
+    let view = Arc::new(WorldView::new(true));
     let (tx, rx) = SessionTx::with_depth(0);
     let peer = viewer(1, PLAYER_BASE + 10, tx);
     peer.created

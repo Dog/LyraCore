@@ -7,7 +7,7 @@ use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
 #[test]
 fn creature_observers_share_encoded_bodies_after_the_create_gate() {
-    let view = WorldView::new(true);
+    let view = Arc::new(WorldView::new(true));
     let mut receivers = Vec::new();
     for byte in 1u8..=3 {
         let id = u64::from(byte);
@@ -44,7 +44,7 @@ fn creature_observers_share_encoded_bodies_after_the_create_gate() {
 
 #[test]
 fn a_viewer_receives_only_staged_rows_inside_its_audience_box() {
-    let view = WorldView::new(true);
+    let view = Arc::new(WorldView::new(true));
     let (tx, rx) = SessionTx::with_depth(0);
     let viewer = viewer_with_tx(1, 1, identity(1), tx);
     viewer.created.lock().unwrap().extend([98, 99]);
@@ -63,6 +63,30 @@ fn a_viewer_receives_only_staged_rows_inside_its_audience_box() {
         rx.try_recv().is_err(),
         "one flush for the whole SDK message"
     );
+}
+
+#[test]
+fn a_nearby_mover_the_viewer_does_not_show_gets_one_create_offer_per_interval() {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    view.add_viewer_on_shard(viewer, CellKey::at(0, 0, 0, 0), 0);
+    let row = super::packet_tests::creature_spline(99, 0, 1000);
+
+    let mut offers = 0;
+    for _ in 0..2 {
+        creature_leg(&view, 0, &row);
+        flush_motion(&view, 0);
+        let Ok(Outbound::Motion(flush)) = rx.try_recv() else {
+            panic!("one movement flush per SDK message");
+        };
+        assert!(flush().is_empty(), "no path for an unshown creature");
+        while let Ok(Outbound::Job(_)) = rx.try_recv() {
+            offers += 1;
+        }
+    }
+
+    assert_eq!(offers, 1, "the second flush waits for the interval");
 }
 
 #[test]

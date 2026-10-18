@@ -560,7 +560,7 @@ fn stage(
 }
 
 /// Hands the SDK message's staged rows to each nearby viewer and queues one flush per viewer.
-pub(crate) fn flush_motion(view: &WorldView, shard: ShardId) {
+pub(crate) fn flush_motion(view: &Arc<WorldView>, shard: ShardId) {
     let Some(stage) = view.staged_motion.lock().unwrap().remove(&shard) else {
         return;
     };
@@ -591,7 +591,7 @@ pub(crate) fn flush_motion(view: &WorldView, shard: ShardId) {
         let flush_queued = &viewer.motion_pending.flush_queued;
         // A load first keeps the shared cache line clean when a flush is already queued.
         if !flush_queued.load(Ordering::Acquire) && !flush_queued.swap(true, Ordering::AcqRel) {
-            queue_motion_flush(viewer);
+            queue_motion_flush(view, shard, viewer);
         }
     }
 }
@@ -627,7 +627,10 @@ fn fold_batches(viewer: &Viewer) -> bool {
     true
 }
 
-fn queue_motion_flush(viewer: Arc<Viewer>) {
+// A nearby mover the viewer does not show gets at most one CREATE offer per interval.
+const MISSING_CREATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn queue_motion_flush(view: &Arc<WorldView>, shard: ShardId, viewer: Arc<Viewer>) {
     use std::sync::atomic::Ordering as AtOrd;
     if crate::stdb::subscriptions::shed_motion_at_depth(viewer.tx.depth()) {
         crate::stdb::subscriptions::MOTION_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -642,6 +645,7 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
     }
     // The writer runs this flush inline; it must not wait on a lock held across an SDK message.
     let tx = viewer.tx.clone();
+    let view = view.clone();
     let flush = crate::stdb::world_view::viewer_job(viewer, move |viewer| {
         // Clear before draining so a racing batch can queue another flush.
         viewer
@@ -661,6 +665,7 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
             m.drain()
         };
         let mut out = Vec::with_capacity(moves.len() + legs.len());
+        let mut missing = Vec::new();
         for movement in moves {
             MOTION_CALLS.fetch_add(1, Ordering::Relaxed);
             if viewer.created.lock().unwrap().contains(&movement.row.guid) {
@@ -669,16 +674,45 @@ fn queue_motion_flush(viewer: Arc<Viewer>) {
                     MOTION_SENT.fetch_add(1, Ordering::Relaxed);
                 }
                 out.extend(packets);
+            } else {
+                missing.push(movement.row.guid);
             }
         }
         for leg in legs {
             if viewer.created.lock().unwrap().contains(&leg.row.guid) {
                 out.extend(leg.outbound(&viewer.tx, creature_spline_outbound));
+            } else {
+                missing.push(leg.row.guid);
             }
         }
+        offer_missing_creates(&view, shard, &viewer, missing);
         out
     });
     let _ = tx.send(Outbound::Motion(flush));
+}
+
+fn offer_missing_creates(
+    view: &Arc<WorldView>,
+    shard: ShardId,
+    viewer: &Arc<Viewer>,
+    guids: Vec<u64>,
+) {
+    if guids.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut offered = viewer.motion_pending.create_offers.lock().unwrap();
+    offered.retain(|_, at| now.duration_since(*at) < MISSING_CREATE_INTERVAL);
+    for guid in guids {
+        if offered.insert(guid, now).is_none() {
+            crate::codec::entity::subscriptions::offer_missing_create(
+                view,
+                shard,
+                viewer.clone(),
+                guid,
+            );
+        }
+    }
 }
 
 pub(crate) fn teleport_appeared(view: &WorldView, shard: ShardId, row: &TeleportEvent) {

@@ -115,6 +115,8 @@ pub(crate) struct MotionPending {
     pub(crate) entity: Mutex<crate::codec::movement::subscriptions::MotionRows<EntityMotion>>,
     pub(crate) creature: Mutex<crate::codec::movement::subscriptions::MotionRows<CreatureSpline>>,
     pub(crate) batches: Mutex<Vec<crate::codec::movement::subscriptions::ViewerMotion>>,
+    /// Movers this viewer recently got a CREATE offer for, from its movement flush.
+    pub(crate) create_offers: Mutex<HashMap<u64, std::time::Instant>>,
     /// Clear before draining so a racing batch can queue its own flush.
     pub(crate) flush_queued: std::sync::atomic::AtomicBool,
 }

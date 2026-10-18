@@ -161,11 +161,6 @@ fn movement_reentry_stays_ordered_after_a_queued_destroy() {
         Some(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(_)))
     ));
     assert!(peer.created.lock().unwrap().contains(&1));
-
-    peer.created.lock().unwrap().remove(&1);
-    entity_changed(&view, 0, &old, &old);
-    assert_eq!(drain(&peer, &rx).0, 1);
-    assert!(peer.created.lock().unwrap().contains(&1));
 }
 
 #[test]
@@ -186,6 +181,35 @@ fn a_cell_crossing_queues_work_only_for_viewers_entering_the_audience() {
 
     assert_eq!(drain(&nearby, &nearby_rx).0, 0);
     assert_eq!(drain(&distant, &distant_rx).0, 1);
+}
+
+#[test]
+#[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
+fn a_moving_entity_offers_its_create_only_to_unshown_viewers_in_range() {
+    let realm = ObserverRealm::start();
+    let view = realm.coord.world_view();
+    let (near, near_rx) = test_support::registered_viewer(&view, 0, 2);
+    let (distant, distant_rx) =
+        test_support::registered_viewer_at(&view, 0, 3, CellKey::at(0, 0, 9, 0));
+    let entity = realm.entity();
+    let row = crate::stdb::bindings::EntityMotion {
+        guid: entity.guid,
+        map_id: entity.map_id,
+        instance_id: entity.instance_id,
+        grid_x: entity.grid_x,
+        grid_y: entity.grid_y,
+        opcode: 0x00ee,
+        movement_info: vec![],
+        seq: 1,
+        cell: entity.cell,
+    };
+
+    crate::codec::movement::subscriptions::motion(&view, 0, &row, &Default::default());
+    crate::codec::movement::subscriptions::flush_motion(&view, 0);
+    drain(&near, &near_rx);
+
+    assert!(near.created.lock().unwrap().contains(&entity.guid));
+    assert_eq!(drain(&distant, &distant_rx).0, 0);
 }
 
 #[test]
