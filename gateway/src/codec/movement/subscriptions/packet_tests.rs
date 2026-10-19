@@ -2,7 +2,6 @@ use super::*;
 use crate::codec::entity::subscriptions::tests::creature_create_outbound;
 use crate::stdb::bindings::CreatureSpline;
 use crate::world::Outbound;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::Vector3d;
@@ -93,7 +92,7 @@ pub(super) fn creature_spline(guid: u64, start_micros: u64, dur_ms: u32) -> Crea
 
 #[test]
 fn an_empty_retained_path_stops_the_client_instead_of_sending_invalid_geometry() {
-    let created = Mutex::new(HashSet::from([99]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([99]));
     let mut row = creature_spline(99, 1_000_000, 1_000);
     row.path = Some(crate::stdb::bindings::CreaturePath {
         navigation: crate::stdb::bindings::NavigationInputs {
@@ -117,7 +116,7 @@ fn an_empty_retained_path_stops_the_client_instead_of_sending_invalid_geometry()
 #[test]
 fn resident_waypoint_path_resumes_after_the_turn() {
     let guid = 99;
-    let created = Mutex::new(HashSet::from([guid]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([guid]));
     let mut row = creature_spline(guid, 1_000_000, 7_000);
     (row.sx, row.sy, row.sz) = (0.0, 0.0, 0.0);
     (row.dx, row.dy, row.dz) = (3.0, 4.0, 0.0);
@@ -162,7 +161,7 @@ fn resident_waypoint_path_resumes_after_the_turn() {
 #[test]
 fn resident_creature_replay_follows_create_from_the_current_point() {
     let guid = 99;
-    let created = Mutex::new(HashSet::from([guid]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([guid]));
     let row = creature_spline(guid, 1_000_000, 1_000);
     let mut outbound = creature_create_outbound();
 
@@ -205,28 +204,28 @@ fn resident_creature_replay_skips_absent_expired_and_ineligible_legs() {
 
     append_resident_creature_after_create(
         &mut outbound,
-        &Mutex::new(HashSet::from([guid])),
+        &Mutex::new(rustc_hash::FxHashSet::from_iter([guid])),
         0,
         None,
         1_250_000,
     );
     append_resident_creature_after_create(
         &mut outbound,
-        &Mutex::new(HashSet::new()),
+        &Mutex::new(rustc_hash::FxHashSet::default()),
         0,
         Some(&row),
         1_250_000,
     );
     append_resident_creature_after_create(
         &mut outbound,
-        &Mutex::new(HashSet::from([guid])),
+        &Mutex::new(rustc_hash::FxHashSet::from_iter([guid])),
         1,
         Some(&row),
         1_250_000,
     );
     append_resident_creature_after_create(
         &mut outbound,
-        &Mutex::new(HashSet::from([guid])),
+        &Mutex::new(rustc_hash::FxHashSet::from_iter([guid])),
         0,
         Some(&row),
         2_000_000,
@@ -238,7 +237,7 @@ fn resident_creature_replay_skips_absent_expired_and_ineligible_legs() {
 #[test]
 fn resident_facing_replay_follows_create_even_after_its_timestamp() {
     let guid = 99;
-    let created = Mutex::new(HashSet::from([guid]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([guid]));
     let mut row = creature_spline(guid, 1_000_000, 0);
     row.facing = true;
     row.facing_angle = 2.1;
@@ -259,7 +258,7 @@ fn resident_facing_replay_follows_create_even_after_its_timestamp() {
 
 #[test]
 fn a_facing_leg_relays_as_the_facing_angle_variant() {
-    let created = Arc::new(Mutex::new(HashSet::from([42u64])));
+    let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64])));
     let row = CreatureSpline {
         guid: 42,
         start_micros: 0,

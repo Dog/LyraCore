@@ -1,7 +1,7 @@
 use super::*;
 use crate::stdb::aoi::ViewerGates;
 use crate::world::{Outbound, SessionTx};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,7 @@ pub(crate) fn viewer_in_zone(
         instance_id: 0,
         zone_id: zone_id.into(),
         tx,
-        created: Arc::new(Mutex::new(HashSet::new())),
+        created: Default::default(),
         gates: Arc::new(ViewerGates::default()),
         skill_slots: Arc::new(Mutex::new((HashMap::new(), 0))),
         explored: Mutex::new(ExplorationReplay::default()),

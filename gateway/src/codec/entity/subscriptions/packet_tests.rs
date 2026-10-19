@@ -25,7 +25,7 @@ fn viewer_with_created(creature_guid: u64) -> Viewer {
         instance_id: 0,
         zone_id: 0.into(),
         tx,
-        created: Arc::new(Mutex::new(HashSet::from([creature_guid]))),
+        created: Arc::new(Mutex::new([creature_guid].into_iter().collect())),
         gates: Arc::new(ViewerGates::default()),
         skill_slots: Arc::new(Mutex::new((std::collections::HashMap::new(), 0))),
         explored: Mutex::new(world_view::ExplorationReplay::default()),

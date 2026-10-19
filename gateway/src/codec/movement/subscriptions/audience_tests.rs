@@ -171,7 +171,7 @@ fn a_nearby_mover_the_viewer_does_not_show_gets_one_create_offer_per_interval() 
 #[test]
 fn pending_motion_replaces_existing_rows_without_spending_the_budget_twice() {
     let mut pending = MotionRows::default();
-    let row = Arc::new(SharedMotion::new(()));
+    let row = Arc::new(SharedMotion::new((), |_| Vec::new()));
     let bytes = 1536 * 1024;
     assert!(pending.insert(1, row.clone(), bytes));
     assert!(pending.insert(1, row.clone(), bytes));

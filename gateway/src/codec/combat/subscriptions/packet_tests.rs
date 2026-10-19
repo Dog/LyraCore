@@ -212,7 +212,7 @@ fn swing_event() -> CombatEvent {
 
 #[test]
 fn ranged_launch_relays_one_spell_go_for_a_hit_or_miss() {
-    let created = Mutex::new(HashSet::from([7]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([7]));
     for (hit_info, hits, misses) in [(0, 1, 0), (2, 0, 1)] {
         let row = CombatEvent {
             damage: 0,
@@ -228,7 +228,12 @@ fn ranged_launch_relays_one_spell_go_for_a_hit_or_miss() {
         };
         assert_eq!((go.caster.guid(), go.spell), (7, 75));
         assert_eq!((go.hits.len(), go.misses.len()), (hits, misses));
-        assert!(combat_event_outbound(&Mutex::new(HashSet::new()), BYSTANDER, &row).is_empty());
+        assert!(combat_event_outbound(
+            &Mutex::new(rustc_hash::FxHashSet::default()),
+            BYSTANDER,
+            &row
+        )
+        .is_empty());
     }
 }
 
@@ -282,7 +287,7 @@ fn ranged_impact_relays_only_its_authoritative_damage() {
 
 #[test]
 fn melee_swing_relays_damage_then_stops_on_a_killing_blow() {
-    let created = Mutex::new(HashSet::from([7]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([7]));
     let mut row = swing_event();
     let out = combat_event_outbound(&created, BYSTANDER, &row);
     assert!(matches!(

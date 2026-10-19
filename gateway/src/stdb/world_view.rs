@@ -27,7 +27,7 @@ pub(crate) struct Viewer {
     pub(crate) instance_id: u64,
     pub(crate) zone_id: AtomicU32,
     pub(crate) tx: SessionTx,
-    pub(crate) created: Arc<Mutex<HashSet<u64>>>,
+    pub(crate) created: Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
     pub(crate) gates: Arc<ViewerGates>,
     pub(crate) skill_slots: Arc<Mutex<(HashMap<u32, u8>, u8)>>,
     pub(crate) explored: Mutex<ExplorationReplay>,

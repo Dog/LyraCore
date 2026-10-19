@@ -67,7 +67,7 @@ mod tests {
     use crate::stdb::world_view::{ExplorationReplay, MotionPending};
     use crate::world::{MemberPresence, SessionTx};
     use anyhow::Result;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     const VIEWER: u64 = 10;
@@ -117,7 +117,7 @@ mod tests {
             instance_id: 0,
             zone_id: 0.into(),
             tx,
-            created: Arc::new(Mutex::new(HashSet::from([VIEWER]))),
+            created: Arc::new(Mutex::new([VIEWER].into_iter().collect())),
             gates: Arc::new(ViewerGates::default()),
             skill_slots: Arc::new(Mutex::new((HashMap::new(), 0))),
             explored: Mutex::new(ExplorationReplay::default()),

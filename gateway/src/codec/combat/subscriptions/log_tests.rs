@@ -1,7 +1,6 @@
 use super::*;
 use crate::stdb::bindings::{MeleeAttack, SpellCastEvent};
 use crate::world::Outbound;
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 const CASTER: u64 = 7;
@@ -117,7 +116,7 @@ fn a_swing_error_change_sends_its_message_once_and_a_cleared_error_sends_nothing
 
 #[test]
 fn a_creature_engagement_plays_the_aggro_reaction_before_the_attack_start() {
-    let created = Mutex::new(HashSet::from([WOLF, CASTER]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([WOLF, CASTER]));
     let out = frames(&melee_engage_outbound(&created, &engagement(WOLF, 0), true));
     let mut reaction = header(14, 0x013C);
     reaction.extend_from_slice(&WOLF.to_le_bytes());
@@ -141,7 +140,7 @@ fn a_creature_engagement_plays_the_aggro_reaction_before_the_attack_start() {
 
 #[test]
 fn a_replayed_creature_engagement_restores_the_stance_without_the_aggro_sound() {
-    let created = Mutex::new(HashSet::from([WOLF]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([WOLF]));
     let out = frames(&melee_engage_outbound(
         &created,
         &engagement(WOLF, 0),
@@ -263,7 +262,7 @@ fn a_spell_that_gives_power_sends_the_energize_log_after_the_go() {
 
 #[test]
 fn only_the_killing_player_gets_the_party_kill_line() {
-    let created = Mutex::new(HashSet::from([CASTER]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([CASTER]));
     let kill = crate::stdb::bindings::CombatEvent {
         id: 1,
         attacker_guid: CASTER,

@@ -54,7 +54,7 @@ fn viewer(session: SessionId, self_guid: u64, tx: SessionTx) -> Arc<Viewer> {
         instance_id: 0,
         zone_id: 0.into(),
         tx,
-        created: Arc::new(Mutex::new(HashSet::from([self_guid]))),
+        created: Arc::new(Mutex::new([self_guid].into_iter().collect())),
         gates: Arc::new(ViewerGates::default()),
         skill_slots: Arc::new(Mutex::new((HashMap::new(), 0))),
         explored: Mutex::new(ExplorationReplay::default()),
@@ -1101,7 +1101,7 @@ fn reconnect_removes_missing_rows_through_the_registered_viewers_writer() {
     assert_eq!(destroyed, HashSet::from([CREATURE_BASE, CREATURE_BASE + 1]));
     assert_eq!(
         *observer.created.lock().unwrap(),
-        HashSet::from([PLAYER_BASE])
+        rustc_hash::FxHashSet::from_iter([PLAYER_BASE])
     );
     assert_eq!(view.spatial.viewer_cell(observer.session), Some(cell));
     drop(registration);
@@ -1191,7 +1191,7 @@ fn reconnect_clears_the_action_bar_of_a_pet_missing_from_the_snapshot() {
     ));
     assert_eq!(
         *observer.created.lock().unwrap(),
-        HashSet::from([PLAYER_BASE])
+        rustc_hash::FxHashSet::from_iter([PLAYER_BASE])
     );
 }
 

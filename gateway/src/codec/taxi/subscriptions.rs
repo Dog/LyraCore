@@ -5,13 +5,12 @@ use crate::stdb::world_view::*;
 use crate::stdb::Coordinator;
 use crate::world::Outbound;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
-use std::collections::HashSet;
 use std::sync::Mutex;
 use wow_world_messages::vanilla::Vector3d;
 
 /// Taxi splines must include the owner because the client is not driving the mover.
 pub(crate) fn taxi_spline_outbound(
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     self_guid: u64,
     row: &TaxiPassengerSpline,
 ) -> Vec<Outbound> {
@@ -54,7 +53,7 @@ pub(crate) fn taxi_spline_outbound(
 
 pub(crate) fn append_resident_taxi_after_create(
     created_outbound: &mut Vec<Outbound>,
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     self_guid: u64,
     row: &TaxiPassengerSpline,
 ) {
