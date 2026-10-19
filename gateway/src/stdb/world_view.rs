@@ -545,7 +545,10 @@ pub(crate) fn arm_shard(view: Arc<WorldView>, coord: Coordinator, shard: ShardId
         .after_each_message(crate::codec::movement::subscriptions::motion_fanout(
             view.clone(),
             shard,
-            coord.0.motion_fanout_timing(),
+            crate::stage_timing::pump_timing(&format!(
+                "shard {} movement fan-out",
+                coord.shard_name()
+            )),
         )?)?;
     let owner = coord.clone();
     coord.0.on_pump(move |conn| {

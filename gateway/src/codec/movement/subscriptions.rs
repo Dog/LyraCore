@@ -600,8 +600,7 @@ fn take_staged(view: &WorldView, shard: ShardId) -> Option<Arc<MotionBatch>> {
 const FANOUT_BACKLOG: usize = 64;
 
 /// Returns the after-message hook that hands each SDK message's staged rows to a fan-out
-/// thread, so the serial SDK pump does no per-viewer work unless the thread falls 64 messages
-/// behind.
+/// thread, so the serial SDK pump does no per-viewer work unless the thread falls behind.
 pub(crate) fn motion_fanout(
     view: Arc<WorldView>,
     shard: ShardId,
@@ -609,26 +608,63 @@ pub(crate) fn motion_fanout(
 ) -> Result<impl Fn() + Send + 'static> {
     let (send, batches) = std::sync::mpsc::sync_channel::<Arc<MotionBatch>>(FANOUT_BACKLOG);
     let fanout_view = view.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name(format!("motion-fanout-{shard}"))
         .spawn(move || {
-            while let Ok(batch) = batches.recv() {
+            while let Some(pass) = next_pass(&batches) {
                 let started = std::time::Instant::now();
-                // A fan-out that fell behind takes every waiting batch and wakes each viewer once.
-                let waiting = std::iter::from_fn(|| batches.try_recv().ok());
-                fan_out(&fanout_view, shard, std::iter::once(batch).chain(waiting));
+                fan_out(&fanout_view, shard, pass);
                 timing.record_message(started);
             }
         })?;
+    let fanout = FanOutThread {
+        send: Some(send),
+        thread: Some(thread),
+    };
     Ok(move || {
         if let Some(batch) = take_staged(&view, shard) {
             // A panic here reconnects the Shard, which arms a new fan-out thread.
             assert!(
-                send.send(batch).is_ok(),
+                fanout.send(batch),
                 "movement fan-out thread for Shard {shard} stopped"
             );
         }
     })
+}
+
+/// Takes the next batch and, when the thread fell behind, at most a backlog of waiting batches,
+/// so a pass ends and queues its flushes while the pump keeps the channel full.
+fn next_pass<T>(batches: &std::sync::mpsc::Receiver<T>) -> Option<Vec<T>> {
+    let first = batches.recv().ok()?;
+    Some(
+        std::iter::once(first)
+            .chain(batches.try_iter().take(FANOUT_BACKLOG))
+            .collect(),
+    )
+}
+
+/// Dropping the hook closes the channel and waits for the thread to drain, so the old Shard
+/// pump's batches all reach viewers before a reconnect arms the next fan-out thread.
+struct FanOutThread {
+    send: Option<std::sync::mpsc::SyncSender<Arc<MotionBatch>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FanOutThread {
+    fn send(&self, batch: Arc<MotionBatch>) -> bool {
+        self.send
+            .as_ref()
+            .is_some_and(|send| send.send(batch).is_ok())
+    }
+}
+
+impl Drop for FanOutThread {
+    fn drop(&mut self) {
+        drop(self.send.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn fan_out(

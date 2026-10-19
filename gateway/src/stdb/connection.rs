@@ -722,10 +722,6 @@ impl CoordinatorInner {
             .map_err(|error| anyhow!("{} {error}", self.db_name))
     }
 
-    pub(crate) fn motion_fanout_timing(&self) -> Arc<crate::stage_timing::PumpTiming> {
-        crate::stage_timing::pump_timing(&format!("shard {} movement fan-out", self.db_name))
-    }
-
     /// Runs `hook` after each SDK message applies its row callbacks; replaces any earlier hook.
     pub(crate) fn after_each_message(&self, hook: impl Fn() + Send + 'static) -> Result<()> {
         let timing = crate::stage_timing::pump_timing(&coordinator_role_label(&self.db_name));

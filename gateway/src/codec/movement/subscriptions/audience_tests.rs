@@ -270,3 +270,39 @@ fn the_after_message_hook_hands_staged_rows_to_the_fan_out_thread() {
     };
     assert_eq!(flush().len(), 1);
 }
+
+#[test]
+fn a_fan_out_pass_takes_at_most_a_backlog_of_waiting_batches() {
+    let (send, batches) = std::sync::mpsc::sync_channel(3 * FANOUT_BACKLOG);
+    for batch in 0..3 * FANOUT_BACKLOG {
+        send.send(batch).unwrap();
+    }
+
+    let pass = next_pass(&batches).unwrap();
+
+    assert_eq!(pass, (0..=FANOUT_BACKLOG).collect::<Vec<_>>());
+}
+
+#[test]
+fn dropping_the_after_message_hook_drains_the_fan_out_thread() {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    viewer.created.lock().unwrap().insert(99);
+    view.add_viewer_on_shard(viewer, CellKey::at(0, 0, 0, 0), 0);
+    let hook = motion_fanout(
+        view.clone(),
+        0,
+        crate::stage_timing::pump_timing("fan-out drain test"),
+    )
+    .unwrap();
+
+    creature_leg(&view, 0, &super::packet_tests::creature_spline(99, 0, 1000));
+    hook();
+    drop(hook);
+
+    assert!(
+        matches!(rx.try_recv(), Ok(Outbound::Motion(_))),
+        "the flush is queued before the hook finishes dropping"
+    );
+}
