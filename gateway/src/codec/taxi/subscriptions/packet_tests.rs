@@ -2,7 +2,6 @@ use super::*;
 use crate::codec;
 use crate::stdb::bindings::TaxiPassengerSpline;
 use crate::world::Outbound;
-use std::collections::HashSet;
 use std::sync::Mutex;
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
@@ -26,7 +25,7 @@ fn taxi_row(character_guid: u64) -> TaxiPassengerSpline {
 #[test]
 fn taxi_spline_reaches_self_and_only_created_observers() {
     let row = taxi_row(42);
-    let created = Mutex::new(HashSet::new());
+    let created = Mutex::new(rustc_hash::FxHashSet::default());
     assert_eq!(taxi_spline_outbound(&created, 42, &row).len(), 1);
     assert!(taxi_spline_outbound(&created, 7, &row).is_empty());
 
@@ -38,13 +37,15 @@ fn taxi_spline_reaches_self_and_only_created_observers() {
 fn malformed_taxi_spline_is_not_written_to_a_client() {
     let mut row = taxi_row(42);
     row.points.pop();
-    assert!(taxi_spline_outbound(&Mutex::new(HashSet::new()), 42, &row).is_empty());
+    assert!(
+        taxi_spline_outbound(&Mutex::new(rustc_hash::FxHashSet::default()), 42, &row).is_empty()
+    );
 }
 
 #[test]
 fn resident_taxi_spline_is_chained_after_passenger_create() {
     let row = taxi_row(42);
-    let created = Mutex::new(HashSet::from([42]));
+    let created = Mutex::new(rustc_hash::FxHashSet::from_iter([42]));
     let mut outbound = vec![Outbound::One(ServerOpcodeMessage::SMSG_DESTROY_OBJECT(
         codec::build_destroy_object(99),
     ))];

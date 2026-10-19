@@ -44,7 +44,7 @@ fn viewer(session: SessionId, self_guid: u64, tx: SessionTx) -> Arc<Viewer> {
         instance_id: 0,
         zone_id: 0.into(),
         tx,
-        created: Arc::new(Mutex::new(HashSet::from([self_guid]))),
+        created: Arc::new(Mutex::new([self_guid].into_iter().collect())),
         gates: Arc::new(ViewerGates::default()),
         skill_slots: Arc::new(Mutex::new((HashMap::new(), 0))),
         explored: Mutex::new(ExplorationReplay::default()),

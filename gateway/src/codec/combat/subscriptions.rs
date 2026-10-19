@@ -9,7 +9,6 @@ use crate::stdb::Coordinator;
 use crate::world::Outbound;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
 use spacetimedb_sdk::Table;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 
@@ -93,7 +92,7 @@ impl SharedEventPackets {
 
 #[cfg(test)]
 fn combat_event_outbound(
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     self_guid: u64,
     row: &CombatEvent,
 ) -> Vec<Outbound> {
@@ -167,7 +166,7 @@ fn combat_event_messages(row: &CombatEvent) -> Vec<(EventAudience, Outbound)> {
 }
 
 pub(crate) fn melee_engage_outbound(
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     row: &MeleeAttack,
     live: bool,
 ) -> Vec<Outbound> {
@@ -530,7 +529,7 @@ pub(crate) fn stealth_visibility(
     shard: crate::stdb::world_index::ShardId,
     session: u64,
     coord: &Coordinator,
-    created: &Arc<Mutex<HashSet<u64>>>,
+    created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
     changed: &Aura,
     self_guid: u64,
     is_insert: bool,
@@ -642,7 +641,7 @@ pub(crate) fn aura_insert_outbound(
     view: &WorldView,
     shard: crate::stdb::world_index::ShardId,
     session: u64,
-    created: &Arc<Mutex<HashSet<u64>>>,
+    created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
     self_guid: u64,
     row: &Aura,
     stealth_count: usize,
@@ -692,7 +691,7 @@ pub(crate) fn aura_update_outbound(
     coord: &Coordinator,
     view: &WorldView,
     shard: crate::stdb::world_index::ShardId,
-    created: &Arc<Mutex<HashSet<u64>>>,
+    created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
     self_guid: u64,
     row: &Aura,
     expires_changed: bool,
@@ -733,7 +732,7 @@ pub(crate) fn aura_delete_outbound(
     view: &WorldView,
     shard: crate::stdb::world_index::ShardId,
     session: u64,
-    created: &Arc<Mutex<HashSet<u64>>>,
+    created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
     self_guid: u64,
     row: &Aura,
     stealth_count: usize,

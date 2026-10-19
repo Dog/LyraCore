@@ -134,7 +134,7 @@ fn live_worn_item_insert_enchant_and_delete_reach_a_nearby_peer() {
         instance_id: anchor.instance_id,
         zone_id: AtomicU32::new(0),
         tx,
-        created: Arc::new(Mutex::new(HashSet::from([1, 2]))),
+        created: Arc::new(Mutex::new([1, 2].into_iter().collect())),
         gates: Arc::new(ViewerGates::default()),
         skill_slots: Arc::new(Mutex::default()),
         explored: Mutex::default(),

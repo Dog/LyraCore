@@ -7,9 +7,8 @@ use crate::world::Outbound;
 use anyhow::Result;
 use lyracore_shared::spatial::BOX_HALF_SPAN;
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wow_world_messages::vanilla::opcodes::ServerOpcodeMessage;
 use wow_world_messages::vanilla::Vector3d;
@@ -54,7 +53,7 @@ pub(crate) fn teleport_event_outbound(row: &TeleportEvent) -> Vec<Outbound> {
 
 #[cfg(test)]
 pub(crate) fn motion_outbound(
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     self_guid: u64,
     row: &EntityMotion,
 ) -> Vec<Outbound> {
@@ -272,7 +271,7 @@ pub(crate) fn world_entry_movement_outbound(entity: &WorldEntity, auras: &[Aura]
 }
 
 pub(crate) fn creature_leg_outbound(
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     row: &CreatureSpline,
 ) -> Vec<Outbound> {
     if !created.lock().unwrap().contains(&row.guid) {
@@ -348,7 +347,7 @@ fn creature_spline_outbound(row: &CreatureSpline) -> Vec<Outbound> {
 
 pub(crate) fn append_resident_creature_after_create(
     created_outbound: &mut Vec<Outbound>,
-    created: &Mutex<HashSet<u64>>,
+    created: &Mutex<rustc_hash::FxHashSet<u64>>,
     viewer_instance_id: u64,
     row: Option<&CreatureSpline>,
     now_micros: u64,
@@ -441,27 +440,20 @@ impl<T> MotionRows<T> {
 
 pub(crate) struct SharedMotion<T> {
     pub(crate) row: T,
-    packets: OnceLock<std::result::Result<Vec<crate::world::egress::Packet>, String>>,
+    // Encoded once on the SDK pump when staged.
+    packets: std::result::Result<Vec<crate::world::egress::Packet>, String>,
 }
 
 impl<T> SharedMotion<T> {
-    fn new(row: T) -> Self {
-        Self {
-            row,
-            packets: OnceLock::new(),
-        }
+    fn new(row: T, project: fn(&T) -> Vec<Outbound>) -> Self {
+        let packets =
+            crate::world::egress::encode(project(&row)).map_err(|error| error.to_string());
+        Self { row, packets }
     }
 
     /// Appends this row's packets; returns whether it had any.
-    fn relay(
-        &self,
-        tx: &crate::world::SessionTx,
-        project: fn(&T) -> Vec<Outbound>,
-        out: &mut Vec<Outbound>,
-    ) -> bool {
-        match self.packets.get_or_init(|| {
-            crate::world::egress::encode(project(&self.row)).map_err(|error| error.to_string())
-        }) {
+    fn relay(&self, tx: &crate::world::SessionTx, out: &mut Vec<Outbound>) -> bool {
+        match &self.packets {
             Ok(packets) => {
                 out.extend(packets.iter().map(crate::world::egress::Packet::outbound));
                 !packets.is_empty()
@@ -484,7 +476,7 @@ pub(crate) fn motion(
     delivery.received();
     let key = CellKey::at(row.map_id, row.instance_id, row.grid_x, row.grid_y);
     let bytes = std::mem::size_of::<EntityMotion>() + row.movement_info.len() + 64;
-    let row = Arc::new(SharedMotion::new(row.clone()));
+    let row = Arc::new(SharedMotion::new(row.clone(), movement_outbound));
     stage(view, shard, key, |batch, cell| {
         batch.entity.push(StagedRow {
             cell,
@@ -503,7 +495,7 @@ pub(crate) fn creature_leg(view: &WorldView, shard: ShardId, row: &CreatureSplin
             .path
             .as_ref()
             .map_or(0, |path| std::mem::size_of_val(path.points.as_slice()));
-    let row = Arc::new(SharedMotion::new(row.clone()));
+    let row = Arc::new(SharedMotion::new(row.clone(), creature_spline_outbound));
     stage(view, shard, key, |batch, cell| {
         batch.creature.push(StagedRow {
             cell,
@@ -673,11 +665,10 @@ fn relay_rows<T>(
     viewer: &Viewer,
     mut rows: Vec<&SharedMotion<T>>,
     guid: fn(&T) -> u64,
-    project: fn(&T) -> Vec<Outbound>,
     out: &mut Vec<Outbound>,
     missing: &mut Vec<u64>,
 ) -> u64 {
-    // Release `created` before encoding; SDK pumps take it.
+    // Release `created` before cloning packets; SDK pumps take it.
     {
         let created = viewer.created.lock().unwrap();
         rows.retain(|row| {
@@ -689,7 +680,7 @@ fn relay_rows<T>(
         });
     }
     rows.into_iter()
-        .map(|row| u64::from(row.relay(&viewer.tx, project, out)))
+        .map(|row| u64::from(row.relay(&viewer.tx, out)))
         .sum()
 }
 
@@ -739,22 +730,8 @@ fn queue_motion_flush(view: &Arc<WorldView>, shard: ShardId, viewer: Arc<Viewer>
         let calls = moves.len() as u64;
         let mut out = Vec::new();
         let mut missing = Vec::new();
-        let sent = relay_rows(
-            &viewer,
-            moves,
-            |row| row.guid,
-            movement_outbound,
-            &mut out,
-            &mut missing,
-        );
-        relay_rows(
-            &viewer,
-            legs,
-            |row| row.guid,
-            creature_spline_outbound,
-            &mut out,
-            &mut missing,
-        );
+        let sent = relay_rows(&viewer, moves, |row| row.guid, &mut out, &mut missing);
+        relay_rows(&viewer, legs, |row| row.guid, &mut out, &mut missing);
         // One add per flush; a per-row add contends across every writer.
         MOTION_CALLS.fetch_add(calls, Ordering::Relaxed);
         MOTION_SENT.fetch_add(sent, Ordering::Relaxed);

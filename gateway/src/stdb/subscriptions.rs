@@ -53,7 +53,7 @@ impl PlayerSubscriptions {
             map_id,
             zone_id: arrival.zone_id.into(),
             tx,
-            created: Arc::new(Mutex::new(HashSet::from([self_guid]))),
+            created: Arc::new(Mutex::new([self_guid].into_iter().collect())),
             gates: Arc::new(ViewerGates::default()),
             skill_slots: Arc::new(Mutex::new((std::collections::HashMap::new(), 0))),
             explored: Mutex::new(world_view::ExplorationReplay::default()),
@@ -307,7 +307,7 @@ impl Coordinator {
             arrival.x,
             arrival.y,
         );
-        let created = Arc::new(Mutex::new(HashSet::from([self_guid])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([self_guid])));
         // Read ghost state from the mirror; re-entering the cache from a callback would deadlock.
         let viewer_gates = Arc::new(ViewerGates::default());
         let view = self.world_view();
@@ -923,7 +923,7 @@ mod tests {
     use crate::codec::movement::subscriptions::{creature_leg_outbound, motion_outbound};
     use crate::stdb::bindings::{CreatureSpline, EntityMotion};
     use crate::world::{Outbound, SessionTx};
-    use std::collections::HashSet;
+
     use std::sync::{Arc, Mutex};
     use wow_world_messages::vanilla::Vector3d;
 
@@ -943,7 +943,7 @@ mod tests {
 
     fn relay_entity_motion(
         tx: &SessionTx,
-        created: &Arc<Mutex<HashSet<u64>>>,
+        created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
         self_guid: u64,
         row: &EntityMotion,
     ) {
@@ -960,7 +960,7 @@ mod tests {
 
     fn relay_creature_leg(
         tx: &SessionTx,
-        created: &Arc<Mutex<HashSet<u64>>>,
+        created: &Arc<Mutex<rustc_hash::FxHashSet<u64>>>,
         row: &CreatureSpline,
     ) {
         if shed_motion_at_depth(tx.depth()) {
@@ -1013,7 +1013,7 @@ mod tests {
         let _counters = motion_counter_lock();
         let (info, bytes) = moving_forward();
         let (tx, rx) = crate::world::SessionTx::with_depth(0);
-        let created = Arc::new(Mutex::new(HashSet::from([42u64])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64])));
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_START_FORWARD;
 
         relay_entity_motion(&tx, &created, 1, &motion_row(42, opcode as u16, bytes));
@@ -1058,7 +1058,7 @@ mod tests {
         let (_, bytes) = moving_forward();
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT as u16;
         let (tx, rx) = crate::world::SessionTx::with_depth(0);
-        let created = Arc::new(Mutex::new(HashSet::from([42u64, 7u64])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64, 7u64])));
 
         relay_entity_motion(&tx, &created, 7, &motion_row(7, opcode, bytes.clone()));
         assert!(
@@ -1078,7 +1078,7 @@ mod tests {
         let _counters = motion_counter_lock();
         let (_, bytes) = moving_forward();
         let (tx, rx) = crate::world::SessionTx::with_depth(0);
-        let created = Arc::new(Mutex::new(HashSet::from([42u64])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64])));
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT as u16;
 
         relay_entity_motion(
@@ -1098,7 +1098,7 @@ mod tests {
         let _counters = motion_counter_lock();
         use std::sync::atomic::Ordering::Relaxed;
         let (_, bytes) = moving_forward();
-        let created = Arc::new(Mutex::new(HashSet::from([42u64])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64])));
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT as u16;
         let before = MOTION_DROPPED.load(Relaxed);
 
@@ -1365,7 +1365,7 @@ mod tests {
         let _counters = motion_counter_lock();
         use std::sync::atomic::Ordering::Relaxed;
         let (_, bytes) = moving_forward();
-        let created = Arc::new(Mutex::new(HashSet::from([42u64])));
+        let created = Arc::new(Mutex::new(rustc_hash::FxHashSet::from_iter([42u64])));
         let opcode = lyracore_shared::opcodes::movement::MSG_MOVE_HEARTBEAT as u16;
         let leg = CreatureSpline {
             guid: 42,
