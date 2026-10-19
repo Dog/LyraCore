@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,31 @@ pub enum LogonRefusal {
     TooManyConnections,
     TooManyFailures,
     AttemptsExhausted,
+}
+
+static REFUSALS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+impl LogonRefusal {
+    pub fn count(&self) {
+        let kind = match self {
+            Self::TooManyConnections => 0,
+            Self::TooManyFailures => 1,
+            Self::AttemptsExhausted => 2,
+        };
+        REFUSALS[kind].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Logs the refusals counted since the last call, if any.
+pub fn log_refusals() {
+    let [connections, failures, exhausted] = REFUSALS
+        .each_ref()
+        .map(|count| count.swap(0, Ordering::Relaxed));
+    if connections + failures + exhausted > 0 {
+        log::info!(
+            "LOGONSTAT refused too_many_connections={connections} too_many_failures={failures} attempts_exhausted={exhausted}"
+        );
+    }
 }
 
 impl fmt::Display for LogonRefusal {

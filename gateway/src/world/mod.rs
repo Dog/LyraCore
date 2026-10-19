@@ -796,6 +796,7 @@ pub async fn run(
                 );
             }
             prev_admitted = admitted;
+            crate::logon::limiter::log_refusals();
             let (c, s, d) = (
                 crate::stdb::subscriptions::MOTION_CALLS.load(Relaxed),
                 crate::stdb::subscriptions::MOTION_SENT.load(Relaxed),

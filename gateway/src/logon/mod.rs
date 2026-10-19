@@ -309,6 +309,7 @@ pub async fn run(cfg: GatewayConfig, coordinator: Coordinator) -> Result<()> {
         let mut connection = match limiter.admit(peer.ip(), Instant::now()) {
             Ok(connection) => connection,
             Err(refusal) => {
+                refusal.count();
                 log::debug!("logon: refused {peer}: {refusal}");
                 continue;
             }
@@ -355,6 +356,9 @@ pub async fn run(cfg: GatewayConfig, coordinator: Coordinator) -> Result<()> {
                             | std::io::ErrorKind::ConnectionAborted
                     )
                 });
+                if let Some(refusal) = e.downcast_ref::<limiter::LogonRefusal>() {
+                    refusal.count();
+                }
                 if e.is::<limiter::LogonRefusal>() || disconnected {
                     log::debug!("logon connection {peer} ended: {e:#}");
                 } else {
