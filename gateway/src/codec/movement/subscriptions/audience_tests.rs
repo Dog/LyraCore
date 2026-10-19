@@ -65,6 +65,85 @@ fn a_viewer_receives_only_staged_rows_inside_its_audience_box() {
     );
 }
 
+fn newest_path_after(fold_first: bool) {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    viewer.created.lock().unwrap().insert(99);
+    view.add_viewer_on_shard(viewer.clone(), CellKey::at(0, 0, 0, 0), 0);
+    let older = super::packet_tests::creature_spline(99, 0, 1000);
+    let mut newer = older.clone();
+    newer.spline_id = 11;
+
+    creature_leg(&view, 0, &older);
+    flush_motion(&view, 0);
+    if fold_first {
+        assert!(fold_batches(&viewer), "a shed folds the waiting batch");
+    }
+    creature_leg(&view, 0, &newer);
+    flush_motion(&view, 0);
+
+    let packets = queued_job(&rx);
+    assert!(rx.try_recv().is_err(), "one flush is queued");
+    assert!(viewer.motion_pending.creature.lock().unwrap().is_empty());
+    let expected = crate::world::egress::encode(creature_spline_outbound(&newer)).unwrap();
+    let (
+        [Outbound::Shared { body, .. }],
+        Outbound::Shared {
+            body: newest_body, ..
+        },
+    ) = (packets.as_slice(), expected[0].outbound())
+    else {
+        panic!("one path for the mover");
+    };
+    assert_eq!(*body, newest_body);
+}
+
+#[test]
+fn a_late_flush_relays_only_the_newest_path_of_each_mover() {
+    newest_path_after(false);
+}
+
+#[test]
+fn a_flush_after_a_shed_relays_only_the_newest_path_of_each_mover() {
+    newest_path_after(true);
+}
+
+#[test]
+fn a_flush_never_echoes_a_characters_own_movement() {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 7, identity(1), tx);
+    view.add_viewer_on_shard(viewer.clone(), CellKey::at(0, 0, 0, 0), 0);
+    let delivery = crate::stdb::movement_batch::MotionDelivery::default();
+    for guid in [7, 8] {
+        let row = EntityMotion {
+            guid,
+            map_id: 0,
+            instance_id: 0,
+            grid_x: 0,
+            grid_y: 0,
+            cell: lyracore_shared::spatial::grid_cell_id(0, 0),
+            opcode: 0x00ee,
+            movement_info: Vec::new(),
+            seq: 0,
+        };
+        motion(&view, 0, &row, &delivery);
+    }
+    flush_motion(&view, 0);
+
+    let Ok(Outbound::Motion(flush)) = rx.try_recv() else {
+        panic!("one movement flush per SDK message");
+    };
+    assert!(flush().is_empty());
+    let offers = viewer.motion_pending.create_offers.lock().unwrap();
+    assert!(offers.contains_key(&8), "the unshown peer is offered");
+    assert!(
+        !offers.contains_key(&7),
+        "the viewer's own Character is skipped"
+    );
+}
+
 #[test]
 fn a_nearby_mover_the_viewer_does_not_show_gets_one_create_offer_per_interval() {
     let view = Arc::new(WorldView::new(true));
