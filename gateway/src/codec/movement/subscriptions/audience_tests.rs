@@ -216,3 +216,57 @@ fn teleport_routes_one_writer_job_to_its_owner_and_keeps_cross_map_order() {
         "the owner receives exactly one job"
     );
 }
+
+#[test]
+fn a_fan_out_of_waiting_batches_relays_only_the_newest_path() {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    viewer.created.lock().unwrap().insert(99);
+    view.add_viewer_on_shard(viewer, CellKey::at(0, 0, 0, 0), 0);
+    let older = super::packet_tests::creature_spline(99, 0, 1000);
+    let mut newer = older.clone();
+    newer.spline_id = 11;
+
+    creature_leg(&view, 0, &older);
+    let first = take_staged(&view, 0).unwrap();
+    creature_leg(&view, 0, &newer);
+    let second = take_staged(&view, 0).unwrap();
+    fan_out(&view, 0, [first, second]);
+
+    let packets = queued_job(&rx);
+    assert!(rx.try_recv().is_err(), "one flush for both batches");
+    let expected = crate::world::egress::encode(creature_spline_outbound(&newer)).unwrap();
+    let ([Outbound::Shared { body, .. }], Outbound::Shared { body: newest, .. }) =
+        (packets.as_slice(), expected[0].outbound())
+    else {
+        panic!("one path for the mover");
+    };
+    assert_eq!(*body, newest);
+}
+
+#[test]
+fn the_after_message_hook_hands_staged_rows_to_the_fan_out_thread() {
+    let view = Arc::new(WorldView::new(true));
+    let (tx, rx) = SessionTx::with_depth(0);
+    let viewer = viewer_with_tx(1, 1, identity(1), tx);
+    viewer.created.lock().unwrap().insert(99);
+    view.add_viewer_on_shard(viewer, CellKey::at(0, 0, 0, 0), 0);
+    let hook = motion_fanout(
+        view.clone(),
+        0,
+        crate::stage_timing::pump_timing("fan-out test"),
+    )
+    .unwrap();
+
+    creature_leg(&view, 0, &super::packet_tests::creature_spline(99, 0, 1000));
+    hook();
+
+    let flush = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the fan-out thread queues a flush");
+    let Outbound::Motion(flush) = flush else {
+        panic!("a movement flush");
+    };
+    assert_eq!(flush().len(), 1);
+}

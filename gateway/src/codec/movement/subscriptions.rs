@@ -584,30 +584,83 @@ fn stage(
 }
 
 /// Hands the SDK message's staged rows to each nearby viewer and queues one flush per viewer.
+#[cfg(test)]
 pub(crate) fn flush_motion(view: &Arc<WorldView>, shard: ShardId) {
-    let Some(stage) = view.staged_motion.lock().unwrap().remove(&shard) else {
-        return;
-    };
-    let batch = Arc::new(stage.batch);
-    let mut cells_of: FxHashMap<SessionId, Vec<usize>> = FxHashMap::default();
-    for (index, cell) in batch.cells.iter().enumerate() {
-        for session in view.spatial.viewers_within(*cell, BOX_HALF_SPAN) {
-            cells_of.entry(session).or_default().push(index);
+    if let Some(batch) = take_staged(view, shard) {
+        fan_out(view, shard, [batch]);
+    }
+}
+
+fn take_staged(view: &WorldView, shard: ShardId) -> Option<Arc<MotionBatch>> {
+    let stage = view.staged_motion.lock().unwrap().remove(&shard)?;
+    Some(Arc::new(stage.batch))
+}
+
+// SDK messages a Shard's fan-out thread may fall behind before the pump waits for it.
+const FANOUT_BACKLOG: usize = 64;
+
+/// Returns the after-message hook that hands each SDK message's staged rows to a fan-out
+/// thread, so the serial SDK pump does no per-viewer work unless the thread falls 64 messages
+/// behind.
+pub(crate) fn motion_fanout(
+    view: Arc<WorldView>,
+    shard: ShardId,
+    timing: Arc<crate::stage_timing::PumpTiming>,
+) -> Result<impl Fn() + Send + 'static> {
+    let (send, batches) = std::sync::mpsc::sync_channel::<Arc<MotionBatch>>(FANOUT_BACKLOG);
+    let fanout_view = view.clone();
+    std::thread::Builder::new()
+        .name(format!("motion-fanout-{shard}"))
+        .spawn(move || {
+            while let Ok(batch) = batches.recv() {
+                let started = std::time::Instant::now();
+                // A fan-out that fell behind takes every waiting batch and wakes each viewer once.
+                let waiting = std::iter::from_fn(|| batches.try_recv().ok());
+                fan_out(&fanout_view, shard, std::iter::once(batch).chain(waiting));
+                timing.record_message(started);
+            }
+        })?;
+    Ok(move || {
+        if let Some(batch) = take_staged(&view, shard) {
+            // A panic here reconnects the Shard, which arms a new fan-out thread.
+            assert!(
+                send.send(batch).is_ok(),
+                "movement fan-out thread for Shard {shard} stopped"
+            );
+        }
+    })
+}
+
+fn fan_out(
+    view: &Arc<WorldView>,
+    shard: ShardId,
+    batches: impl IntoIterator<Item = Arc<MotionBatch>>,
+) {
+    let mut woken: FxHashMap<SessionId, Arc<Viewer>> = FxHashMap::default();
+    for batch in batches {
+        let mut cells_of: FxHashMap<SessionId, Vec<usize>> = FxHashMap::default();
+        for (index, cell) in batch.cells.iter().enumerate() {
+            for session in view.spatial.viewers_within(*cell, BOX_HALF_SPAN) {
+                cells_of.entry(session).or_default().push(index);
+            }
+        }
+        for (viewer, cells) in view.viewers_on_shard_with(shard, cells_of) {
+            let behind = {
+                let mut batches = viewer.motion_pending.batches.lock().unwrap();
+                batches.push(ViewerMotion {
+                    batch: batch.clone(),
+                    cells,
+                });
+                batches.len() > MAX_PENDING_BATCHES
+            };
+            if behind && !fold_batches(&viewer) {
+                viewer.tx.close();
+                continue;
+            }
+            woken.insert(viewer.session, viewer);
         }
     }
-    for (viewer, cells) in view.viewers_on_shard_with(shard, cells_of) {
-        let behind = {
-            let mut batches = viewer.motion_pending.batches.lock().unwrap();
-            batches.push(ViewerMotion {
-                batch: batch.clone(),
-                cells,
-            });
-            batches.len() > MAX_PENDING_BATCHES
-        };
-        if behind && !fold_batches(&viewer) {
-            viewer.tx.close();
-            continue;
-        }
+    for viewer in woken.into_values() {
         let flush_queued = &viewer.motion_pending.flush_queued;
         // A load first keeps the shared cache line clean when a flush is already queued.
         if !flush_queued.load(Ordering::Acquire) && !flush_queued.swap(true, Ordering::AcqRel) {

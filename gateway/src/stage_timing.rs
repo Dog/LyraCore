@@ -79,9 +79,10 @@ pub(crate) fn log_line() -> String {
 /// Timing for one SDK pump role, such as `shard lyracore-world-1 coordinator`.
 pub(crate) struct PumpTiming {
     role: String,
-    /// Snapshot lock wait, cache apply and every Relay row callback of one SDK message.
+    /// One unit of work: an SDK message with its snapshot lock wait, cache apply and Relay row
+    /// callbacks, or one movement fan-out pass.
     message: StageTiming,
-    /// The after-message hook, which queues movement flushes.
+    /// The after-message hook, which hands staged movement to the fan-out thread.
     hook: StageTiming,
     /// From the start of one SDK message to the start of the next.
     spacing: StageTiming,
