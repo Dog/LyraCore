@@ -118,7 +118,8 @@ A new issue goes to the repository that owns the failing code. It uses the shape
 Permalinks in **Actual** point at the code the person runs:
 `https://github.com/LyraCoreProject/<repo>/blob/<sha>/<path>#L<n>`. For the CLI, the SHA is the pin.
 For LyraCore and Packages, it is HEAD, which works only when step 2 showed HEAD is on
-`origin/main`. Otherwise link the same lines at the merge base, and confirm they still match. Write **Fix direction** only when the source supports it.
+`origin/main`. Otherwise link the same lines at the merge base, and confirm they still match.
+Write **Fix direction** only when the source supports it.
 
 End every report with one line: "Filed with `docs/triage.md` by <model> via <agent>."
 
