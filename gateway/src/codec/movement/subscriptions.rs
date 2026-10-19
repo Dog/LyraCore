@@ -1,7 +1,7 @@
 use crate::codec::{self};
 use crate::stdb::bindings::*;
 use crate::stdb::subscriptions::{MOTION_CALLS, MOTION_SENT};
-use crate::stdb::world_index::{CellKey, ShardId};
+use crate::stdb::world_index::{CellKey, SessionId, ShardId};
 use crate::stdb::world_view::*;
 use crate::world::Outbound;
 use anyhow::Result;
@@ -434,7 +434,6 @@ impl<T> MotionRows<T> {
         self.rows.drain().map(|(_, (row, _))| row).collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -453,22 +452,24 @@ impl<T> SharedMotion<T> {
         }
     }
 
-    fn outbound(
+    /// Appends this row's packets; returns whether it had any.
+    fn relay(
         &self,
         tx: &crate::world::SessionTx,
-        project: impl FnOnce(&T) -> Vec<Outbound>,
-    ) -> Vec<Outbound> {
+        project: fn(&T) -> Vec<Outbound>,
+        out: &mut Vec<Outbound>,
+    ) -> bool {
         match self.packets.get_or_init(|| {
             crate::world::egress::encode(project(&self.row)).map_err(|error| error.to_string())
         }) {
-            Ok(packets) => packets
-                .iter()
-                .map(crate::world::egress::Packet::outbound)
-                .collect(),
+            Ok(packets) => {
+                out.extend(packets.iter().map(crate::world::egress::Packet::outbound));
+                !packets.is_empty()
+            }
             Err(error) => {
                 log::warn!("movement Relay encoding failed: {error}");
                 tx.close();
-                Vec::new()
+                false
             }
         }
     }
@@ -540,6 +541,36 @@ pub(crate) struct ViewerMotion {
     cells: Vec<usize>,
 }
 
+type Staged<'a, T> = Vec<&'a StagedRow<T>>;
+
+impl ViewerMotion {
+    /// The rows this viewer is sent: inside its audience box, without its own Character.
+    fn rows(&self, self_guid: u64) -> (Staged<'_, EntityMotion>, Staged<'_, CreatureSpline>) {
+        let mut nearby = vec![false; self.batch.cells.len()];
+        for &cell in &self.cells {
+            nearby[cell] = true;
+        }
+        let entity = self.batch.entity.iter();
+        let creature = self.batch.creature.iter();
+        (
+            // An echo of a Character's own movement fights its client's position authority.
+            entity
+                .filter(|staged| nearby[staged.cell] && staged.guid != self_guid)
+                .collect(),
+            creature.filter(|staged| nearby[staged.cell]).collect(),
+        )
+    }
+}
+
+enum PendingMotion {
+    /// The usual case: one batch, read in place.
+    Batch(ViewerMotion),
+    Coalesced(
+        Vec<Arc<SharedMotion<EntityMotion>>>,
+        Vec<Arc<SharedMotion<CreatureSpline>>>,
+    ),
+}
+
 // Fold pending batches into the coalesced rows when a writer falls this far behind; each
 // pending batch keeps its whole SDK message alive.
 const MAX_PENDING_BATCHES: usize = 16;
@@ -566,17 +597,13 @@ pub(crate) fn flush_motion(view: &Arc<WorldView>, shard: ShardId) {
         return;
     };
     let batch = Arc::new(stage.batch);
-    let mut audience: FxHashMap<u64, (Arc<Viewer>, Vec<usize>)> = FxHashMap::default();
+    let mut cells_of: FxHashMap<SessionId, Vec<usize>> = FxHashMap::default();
     for (index, cell) in batch.cells.iter().enumerate() {
-        for viewer in view.cell_audience(shard, Some(*cell), BOX_HALF_SPAN, &[]) {
-            audience
-                .entry(viewer.session)
-                .or_insert_with(|| (viewer.clone(), Vec::new()))
-                .1
-                .push(index);
+        for session in view.spatial.viewers_within(*cell, BOX_HALF_SPAN) {
+            cells_of.entry(session).or_default().push(index);
         }
     }
-    for (viewer, cells) in audience.into_values() {
+    for (viewer, cells) in view.viewers_on_shard_with(shard, cells_of) {
         let behind = {
             let mut batches = viewer.motion_pending.batches.lock().unwrap();
             batches.push(ViewerMotion {
@@ -603,29 +630,67 @@ fn fold_batches(viewer: &Viewer) -> bool {
     let mut entity = viewer.motion_pending.entity.lock().unwrap();
     let mut creature = viewer.motion_pending.creature.lock().unwrap();
     let batches = std::mem::take(&mut *viewer.motion_pending.batches.lock().unwrap());
-    for ViewerMotion { batch, cells } in batches {
-        let mut nearby = vec![false; batch.cells.len()];
-        for cell in cells {
-            nearby[cell] = true;
-        }
-        for staged in &batch.entity {
-            // Never echo a Character's movement to its own client; it fights position authority.
-            if nearby[staged.cell]
-                && staged.guid != viewer.self_guid
-                && !entity.insert(staged.guid, staged.row.clone(), staged.bytes)
-            {
+    fold_into(viewer.self_guid, &mut entity, &mut creature, batches)
+}
+
+/// Returns None when the coalesced rows would exceed their bounds.
+fn take_motion(viewer: &Viewer) -> Option<PendingMotion> {
+    let mut entity = viewer.motion_pending.entity.lock().unwrap();
+    let mut creature = viewer.motion_pending.creature.lock().unwrap();
+    let mut batches = std::mem::take(&mut *viewer.motion_pending.batches.lock().unwrap());
+    // One batch is bounded by the encoded byte limit; the row bounds cap a backlog.
+    if batches.len() == 1 && entity.is_empty() && creature.is_empty() {
+        return batches.pop().map(PendingMotion::Batch);
+    }
+    fold_into(viewer.self_guid, &mut entity, &mut creature, batches)
+        .then(|| PendingMotion::Coalesced(entity.drain(), creature.drain()))
+}
+
+fn fold_into(
+    self_guid: u64,
+    entity: &mut MotionRows<EntityMotion>,
+    creature: &mut MotionRows<CreatureSpline>,
+    batches: Vec<ViewerMotion>,
+) -> bool {
+    for motion in batches {
+        let (moves, legs) = motion.rows(self_guid);
+        for staged in moves {
+            if !entity.insert(staged.guid, staged.row.clone(), staged.bytes) {
                 return false;
             }
         }
-        for staged in &batch.creature {
-            if nearby[staged.cell]
-                && !creature.insert(staged.guid, staged.row.clone(), staged.bytes)
-            {
+        for staged in legs {
+            if !creature.insert(staged.guid, staged.row.clone(), staged.bytes) {
                 return false;
             }
         }
     }
     true
+}
+
+/// Appends shown rows' packets and unshown rows' guids; returns the count of rows relayed.
+fn relay_rows<T>(
+    viewer: &Viewer,
+    mut rows: Vec<&SharedMotion<T>>,
+    guid: fn(&T) -> u64,
+    project: fn(&T) -> Vec<Outbound>,
+    out: &mut Vec<Outbound>,
+    missing: &mut Vec<u64>,
+) -> u64 {
+    // Release `created` before encoding; SDK pumps take it.
+    {
+        let created = viewer.created.lock().unwrap();
+        rows.retain(|row| {
+            let guid = guid(&row.row);
+            created.contains(&guid) || {
+                missing.push(guid);
+                false
+            }
+        });
+    }
+    rows.into_iter()
+        .map(|row| u64::from(row.relay(&viewer.tx, project, out)))
+        .sum()
 }
 
 // A nearby mover the viewer does not show gets at most one CREATE offer per interval.
@@ -653,39 +718,46 @@ fn queue_motion_flush(view: &Arc<WorldView>, shard: ShardId, viewer: Arc<Viewer>
             .motion_pending
             .flush_queued
             .store(false, AtOrd::Release);
-        if !fold_batches(&viewer) {
+        let Some(pending) = take_motion(&viewer) else {
             viewer.tx.close();
             return Vec::new();
-        }
-        let moves: Vec<Arc<SharedMotion<EntityMotion>>> = {
-            let mut m = viewer.motion_pending.entity.lock().unwrap();
-            m.drain()
         };
-        let legs: Vec<Arc<SharedMotion<CreatureSpline>>> = {
-            let mut m = viewer.motion_pending.creature.lock().unwrap();
-            m.drain()
+        type Rows<'a, T> = Vec<&'a SharedMotion<T>>;
+        let (moves, legs): (Rows<EntityMotion>, Rows<CreatureSpline>) = match &pending {
+            PendingMotion::Batch(motion) => {
+                let (moves, legs) = motion.rows(viewer.self_guid);
+                (
+                    moves.into_iter().map(|staged| &*staged.row).collect(),
+                    legs.into_iter().map(|staged| &*staged.row).collect(),
+                )
+            }
+            PendingMotion::Coalesced(moves, legs) => (
+                moves.iter().map(|row| &**row).collect(),
+                legs.iter().map(|row| &**row).collect(),
+            ),
         };
-        let mut out = Vec::with_capacity(moves.len() + legs.len());
+        let calls = moves.len() as u64;
+        let mut out = Vec::new();
         let mut missing = Vec::new();
-        for movement in moves {
-            MOTION_CALLS.fetch_add(1, Ordering::Relaxed);
-            if viewer.created.lock().unwrap().contains(&movement.row.guid) {
-                let packets = movement.outbound(&viewer.tx, movement_outbound);
-                if !packets.is_empty() {
-                    MOTION_SENT.fetch_add(1, Ordering::Relaxed);
-                }
-                out.extend(packets);
-            } else {
-                missing.push(movement.row.guid);
-            }
-        }
-        for leg in legs {
-            if viewer.created.lock().unwrap().contains(&leg.row.guid) {
-                out.extend(leg.outbound(&viewer.tx, creature_spline_outbound));
-            } else {
-                missing.push(leg.row.guid);
-            }
-        }
+        let sent = relay_rows(
+            &viewer,
+            moves,
+            |row| row.guid,
+            movement_outbound,
+            &mut out,
+            &mut missing,
+        );
+        relay_rows(
+            &viewer,
+            legs,
+            |row| row.guid,
+            creature_spline_outbound,
+            &mut out,
+            &mut missing,
+        );
+        // One add per flush; a per-row add contends across every writer.
+        MOTION_CALLS.fetch_add(calls, Ordering::Relaxed);
+        MOTION_SENT.fetch_add(sent, Ordering::Relaxed);
         offer_missing_creates(&view, shard, &viewer, missing);
         out
     });

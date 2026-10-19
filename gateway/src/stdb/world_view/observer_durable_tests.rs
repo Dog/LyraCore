@@ -206,9 +206,12 @@ fn a_moving_entity_offers_its_create_only_to_unshown_viewers_in_range() {
 
     crate::codec::movement::subscriptions::motion(&view, 0, &row, &Default::default());
     crate::codec::movement::subscriptions::flush_motion(&view, 0);
-    drain(&near, &near_rx);
 
-    assert!(near.created.lock().unwrap().contains(&entity.guid));
+    // The pump's after-message hook can take the staged row first and queue the flush later.
+    assert!(poll_until(POLL_TIMEOUT, || {
+        drain(&near, &near_rx);
+        near.created.lock().unwrap().contains(&entity.guid)
+    }));
     assert_eq!(drain(&distant, &distant_rx).0, 0);
 }
 

@@ -518,6 +518,22 @@ impl WorldView {
             .collect()
     }
 
+    /// Each session's viewer on `shard`, with the value given for that session.
+    pub(crate) fn viewers_on_shard_with<T>(
+        &self,
+        shard: ShardId,
+        sessions: impl IntoIterator<Item = (SessionId, T)>,
+    ) -> Vec<(Arc<Viewer>, T)> {
+        let registry = self.viewers.read().unwrap();
+        sessions
+            .into_iter()
+            .filter_map(|(session, value)| {
+                let registered = registry.by_session.get(&session)?;
+                (registered.shard == shard).then(|| (registered.viewer.clone(), value))
+            })
+            .collect()
+    }
+
     pub(crate) fn set_shards(&self, shards: Vec<Coordinator>) {
         *self.shards.write().unwrap() = shards;
     }
