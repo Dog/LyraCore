@@ -24,6 +24,10 @@ Before you report a problem, run:
 `doctor` finds a wrong toolchain version or a port held by another process. `dev status` finds a
 running stack whose node has no published Module.
 
+If you use a coding agent, start it in the checkout and ask it to read and follow
+[`docs/triage.md`](./docs/triage.md). It diagnoses the problem on your machine, searches existing
+issues, and drafts a report for you to approve.
+
 ## Where to ask
 
 Use [GitHub Issues](https://github.com/LyraCoreProject/LyraCore/issues) for bugs, questions and
