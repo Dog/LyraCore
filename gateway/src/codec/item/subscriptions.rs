@@ -220,34 +220,27 @@ pub(crate) fn item_instance_insert_outbound(
     out
 }
 
+fn committed_item_in_slot(
+    live: &LiveConn,
+    self_guid: u64,
+    slot: u8,
+) -> Option<codec::ItemInstanceView> {
+    live.item_rows(self_guid)
+        .into_iter()
+        .find(|item| item.slot == slot)
+        .map(|item| view_of_item_row(&item))
+}
+
+// The SDK runs a transaction's inserts before its deletes, so a new item may hold this slot.
 pub(crate) fn item_instance_delete_outbound(
     live: &LiveConn,
     self_guid: u64,
     row: &ItemInstance,
 ) -> Vec<Outbound> {
     let mut out = Vec::new();
-    if let Some(values) = codec::build_inv_slot_values(self_guid, row.slot, 0) {
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
-            Box::new(values),
-        )));
-    }
-    if let Some(values) =
-        codec::build_visible_item_values(self_guid, row.slot, &codec::ItemInstanceView::default())
-    {
-        out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
-            Box::new(values),
-        )));
-    }
-    if let Some((bag_slot, slot_in_bag)) = codec::bag_content_parts(row.slot) {
-        if let Some(bag) = live
-            .item_rows(self_guid)
-            .into_iter()
-            .find(|item| item.slot == bag_slot)
-        {
-            let (opcode, body) = codec::build_container_slot_values(bag.guid, slot_in_bag, 0);
-            out.push(Outbound::Raw { opcode, body });
-        }
-    }
+    append_vacated_item_slot(self_guid, row.slot, &mut out, |slot| {
+        committed_item_in_slot(live, self_guid, slot)
+    });
     out.push(Outbound::One(ServerOpcodeMessage::SMSG_DESTROY_OBJECT(
         codec::build_destroy_object(row.guid),
     )));
@@ -283,10 +276,7 @@ pub(crate) fn item_instance_update_outbound(
     };
     if old.slot != row.slot {
         append_final_item_slots(self_guid, old.slot, row.slot, &mut out, |slot| {
-            live.item_rows(self_guid)
-                .into_iter()
-                .find(|item| item.slot == slot)
-                .map(|item| view_of_item_row(&item))
+            committed_item_in_slot(live, self_guid, slot)
         });
     }
     out.extend(enchant_change_outbound(self_guid, old, row));
@@ -346,26 +336,48 @@ pub(crate) fn append_final_item_slots(
 ) {
     let old_item = item_in_slot(old_slot);
     let new_item = item_in_slot(new_slot).unwrap_or_default();
-    let slots = old_item
+    let slots: Vec<_> = old_item
         .is_none()
         .then_some((old_slot, codec::ItemInstanceView::default()))
         .into_iter()
-        .chain([(new_slot, new_item)]);
-    for (slot, item) in slots.clone() {
+        .chain([(new_slot, new_item)])
+        .collect();
+    append_item_slots(self_guid, &slots, out, item_in_slot);
+}
+
+pub(crate) fn append_vacated_item_slot(
+    self_guid: u64,
+    slot: u8,
+    out: &mut Vec<Outbound>,
+    item_in_slot: impl Fn(u8) -> Option<codec::ItemInstanceView>,
+) {
+    if item_in_slot(slot).is_none() {
+        let slots = [(slot, codec::ItemInstanceView::default())];
+        append_item_slots(self_guid, &slots, out, item_in_slot);
+    }
+}
+
+fn append_item_slots(
+    self_guid: u64,
+    slots: &[(u8, codec::ItemInstanceView)],
+    out: &mut Vec<Outbound>,
+    item_in_slot: impl Fn(u8) -> Option<codec::ItemInstanceView>,
+) {
+    for &(slot, ref item) in slots {
         if let Some(values) = codec::build_inv_slot_values(self_guid, slot, item.guid) {
             out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
                 Box::new(values),
             )));
         }
     }
-    for (slot, item) in slots.clone() {
-        if let Some(values) = codec::build_visible_item_values(self_guid, slot, &item) {
+    for &(slot, ref item) in slots {
+        if let Some(values) = codec::build_visible_item_values(self_guid, slot, item) {
             out.push(Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(
                 Box::new(values),
             )));
         }
     }
-    for (slot, item) in slots {
+    for &(slot, ref item) in slots {
         if let Some((bag_slot, slot_in_bag)) = codec::bag_content_parts(slot) {
             if let Some(bag) = item_in_slot(bag_slot) {
                 let (opcode, body) =

@@ -506,3 +506,41 @@ fn ordinary_backpack_move_clears_source_and_sets_destination() {
     assert_eq!(source, [Guid::new(0)]);
     assert_eq!(destination, [Guid::new(202)]);
 }
+
+fn backpack_pointers(outbound: &[Outbound]) -> Vec<wow_world_messages::vanilla::Guid> {
+    use wow_world_messages::vanilla::{ItemSlot, Object, UpdateMask};
+    outbound
+        .iter()
+        .filter_map(|message| match message {
+            Outbound::One(ServerOpcodeMessage::SMSG_UPDATE_OBJECT(update)) => {
+                match &update.objects[0] {
+                    Object::Values {
+                        mask1: UpdateMask::Player(player),
+                        ..
+                    } => player.player_field_inv(ItemSlot::Inventory0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_deleted_item_clears_a_slot_no_other_item_holds() {
+    let mut outbound = Vec::new();
+    append_vacated_item_slot(7, 23, &mut outbound, |_| None);
+    assert_eq!(
+        backpack_pointers(&outbound),
+        [wow_world_messages::vanilla::Guid::new(0)]
+    );
+}
+
+#[test]
+fn a_deleted_item_leaves_its_slot_to_the_item_that_took_it_in_the_same_transaction() {
+    let mut outbound = Vec::new();
+    append_vacated_item_slot(7, 23, &mut outbound, |slot| {
+        (slot == 23).then(|| item_view(202, 1337))
+    });
+    assert!(outbound.is_empty());
+}
