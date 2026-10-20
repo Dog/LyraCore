@@ -1242,7 +1242,10 @@ pub(crate) fn seed_createinfo_spells(ctx: &ReducerContext) {
     if table.count() > 0 {
         return;
     }
-    for &(race, class, spell_id) in CREATEINFO_KIT {
+    let weapon_kit = CREATEINFO_WEAPON_KIT
+        .iter()
+        .flat_map(|&(race, class, spells)| spells.iter().map(move |&spell| (race, class, spell)));
+    for (race, class, spell_id) in CREATEINFO_KIT.iter().copied().chain(weapon_kit) {
         table.insert(crate::spell::spellbook::CreateinfoSpell {
             id: 0,
             race,
@@ -1388,6 +1391,50 @@ pub(crate) const CREATEINFO_KIT: &[(u8, u8, u32)] = &[
     (1, 0, 20864),
 ];
 
+// The weapon proficiency rows of classic-db playercreateinfo_spell, by race and class.
+pub(crate) const CREATEINFO_WEAPON_KIT: &[(u8, u8, &[u32])] = &[
+    (1, 1, &[196, 198, 201]),
+    (1, 2, &[198, 199]),
+    (1, 4, &[1180, 2567]),
+    (1, 5, &[198, 5009]),
+    (1, 8, &[227, 5009]),
+    (1, 9, &[1180, 5009]),
+    (2, 1, &[196, 197, 201]),
+    (2, 3, &[196, 264]),
+    (2, 4, &[1180, 2567]),
+    (2, 7, &[198, 227]),
+    (2, 9, &[1180, 5009]),
+    (3, 1, &[196, 197, 198]),
+    (3, 2, &[198, 199]),
+    (3, 3, &[196, 266]),
+    (3, 4, &[1180, 2567]),
+    (3, 5, &[198, 5009]),
+    (4, 1, &[198, 201, 1180]),
+    (4, 3, &[264, 1180]),
+    (4, 4, &[1180, 2567]),
+    (4, 5, &[198, 5009]),
+    (4, 11, &[227, 1180]),
+    (5, 1, &[201, 202, 1180]),
+    (5, 4, &[1180, 2567]),
+    (5, 5, &[198, 5009]),
+    (5, 8, &[227, 5009]),
+    (5, 9, &[1180, 5009]),
+    (6, 1, &[196, 198, 199]),
+    (6, 3, &[196, 266]),
+    (6, 7, &[198, 227]),
+    (6, 11, &[198, 227]),
+    (7, 1, &[198, 201, 1180]),
+    (7, 4, &[1180, 2567]),
+    (7, 8, &[227, 5009]),
+    (7, 9, &[1180, 5009]),
+    (8, 1, &[196, 1180, 2567]),
+    (8, 3, &[196, 264]),
+    (8, 4, &[1180, 2567]),
+    (8, 5, &[198, 5009]),
+    (8, 7, &[198, 227]),
+    (8, 8, &[227, 5009]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1445,6 +1492,26 @@ mod tests {
             CREATEINFO_KIT.iter().any(|(race, _, _)| *race == 1),
             "no Human racials in the kit; every new character would be missing them with no error"
         );
+    }
+
+    #[test]
+    fn every_race_and_class_starts_with_weapon_proficiencies() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &(race, class, spells) in CREATEINFO_WEAPON_KIT {
+            assert!(
+                seen.insert((race, class)),
+                "race {race} class {class} twice"
+            );
+            assert!(VANILLA_CLASSES.contains(&class) && (1..=8).contains(&race));
+            assert!(!spells.is_empty(), "race {race} class {class}");
+            for &spell in spells {
+                assert!(
+                    lyracore_shared::item::is_weapon_proficiency_spell(spell),
+                    "race {race} class {class} spell {spell}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 40, "vanilla has 40 race and class pairs");
     }
 
     #[test]

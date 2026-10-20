@@ -1,5 +1,5 @@
 use super::*;
-use lyracore_shared::item::{item_class, weapon_subclass, ItemRefusal, Proficiency};
+use lyracore_shared::item::{ItemRefusal, Proficiency};
 pub use wow_world_messages::vanilla::SellItemResult;
 use wow_world_messages::vanilla::{SMSG_ITEM_NAME_QUERY_RESPONSE, SMSG_SELL_ITEM};
 
@@ -488,32 +488,29 @@ pub fn build_item_push_result(
     }
 }
 
-pub fn armor_proficiency(player_class: u8, learned: &[u32]) -> Proficiency {
+pub fn learned_proficiency(player_class: u8, learned: &[u32]) -> Proficiency {
     Proficiency::from_spellbook(player_class, |spell_id| learned.contains(&spell_id))
 }
 
 pub fn build_set_proficiency_msgs(player_class: u8, learned: &[u32]) -> [ServerOpcodeMessage; 2] {
     [
-        ServerOpcodeMessage::SMSG_SET_PROFICIENCY(SMSG_SET_PROFICIENCY {
-            class: ItemClass::Weapon,
-            item_sub_class_mask: weapon_subclass_mask(player_class),
-        }),
+        build_weapon_proficiency_msg(player_class, learned),
         build_armor_proficiency_msg(player_class, learned),
     ]
+}
+
+pub fn build_weapon_proficiency_msg(player_class: u8, learned: &[u32]) -> ServerOpcodeMessage {
+    ServerOpcodeMessage::SMSG_SET_PROFICIENCY(SMSG_SET_PROFICIENCY {
+        class: ItemClass::Weapon,
+        item_sub_class_mask: learned_proficiency(player_class, learned).weapon_subclass_mask(),
+    })
 }
 
 pub fn build_armor_proficiency_msg(player_class: u8, learned: &[u32]) -> ServerOpcodeMessage {
     ServerOpcodeMessage::SMSG_SET_PROFICIENCY(SMSG_SET_PROFICIENCY {
         class: ItemClass::Armor,
-        item_sub_class_mask: armor_proficiency(player_class, learned).armor_subclass_mask(),
+        item_sub_class_mask: learned_proficiency(player_class, learned).armor_subclass_mask(),
     })
-}
-
-fn weapon_subclass_mask(player_class: u8) -> u32 {
-    let table = Proficiency::class_ceiling(player_class);
-    (0..=weapon_subclass::FISHING_POLE)
-        .filter(|&subclass| table.can_equip(item_class::WEAPON, subclass))
-        .fold(0, |mask, subclass| mask | 1 << subclass)
 }
 
 #[cfg(test)]

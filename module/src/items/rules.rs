@@ -273,7 +273,7 @@ pub(crate) mod tests {
     use crate::items::tables::ItemTemplate;
 
     fn can_equip_proficiency(player_class: u8, item_class: u8, item_subclass: u8) -> bool {
-        Proficiency::class_ceiling(player_class).can_equip(item_class, item_subclass)
+        Proficiency::derive(player_class, true, true).can_equip(item_class, item_subclass)
     }
 
     #[test]
@@ -734,16 +734,6 @@ pub(crate) mod tests {
         assert!(can_equip_proficiency(8, 0, 0));
         assert!(can_equip_proficiency(8, 7, 0));
         assert!(can_equip_proficiency(9, 12, 0));
-    }
-
-    #[test]
-    fn proficiency_wand_only_for_caster_classes() {
-        use weapon_subclass as w;
-        assert!(can_equip_proficiency(8, 2, w::WAND));
-        assert!(can_equip_proficiency(9, 2, w::WAND));
-        assert!(can_equip_proficiency(5, 2, w::WAND));
-        assert!(!can_equip_proficiency(1, 2, w::WAND));
-        assert!(!can_equip_proficiency(4, 2, w::WAND));
     }
 
     #[test]

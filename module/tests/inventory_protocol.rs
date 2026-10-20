@@ -206,6 +206,7 @@ fn inventory_changes_preserve_accepted_trade_items() {
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
 fn two_handed_weapons_and_offhand_items_cannot_be_equipped_together() {
     let shard = fixture("inventory-two-hand");
+    shard.assert_call("debug_learn_spell", &["1", "202"]);
     shard.assert_sql("UPDATE game_item_template SET class = 2, subclass = 8, inventory_type = 17 WHERE entry = 5090050");
     shard.assert_sql("UPDATE game_item_template SET class = 4, subclass = 6, inventory_type = 14 WHERE entry = 5090054");
     shard.assert_call("debug_grant_item", &["1", "5090050", "1"]);

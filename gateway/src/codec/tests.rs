@@ -3676,7 +3676,7 @@ fn proficiency(msg: &ServerOpcodeMessage) -> &SMSG_SET_PROFICIENCY {
 
 #[test]
 fn set_proficiency_pins_both_masks_on_the_wire() {
-    let msgs = build_set_proficiency_msgs(1, &[750]);
+    let msgs = build_set_proficiency_msgs(1, &[750, 196, 198, 201]);
     let bytes = |msg: &ServerOpcodeMessage| {
         let mut buf = Vec::new();
         proficiency(msg).write_unencrypted_server(&mut buf).unwrap();
@@ -3684,8 +3684,8 @@ fn set_proficiency_pins_both_masks_on_the_wire() {
     };
     assert_eq!(
         bytes(&msgs[0]),
-        vec![0x00, 0x07, 0x27, 0x01, 2, 0xFF, 0xFF, 0x17, 0x00],
-        "weapon mask = every subclass 0..=20 except the wand (19)"
+        vec![0x00, 0x07, 0x27, 0x01, 2, 0x91, 0x40, 0x10, 0x00],
+        "weapon mask = axe (0), mace (4), sword (7), misc (14), fishing pole (20)"
     );
     assert_eq!(
         bytes(&msgs[1]),
@@ -3716,6 +3716,19 @@ fn the_armor_mask_follows_the_trained_passives_per_class() {
     assert_eq!(mask(8, &[750, 8737]), 0b11);
     assert_eq!(mask(3, &[]) & MAIL, 0);
     assert_eq!(mask(3, &[8737]) & MAIL, MAIL);
+}
+
+#[test]
+fn the_weapon_mask_follows_the_learned_weapon_spells() {
+    let mask = |learned: &[u32]| {
+        let msg = build_weapon_proficiency_msg(1, learned);
+        assert_eq!(proficiency(&msg).class.as_int(), 2);
+        proficiency(&msg).item_sub_class_mask
+    };
+    const SWORD_2H: u32 = 1 << 8;
+
+    assert_eq!(mask(&[201]) & SWORD_2H, 0);
+    assert_eq!(mask(&[201, 202]) & SWORD_2H, SWORD_2H);
 }
 
 #[test]
