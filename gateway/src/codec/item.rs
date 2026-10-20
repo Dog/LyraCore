@@ -231,8 +231,13 @@ pub fn build_inventory_change_failure() -> SMSG_INVENTORY_CHANGE_FAILURE {
     }
 }
 
-pub fn build_inventory_refusal(refusal: ItemRefusal) -> SMSG_INVENTORY_CHANGE_FAILURE {
-    let (item1, item2, bag_type_subclass) = (Guid::new(0), Guid::new(0), 0);
+// The client unlocks item1 and item2; a zero guid leaves a locked item grey until relog.
+pub fn build_inventory_refusal(
+    refusal: ItemRefusal,
+    item1: u64,
+    item2: u64,
+) -> SMSG_INVENTORY_CHANGE_FAILURE {
+    let (item1, item2, bag_type_subclass) = (Guid::new(item1), Guid::new(item2), 0);
     match refusal {
         ItemRefusal::Indestructible => SMSG_INVENTORY_CHANGE_FAILURE::CantDropSoulbound {
             item1,
@@ -264,6 +269,13 @@ pub fn build_inventory_refusal(refusal: ItemRefusal) -> SMSG_INVENTORY_CHANGE_FA
             item2,
             bag_type_subclass,
         },
+        ItemRefusal::TwoHandedWeaponEquipped => {
+            SMSG_INVENTORY_CHANGE_FAILURE::CantEquipWithTwohanded {
+                item1,
+                item2,
+                bag_type_subclass,
+            }
+        }
         ItemRefusal::NoProficiency => SMSG_INVENTORY_CHANGE_FAILURE::NoRequiredProficiency {
             item1,
             item2,

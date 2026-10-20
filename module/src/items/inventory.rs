@@ -265,27 +265,14 @@ pub(crate) fn apply_item_move(
             }
         }
     }
-    if [from_slot, to_slot]
-        .iter()
-        .any(|slot| matches!(*slot, equip_slot::MAINHAND | equip_slot::OFFHAND))
-    {
-        let entry_after_move = |slot| {
-            if to_slot == slot {
-                Some(src.entry)
-            } else if from_slot == slot {
-                destination.as_ref().map(|item| item.entry)
-            } else {
-                item_in_slot(ctx, player_guid, slot).map(|item| item.entry)
-            }
-        };
-        if entry_after_move(equip_slot::OFFHAND).is_some()
-            && entry_after_move(equip_slot::MAINHAND)
-                .and_then(|entry| ctx.db.game_item_template().entry().find(entry))
-                .is_some_and(|template| template.inventory_type == invtype::TWO_HAND_WEAPON)
-        {
-            return Err(ItemRefusal::CannotEquip);
-        }
-    }
+    let displaced_off_hand = displaced_off_hand(
+        ctx,
+        player_guid,
+        from_slot,
+        to_slot,
+        src.guid,
+        destination.as_ref().map(|item| item.guid),
+    )?;
     if let Some(mut dst) = destination {
         if dst.entry == src.entry && dst.random_property_id == src.random_property_id {
             if let Some(tmpl) = ctx.db.game_item_template().entry().find(src.entry) {
@@ -310,6 +297,9 @@ pub(crate) fn apply_item_move(
     }
     src.slot = to_slot;
     instances.guid().update(src);
+    if let Some(off_hand) = displaced_off_hand {
+        instances.guid().update(off_hand);
+    }
     if from_slot <= equip_slot::END || to_slot <= equip_slot::END {
         crate::spell::recompute_vitals(ctx, player_guid);
         crate::spell::recompute_sheet(ctx, player_guid);
@@ -344,21 +334,76 @@ pub(crate) fn apply_equip_item(
             .ok_or_else(|| refuse(ItemRefusal::InventoryFull, "all four bag slots are full"))?;
         return apply_item_move(ctx, player_guid, from_slot, to_slot);
     }
-    let can_dual_wield = crate::spell::knows_spell(
-        ctx,
-        player_guid,
-        lyracore_shared::constants::dual_wield::SPELL_ID,
-    );
-    let to_slot = resolve_equip_slot(tmpl.inventory_type, can_dual_wield, |s| {
-        slot_occupied(ctx, player_guid, s)
-    })
-    .ok_or_else(|| {
+    let to_slot = auto_equip_slot(ctx, player_guid, tmpl.inventory_type).ok_or_else(|| {
         refuse(
             ItemRefusal::CannotEquip,
             format!("item {} is not equippable", src.entry),
         )
     })?;
     apply_item_move(ctx, player_guid, from_slot, to_slot)
+}
+
+fn displaced_off_hand(
+    ctx: &ReducerContext,
+    player_guid: u64,
+    from_slot: u8,
+    to_slot: u8,
+    src_guid: u64,
+    destination_guid: Option<u64>,
+) -> Result<Option<ItemInstance>, ItemRefusal> {
+    if ![from_slot, to_slot]
+        .iter()
+        .any(|slot| matches!(*slot, equip_slot::MAINHAND | equip_slot::OFFHAND))
+    {
+        return Ok(None);
+    }
+    let owned_after_move = ctx
+        .db
+        .game_item_instance()
+        .by_owner_guid()
+        .filter(&player_guid)
+        .map(|mut item| {
+            if item.guid == src_guid {
+                item.slot = to_slot;
+            } else if Some(item.guid) == destination_guid {
+                item.slot = from_slot;
+            }
+            item
+        })
+        .collect();
+    let templates = ctx.db.game_item_template();
+    off_hand_after_move(
+        owned_after_move,
+        &[Some(src_guid), destination_guid],
+        |entry| {
+            templates
+                .entry()
+                .find(entry)
+                .is_some_and(|template| template.inventory_type == invtype::TWO_HAND_WEAPON)
+        },
+        |entry| {
+            templates
+                .entry()
+                .find(entry)
+                .map_or(0, |t| t.container_slots)
+        },
+    )
+}
+
+// The off-hand slot counts as taken while the main hand holds a two-handed weapon.
+fn auto_equip_slot(ctx: &ReducerContext, player_guid: u64, inventory_type: u8) -> Option<u8> {
+    let can_dual_wield = crate::spell::knows_spell(
+        ctx,
+        player_guid,
+        lyracore_shared::constants::dual_wield::SPELL_ID,
+    );
+    let two_hander_equipped = item_in_slot(ctx, player_guid, equip_slot::MAINHAND)
+        .and_then(|item| ctx.db.game_item_template().entry().find(item.entry))
+        .is_some_and(|template| template.inventory_type == invtype::TWO_HAND_WEAPON);
+    resolve_equip_slot(inventory_type, can_dual_wield, |slot| {
+        slot_occupied(ctx, player_guid, slot)
+            || (slot == equip_slot::OFFHAND && two_hander_equipped)
+    })
 }
 
 #[cfg_attr(not(has_packages), allow(dead_code))]
@@ -397,15 +442,7 @@ pub(crate) fn apply_equip_profile_upgrade(
         };
         slot
     } else {
-        let can_dual_wield = crate::spell::knows_spell(
-            ctx,
-            player_guid,
-            lyracore_shared::constants::dual_wield::SPELL_ID,
-        );
-        resolve_equip_slot(candidate_template.inventory_type, can_dual_wield, |slot| {
-            slot_occupied(ctx, player_guid, slot)
-        })
-        .ok_or_else(|| {
+        auto_equip_slot(ctx, player_guid, candidate_template.inventory_type).ok_or_else(|| {
             refuse(
                 ItemRefusal::CannotEquip,
                 format!("item {} is not equippable", candidate.entry),
@@ -584,6 +621,49 @@ pub(super) fn free_inventory_slots(
     free
 }
 
+// A two-hander moved into the main hand sends the off-hand item to the first free carried slot.
+fn off_hand_after_move(
+    mut owned_after_move: Vec<ItemInstance>,
+    moved: &[Option<u64>; 2],
+    is_two_hander: impl Fn(u32) -> bool,
+    bag_capacity: impl FnMut(u32) -> u8,
+) -> Result<Option<ItemInstance>, ItemRefusal> {
+    let in_slot = |slot| owned_after_move.iter().position(|item| item.slot == slot);
+    let (Some(main_hand), Some(off_hand)) =
+        (in_slot(equip_slot::MAINHAND), in_slot(equip_slot::OFFHAND))
+    else {
+        return Ok(None);
+    };
+    if !is_two_hander(owned_after_move[main_hand].entry) {
+        return Ok(None);
+    }
+    let was_moved = |index: usize| moved.contains(&Some(owned_after_move[index].guid));
+    match (was_moved(main_hand), was_moved(off_hand)) {
+        (true, false) => {
+            let free_slot = free_inventory_slots(&owned_after_move, bag_capacity)
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    refuse(
+                        ItemRefusal::InventoryFull,
+                        "no free slot for the off-hand item",
+                    )
+                })?;
+            let mut off_hand = owned_after_move.swap_remove(off_hand);
+            off_hand.slot = free_slot;
+            Ok(Some(off_hand))
+        }
+        (false, true) => Err(refuse(
+            ItemRefusal::TwoHandedWeaponEquipped,
+            "the main hand holds a two-handed weapon",
+        )),
+        _ => Err(refuse(
+            ItemRefusal::CannotEquip,
+            "a two-handed weapon and an off-hand item cannot swap hands",
+        )),
+    }
+}
+
 pub(crate) fn first_free_backpack_slot(ctx: &ReducerContext, player_guid: u64) -> Option<u8> {
     let occupied = occupied_slots(ctx, player_guid);
     (starter_item::BACKPACK_SLOT_0..BACKPACK_SLOT_END).find(|slot| !occupied.contains(slot))
@@ -655,9 +735,12 @@ pub(crate) fn apply_auto_bank_item(
 #[cfg(test)]
 mod tests {
     use super::{
-        bag_content_decompose, is_bank_slot, is_carried_slot, valid_dest_slot, valid_split_count,
-        valid_split_dest_slot, BANK_SLOT_END_INCL, BANK_SLOT_START,
+        bag_content_decompose, equip_slot, is_bank_slot, is_carried_slot, off_hand_after_move,
+        valid_dest_slot, valid_split_count, valid_split_dest_slot, ItemInstance, ItemRefusal,
+        BACKPACK_SLOT_END, BANK_SLOT_END_INCL, BANK_SLOT_START,
     };
+    use lyracore_shared::constants::starter_item::BACKPACK_SLOT_0;
+    use spacetimedb::{Identity, Timestamp};
 
     #[test]
     fn is_bank_slot_covers_the_24_base_slots_only() {
@@ -725,6 +808,101 @@ mod tests {
         for slot in [63, 119, 192, 255] {
             assert!(!valid_split_dest_slot(slot));
         }
+    }
+
+    const TWO_HANDER: u32 = 1;
+    const SHIELD: u32 = 2;
+    const ONE_HANDER: u32 = 3;
+    const FILLER: u32 = 4;
+
+    fn item(guid: u64, slot: u8, entry: u32) -> ItemInstance {
+        ItemInstance {
+            guid,
+            entry,
+            owner_identity: Identity::ZERO,
+            owner_guid: 1,
+            slot,
+            stack_count: 1,
+            durability: 50,
+            created_at: Timestamp::UNIX_EPOCH,
+            enchant_id: 0,
+            soulbound: false,
+            random_property_id: 0,
+            item_text_id: 0,
+        }
+    }
+
+    fn backpack_filler(except: &[u8]) -> Vec<ItemInstance> {
+        (BACKPACK_SLOT_0..BACKPACK_SLOT_END)
+            .filter(|slot| !except.contains(slot))
+            .map(|slot| item(100 + u64::from(slot), slot, FILLER))
+            .collect()
+    }
+
+    fn off_hand_after(
+        owned_after_move: Vec<ItemInstance>,
+        moved: [Option<u64>; 2],
+    ) -> Result<Option<(u64, u8)>, ItemRefusal> {
+        off_hand_after_move(owned_after_move, &moved, |entry| entry == TWO_HANDER, |_| 0)
+            .map(|off_hand| off_hand.map(|item| (item.guid, item.slot)))
+    }
+
+    #[test]
+    fn a_two_hander_from_a_full_backpack_frees_the_slot_the_off_hand_item_takes() {
+        let mut owned = backpack_filler(&[BACKPACK_SLOT_0]);
+        owned.push(item(1, equip_slot::MAINHAND, TWO_HANDER));
+        owned.push(item(2, equip_slot::OFFHAND, SHIELD));
+
+        assert_eq!(
+            off_hand_after(owned, [Some(1), None]),
+            Ok(Some((2, BACKPACK_SLOT_0)))
+        );
+    }
+
+    #[test]
+    fn a_two_hander_swapped_with_a_main_hand_weapon_needs_another_free_slot() {
+        let mut owned = backpack_filler(&[BACKPACK_SLOT_0]);
+        owned.push(item(1, equip_slot::MAINHAND, TWO_HANDER));
+        owned.push(item(3, BACKPACK_SLOT_0, ONE_HANDER));
+        owned.push(item(2, equip_slot::OFFHAND, SHIELD));
+
+        assert_eq!(
+            off_hand_after(owned, [Some(1), Some(3)]),
+            Err(ItemRefusal::InventoryFull)
+        );
+    }
+
+    #[test]
+    fn a_two_hander_sends_the_off_hand_item_to_the_first_free_backpack_slot() {
+        let mut owned = backpack_filler(&[BACKPACK_SLOT_0, 30]);
+        owned.push(item(1, equip_slot::MAINHAND, TWO_HANDER));
+        owned.push(item(3, BACKPACK_SLOT_0, ONE_HANDER));
+        owned.push(item(2, equip_slot::OFFHAND, SHIELD));
+
+        assert_eq!(off_hand_after(owned, [Some(1), Some(3)]), Ok(Some((2, 30))));
+    }
+
+    #[test]
+    fn an_off_hand_item_cannot_join_an_equipped_two_hander() {
+        let owned = vec![
+            item(1, equip_slot::MAINHAND, TWO_HANDER),
+            item(2, equip_slot::OFFHAND, SHIELD),
+        ];
+
+        assert_eq!(
+            off_hand_after(owned, [Some(2), None]),
+            Err(ItemRefusal::TwoHandedWeaponEquipped)
+        );
+    }
+
+    #[test]
+    fn a_one_hander_keeps_the_off_hand_item_in_place() {
+        let owned = vec![
+            item(3, equip_slot::MAINHAND, ONE_HANDER),
+            item(2, equip_slot::OFFHAND, SHIELD),
+        ];
+
+        assert_eq!(off_hand_after(owned, [Some(3), None]), Ok(None));
     }
 
     #[test]

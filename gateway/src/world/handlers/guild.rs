@@ -1166,7 +1166,11 @@ fn charter_purchase_reply(
         Refused(GuildRefusal::CharterUnavailable) => vec![buy_failed(0, BuyResult::CantFindItem)],
         Refused(GuildRefusal::BagsFull) => vec![Outbound::One(
             ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
-                codec::build_inventory_refusal(lyracore_shared::item::ItemRefusal::InventoryFull),
+                codec::build_inventory_refusal(
+                    lyracore_shared::item::ItemRefusal::InventoryFull,
+                    0,
+                    0,
+                ),
             )),
         )],
         Refused(GuildRefusal::CharterLimit) => vec![Outbound::One(

@@ -52,6 +52,8 @@ pub(crate) fn unavailable_outbound(
             Outbound::One(ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(
                 Box::new(codec::build_inventory_refusal(
                     lyracore_shared::item::ItemRefusal::NotRightNow,
+                    0,
+                    0,
                 )),
             ))
         }
@@ -113,11 +115,15 @@ pub(crate) fn unavailable_outbound(
         ClientOpcodeMessage::CMSG_RESET_INSTANCES => unavailable("Instance reset requests"),
         ClientOpcodeMessage::CMSG_REQUEST_RAID_INFO => unavailable("Raid lockout queries"),
         ClientOpcodeMessage::MSG_INSPECT_HONOR_STATS(_) => unavailable("Honor statistics"),
-        ClientOpcodeMessage::CMSG_BUY_ITEM_IN_SLOT(_) => Outbound::One(
-            ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
-                codec::build_inventory_refusal(lyracore_shared::item::ItemRefusal::NotRightNow),
-            )),
-        ),
+        ClientOpcodeMessage::CMSG_BUY_ITEM_IN_SLOT(_) => {
+            Outbound::One(ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(
+                Box::new(codec::build_inventory_refusal(
+                    lyracore_shared::item::ItemRefusal::NotRightNow,
+                    0,
+                    0,
+                )),
+            ))
+        }
         _ => return None,
     };
     Some(vec![response])
