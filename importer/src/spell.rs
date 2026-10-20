@@ -436,13 +436,6 @@ fn aura_mod_to_kind(aura: AuraMod) -> u8 {
     }
 }
 
-fn is_wrapper_rank_trigger(kind: u8) -> bool {
-    !matches!(
-        kind,
-        A_PERIODIC_TRIGGER | A_FLAG | A_PROC_TRIGGER | A_PROC_DAMAGE | E_TRIGGER
-    )
-}
-
 fn resolve_aura_params(kind: u8, aura: AuraMod, misc: u32) -> (i32, u8) {
     use AuraMod::*;
     match kind {
@@ -1035,7 +1028,7 @@ fn push_spell_effect_rows(
         };
         let chain_targets = s.effect_chain_target[i].clamp(0, 255) as u8;
         let trigger_spell = s.effect_trigger_spell[i];
-        if trigger_spell != 0 && is_wrapper_rank_trigger(kind) {
+        if lyracore_shared::trainer::learn_target_trigger(kind, trigger_spell).is_some() {
             wrapper_to_rank.entry(spell_id).or_insert(trigger_spell);
         }
         let effect_mechanic = s.effect_mechanic[i] as u8;
@@ -2771,17 +2764,6 @@ mod tests {
         assert_eq!(proc_header_fields(139944, 100, 3), (139944, 100, 3));
         assert_eq!(proc_header_fields(1, 999, 999), (1, 255, 255));
         assert_eq!(proc_header_fields(1, 0, 0), (1, 0, 0));
-    }
-
-    #[test]
-    fn wrapper_rank_trigger_excludes_every_non_rank_payload() {
-        assert!(!is_wrapper_rank_trigger(A_PERIODIC_TRIGGER));
-        assert!(!is_wrapper_rank_trigger(A_FLAG));
-        assert!(!is_wrapper_rank_trigger(A_PROC_TRIGGER));
-        assert!(!is_wrapper_rank_trigger(A_PROC_DAMAGE));
-        assert!(!is_wrapper_rank_trigger(E_TRIGGER));
-        assert!(is_wrapper_rank_trigger(E_SCRIPTED));
-        assert!(is_wrapper_rank_trigger(E_DAMAGE));
     }
 
     #[test]
