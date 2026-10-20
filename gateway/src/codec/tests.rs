@@ -1837,19 +1837,20 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
             "title_text_id must be a low, in-range npc_text id"
         )
     };
-    assert_eq!(m.gossips.len(), 1);
-    assert_eq!(m.gossips[0].message, "Farewell.");
-    assert!(!m.gossips[0].coded);
+    assert!(
+        m.gossips.is_empty(),
+        "an NPC with no options has a greeting-only window"
+    );
     let v = build_gossip_message(
         0xF130_0000_0000_0001,
         GOSSIP_GREETING_TEXT_ID,
         Vec::new(),
         &menu(true, false),
     );
-    assert_eq!(v.gossips.len(), 2);
+    assert_eq!(v.gossips.len(), 1);
     assert_eq!(v.gossips[0].id, 0);
     assert_eq!(v.gossips[0].item_icon, 1);
-    assert_eq!(v.gossips[1].message, "Farewell.");
+    assert!(!v.gossips[0].coded);
     assert!(m.quests.is_empty());
 
     use lyracore_shared::constants::npc_flags;
@@ -1884,7 +1885,7 @@ fn gossip_message_echoes_guid_with_a_greeting_option() {
         Vec::new(),
         &menu(true, true),
     );
-    assert_eq!(both.gossips.len(), 3);
+    assert_eq!(both.gossips.len(), 2);
     assert_eq!(both.gossips[1].message, "Make this inn your home.");
     assert_eq!(both.gossips[1].id, 1);
 }
@@ -1898,14 +1899,13 @@ fn gossip_message_with_no_imports_is_byte_identical_to_pre_217() {
         Vec::new(),
         &gossip_menu_options(Vec::new(), true, true),
     );
-    assert_eq!(m.gossips.len(), 3);
+    assert_eq!(m.gossips.len(), 2);
     assert_eq!(m.gossips[0].message, "I'd like to browse your goods.");
     assert_eq!(m.gossips[1].message, "Make this inn your home.");
-    assert_eq!(m.gossips[2].message, "Farewell.");
 }
 
 #[test]
-fn gossip_message_renders_imported_options_verbatim_with_a_trailing_farewell() {
+fn gossip_message_renders_imported_options_verbatim() {
     use lyracore_shared::constants::gossip_option;
     let opt = |icon, text: &str, action| GossipOptionView {
         icon,
@@ -1928,14 +1928,13 @@ fn gossip_message_renders_imported_options_verbatim_with_a_trailing_farewell() {
         Vec::new(),
         &gossip_menu_options(opts, true, true),
     );
-    assert_eq!(m.gossips.len(), 4, "3 imported + a trailing Farewell");
+    assert_eq!(m.gossips.len(), 3);
     assert_eq!(m.gossips[0].message, "Care for a chat?");
     assert_eq!(m.gossips[0].id, 0);
     assert_eq!(m.gossips[1].message, "Let me see your goods.");
     assert_eq!(m.gossips[1].item_icon, 1);
     assert_eq!(m.gossips[2].message, "I'd like to stay here a while.");
-    assert_eq!(m.gossips[3].message, "Farewell.");
-    assert_eq!(m.gossips[3].id, 3);
+    assert_eq!(m.gossips[2].id, 2);
 }
 
 #[test]

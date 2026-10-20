@@ -95,7 +95,7 @@ pub fn build_gossip_message(
     options: &[GossipOptionView],
 ) -> SMSG_GOSSIP_MESSAGE {
     // The client echoes the option's list position; resolve it against this snapshot.
-    let mut gossips: Vec<GossipItem> = options
+    let gossips: Vec<GossipItem> = options
         .iter()
         .enumerate()
         .map(|(i, o)| GossipItem {
@@ -105,12 +105,6 @@ pub fn build_gossip_message(
             message: o.text.clone(),
         })
         .collect();
-    gossips.push(GossipItem {
-        id: gossips.len() as u32,
-        item_icon: 0,
-        coded: false,
-        message: "Farewell.".to_string(),
-    });
     SMSG_GOSSIP_MESSAGE {
         guid: Guid::new(npc_guid),
         title_text_id,

@@ -395,7 +395,7 @@ fn gossip_select_of_any_other_option_completes_without_binding() {
 }
 
 #[test]
-fn gossip_hello_renders_imported_options_verbatim_with_a_trailing_farewell() {
+fn gossip_hello_renders_imported_options_verbatim() {
     use lyracore_shared::constants::gossip_option;
     let mut s = quest_store();
     s.npc.gossip_opts = vec![
@@ -421,16 +421,10 @@ fn gossip_hello_renders_imported_options_verbatim_with_a_trailing_farewell() {
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
-            assert_eq!(
-                m.gossips.len(),
-                4,
-                "3 imported + a trailing Farewell: {:?}",
-                m.gossips
-            );
+            assert_eq!(m.gossips.len(), 3, "3 imported options: {:?}", m.gossips);
             assert_eq!(m.gossips[0].message, "Well met, traveler.");
             assert_eq!(m.gossips[1].message, "I'd like to browse your goods.");
             assert_eq!(m.gossips[2].message, "I'd like to stay here a while.");
-            assert_eq!(m.gossips[3].message, "Farewell.");
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
     }
@@ -693,6 +687,34 @@ fn a_select_with_no_open_menu_just_closes_the_window() {
 }
 
 #[test]
+fn a_select_past_the_last_option_just_closes_the_window() {
+    use lyracore_shared::constants::gossip_option;
+    let mut s = quest_store();
+    s.npc.gossip_opts = vec![opt(0, "Stay here.", gossip_option::INNKEEPER)];
+    let store = std::sync::Arc::new(s);
+    let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
+    let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
+    CMSG_GOSSIP_SELECT_OPTION {
+        guid: Guid::new(90),
+        gossip_list_id: menu.gossips.len() as u32,
+        unknown: None,
+    }
+    .write_encrypted_client(&mut client, &mut c_enc)
+    .unwrap();
+    match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
+        ServerOpcodeMessage::SMSG_GOSSIP_COMPLETE => {}
+        other => panic!("expected SMSG_GOSSIP_COMPLETE, got {other}"),
+    }
+    drop(client);
+    server.join().unwrap();
+    assert!(!store
+        .npc
+        .home_bound
+        .load(std::sync::atomic::Ordering::SeqCst));
+    assert!(store.npc.gossip_selects.lock().unwrap().is_empty());
+}
+
+#[test]
 fn an_imported_menu_missing_its_vendor_row_still_reaches_the_stock() {
     use lyracore_shared::constants::gossip_option;
     let mut s = quest_store();
@@ -706,7 +728,7 @@ fn an_imported_menu_missing_its_vendor_row_still_reaches_the_stock() {
     let store = std::sync::Arc::new(s);
     let (mut client, mut c_enc, mut c_dec, server) = enter_world(store.clone(), 1);
     let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
-    assert_eq!(menu.gossips.len(), 3, "chat + browse goods + Farewell");
+    assert_eq!(menu.gossips.len(), 2, "chat + browse goods");
     assert_eq!(menu.gossips[0].message, "What is Children's Week?");
     assert_eq!(menu.gossips[1].message, "I'd like to browse your goods.");
     CMSG_GOSSIP_SELECT_OPTION {
@@ -802,12 +824,11 @@ fn gossip_hello_hides_unlearn_talents_below_level_10() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
             assert_eq!(
                 m.gossips.len(),
-                2,
-                "training + trailing Farewell only, no unlearn option: {:?}",
+                1,
+                "training only, no unlearn option: {:?}",
                 m.gossips
             );
             assert_eq!(m.gossips[0].message, "I require warrior training.");
-            assert_eq!(m.gossips[1].message, "Farewell.");
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
     }
@@ -838,12 +859,7 @@ fn gossip_hello_shows_unlearn_talents_at_level_10_and_select_routes_to_reset_tal
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
-            assert_eq!(
-                m.gossips.len(),
-                3,
-                "training + unlearn + trailing Farewell: {:?}",
-                m.gossips
-            );
+            assert_eq!(m.gossips.len(), 2, "training + unlearn: {:?}", m.gossips);
             assert_eq!(m.gossips[1].message, "I wish to unlearn my talents.");
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
@@ -902,7 +918,7 @@ fn gossip_hello_shows_a_quest_gated_option_once_the_quest_is_taken() {
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
-            assert_eq!(m.gossips.len(), 2, "{:?}", m.gossips);
+            assert_eq!(m.gossips.len(), 1, "{:?}", m.gossips);
             assert_eq!(m.gossips[0].message, "About that favor...");
         }
         other => panic!("expected SMSG_GOSSIP_MESSAGE, got {other}"),
@@ -935,7 +951,7 @@ fn gossip_hello_and_select_option_stay_position_aligned_under_a_hidden_option() 
     .unwrap();
     match ServerOpcodeMessage::read_encrypted(&mut client, &mut c_dec).unwrap() {
         ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(m) => {
-            assert_eq!(m.gossips.len(), 3, "2 visible + Farewell: {:?}", m.gossips);
+            assert_eq!(m.gossips.len(), 2, "2 visible options: {:?}", m.gossips);
             assert_eq!(m.gossips[0].message, "Chat.");
             assert_eq!(m.gossips[1].message, "Stay here.");
         }
@@ -1224,8 +1240,7 @@ fn a_condition_hidden_service_option_is_not_recreated_by_synthesis() {
     let store = std::sync::Arc::new(fixture);
     let (mut client, mut c_enc, mut c_dec, world) = enter_world(store, 1);
     let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
-    assert_eq!(menu.gossips.len(), 1);
-    assert_eq!(menu.gossips[0].message, "Farewell.");
+    assert!(menu.gossips.is_empty(), "{:?}", menu.gossips);
     drop(client);
     world.join().unwrap();
 }
@@ -1255,7 +1270,7 @@ fn gossip_menu_distinguishes_complete_and_incomplete_quest_options() {
     let store = std::sync::Arc::new(fixture);
     let (mut client, mut c_enc, mut c_dec, world) = enter_world(store, 1);
     let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
-    assert_eq!(menu.gossips.len(), 2);
+    assert_eq!(menu.gossips.len(), 1);
     assert_eq!(menu.gossips[0].message, "Ready to report.");
     drop(client);
     world.join().unwrap();
@@ -1289,7 +1304,7 @@ fn a_menu_source_switch_refuses_colliding_and_synthesized_clicks_before_service_
             let store = std::sync::Arc::new(fixture);
             let (mut client, mut c_enc, mut c_dec, world) = enter_world(store.clone(), 1);
             let menu = gossip_hello(&mut client, &mut c_enc, &mut c_dec, 90);
-            assert_eq!(menu.gossips.len(), 2);
+            assert_eq!(menu.gossips.len(), 1);
             store
                 .npc
                 .gossip_source_menu_id
@@ -1371,7 +1386,7 @@ fn changed_actions_and_new_authored_services_close_the_stale_menu_without_a_serv
             let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
                 panic!("expected the service menu");
             };
-            assert_eq!(menu.gossips.len(), 2);
+            assert_eq!(menu.gossips.len(), 1);
             let current = if source == 0 {
                 &mut store.npc.gossip_opts
             } else {
@@ -1459,8 +1474,7 @@ fn rewarded_repeatable_quests_show_only_the_source_eligible_options() {
         [
             "Not rewarded",
             "No current or rewarded quest",
-            "No current quest",
-            "Farewell."
+            "No current quest"
         ]
     );
 }
@@ -1582,6 +1596,5 @@ fn missing_quest_subjects_hide_options_even_when_progress_rows_remain() {
     let [ServerOpcodeMessage::SMSG_GOSSIP_MESSAGE(menu)] = messages.as_slice() else {
         panic!("expected the quest-conditioned menu");
     };
-    assert_eq!(menu.gossips.len(), 1);
-    assert_eq!(menu.gossips[0].message, "Farewell.");
+    assert!(menu.gossips.is_empty(), "{:?}", menu.gossips);
 }
