@@ -149,8 +149,6 @@ pub(crate) const CHASE_MELEE_SQ: f32 = crate::combat::MELEE_RANGE_SQ;
 
 pub(crate) const CHASE_LEASH_SQ: f32 = combat_active_radius(0.0) * combat_active_radius(0.0);
 
-pub(crate) const CHASE_LEAD_YD: f32 = 8.0;
-
 pub(crate) const CHASE_REPATH_COS: f32 = 0.9;
 
 pub(crate) const FLEE_LEG_YD: f32 = 28.0;
