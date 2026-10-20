@@ -117,6 +117,7 @@ pub mod weapon_subclass {
     pub const SWORD_2H: u8 = 8;
     pub const STAFF: u8 = 10;
     pub const FIST: u8 = 13;
+    pub const MISC: u8 = 14;
     pub const DAGGER: u8 = 15;
     pub const THROWN: u8 = 16;
     pub const CROSSBOW: u8 = 18;
@@ -124,10 +125,38 @@ pub mod weapon_subclass {
     pub const FISHING_POLE: u8 = 20;
 }
 
+// Spell.dbc: each spell's Proficiency effect sets one weapon subclass bit.
+pub const WEAPON_PROFICIENCY_SPELLS: [(u8, u32); 15] = {
+    use weapon_subclass::*;
+    [
+        (AXE_1H, 196),
+        (AXE_2H, 197),
+        (BOW, 264),
+        (GUN, 266),
+        (MACE_1H, 198),
+        (MACE_2H, 199),
+        (POLEARM, 200),
+        (SWORD_1H, 201),
+        (SWORD_2H, 202),
+        (STAFF, 227),
+        (FIST, 15590),
+        (DAGGER, 1180),
+        (THROWN, 2567),
+        (CROSSBOW, 5011),
+        (WAND, 5009),
+    ]
+};
+
+pub fn is_weapon_proficiency_spell(spell_id: u32) -> bool {
+    WEAPON_PROFICIENCY_SPELLS
+        .iter()
+        .any(|&(_, proficiency_spell)| proficiency_spell == spell_id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proficiency {
-    player_class: u8,
     armor_subclass_mask: u32,
+    weapon_subclass_mask: u32,
 }
 
 impl Proficiency {
@@ -149,41 +178,47 @@ impl Proficiency {
             mask |= bit(MAIL);
         }
         Self {
-            player_class,
             armor_subclass_mask: mask,
+            // Misc weapons need no proficiency. Vanilla also requires Fishing for poles; this does not.
+            weapon_subclass_mask: bit(weapon_subclass::MISC) | bit(weapon_subclass::FISHING_POLE),
         }
     }
 
     pub fn from_spellbook(player_class: u8, knows: impl Fn(u32) -> bool) -> Self {
         use crate::constants::armor_proficiency::{MAIL_PASSIVE_SPELL_ID, PLATE_PASSIVE_SPELL_ID};
 
-        Self::derive(
+        let mut proficiency = Self::derive(
             player_class,
             knows(PLATE_PASSIVE_SPELL_ID),
             knows(MAIL_PASSIVE_SPELL_ID),
-        )
+        );
+        for (subclass, spell_id) in WEAPON_PROFICIENCY_SPELLS {
+            if knows(spell_id) {
+                proficiency.weapon_subclass_mask |= bit(subclass);
+            }
+        }
+        proficiency
     }
 
-    // Auction filtering uses the class ceiling; equipping must use the learned passives.
-    pub const fn class_ceiling(player_class: u8) -> Self {
-        Self::derive(player_class, true, true)
-    }
-
-    // SMSG_SET_PROFICIENCY encodes armor subclasses as 1 << subclass.
+    // SMSG_SET_PROFICIENCY encodes subclasses as 1 << subclass.
     pub const fn armor_subclass_mask(self) -> u32 {
         self.armor_subclass_mask
     }
 
+    pub const fn weapon_subclass_mask(self) -> u32 {
+        self.weapon_subclass_mask
+    }
+
     pub const fn can_equip(self, item_class: u8, item_subclass: u8) -> bool {
         match item_class {
-            item_class::ARMOR => self.allows_armor(item_subclass),
-            item_class::WEAPON => weapon_proficiency(self.player_class, item_subclass),
+            item_class::ARMOR => has_subclass(self.armor_subclass_mask, item_subclass),
+            item_class::WEAPON => has_subclass(self.weapon_subclass_mask, item_subclass),
             _ => true,
         }
     }
 
     pub const fn allows_armor(self, subclass: u8) -> bool {
-        subclass < u32::BITS as u8 && self.armor_subclass_mask & bit(subclass) != 0
+        has_subclass(self.armor_subclass_mask, subclass)
     }
 }
 
@@ -191,46 +226,8 @@ const fn bit(subclass: u8) -> u32 {
     1 << subclass
 }
 
-const fn weapon_proficiency(player_class: u8, subclass: u8) -> bool {
-    use weapon_subclass::*;
-
-    if subclass == FISHING_POLE {
-        return true;
-    }
-    match player_class {
-        1 => subclass != WAND,
-        2 => matches!(
-            subclass,
-            AXE_1H | AXE_2H | MACE_1H | MACE_2H | POLEARM | SWORD_1H | SWORD_2H
-        ),
-        3 => matches!(
-            subclass,
-            AXE_1H
-                | AXE_2H
-                | BOW
-                | CROSSBOW
-                | DAGGER
-                | FIST
-                | GUN
-                | POLEARM
-                | STAFF
-                | SWORD_1H
-                | SWORD_2H
-                | THROWN
-        ),
-        4 => matches!(
-            subclass,
-            BOW | CROSSBOW | DAGGER | FIST | GUN | MACE_1H | SWORD_1H | THROWN
-        ),
-        5 => matches!(subclass, DAGGER | MACE_1H | STAFF | WAND),
-        7 => matches!(
-            subclass,
-            AXE_1H | AXE_2H | DAGGER | FIST | MACE_1H | MACE_2H | STAFF
-        ),
-        8 | 9 => matches!(subclass, DAGGER | STAFF | SWORD_1H | WAND),
-        11 => matches!(subclass, DAGGER | FIST | MACE_1H | MACE_2H | STAFF),
-        _ => false,
-    }
+const fn has_subclass(mask: u32, subclass: u8) -> bool {
+    subclass < u32::BITS as u8 && mask & bit(subclass) != 0
 }
 
 #[cfg(test)]
@@ -284,10 +281,6 @@ mod tests {
             ItemRefusal::parse_tag("gw_move_item reducer timed out after 10s"),
             None
         );
-    }
-
-    fn ceiling_can_equip(player_class: u8, item_class: u8, item_subclass: u8) -> bool {
-        Proficiency::class_ceiling(player_class).can_equip(item_class, item_subclass)
     }
 
     fn armor_set(proficiency: Proficiency) -> Vec<u8> {
@@ -408,67 +401,142 @@ mod tests {
         }
     }
 
-    #[test]
-    fn armor_training_never_changes_the_weapon_table() {
-        for class in PLAYABLE {
-            for subclass in 0..=weapon_subclass::FISHING_POLE {
-                assert_eq!(
-                    Proficiency::derive(class, false, false)
-                        .can_equip(item_class::WEAPON, subclass),
-                    Proficiency::derive(class, true, true).can_equip(item_class::WEAPON, subclass),
-                    "class {class} weapon subclass {subclass}"
-                );
-            }
-        }
+    fn spellbook(player_class: u8, book: &[u32]) -> Proficiency {
+        Proficiency::from_spellbook(player_class, |spell| book.contains(&spell))
+    }
+
+    fn weapon_set(proficiency: Proficiency) -> Vec<u8> {
+        (0..u32::BITS as u8)
+            .filter(|&subclass| proficiency.can_equip(item_class::WEAPON, subclass))
+            .collect()
     }
 
     #[test]
-    fn the_class_ceiling_is_the_fully_trained_derivation() {
-        for class in PLAYABLE {
-            assert_eq!(
-                Proficiency::class_ceiling(class),
-                Proficiency::derive(class, true, true)
-            );
-        }
-        assert!(ceiling_can_equip(1, item_class::ARMOR, PLATE));
-        assert!(ceiling_can_equip(3, item_class::ARMOR, MAIL));
-    }
-
-    #[test]
-    fn representative_class_proficiencies_are_available_to_gateway_reads() {
-        assert!(!ceiling_can_equip(8, 4, 4));
-        assert!(ceiling_can_equip(1, 4, 4));
-        assert!(ceiling_can_equip(8, 2, 19));
-        assert!(!ceiling_can_equip(1, 2, 19));
-        assert!(ceiling_can_equip(8, 7, 0));
-    }
-
-    #[test]
-    fn the_spellbook_reader_maps_the_two_passives_and_ignores_the_rest() {
+    fn the_spellbook_reader_maps_the_two_passives_to_armor() {
         use crate::constants::armor_proficiency::{MAIL_PASSIVE_SPELL_ID, PLATE_PASSIVE_SPELL_ID};
 
-        let from = |class, book: &[u32]| {
-            let owned = book.to_vec();
-            Proficiency::from_spellbook(class, move |spell| owned.contains(&spell))
-        };
+        let armor = |class, book: &[u32]| armor_set(spellbook(class, book));
         for class in PLAYABLE {
-            assert_eq!(from(class, &[]), Proficiency::derive(class, false, false));
+            let derived = |plate, mail| armor_set(Proficiency::derive(class, plate, mail));
+            assert_eq!(armor(class, &[]), derived(false, false));
             assert_eq!(
-                from(class, &[PLATE_PASSIVE_SPELL_ID]),
-                Proficiency::derive(class, true, false)
+                armor(class, &[PLATE_PASSIVE_SPELL_ID]),
+                derived(true, false)
+            );
+            assert_eq!(armor(class, &[MAIL_PASSIVE_SPELL_ID]), derived(false, true));
+            assert_eq!(
+                armor(class, &[PLATE_PASSIVE_SPELL_ID, MAIL_PASSIVE_SPELL_ID]),
+                derived(true, true)
             );
             assert_eq!(
-                from(class, &[MAIL_PASSIVE_SPELL_ID]),
-                Proficiency::derive(class, false, true)
-            );
-            assert_eq!(
-                from(class, &[PLATE_PASSIVE_SPELL_ID, MAIL_PASSIVE_SPELL_ID]),
-                Proficiency::class_ceiling(class)
-            );
-            assert_eq!(
-                from(class, &[7109, 8738, 674, 201]),
-                Proficiency::derive(class, false, false),
+                armor(class, &[7109, 8738, 674, 201, 202]),
+                derived(false, false),
                 "class {class}: only the passives move armor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warrior_needs_two_handed_swords_before_equipping_one() {
+        use weapon_subclass::*;
+
+        let human_warrior_kit = [196, 198, 201];
+        let new_warrior = spellbook(1, &human_warrior_kit);
+        assert!(new_warrior.can_equip(item_class::WEAPON, SWORD_1H));
+        assert!(!new_warrior.can_equip(item_class::WEAPON, SWORD_2H));
+
+        let trained = spellbook(1, &[196, 198, 201, 202]);
+        assert!(trained.can_equip(item_class::WEAPON, SWORD_2H));
+    }
+
+    #[test]
+    fn each_weapon_proficiency_spell_opens_only_its_own_subclass() {
+        use weapon_subclass::*;
+
+        for (subclass, spell) in [
+            (AXE_1H, 196),
+            (AXE_2H, 197),
+            (BOW, 264),
+            (GUN, 266),
+            (MACE_1H, 198),
+            (MACE_2H, 199),
+            (POLEARM, 200),
+            (SWORD_1H, 201),
+            (SWORD_2H, 202),
+            (STAFF, 227),
+            (FIST, 15590),
+            (DAGGER, 1180),
+            (THROWN, 2567),
+            (CROSSBOW, 5011),
+            (WAND, 5009),
+        ] {
+            assert!(is_weapon_proficiency_spell(spell));
+            let mut expected = vec![subclass, MISC, FISHING_POLE];
+            expected.sort_unstable();
+            assert_eq!(
+                weapon_set(spellbook(1, &[spell])),
+                expected,
+                "spell {spell}"
+            );
+        }
+        assert!(
+            !is_weapon_proficiency_spell(203),
+            "Unarmed has no Proficiency effect"
+        );
+        assert!(!is_weapon_proficiency_spell(750));
+    }
+
+    #[test]
+    fn an_empty_spellbook_wields_only_misc_weapons_and_fishing_poles() {
+        for class in PLAYABLE {
+            assert_eq!(
+                weapon_set(spellbook(class, &[])),
+                vec![weapon_subclass::MISC, weapon_subclass::FISHING_POLE],
+                "class {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn weapon_proficiency_follows_the_spellbook_not_the_class() {
+        assert!(spellbook(8, &[202]).can_equip(item_class::WEAPON, weapon_subclass::SWORD_2H));
+        assert!(!spellbook(1, &[]).can_equip(item_class::WEAPON, weapon_subclass::WAND));
+    }
+
+    #[test]
+    fn weapon_subclasses_without_a_proficiency_spell_fail_closed() {
+        let every_spell: Vec<u32> = WEAPON_PROFICIENCY_SPELLS
+            .iter()
+            .map(|&(_, spell)| spell)
+            .collect();
+        let master = spellbook(1, &every_spell);
+        for subclass in [9u8, 11, 12, 17, 21, 31, 32, 255] {
+            assert!(
+                !master.can_equip(item_class::WEAPON, subclass),
+                "weapon subclass {subclass} has no proficiency spell"
+            );
+        }
+    }
+
+    #[test]
+    fn armor_training_never_teaches_a_weapon() {
+        for class in PLAYABLE {
+            assert_eq!(
+                Proficiency::derive(class, true, true).weapon_subclass_mask(),
+                Proficiency::derive(class, false, false).weapon_subclass_mask(),
+                "class {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_weapon_wire_mask_agrees_with_the_gate() {
+        let warrior = spellbook(1, &[196, 202, 5011]);
+        for subclass in 0..u32::BITS as u8 {
+            assert_eq!(
+                warrior.weapon_subclass_mask() & (1 << subclass) != 0,
+                warrior.can_equip(item_class::WEAPON, subclass),
+                "weapon subclass {subclass}"
             );
         }
     }

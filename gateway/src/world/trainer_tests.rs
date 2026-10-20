@@ -309,6 +309,30 @@ fn a_proficiency_buy_pushes_the_refreshed_armor_mask_after_the_learned_spell() {
 }
 
 #[test]
+fn a_weapon_proficiency_buy_pushes_the_refreshed_weapon_mask() {
+    let store = TrainerFake {
+        learned_spells: vec![196, 198, 201, 202],
+        ..TrainerFake::buying_as(10, 1)
+    };
+    let sent = run(&store, buy(202));
+    let [ServerOpcodeMessage::SMSG_TRAINER_BUY_SUCCEEDED(_), ServerOpcodeMessage::SMSG_LEARNED_SPELL(learned), ServerOpcodeMessage::SMSG_SET_PROFICIENCY(mask)] =
+        sent.as_slice()
+    else {
+        panic!(
+            "expected confirmation, learned spell, proficiency mask, got [{}]",
+            kinds(&sent)
+        );
+    };
+    assert_eq!(learned.id, 202);
+    assert_eq!(mask.class.as_int(), 2, "a weapon buy refreshes WEAPON only");
+    assert!(
+        mask.item_sub_class_mask & (1 << lyracore_shared::item::weapon_subclass::SWORD_2H) != 0,
+        "the trained two-handed sword bit must be set: {:#x}",
+        mask.item_sub_class_mask
+    );
+}
+
+#[test]
 fn an_ordinary_trainer_buy_pushes_no_proficiency_mask() {
     let sent = run(&TrainerFake::buying_as(40, 1), buy(1234));
     assert!(
