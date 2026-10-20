@@ -454,7 +454,7 @@ impl IdleSink for CtxWorld<'_> {
             },
         )
     }
-    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32) -> (f32, f32) {
+    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32, stop_dist: f32) -> (f32, f32) {
         self.ctx
             .db
             .game_world_entity()
@@ -468,7 +468,7 @@ impl IdleSink for CtxWorld<'_> {
                     (c.x, c.y),
                     to,
                     max_step,
-                    0.0,
+                    stop_dist,
                     c.z,
                 )
             })

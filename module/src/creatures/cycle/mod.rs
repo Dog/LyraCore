@@ -7,9 +7,9 @@ use super::ai::{
     aggro_radius, fear_step_for_tick, feared_flee_step, finite_point, flee_step, hp_pct_below,
     is_aggro_candidate, leg_in_flight, leg_toward, may_start_rout, nearest_waypoint_idx,
     next_waypoint_idx, rout_close_ms, spline_t, stealth_detect_range, wander_point,
-    within_assist_radius, wounded_slow_factor, TickScope, CHASE_LEAD_YD, CHASE_LEASH_SQ,
-    CHASE_MELEE_SQ, CHASE_REPATH_COS, FLEE_LEG_YD, MOVE_TICK_SECS, RETURN_LEASH_SQ,
-    SENSE_EVERY_N_TICKS, WANDER_CHANCE_PCT, WANDER_RADIUS,
+    within_assist_radius, wounded_slow_factor, TickScope, CHASE_LEASH_SQ, CHASE_MELEE_SQ,
+    CHASE_REPATH_COS, FLEE_LEG_YD, MOVE_TICK_SECS, RETURN_LEASH_SQ, SENSE_EVERY_N_TICKS,
+    WANDER_CHANCE_PCT, WANDER_RADIUS,
 };
 use super::cast_condition;
 use super::eventai::EventAiRequest;
@@ -190,7 +190,7 @@ pub(crate) trait IdleSink {
     }
     fn engaged(&self, guid: u64) -> bool;
     fn speed_of(&self, guid: u64, gait: Gait) -> f32;
-    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32) -> (f32, f32);
+    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32, stop_dist: f32) -> (f32, f32);
     fn roll(&self) -> u32;
     fn aim_at_waypoint(&mut self, guid: u64, waypoint_id: u64);
     fn reached_home(&mut self, guid: u64);
@@ -640,7 +640,7 @@ fn patrol<W: IdleSink + MotionSink>(w: &mut W, tick: &TickContext, active: &Hash
         } else {
             let gait = w.idle_gait(c.guid, Gait::Walk);
             let speed = w.speed_of(c.guid, gait);
-            let step = w.navigate(c.guid, (wp.at.x, wp.at.y), speed * tick.tick_secs);
+            let step = w.navigate(c.guid, (wp.at.x, wp.at.y), speed * tick.tick_secs, 0.0);
             let Some((x, y, dur_ms)) = leg_toward((c.at.x, c.at.y), step, speed) else {
                 continue;
             };
@@ -894,7 +894,7 @@ fn follow<W: IdleSink>(
     let leg_len = gap - PET_TRAIL_YD;
     let aim = (pet.at.x + dx / gap * leg_len, pet.at.y + dy / gap * leg_len);
     let run = w.speed_of(pet.guid, Gait::Run);
-    let step = w.navigate(pet.guid, aim, run * tick.sense_secs);
+    let step = w.navigate(pet.guid, aim, run * tick.sense_secs, 0.0);
     let (x, y, dur_ms) = leg_toward((pet.at.x, pet.at.y), step, run)?;
     Some(PetAction::Follow(Leg {
         to: (x, y),
@@ -988,7 +988,13 @@ fn threat_retarget<W: ThreatSink>(w: &mut W, scope: &TickScope) -> usize {
     visited
 }
 
-const MELEE_STOP_SHORT_YD: f32 = 4.0;
+// Two default 0.389 yd bounding radii plus the 0.5 yd vanilla contact distance.
+const CHASE_CONTACT_YD: f32 = 2.0 * 0.389 + 0.5;
+
+const _: () = assert!(
+    CHASE_CONTACT_YD * CHASE_CONTACT_YD < CHASE_MELEE_SQ,
+    "a chaser must stop inside the reach its own swing needs"
+);
 
 const CASTER_HOLD_MARGIN: f32 = 0.9;
 
@@ -1030,12 +1036,13 @@ fn chase<W: PursuitSink + MotionSink + IdleSink + EngageSink>(
             if dist_sq(c.at, aim) <= RANGED_HOLD_ARRIVED_SQ {
                 stand_and_face(w, tick, &c);
             } else {
-                commit_chase_leg(w, &c, aim, Some((aim.x, aim.y)), tick.now_ms);
+                commit_chase_leg(w, &c, aim, 0.0, tick.now_ms);
             }
             continue;
         }
         let victim_moving = crate::combat::is_translating(c.victim_movement_flags);
-        if gap_sq <= CHASE_MELEE_SQ && !victim_moving {
+        let in_contact = gap_sq <= CHASE_CONTACT_YD * CHASE_CONTACT_YD;
+        if in_contact || (gap_sq <= CHASE_MELEE_SQ && !victim_moving) {
             stand_and_face(w, tick, &c);
             continue;
         }
@@ -1045,23 +1052,7 @@ fn chase<W: PursuitSink + MotionSink + IdleSink + EngageSink>(
                 continue;
             }
         }
-        let gap = gap_sq.sqrt();
-        let dir = (
-            (c.victim_at.x - c.at.x) / gap,
-            (c.victim_at.y - c.at.y) / gap,
-        );
-        let leg_len = if victim_moving {
-            gap + CHASE_LEAD_YD
-        } else {
-            (gap - MELEE_STOP_SHORT_YD).max(0.0)
-        };
-        let aim = Point {
-            x: c.at.x + dir.0 * leg_len,
-            y: c.at.y + dir.1 * leg_len,
-            z: c.victim_at.z,
-        };
-        let stop_at = (!victim_moving).then_some((aim.x, aim.y));
-        commit_chase_leg(w, &c, aim, stop_at, tick.now_ms);
+        commit_chase_leg(w, &c, c.victim_at, CHASE_CONTACT_YD, tick.now_ms);
     }
     visited
 }
@@ -1069,20 +1060,21 @@ fn chase<W: PursuitSink + MotionSink + IdleSink + EngageSink>(
 fn commit_chase_leg<W: MotionSink + IdleSink + PursuitSink>(
     w: &mut W,
     c: &Pursuit,
-    aim: Point,
-    stop_at: Option<(f32, f32)>,
+    target: Point,
+    stop_dist: f32,
     now_ms: u32,
 ) {
-    let leg_len = dist_sq(c.at, aim).sqrt();
-    if leg_len <= 0.0 {
+    let gap = dist_sq(c.at, target).sqrt();
+    if gap <= stop_dist {
         return;
     }
-    let dir = ((aim.x - c.at.x) / leg_len, (aim.y - c.at.y) / leg_len);
-    let step = w.navigate(c.guid, (aim.x, aim.y), leg_len);
+    let dir = ((target.x - c.at.x) / gap, (target.y - c.at.y) / gap);
+    let step = w.navigate(c.guid, (target.x, target.y), gap, stop_dist);
     if step == (c.at.x, c.at.y) {
         w.target_not_reachable(c.guid);
         return;
     }
+    let stop_at = (target.x - dir.0 * stop_dist, target.y - dir.1 * stop_dist);
     if !needs_new_leg(c.leg.as_ref(), dir, stop_at) {
         return;
     }
@@ -1095,7 +1087,7 @@ fn commit_chase_leg<W: MotionSink + IdleSink + PursuitSink>(
         c.guid,
         Leg {
             to: (x, y),
-            z_fallback: aim.z,
+            z_fallback: target.z,
             dur_ms,
             gait,
             hold_until_landed: false,
@@ -1117,14 +1109,12 @@ fn ranged_hold_point(pursuit: &Pursuit, distance: f32, angle: f32) -> Point {
     }
 }
 
-fn needs_new_leg(leg: Option<&LegInFlight>, dir: (f32, f32), stop_at: Option<(f32, f32)>) -> bool {
+fn needs_new_leg(leg: Option<&LegInFlight>, dir: (f32, f32), stop_at: (f32, f32)) -> bool {
     let Some(leg) = leg else {
         return true;
     };
-    if let Some((sx, sy)) = stop_at {
-        if (leg.dest.x - sx) * dir.0 + (leg.dest.y - sy) * dir.1 > 0.0 {
-            return true;
-        }
+    if (leg.dest.x - stop_at.0) * dir.0 + (leg.dest.y - stop_at.1) * dir.1 > 0.0 {
+        return true;
     }
     let (lx, ly) = (leg.dest.x - leg.start.x, leg.dest.y - leg.start.y);
     let len = (lx * lx + ly * ly).sqrt();
@@ -1224,7 +1214,7 @@ fn follow_authored<W: IdleSink>(w: &mut W, tick: &TickContext, c: &IdleCreature,
     let gait = w.idle_gait(c.guid, Gait::Walk);
     let speed = w.speed_of(c.guid, gait);
     let max_step = (distance - FOLLOW_ARRIVE_YD).min(speed * tick.tick_secs);
-    let step = w.navigate(c.guid, (target.x, target.y), max_step);
+    let step = w.navigate(c.guid, (target.x, target.y), max_step, 0.0);
     let Some((x, y, dur_ms)) = leg_toward((c.at.x, c.at.y), step, speed) else {
         return;
     };
@@ -1243,7 +1233,7 @@ fn follow_authored<W: IdleSink>(w: &mut W, tick: &TickContext, c: &IdleCreature,
 
 fn walk_home<W: IdleSink>(w: &mut W, tick: &TickContext, c: &IdleCreature, home: Home) {
     let run = w.speed_of(c.guid, Gait::Run);
-    let step = w.navigate(c.guid, (home.at.x, home.at.y), run * tick.tick_secs);
+    let step = w.navigate(c.guid, (home.at.x, home.at.y), run * tick.tick_secs, 0.0);
     let Some((x, y, dur_ms)) = leg_toward((c.at.x, c.at.y), step, run) else {
         return;
     };
@@ -1268,7 +1258,7 @@ fn loiter<W: IdleSink>(w: &mut W, tick: &TickContext, c: &IdleCreature, home: Ho
     let (hx, hy) = wander_point(home.at.x, home.at.y, w.roll(), w.roll(), radius);
     let gait = w.idle_gait(c.guid, Gait::Walk);
     let speed = w.speed_of(c.guid, gait);
-    let step = w.navigate(c.guid, (hx, hy), speed * WANDER_HOP_SECS);
+    let step = w.navigate(c.guid, (hx, hy), speed * WANDER_HOP_SECS, 0.0);
     let Some((x, y, dur_ms)) = leg_toward((c.at.x, c.at.y), step, speed) else {
         return;
     };
@@ -1343,7 +1333,7 @@ fn rout<W: RoutSink + MotionSink + IdleSink + EngageSink>(w: &mut W, tick: &Tick
         }
         let run = w.speed_of(c.guid, Gait::Run) * wounded_slow_factor(c.health, c.max_health);
         let away = flee_step(c.at.x, c.at.y, victim_at.x, victim_at.y, FLEE_LEG_YD);
-        let step = w.navigate(c.guid, away, FLEE_LEG_YD);
+        let step = w.navigate(c.guid, away, FLEE_LEG_YD, 0.0);
         let Some((x, y, dur_ms)) = leg_toward((c.at.x, c.at.y), step, run) else {
             continue;
         };
@@ -1441,7 +1431,7 @@ mod chase_leg_tests {
     use super::*;
 
     const DIR: (f32, f32) = (1.0, 0.0);
-    const STOP_AT: Option<(f32, f32)> = Some((19.0, 0.0));
+    const STOP_AT: (f32, f32) = (19.0, 0.0);
 
     fn leg_to(dest_x: f32) -> LegInFlight {
         LegInFlight {
@@ -1468,33 +1458,25 @@ mod chase_leg_tests {
     #[test]
     fn no_leg_in_flight_always_needs_one() {
         assert!(needs_new_leg(None, DIR, STOP_AT));
-        assert!(needs_new_leg(None, DIR, None));
     }
 
     #[test]
-    fn a_stopped_victim_keeps_a_leg_that_still_lands_short_of_the_stop_point() {
+    fn a_leg_that_lands_short_of_the_stop_point_is_kept() {
         assert!(!needs_new_leg(Some(&leg_to(10.0)), DIR, STOP_AT));
     }
 
     #[test]
-    fn a_stopped_victim_keeps_a_leg_landing_exactly_on_the_stop_point() {
+    fn a_leg_landing_exactly_on_the_stop_point_is_kept() {
         assert!(!needs_new_leg(Some(&leg_to(19.0)), DIR, STOP_AT));
     }
 
     #[test]
-    fn a_stopped_victim_replaces_a_leg_that_would_overshoot_the_stop_point() {
+    fn a_leg_that_would_overshoot_the_stop_point_is_replaced() {
         assert!(needs_new_leg(Some(&leg_to(28.0)), DIR, STOP_AT));
     }
 
     #[test]
-    fn a_still_translating_victim_keeps_the_same_overshooting_leg() {
-        assert!(!needs_new_leg(Some(&leg_to(28.0)), DIR, None));
-    }
-
-    #[test]
-    fn a_veered_heading_still_forces_a_new_leg_whatever_the_victim_is_doing() {
-        let off_heading = (0.0, 1.0);
-        assert!(needs_new_leg(Some(&leg_to(19.0)), off_heading, STOP_AT));
-        assert!(needs_new_leg(Some(&leg_to(19.0)), off_heading, None));
+    fn a_veered_heading_forces_a_new_leg() {
+        assert!(needs_new_leg(Some(&leg_to(19.0)), (0.0, 1.0), STOP_AT));
     }
 }

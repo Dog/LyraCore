@@ -2390,10 +2390,12 @@ impl IdleSink for Scenario {
             Gait::Run => lyracore_shared::constants::speeds::RUN,
         }
     }
-    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32) -> (f32, f32) {
+    fn navigate(&self, guid: u64, to: (f32, f32), max_step: f32, stop_dist: f32) -> (f32, f32) {
         let from = self.creatures.borrow()[&guid].at;
-        let aim = self.detours.borrow().get(&guid).copied().unwrap_or(to);
-        chase_step(from.x, from.y, aim.0, aim.1, max_step, 0.0)
+        match self.detours.borrow().get(&guid) {
+            Some(corner) => chase_step(from.x, from.y, corner.0, corner.1, max_step, 0.0),
+            None => chase_step(from.x, from.y, to.0, to.1, max_step, stop_dist),
+        }
     }
     fn roll(&self) -> u32 {
         self.rolls
@@ -4044,11 +4046,29 @@ fn a_creature_that_pulls_is_in_combat_before_the_same_cycle_ends() {
 
 const SETTLED: u64 = 4_000_000;
 
+// Vanilla chase stop: two 0.389 yd bounding radii plus the 0.5 yd contact distance.
+const CONTACT_YD: f32 = 1.278;
+
 fn wolf_fighting(player_at: Point) -> Scenario {
     Scenario::new(SETTLED)
         .creature(WOLF, p(0.0, 0.0, 10.0))
         .at_war(BEASTS, ALLIANCE)
         .player(HUNTER, player_at)
+}
+
+fn near(at: Point, want: Point, tolerance: f32) -> bool {
+    (at.x - want.x).abs() < tolerance && (at.y - want.y).abs() < tolerance && at.z == want.z
+}
+
+fn assert_running_legs_to(w: &Scenario, want: &[Point], why: &str) {
+    let legs = w.effects();
+    assert_eq!(legs.len(), want.len(), "{why}: {legs:?}");
+    for (leg, want) in legs.iter().zip(want) {
+        assert!(
+            leg.run && !leg.facing && leg.dur_ms > 0 && near(leg.dest, *want, 1e-4),
+            "{why}: expected a running leg to {want:?}, got {leg:?}"
+        );
+    }
 }
 
 #[test]
@@ -4058,12 +4078,12 @@ fn a_creature_that_notices_a_player_closes_on_it_in_the_same_cycle() {
     run_cycle(&mut w, tick);
 
     assert_eq!(w.pulls(), [(WOLF, HUNTER, Pull::Noticed)]);
-    let effects = w.effects();
-    assert_eq!(
-        effects.iter().map(|e| (e.dest, e.run)).collect::<Vec<_>>(),
-        [(p(11.0, 0.0, 10.0), true)],
-        "a creature that pulls must start closing in the SAME firing, at a run and to just inside \
-         melee reach; waiting a firing to move is a mob that stares at the player it just aggroed"
+    assert_running_legs_to(
+        &w,
+        &[p(15.0 - CONTACT_YD, 0.0, 10.0)],
+        "a creature that pulls must start closing in the SAME firing, at a run and to the contact \
+         point on its own side; waiting a firing to move is a mob that stares at the player it just \
+         aggroed",
     );
 }
 
@@ -4165,7 +4185,7 @@ fn a_creature_that_reaches_a_standing_victim_stops_and_faces_it() {
         [(rendered, rendered, 0, true, 0.0)],
         "the stop and the turn are ONE facing spline at the point the client renders the creature: \
          two rows land on its single spline row inside one transaction, so the client would receive \
-         the turn alone and ride the lead leg on through the player it is supposed to be swinging at"
+         the turn alone and ride the leg on through the player it is supposed to be swinging at"
     );
     assert!(
         stop[0].spline_id > (launched / 1000) as u32,
@@ -4197,15 +4217,12 @@ fn a_creature_whose_victim_kites_out_of_reach_keeps_chasing() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    assert_eq!(
-        w.effects()
-            .iter()
-            .map(|e| (e.dest, e.dur_ms > 0, e.run))
-            .collect::<Vec<_>>(),
-        [(p(12.0, 0.0, 10.0), true, true)],
+    assert_running_legs_to(
+        &w,
+        &[p(4.0 - CONTACT_YD, 0.0, 10.0)],
         "planting into attack stance the moment a moving victim touches melee reach is the \
-         run/stand/run flicker of chasing someone who never stops; the mob must keep running and \
-         aim PAST them"
+         run/stand/run flicker of chasing someone who never stops; the mob must keep running to the \
+         contact point on its own side of them",
     );
 }
 
@@ -4265,8 +4282,8 @@ fn a_player_who_just_released_the_movement_key_is_standing_at_once() {
             .collect::<Vec<_>>(),
         [(true, 0)],
         "a stop takes effect on the next covered firing, not once a move clock goes quiet: the \
-         creature must turn to the player, and a lead leg thrown at a player who has stopped runs \
-         eight yards through them"
+         creature must turn to the player it already reaches, not keep stepping toward one who \
+         has stopped"
     );
 }
 
@@ -4302,20 +4319,68 @@ fn a_kiter_inside_reach_is_chased_without_a_stop_between_firings() {
         w = w.kiting(HUNTER, p(7.0 + 3.0 * step as f32, 0.0, 10.0));
     }
 
-    assert_eq!(
-        w.effects()
-            .iter()
-            .map(|e| (e.dest, e.run))
-            .collect::<Vec<_>>(),
-        [(p(12.0, 0.0, 10.0), true)],
-        "a genuinely translating victim must be run down on ONE committed leg: a stop between \
-         firings is the run/stand/run flicker, and re-throwing the leg is the client re-computing \
-         its path every tick"
+    assert_running_legs_to(
+        &w,
+        &[
+            p(4.0 - CONTACT_YD, 0.0, 10.0),
+            p(7.0 - CONTACT_YD, 0.0, 10.0),
+            p(10.0 - CONTACT_YD, 0.0, 10.0),
+        ],
+        "a translating victim must be run down with no stop between firings, which is the \
+         run/stand/run flicker, and each leg must end at the contact point short of where the \
+         victim stands, never past them",
     );
 }
 
 #[test]
-fn a_lead_leg_is_stopped_where_it_renders_once_the_victim_stops() {
+fn a_victim_moving_inside_reach_is_never_run_into_or_past_from_any_approach() {
+    for bearing in APPROACHES {
+        let victim = p(3.0 * bearing.cos(), 3.0 * bearing.sin(), 10.0);
+        let mut w = wolf_fighting(victim)
+            .kiting(HUNTER, victim)
+            .attacking(WOLF, HUNTER);
+        let tick = w.tick(false, catch_all());
+        run_cycle(&mut w, tick);
+
+        let stop = p(
+            (3.0 - CONTACT_YD) * bearing.cos(),
+            (3.0 - CONTACT_YD) * bearing.sin(),
+            10.0,
+        );
+        assert_running_legs_to(
+            &w,
+            &[stop],
+            &format!(
+                "a leg thrown at a player who moves in melee must end in front of them on the \
+                 creature's side; a leg past them puts the mob inside or behind the player, who \
+                 then has to turn to keep swinging ({bearing} rad)"
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_victim_moving_inside_contact_distance_is_turned_to_not_chased() {
+    let mut w = wolf_fighting(p(1.0, 0.0, 10.0))
+        .kiting(HUNTER, p(1.0, 0.0, 10.0))
+        .facing(WOLF, std::f32::consts::PI)
+        .attacking(WOLF, HUNTER);
+    let tick = w.tick(false, catch_all());
+    run_cycle(&mut w, tick);
+
+    assert_eq!(
+        w.effects()
+            .iter()
+            .map(|e| (e.dest, e.dur_ms, e.facing, e.facing_angle))
+            .collect::<Vec<_>>(),
+        [(p(0.0, 0.0, 10.0), 0, true, 0.0)],
+        "a creature already in contact with a moving player has nowhere to go but into them; it \
+         must hold its ground and square up"
+    );
+}
+
+#[test]
+fn a_chase_leg_is_stopped_where_it_renders_once_the_victim_stops() {
     let mut w = wolf_fighting(p(6.0, 0.0, 10.0))
         .kiting(HUNTER, p(6.0, 0.0, 10.0))
         .facing(WOLF, std::f32::consts::PI)
@@ -4328,29 +4393,34 @@ fn a_lead_leg_is_stopped_where_it_renders_once_the_victim_stops() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    let rendered = p(3.5, 0.0, 10.0);
     let effects = w.effects();
     assert_eq!(
-        effects
-            .iter()
-            .map(|e| (e.start, e.dest, e.dur_ms, e.facing))
-            .collect::<Vec<_>>(),
-        [
-            (p(0.0, 0.0, 10.0), p(14.0, 0.0, 10.0), 2000, false),
-            (rendered, rendered, 0, true),
-        ],
-        "the leg aimed past a running player has to be ended where the client RENDERS the creature, \
-         and the one row that ends it is the facing row; stopping anywhere else puts the server's \
-         melee reach somewhere the player cannot see the mob"
+        effects.len(),
+        2,
+        "one chase leg, then one stop: {effects:?}"
+    );
+    let (leg, stop) = (effects[0], effects[1]);
+    assert!(
+        near(leg.dest, p(6.0 - CONTACT_YD, 0.0, 10.0), 1e-4) && !leg.facing,
+        "the chase leg must end at the contact point in front of the running player: {leg:?}"
     );
     assert!(
-        effects[1].spline_id > effects[0].spline_id,
-        "the stop must carry a NEWER spline id than the lead leg, or the client keeps the obsolete \
-         leg and runs the eight yards past the player anyway"
+        stop.facing
+            && stop.dur_ms == 0
+            && stop.start == stop.dest
+            && near(stop.dest, p(3.5, 0.0, 10.0), 0.01),
+        "the leg has to be ended where the client RENDERS the creature half a second in, and the \
+         one row that ends it is the facing row; stopping anywhere else puts the server's melee \
+         reach somewhere the player cannot see the mob: {stop:?}"
+    );
+    assert!(
+        stop.spline_id > leg.spline_id,
+        "the stop must carry a NEWER spline id than the chase leg, or the client keeps the \
+         obsolete leg and runs it to its end"
     );
     assert_eq!(
         (w.at(WOLF).at, w.at(WOLF).orientation),
-        (rendered, 0.0),
+        (stop.dest, 0.0),
         "server and client must agree on where the creature stopped and which way it now looks"
     );
 
@@ -4417,7 +4487,7 @@ fn every_chase_leg_travels_at_the_configured_run_speed() {
 }
 
 #[test]
-fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
+fn a_chase_leg_is_replaced_when_the_victim_comes_back_toward_the_creature() {
     let run = lyracore_shared::constants::speeds::RUN;
     let mut w = wolf_fighting(p(20.0, 0.0, 10.0))
         .kiting(HUNTER, p(20.0, 0.0, 10.0))
@@ -4427,7 +4497,7 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
     run_cycle(&mut w, tick);
 
     w.advance_clock(500_000);
-    w = w.kiting(HUNTER, p(23.0, 0.0, 10.0)).stopped(HUNTER);
+    w = w.kiting(HUNTER, p(12.0, 0.0, 10.0)).stopped(HUNTER);
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
@@ -4438,13 +4508,12 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
         "exactly one replacement leg this firing, appended to the first"
     );
     let replacement = legs[1];
-    let rendered = p(3.5, 0.0, 10.0);
-    assert_eq!(
-        (replacement.start, replacement.dest),
-        (rendered, p(19.0, 0.0, 10.0)),
-        "the replacement must start where the client RENDERS the creature now, and land \
-         MELEE_STOP_SHORT_YD short of the victim's new position — riding the old lead leg carries \
-         the creature eight yards past a player who has already stopped"
+    assert!(
+        near(replacement.start, p(3.5, 0.0, 10.0), 0.01)
+            && near(replacement.dest, p(12.0 - CONTACT_YD, 0.0, 10.0), 1e-4),
+        "the replacement must start where the client RENDERS the creature now and end at the \
+         contact point in front of the victim's new position; riding the old leg carries the \
+         creature through a player who came back toward it: {replacement:?}"
     );
     let travelled = ((replacement.dest.x - replacement.start.x).powi(2)
         + (replacement.dest.y - replacement.start.y).powi(2))
@@ -4459,7 +4528,7 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
     assert!(
         replacement.spline_id > legs[0].spline_id,
         "the replacement must carry a NEWER spline id, or the client keeps riding the obsolete \
-         lead leg through the player"
+         leg through the player"
     );
 
     for _ in 0..8 {
@@ -4467,25 +4536,17 @@ fn a_lead_leg_is_replaced_when_the_victim_stops_short_of_reach() {
         let tick = w.tick(false, catch_all());
         run_cycle(&mut w, tick);
         assert!(
-            w.at(WOLF).at.x <= 23.0 + 0.01,
-            "the creature's authoritative position must never pass the victim it stopped short of, \
-             got x = {}",
+            w.at(WOLF).at.x <= 12.0 - CONTACT_YD + 1e-4,
+            "the creature's authoritative position must never pass the contact point in front of \
+             the victim, got x = {}",
             w.at(WOLF).at.x
         );
     }
-    let stop = p(19.0, 0.0, 10.0);
     let last = w.effects().last().copied().expect("at least one effect");
-    assert_eq!(
-        (
-            last.start,
-            last.dest,
-            last.dur_ms,
-            last.facing,
-            last.facing_angle
-        ),
-        (stop, stop, 0, true, 0.0),
-        "the fight must settle on ONE facing spline at the stop point, squared up on the player: \
-         a positional leg as the last word means the creature overshot them"
+    assert!(
+        last.facing && last.dur_ms == 0 && last.start == last.dest && last.facing_angle == 0.0,
+        "the fight must settle on ONE facing spline, squared up on the player: a positional leg \
+         as the last word means the creature overshot them: {last:?}"
     );
 }
 
@@ -4505,15 +4566,12 @@ fn a_creature_victim_with_a_leg_in_flight_is_chased_like_a_kiting_player() {
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    assert_eq!(
-        w.effects()
-            .iter()
-            .map(|e| (e.dest, e.dur_ms > 0, e.run))
-            .collect::<Vec<_>>(),
-        [(p(12.0, 0.0, 10.0), true, true)],
-        "a creature or pet victim mid-leg, inside melee reach, must be chased with a lead exactly \
-         like a kiting player — the Fake derives its translation flags from the leg the cycle is \
-         already moving it along"
+    assert_running_legs_to(
+        &w,
+        &[p(4.0 - CONTACT_YD, 0.0, 10.0)],
+        "a creature or pet victim mid-leg, inside melee reach, must be chased exactly like a \
+         kiting player — the Fake derives its translation flags from the leg the cycle is already \
+         moving it along",
     );
 }
 
@@ -4525,15 +4583,12 @@ fn a_stopped_victim_outside_reach_with_no_leg_in_flight_still_gets_a_closing_leg
     let tick = w.tick(false, catch_all());
     run_cycle(&mut w, tick);
 
-    assert_eq!(
-        w.effects()
-            .iter()
-            .map(|e| (e.dest, e.dur_ms > 0, e.run))
-            .collect::<Vec<_>>(),
-        [(p(11.0, 0.0, 10.0), true, true)],
+    assert_running_legs_to(
+        &w,
+        &[p(15.0 - CONTACT_YD, 0.0, 10.0)],
         "a standing victim outside melee reach with nothing already in flight must still get a \
          closing leg to the stop point — the re-aim rule for a leg already in flight must not \
-         swallow the ordinary no-leg case"
+         swallow the ordinary no-leg case",
     );
 }
 
@@ -4568,7 +4623,7 @@ fn an_offensive_caster_holds_at_its_spell_range() {
 }
 
 #[test]
-fn a_caster_whose_victim_stops_inside_reach_turns_and_halts_its_lead() {
+fn a_caster_whose_victim_stops_inside_reach_turns_and_halts_its_leg() {
     let launched = SETTLED - 500_000;
     let mut w = wolf_fighting(p(7.0, 0.0, 10.0))
         .caster(WOLF, 30.0)
@@ -4592,8 +4647,8 @@ fn a_caster_whose_victim_stops_inside_reach_turns_and_halts_its_lead() {
             .collect::<Vec<_>>(),
         [(rendered, rendered, 0, true, 0.0)],
         "a caster is not exempt from melee reach: facing is the only thing that HALTS a leg, so one \
-         that holds before it turns slides its lead straight past the player who stopped on top of \
-         it and never faces what it is fighting"
+         that holds before it turns slides along its leg straight past the player who stopped on \
+         top of it and never faces what it is fighting"
     );
     assert_eq!((w.at(WOLF).at, w.at(WOLF).orientation), (rendered, 0.0));
 }
@@ -4623,7 +4678,7 @@ fn a_blocked_chase_goes_around_instead_of_through() {
 
     assert_eq!(
         w.effects().first().map(|e| e.dest),
-        Some(p(0.0, 16.0, 10.0)),
+        Some(p(0.0, 20.0, 10.0)),
         "a chase leg must head for the detour corner navigation returns, or the mob walks into the \
          geometry between it and its victim and stands there swinging at nothing"
     );
@@ -4818,11 +4873,11 @@ fn a_creature_re_points_at_a_stronger_threat_and_chases_it_in_the_same_cycle() {
         "the creature must fight whoever out-threats its current target, or a healer can never \
          pull a mob off the player it first aggroed"
     );
-    assert_eq!(
-        w.effects().first().map(|e| e.dest),
-        Some(p(16.0, 0.0, 10.0)),
+    assert_running_legs_to(
+        &w,
+        &[p(20.0 - CONTACT_YD, 0.0, 10.0)],
         "the retarget must land BEFORE the movement decision, or the creature spends the firing \
-         running at the player it no longer fights and only turns round on the next one"
+         running at the player it no longer fights and only turns round on the next one",
     );
 }
 
@@ -5119,14 +5174,15 @@ fn a_pet_takes_its_owners_foe_and_closes_on_it_in_the_same_cycle() {
          that follows the warlock around watching them die"
     );
     assert_eq!(
-        w.effects()
-            .iter()
-            .map(|e| (e.guid, e.dest, e.run))
-            .collect::<Vec<_>>(),
-        [(IMP, p(16.0, 0.0, 10.0), true)],
+        w.effects().iter().map(|e| e.guid).collect::<Vec<_>>(),
+        [IMP]
+    );
+    assert_running_legs_to(
+        &w,
+        &[p(20.0 - CONTACT_YD, 0.0, 10.0)],
         "the pet phase runs before chase, so the pet it just armed must close in the SAME firing \
          through the chase every other creature uses; waiting a firing is a pet that stares at the \
-         foe its owner is already fighting"
+         foe its owner is already fighting",
     );
 }
 
