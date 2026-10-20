@@ -222,7 +222,7 @@ impl AuctionActionStore for crate::stdb::Coordinator {
                 .collect();
             (
                 u8::try_from(player.level).unwrap_or(u8::MAX),
-                crate::codec::armor_proficiency(
+                crate::codec::learned_proficiency(
                     ((player.unit_bytes_0 >> 8) & 0xff) as u8,
                     &learned,
                 ),
@@ -1144,9 +1144,13 @@ mod tests {
         Proficiency::derive(player_class, false, false)
     }
 
+    fn knowing_swords(player_class: u8) -> Proficiency {
+        crate::codec::learned_proficiency(player_class, &[201])
+    }
+
     #[test]
     fn browse_supports_every_exact_filter_and_the_existing_usable_model() {
-        assert!(browse_matches(&request(), 15, untrained(1), facts()));
+        assert!(browse_matches(&request(), 15, knowing_swords(1), facts()));
 
         let mismatches = [
             AuctionBrowseRequest {
@@ -1179,9 +1183,9 @@ mod tests {
             },
         ];
         for mismatch in mismatches {
-            assert!(!browse_matches(&mismatch, 15, untrained(1), facts()));
+            assert!(!browse_matches(&mismatch, 15, knowing_swords(1), facts()));
         }
-        assert!(!browse_matches(&request(), 14, untrained(1), facts()));
+        assert!(!browse_matches(&request(), 14, knowing_swords(1), facts()));
         assert!(!browse_matches(&request(), 15, untrained(5), facts()));
         assert!(browse_matches(
             &AuctionBrowseRequest {
@@ -1236,6 +1240,12 @@ mod tests {
             Proficiency::derive(8, true, true),
             plate
         ));
+    }
+
+    #[test]
+    fn the_usable_filter_follows_learned_weapon_spells() {
+        assert!(!browse_matches(&request(), 15, untrained(1), facts()));
+        assert!(browse_matches(&request(), 15, knowing_swords(1), facts()));
     }
 
     fn auction(id: u32) -> Auction {

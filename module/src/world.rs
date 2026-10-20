@@ -686,6 +686,13 @@ pub(crate) fn apply_player_login(
     crate::mount::restore_mount_on_rebuild(ctx, character_guid);
 
     crate::items::grant_starter_item(ctx, character.guid, owner)?;
+    crate::spell::spellbook::grant_createinfo_spells(
+        ctx,
+        character.guid,
+        owner,
+        character.race,
+        character.class,
+    );
 
     crate::skill::ensure_player_skills(
         ctx,

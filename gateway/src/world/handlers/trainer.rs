@@ -180,7 +180,20 @@ impl<St: CharacterStore + NpcStore + TrainerStore + ?Sized> ProtocolFamily<St> f
                         if teaches_armor_proficiency(spell_id)
                             || teaches_armor_proficiency(resolved)
                         {
-                            append_armor_proficiency(&mut outbound, store, self_guid)?;
+                            append_proficiency(
+                                &mut outbound,
+                                store,
+                                self_guid,
+                                codec::build_armor_proficiency_msg,
+                            );
+                        }
+                        if lyracore_shared::item::is_weapon_proficiency_spell(resolved) {
+                            append_proficiency(
+                                &mut outbound,
+                                store,
+                                self_guid,
+                                codec::build_weapon_proficiency_msg,
+                            );
                         }
                     }
                     TrainerBuyOutcome::Refused(reason) => {
@@ -268,21 +281,15 @@ fn teaches_armor_proficiency(spell_id: u32) -> bool {
     )
 }
 
-fn append_armor_proficiency<St: CharacterStore + TrainerStore + ?Sized>(
+fn append_proficiency<St: CharacterStore + TrainerStore + ?Sized>(
     outbound: &mut Vec<Outbound>,
     store: &St,
     self_guid: u64,
-) -> Result<()> {
+    build: fn(u8, &[u32]) -> ServerOpcodeMessage,
+) {
     let learned = store.player_learned_spells(self_guid).unwrap_or_default();
-    let Some((_, _, player_class, _)) = store.character_presence(self_guid).ok().flatten() else {
-        return Ok(());
-    };
-    {
-        outbound.push(Outbound::One(codec::build_armor_proficiency_msg(
-            player_class,
-            &learned,
-        )));
-        Ok(())
+    if let Some((_, _, player_class, _)) = store.character_presence(self_guid).ok().flatten() {
+        outbound.push(Outbound::One(build(player_class, &learned)));
     }
 }
 
