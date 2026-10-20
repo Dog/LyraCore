@@ -202,23 +202,87 @@ fn inventory_changes_preserve_accepted_trade_items() {
         .is_empty());
 }
 
+fn assert_refused(shard: &Standalone, verb: &str, args: &[&str], refusal: &str) {
+    let before = shard.query_rows("SELECT * FROM game_item_instance");
+    let result = shard.call(verb, args);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!result.status.success(), "{verb} {args:?} succeeded");
+    assert!(output.contains(refusal), "{verb} {args:?}: {output}");
+    assert_eq!(shard.query_rows("SELECT * FROM game_item_instance"), before);
+}
+
+fn slot_of(shard: &Standalone, entry: u32) -> Vec<String> {
+    shard
+        .query_rows(&format!(
+            "SELECT slot FROM game_item_instance WHERE owner_guid = 1 AND entry = {entry}"
+        ))
+        .into_iter()
+        .map(|row| row["slot"].clone())
+        .collect()
+}
+
 #[test]
 #[ignore = "requires the SpacetimeDB 2.7.1 CLI and Wasm toolchain"]
-fn two_handed_weapons_and_offhand_items_cannot_be_equipped_together() {
+fn a_two_handed_weapon_moves_the_off_hand_item_to_a_free_slot() {
+    const TWO_HANDER: u32 = 5090050;
+    const ONE_HANDER: u32 = 5090052;
+    const SHIELD: u32 = 5090054;
     let shard = fixture("inventory-two-hand");
-    shard.assert_sql("UPDATE game_item_template SET class = 2, subclass = 8, inventory_type = 17 WHERE entry = 5090050");
-    shard.assert_sql("UPDATE game_item_template SET class = 4, subclass = 6, inventory_type = 14 WHERE entry = 5090054");
-    shard.assert_call("debug_grant_item", &["1", "5090050", "1"]);
-    shard.assert_call("debug_grant_item", &["1", "5090054", "1"]);
+    shard.assert_call("debug_learn_spell", &["1", "201"]);
+    shard.assert_call("debug_learn_spell", &["1", "202"]);
+    shard.assert_sql(&format!("UPDATE game_item_template SET class = 2, subclass = 8, inventory_type = 17 WHERE entry = {TWO_HANDER}"));
+    shard.assert_sql(&format!("UPDATE game_item_template SET class = 2, subclass = 7, inventory_type = 13, max_stack = 1 WHERE entry = {ONE_HANDER}"));
+    shard.assert_sql(&format!("UPDATE game_item_template SET class = 4, subclass = 6, inventory_type = 14 WHERE entry = {SHIELD}"));
+    shard.assert_call("debug_grant_item", &["1", &TWO_HANDER.to_string(), "1"]);
+    shard.assert_call("debug_grant_item", &["1", &SHIELD.to_string(), "1"]);
     shard.assert_call("gw_move_item", &[ACTOR, "24", "16"]);
-    let before = shard.query_rows("SELECT * FROM game_item_instance");
-    assert!(!shard.call("gw_equip_item", &[ACTOR, "23"]).status.success());
-    assert_eq!(shard.query_rows("SELECT * FROM game_item_instance"), before);
-    shard.assert_call("gw_move_item", &[ACTOR, "16", "24"]);
+
     shard.assert_call("gw_equip_item", &[ACTOR, "23"]);
-    let before = shard.query_rows("SELECT * FROM game_item_instance");
-    assert!(!shard.call("gw_equip_item", &[ACTOR, "24"]).status.success());
-    assert_eq!(shard.query_rows("SELECT * FROM game_item_instance"), before);
-    shard.assert_call("gw_move_item", &[ACTOR, "15", "23"]);
-    shard.assert_call("gw_equip_item", &[ACTOR, "24"]);
+    assert_eq!(slot_of(&shard, TWO_HANDER), ["15"]);
+    assert_eq!(slot_of(&shard, SHIELD), ["23"]);
+
+    assert_refused(
+        &shard,
+        "gw_equip_item",
+        &[ACTOR, "23"],
+        "item:two_handed_weapon_equipped",
+    );
+    assert_refused(
+        &shard,
+        "gw_move_item",
+        &[ACTOR, "23", "16"],
+        "item:two_handed_weapon_equipped",
+    );
+
+    shard.assert_call("gw_move_item", &[ACTOR, "15", "24"]);
+    shard.assert_call("gw_move_item", &[ACTOR, "23", "16"]);
+    shard.assert_call("debug_grant_item", &["1", &ONE_HANDER.to_string(), "15"]);
+    shard.assert_call("gw_move_item", &[ACTOR, "38", "15"]);
+    shard.assert_call("debug_grant_item", &["1", &ONE_HANDER.to_string(), "1"]);
+    assert_refused(
+        &shard,
+        "gw_move_item",
+        &[ACTOR, "24", "15"],
+        "item:inventory_full",
+    );
+    assert_refused(
+        &shard,
+        "gw_equip_item",
+        &[ACTOR, "24"],
+        "item:inventory_full",
+    );
+
+    shard.assert_call("gw_destroy_item", &[ACTOR, "30", "0"]);
+    shard.assert_call("gw_move_item", &[ACTOR, "24", "15"]);
+    assert_eq!(slot_of(&shard, TWO_HANDER), ["15"]);
+    assert_eq!(slot_of(&shard, SHIELD), ["30"]);
+    assert_eq!(
+        shard.query_rows("SELECT entry FROM game_item_instance WHERE owner_guid = 1 AND slot = 24")
+            [0]["entry"],
+        ONE_HANDER.to_string()
+    );
 }

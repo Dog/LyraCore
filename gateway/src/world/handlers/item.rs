@@ -27,6 +27,7 @@ pub(crate) enum ReadableItem {
 pub(crate) trait ItemActionStore: Send + Sync {
     fn item_name(&self, entry: u32) -> Result<Option<String>>;
     fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem>;
+    fn item_guid(&self, owner_guid: u64, slot: u8) -> Option<u64>;
     fn destroy_item(&self, actor: Actor, slot: u8, count: u32) -> Result<ItemActionResult>;
     fn equip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult>;
     fn unequip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult>;
@@ -41,55 +42,54 @@ pub(crate) trait ItemActionStore: Send + Sync {
     ) -> Result<ItemActionResult>;
 }
 
-fn act(
+fn act<St: ItemActionStore + ?Sized>(
+    store: &St,
     player: &ProtocolSession,
     operation: &str,
+    slots: [Option<u8>; 2],
     request: impl FnOnce(Actor) -> Result<ItemActionResult>,
 ) -> Result<ProtocolReply> {
-    let result = match player.self_guid().and_then(Actor::new) {
-        Some(actor) => request(actor)?,
+    let refusal = match player.self_guid().and_then(Actor::new) {
+        Some(actor) => match request(actor)? {
+            ItemActionResult::Done => return Ok(ProtocolReply::from(Vec::new())),
+            ItemActionResult::Refused(refusal) => refusal,
+        },
         None => {
             log::warn!(
                 "world: {operation} has no resolved actor (account {})",
                 player.account_id
             );
-            ItemRefusal::Internal.into()
+            ItemRefusal::Internal
         }
     };
-    Ok(ProtocolReply::from(inventory_action_outbound(
-        player.account_id,
-        operation,
-        result,
-    )))
+    Ok(refuse(store, player, operation, refusal, slots))
 }
 
-fn refuse(player: &ProtocolSession, operation: &str, refusal: ItemRefusal) -> ProtocolReply {
-    ProtocolReply::from(inventory_action_outbound(
-        player.account_id,
-        operation,
-        refusal.into(),
-    ))
-}
-
-fn inventory_action_outbound(
-    account_id: u64,
+// `slots` hold the items the client locked for this request.
+fn refuse<St: ItemActionStore + ?Sized>(
+    store: &St,
+    player: &ProtocolSession,
     operation: &str,
-    result: ItemActionResult,
-) -> Vec<Outbound> {
-    match result {
-        ItemActionResult::Done => Vec::new(),
-        ItemActionResult::Refused(refusal) => {
-            log::debug!(
-                "world: {operation} refused (account {account_id}): {}",
-                refusal.as_tag()
-            );
-            vec![Outbound::One(
-                ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
-                    codec::build_inventory_refusal(refusal),
-                )),
-            )]
-        }
-    }
+    refusal: ItemRefusal,
+    slots: [Option<u8>; 2],
+) -> ProtocolReply {
+    log::debug!(
+        "world: {operation} refused (account {}): {}",
+        player.account_id,
+        refusal.as_tag()
+    );
+    let [item1, item2] = slots.map(|slot| {
+        player
+            .self_guid()
+            .zip(slot)
+            .and_then(|(owner, slot)| store.item_guid(owner, slot))
+            .unwrap_or(0)
+    });
+    ProtocolReply::from(vec![Outbound::One(
+        ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(Box::new(
+            codec::build_inventory_refusal(refusal, item1, item2),
+        )),
+    )])
 }
 
 pub(crate) struct Item;
@@ -105,25 +105,50 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
         match msg {
             ClientOpcodeMessage::CMSG_DESTROYITEM(c) => {
                 match codec::inventory_slot(c.bag, c.slot) {
-                    Some(slot) => act(player, "destroy_item", |actor| {
+                    Some(slot) => act(store, player, "destroy_item", [Some(slot), None], |actor| {
                         store.destroy_item(actor, slot, u32::from(c.amount))
                     }),
-                    None => Ok(refuse(player, "destroy_item", ItemRefusal::WrongSlot)),
+                    None => Ok(refuse(
+                        store,
+                        player,
+                        "destroy_item",
+                        ItemRefusal::WrongSlot,
+                        [None, None],
+                    )),
                 }
             }
-            ClientOpcodeMessage::CMSG_SPLIT_ITEM(c) => match (
-                codec::inventory_slot(c.source_bag, c.source_slot),
-                codec::inventory_slot(c.destination_bag, c.destination_slot),
-            ) {
-                (Some(source), Some(destination)) => act(player, "split_item", |actor| {
-                    store.split_item(actor, source, destination, u32::from(c.amount))
-                }),
-                _ => Ok(refuse(player, "split_item", ItemRefusal::WrongSlot)),
-            },
+            ClientOpcodeMessage::CMSG_SPLIT_ITEM(c) => {
+                let slots = [
+                    codec::inventory_slot(c.source_bag, c.source_slot),
+                    codec::inventory_slot(c.destination_bag, c.destination_slot),
+                ];
+                match slots {
+                    [Some(source), Some(destination)] => {
+                        act(store, player, "split_item", slots, |actor| {
+                            store.split_item(actor, source, destination, u32::from(c.amount))
+                        })
+                    }
+                    _ => Ok(refuse(
+                        store,
+                        player,
+                        "split_item",
+                        ItemRefusal::WrongSlot,
+                        slots,
+                    )),
+                }
+            }
             ClientOpcodeMessage::CMSG_AUTOEQUIP_ITEM(c) => {
                 match codec::inventory_slot(c.source_bag, c.source_slot) {
-                    Some(slot) => act(player, "equip_item", |actor| store.equip_item(actor, slot)),
-                    None => Ok(refuse(player, "equip_item", ItemRefusal::WrongSlot)),
+                    Some(slot) => act(store, player, "equip_item", [Some(slot), None], |actor| {
+                        store.equip_item(actor, slot)
+                    }),
+                    None => Ok(refuse(
+                        store,
+                        player,
+                        "equip_item",
+                        ItemRefusal::WrongSlot,
+                        [None, None],
+                    )),
                 }
             }
             ClientOpcodeMessage::CMSG_AUTOSTORE_BAG_ITEM(c)
@@ -131,32 +156,66 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                     && c.destination_bag == MAIN_BAG
                     && c.source_slot <= EQUIP_SLOT_END =>
             {
-                act(player, "unequip_item", |actor| {
-                    store.unequip_item(actor, c.source_slot)
-                })
+                act(
+                    store,
+                    player,
+                    "unequip_item",
+                    [Some(c.source_slot), None],
+                    |actor| store.unequip_item(actor, c.source_slot),
+                )
             }
-            ClientOpcodeMessage::CMSG_AUTOSTORE_BAG_ITEM(_) => {
-                Ok(refuse(player, "autostore", ItemRefusal::NotRightNow))
+            ClientOpcodeMessage::CMSG_AUTOSTORE_BAG_ITEM(c) => Ok(refuse(
+                store,
+                player,
+                "autostore",
+                ItemRefusal::NotRightNow,
+                [codec::inventory_slot(c.source_bag, c.source_slot), None],
+            )),
+            ClientOpcodeMessage::CMSG_SWAP_INV_ITEM(c) => {
+                let (source, destination) = (c.source_slot.as_int(), c.destination_slot.as_int());
+                act(
+                    store,
+                    player,
+                    "move_item",
+                    [Some(source), Some(destination)],
+                    |actor| store.move_item(actor, source, destination),
+                )
             }
-            ClientOpcodeMessage::CMSG_SWAP_INV_ITEM(c) => act(player, "move_item", |actor| {
-                store.move_item(actor, c.source_slot.as_int(), c.destination_slot.as_int())
-            }),
-            ClientOpcodeMessage::CMSG_SWAP_ITEM(c) => match (
-                codec::inventory_slot(c.source_bag, c.source_slot),
-                codec::inventory_slot(c.destination_bag, c.destionation_slot),
-            ) {
-                (Some(source), Some(destination)) => act(player, "move_item", |actor| {
-                    store.move_item(actor, source, destination)
-                }),
-                _ => Ok(refuse(player, "move_item", ItemRefusal::WrongSlot)),
-            },
+            ClientOpcodeMessage::CMSG_SWAP_ITEM(c) => {
+                let slots = [
+                    codec::inventory_slot(c.source_bag, c.source_slot),
+                    codec::inventory_slot(c.destination_bag, c.destionation_slot),
+                ];
+                match slots {
+                    [Some(source), Some(destination)] => {
+                        act(store, player, "move_item", slots, |actor| {
+                            store.move_item(actor, source, destination)
+                        })
+                    }
+                    _ => Ok(refuse(
+                        store,
+                        player,
+                        "move_item",
+                        ItemRefusal::WrongSlot,
+                        slots,
+                    )),
+                }
+            }
             ClientOpcodeMessage::CMSG_USE_ITEM(c) => {
                 let Some(slot) = codec::inventory_slot(c.bag_index, c.bag_slot) else {
-                    return Ok(refuse(player, "use_item", ItemRefusal::WrongSlot));
+                    return Ok(refuse(
+                        store,
+                        player,
+                        "use_item",
+                        ItemRefusal::WrongSlot,
+                        [None, None],
+                    ));
                 };
                 match item_started_quest(store, player, slot)? {
                     Some(outbound) => Ok(ProtocolReply::from(outbound)),
-                    None => act(player, "use_item", |actor| store.use_item(actor, slot)),
+                    None => act(store, player, "use_item", [Some(slot), None], |actor| {
+                        store.use_item(actor, slot)
+                    }),
                 }
             }
             // An unknown entry gets no reply, as in vmangos.
@@ -177,7 +236,13 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                     codec::inventory_slot(c.bag_index, c.slot),
                     player.self_guid(),
                 ) else {
-                    return Ok(refuse(player, "read_item", ItemRefusal::ItemNotFound));
+                    return Ok(refuse(
+                        store,
+                        player,
+                        "read_item",
+                        ItemRefusal::ItemNotFound,
+                        [None, None],
+                    ));
                 };
                 match store.readable_item(owner, slot)? {
                     ReadableItem::Pages { item_guid } => {
@@ -191,9 +256,13 @@ impl<St: ItemActionStore + QuestActionStore + ?Sized> ProtocolFamily<St> for Ite
                             ))),
                         ]))
                     }
-                    ReadableItem::Missing | ReadableItem::NoPages => {
-                        Ok(refuse(player, "read_item", ItemRefusal::ItemNotFound))
-                    }
+                    ReadableItem::Missing | ReadableItem::NoPages => Ok(refuse(
+                        store,
+                        player,
+                        "read_item",
+                        ItemRefusal::ItemNotFound,
+                        [None, None],
+                    )),
                 }
             }
             other => Err(anyhow!("opcode routed to wrong Protocol Family: {other}")),
@@ -227,6 +296,7 @@ pub(super) mod tests {
         pub(crate) names: Vec<(u32, String)>,
         pub(crate) readable: Option<ReadableItem>,
         pub(crate) read_requests: Mutex<Vec<(u64, u8)>>,
+        pub(crate) item_guids: Vec<(u8, u64)>,
     }
 
     impl InMemoryItemActions {
@@ -257,6 +327,13 @@ pub(super) mod tests {
         fn readable_item(&self, owner_guid: u64, slot: u8) -> Result<ReadableItem> {
             self.read_requests.lock().unwrap().push((owner_guid, slot));
             Ok(self.readable.unwrap_or(ReadableItem::Missing))
+        }
+
+        fn item_guid(&self, _owner_guid: u64, slot: u8) -> Option<u64> {
+            self.item_guids
+                .iter()
+                .find(|(known, _)| *known == slot)
+                .map(|(_, guid)| *guid)
         }
 
         fn destroy_item(&self, _actor: Actor, _slot: u8, _count: u32) -> Result<ItemActionResult> {
@@ -604,6 +681,66 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn swap_refusal_names_the_moved_item_and_the_destination_item() {
+        use wow_world_messages::vanilla::SMSG_INVENTORY_CHANGE_FAILURE as Failure;
+        const TWO_HANDER: u64 = 0x4000_0000_0000_0017;
+        const MAIN_HAND_WEAPON: u64 = 0x4000_0000_0000_0015;
+        let actions = InMemoryItemActions {
+            move_result: Some(ItemRefusal::InventoryFull.into()),
+            item_guids: vec![(23, TWO_HANDER), (15, MAIN_HAND_WEAPON)],
+            ..Default::default()
+        };
+
+        let outbound = handled_outbound(
+            Item::handle(
+                &actions,
+                &mut player(),
+                ClientOpcodeMessage::CMSG_SWAP_INV_ITEM(CMSG_SWAP_INV_ITEM {
+                    source_slot: ItemSlot::Inventory0,
+                    destination_slot: ItemSlot::MainHand,
+                })
+                .into(),
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+                outbound.as_slice(),
+                [Outbound::One(ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(failure))]
+                    if **failure == Failure::InventoryFull {
+                        item1: Guid::new(TWO_HANDER),
+                        item2: Guid::new(MAIN_HAND_WEAPON),
+                        bag_type_subclass: 0,
+                    }
+        ));
+    }
+
+    #[test]
+    fn unsupported_autostore_names_the_item_it_refuses() {
+        use wow_world_messages::vanilla::SMSG_INVENTORY_CHANGE_FAILURE as Failure;
+        const SHIELD: u64 = 0x4000_0000_0000_0016;
+        let actions = InMemoryItemActions {
+            item_guids: vec![(16, SHIELD)],
+            ..Default::default()
+        };
+
+        let outbound = handled_outbound(
+            Item::handle(&actions, &mut player(), unequip(16, 19).into()).unwrap(),
+        );
+
+        assert!(matches!(
+            outbound.as_slice(),
+            [Outbound::One(ServerOpcodeMessage::SMSG_INVENTORY_CHANGE_FAILURE(failure))]
+                if **failure == Failure::CantDoRightNow {
+                    item1: Guid::new(SHIELD),
+                    item2: Guid::new(0),
+                    bag_type_subclass: 0,
+                }
+        ));
+        assert_no_durable_requests(&actions);
+    }
+
+    #[test]
     fn invalid_bag_position_returns_a_refusal_without_a_durable_request() {
         let actions = InMemoryItemActions::default();
 
@@ -721,7 +858,8 @@ pub(super) mod tests {
     fn every_module_refusal_has_one_client_result_code() {
         use wow_world_messages::vanilla::SMSG_INVENTORY_CHANGE_FAILURE as Failure;
         use wow_world_messages::Guid;
-        let (item1, item2, bag_type_subclass) = (Guid::new(0), Guid::new(0), 0u8);
+        const EQUIPPED_ITEM: u64 = 0x4000_0000_0000_0024;
+        let (item1, item2, bag_type_subclass) = (Guid::new(EQUIPPED_ITEM), Guid::new(0), 0u8);
         let expected = |refusal| match refusal {
             ItemRefusal::Indestructible => Failure::CantDropSoulbound {
                 item1,
@@ -749,6 +887,11 @@ pub(super) mod tests {
                 bag_type_subclass,
             },
             ItemRefusal::CannotEquip => Failure::ItemCantBeEquipped {
+                item1,
+                item2,
+                bag_type_subclass,
+            },
+            ItemRefusal::TwoHandedWeaponEquipped => Failure::CantEquipWithTwohanded {
                 item1,
                 item2,
                 bag_type_subclass,
@@ -797,6 +940,7 @@ pub(super) mod tests {
         for refusal in ItemRefusal::ALL {
             let actions = InMemoryItemActions {
                 equip_result: Some(refusal.into()),
+                item_guids: vec![(24, EQUIPPED_ITEM)],
                 ..Default::default()
             };
 

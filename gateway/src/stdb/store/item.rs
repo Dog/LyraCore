@@ -43,6 +43,15 @@ impl ItemActionStore for Coordinator {
         })
     }
 
+    fn item_guid(&self, owner_guid: u64, slot: u8) -> Option<u64> {
+        self.0
+            .coord()
+            .item_rows(owner_guid)
+            .into_iter()
+            .find(|item| item.slot == slot)
+            .map(|item| item.guid)
+    }
+
     fn equip_item(&self, actor: Actor, from_slot: u8) -> Result<ItemActionResult> {
         let coord = self.0.call_pipe();
         item_action(call_reducer!(

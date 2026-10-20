@@ -35,6 +35,7 @@ pub enum ItemRefusal {
     InventoryFull,
     WrongSlot,
     CannotEquip,
+    TwoHandedWeaponEquipped,
     NoProficiency,
     RequiredSkill,
     RequiredReputation,
@@ -48,11 +49,12 @@ pub enum ItemRefusal {
 }
 
 impl ItemRefusal {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ItemNotFound,
         Self::InventoryFull,
         Self::WrongSlot,
         Self::CannotEquip,
+        Self::TwoHandedWeaponEquipped,
         Self::NoProficiency,
         Self::RequiredSkill,
         Self::RequiredReputation,
@@ -71,6 +73,7 @@ impl ItemRefusal {
             Self::InventoryFull => "item:inventory_full",
             Self::WrongSlot => "item:wrong_slot",
             Self::CannotEquip => "item:cannot_equip",
+            Self::TwoHandedWeaponEquipped => "item:two_handed_weapon_equipped",
             Self::NoProficiency => "item:no_proficiency",
             Self::RequiredSkill => "item:required_skill",
             Self::RequiredReputation => "item:required_reputation",
