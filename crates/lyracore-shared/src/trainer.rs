@@ -143,20 +143,9 @@ pub struct LearnEffect {
     pub trigger_spell: u32,
 }
 
+// The importer turns LEARN_SPELL into E_SCRIPTED. Stances and forms carry a trigger spell too.
 pub fn learn_target_trigger(kind: u8, trigger_spell: u32) -> Option<u32> {
-    use crate::spell::taxonomy::{
-        A_FLAG, A_PERIODIC_TRIGGER, A_PROC_DAMAGE, A_PROC_TRIGGER, E_TRIGGER,
-    };
-    (trigger_spell != 0
-        && ![
-            A_PERIODIC_TRIGGER,
-            A_FLAG,
-            A_PROC_TRIGGER,
-            A_PROC_DAMAGE,
-            E_TRIGGER,
-        ]
-        .contains(&kind))
-    .then_some(trigger_spell)
+    (trigger_spell != 0 && kind == crate::spell::taxonomy::E_SCRIPTED).then_some(trigger_spell)
 }
 
 pub fn resolve_learn_target(spell_id: u32, effects: impl IntoIterator<Item = LearnEffect>) -> u32 {
@@ -212,6 +201,10 @@ pub fn offering_state(known: bool, level: u32, required_level: u32) -> OfferingS
 #[cfg(test)]
 mod rule_tests {
     use super::*;
+    use crate::spell::taxonomy::{
+        A_FLAG, A_MOD_STAT, A_PERIODIC_TRIGGER, A_PROC_DAMAGE, A_PROC_TRIGGER, A_STEALTH, E_DAMAGE,
+        E_SCRIPTED, E_SET_STANCE, E_TRIGGER,
+    };
 
     #[test]
     fn wrapper_resolution_orders_eligible_effects_by_index_then_id() {
@@ -219,19 +212,19 @@ mod rule_tests {
             LearnEffect {
                 index: 2,
                 id: 1,
-                kind: 0,
+                kind: E_SCRIPTED,
                 trigger_spell: 100,
             },
             LearnEffect {
                 index: 1,
                 id: 8,
-                kind: 0,
+                kind: E_SCRIPTED,
                 trigger_spell: 200,
             },
             LearnEffect {
                 index: 1,
                 id: 7,
-                kind: 0,
+                kind: E_SCRIPTED,
                 trigger_spell: 300,
             },
         ];
@@ -240,41 +233,64 @@ mod rule_tests {
     }
 
     #[test]
-    fn wrapper_resolution_ignores_all_trigger_and_proc_kinds() {
-        let excluded = [0x93, 0xBE, 0xAB, 0xB4, 0x05];
-        for kind in excluded {
+    fn a_spell_that_only_triggers_another_spell_resolves_to_itself() {
+        const BATTLE_STANCE: u32 = 2457;
+        const BATTLE_STANCE_PASSIVE: u32 = 21156;
+        let triggering_kinds = [
+            ("stance or form", E_SET_STANCE),
+            ("stealth", A_STEALTH),
+            ("periodic trigger", E_TRIGGER),
+            ("periodic trigger aura", A_PERIODIC_TRIGGER),
+            ("flag aura", A_FLAG),
+            ("proc trigger", A_PROC_TRIGGER),
+            ("proc damage", A_PROC_DAMAGE),
+            ("stat aura", A_MOD_STAT),
+            ("damage", E_DAMAGE),
+        ];
+        for (label, kind) in triggering_kinds {
             let effect = LearnEffect {
                 index: 0,
                 id: 1,
                 kind,
-                trigger_spell: 639,
+                trigger_spell: BATTLE_STANCE_PASSIVE,
             };
-            assert_eq!(resolve_learn_target(1873, [effect]), 1873, "kind {kind:#x}");
+            assert_eq!(
+                resolve_learn_target(BATTLE_STANCE, [effect]),
+                BATTLE_STANCE,
+                "{label}"
+            );
         }
-        assert_eq!(
-            resolve_learn_target(
-                1873,
-                [LearnEffect {
-                    index: 0,
-                    id: 1,
-                    kind: 0,
-                    trigger_spell: 0
-                }]
-            ),
-            1873
-        );
-        assert_eq!(
-            resolve_learn_target(
-                1873,
-                [LearnEffect {
-                    index: 0,
-                    id: 1,
-                    kind: 0,
-                    trigger_spell: 639
-                }]
-            ),
-            639
-        );
+    }
+
+    #[test]
+    fn a_stance_offering_ignores_a_trigger_spell_beside_its_stance_effect() {
+        let effects = [
+            LearnEffect {
+                index: 0,
+                id: 1,
+                kind: E_SET_STANCE,
+                trigger_spell: 21156,
+            },
+            LearnEffect {
+                index: 1,
+                id: 2,
+                kind: A_FLAG,
+                trigger_spell: 0,
+            },
+        ];
+        assert_eq!(resolve_learn_target(2457, effects), 2457);
+    }
+
+    #[test]
+    fn a_learn_effect_resolves_to_the_spell_it_teaches() {
+        let learn = |trigger_spell| LearnEffect {
+            index: 0,
+            id: 1,
+            kind: E_SCRIPTED,
+            trigger_spell,
+        };
+        assert_eq!(resolve_learn_target(1873, [learn(639)]), 639);
+        assert_eq!(resolve_learn_target(1873, [learn(0)]), 1873);
     }
 
     #[test]
