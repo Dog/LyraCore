@@ -359,6 +359,13 @@ A queue entry has ten seconds to finish encoding and writing. Exceeding a limit 
 critical packets are not silently discarded. Movement keeps its existing coalescing and shedding. Its
 pending Character and creature collections also cap each viewer at 4,096 movers and 2 MiB of estimated
 row storage per collection. Overflow closes the session.
+The SDK pump encodes each movement and creature path row once and hands each SDK message's rows to
+its Shard's movement fan-out thread. That thread finds the nearby viewers and queues one flush per
+viewer. When it falls behind, it takes up to 64 waiting messages at once. The pump waits only when
+64 messages are waiting. A reconnect drains the old thread before it starts a new one, so movement
+keeps its order. A flush can reach a writer after Relay Jobs from later SDK messages. The writer
+checks the created set at flush time, so a DESTROY still wins, but a CREATE can be followed by an
+older movement or path row until the mover's next row.
 
 One writer owns each session's header cipher and preserves FIFO order and contiguous entry batches.
 It combines frames into writes of about 64 KiB. Common movement and combat payloads share immutable

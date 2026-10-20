@@ -540,10 +540,16 @@ impl WorldView {
 }
 
 pub(crate) fn arm_shard(view: Arc<WorldView>, coord: Coordinator, shard: ShardId) -> Result<()> {
-    let flush_view = view.clone();
-    coord.0.after_each_message(move || {
-        crate::codec::movement::subscriptions::flush_motion(&flush_view, shard)
-    })?;
+    coord
+        .0
+        .after_each_message(crate::codec::movement::subscriptions::motion_fanout(
+            view.clone(),
+            shard,
+            crate::stage_timing::pump_timing(&format!(
+                "shard {} movement fan-out",
+                coord.shard_name()
+            )),
+        )?)?;
     let owner = coord.clone();
     coord.0.on_pump(move |conn| {
         crate::stdb::relays::register_shard(view.clone(), owner, shard, &conn.db);

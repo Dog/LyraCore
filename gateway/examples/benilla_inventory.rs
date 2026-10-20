@@ -190,8 +190,10 @@ fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn metadata(root: &Path) -> Result<Value> {
+    // Offline metadata for every target needs crates a host build never downloads.
     let output = Command::new("cargo")
         .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .args(["--filter-platform", &host_triple()?])
         .current_dir(root)
         .output()?;
     if !output.status.success() {
@@ -201,6 +203,15 @@ fn metadata(root: &Path) -> Result<Value> {
         );
     }
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn host_triple() -> Result<String> {
+    let output = Command::new("rustc").arg("-vV").output()?;
+    String::from_utf8(output.stdout)?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_owned)
+        .context("rustc -vV must name the host triple")
 }
 
 fn benilla_package(metadata: &Value) -> Result<&Value> {
