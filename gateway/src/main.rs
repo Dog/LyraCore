@@ -22,6 +22,11 @@ use provision_cli::{parse_gateway_mode, read_password_line, GatewayMode};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// glibc malloc serialized frees across SDK pumps and World Session writers on its arena locks.
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
