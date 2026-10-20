@@ -1239,15 +1239,32 @@ pub(crate) use fixtures::{
 pub(crate) fn seed_createinfo_spells(ctx: &ReducerContext) {
     use crate::spell::spellbook::game_createinfo_spell;
     let table = ctx.db.game_createinfo_spell();
-    if table.count() > 0 {
-        return;
-    }
+    let base_kit = if table.count() == 0 {
+        CREATEINFO_KIT
+    } else {
+        &[]
+    };
     let weapon_kit = CREATEINFO_WEAPON_KIT
         .iter()
         .flat_map(|&(race, class, spells)| spells.iter().map(move |&spell| (race, class, spell)));
-    for (race, class, spell_id) in CREATEINFO_KIT.iter().copied().chain(weapon_kit) {
+    let present: std::collections::HashSet<(u8, u8, u32)> = table
+        .iter()
+        .map(|row| (row.race, row.class, row.spell_id))
+        .collect();
+    // Imported rows carry explicit ids, so the auto_inc sequence could collide with them.
+    let mut next_id = table
+        .iter()
+        .map(|row| row.id)
+        .filter(|&id| !lyracore_package_delta::is_package_globals_id(id))
+        .max()
+        .unwrap_or(0);
+    for (race, class, spell_id) in base_kit.iter().copied().chain(weapon_kit) {
+        if present.contains(&(race, class, spell_id)) {
+            continue;
+        }
+        next_id += 1;
         table.insert(crate::spell::spellbook::CreateinfoSpell {
-            id: 0,
+            id: next_id,
             race,
             class,
             spell_id,
