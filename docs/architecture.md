@@ -876,6 +876,7 @@ warning banner states plainly, not a contradiction to resolve in this document.
 | [`quickstart.md`](./quickstart.md) | The shortest path from a clean checkout to a running realm. |
 | [`development-cli.md`](./development-cli.md) | Where the `./lyracore` CLI and its command reference live. |
 | [`data-ingestion.md`](./data-ingestion.md) | Where vanilla content comes from and the licensing firewall. |
+| [`operator-content-api.md`](./operator-content-api.md) | The reducers a tool calls to edit one spawn on a running realm. |
 
 ### Verification write-ups
 

@@ -36,6 +36,11 @@ and is not reconstructed here.
 
 ### Added
 
+- **The Operator Content API.** Eight `operator_*` reducers create, update and delete one creature
+  spawn or gameobject spawn on a running realm, replace a creature's patrol, or apply up to 256 of
+  those edits in one transaction. The live world shows each edit at once. New spawns take
+  identifiers from the Operator Spawn Range, 14,000,000 to 14,999,999. See
+  [`docs/operator-content-api.md`](./docs/operator-content-api.md).
 - **The Package API, version 1** — [`docs/package-api.md`](./docs/package-api.md) names what a
   Package's Rust half may call and what core promises about it. The module build lints every file
   under `packages/*/src/` against that list and fails on a path outside it, naming the Package, the

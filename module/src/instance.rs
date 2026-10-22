@@ -552,13 +552,26 @@ pub(crate) fn create_instance_with_id(
             continue;
         };
         let slot = max_band_low.entry(entry).or_insert(0);
-        *slot += 1;
-        if *slot >= INSTANCE_POP_LOW_BAND {
-            return Err(format!(
-                "instance population low exhausted for entry {entry}"
-            ));
+        // Dormant instance-zero rows in the Operator and Package spawn ranges share this band.
+        loop {
+            *slot += 1;
+            if *slot >= INSTANCE_POP_LOW_BAND {
+                return Err(format!(
+                    "instance population low exhausted for entry {entry}"
+                ));
+            }
+            copy.guid = crate::encounter::wave_guid(entry, INSTANCE_POP_LOW_BAND | *slot);
+            if ctx
+                .db
+                .game_creature_spawn()
+                .guid()
+                .find(copy.guid)
+                .is_none()
+                && entities.guid().find(copy.guid).is_none()
+            {
+                break;
+            }
         }
-        copy.guid = crate::encounter::wave_guid(entry, INSTANCE_POP_LOW_BAND | *slot);
         copy.life_seq = 1;
         copy.respawn_at = crate::creatures::timer_never(ctx);
         copy.despawn_at = crate::creatures::timer_never(ctx);
