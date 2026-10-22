@@ -877,6 +877,7 @@ mod partition_discipline_tripwire {
         ("module/src/package_import/creatures.rs", 1, "a Package Delta apply clears the whole Package creature range before it writes, so a Package that left the enabled set takes its spawns with it — realm-wide reconciliation, and the band has no index"),
         ("module/src/package_import/gameobjects.rs", 1, "the same whole-band clear for the Package gameobject range"),
         ("module/src/instance.rs", 7, "instance population spawn/teardown + the reaper's occupied-instance census — classifying every partition at once is the job"),
+        ("module/src/operator_content.rs", 2, "Operator Spawn Range high-water marks over spawn and gameobject rows when allocating a spawn identifier, not live-world reads"),
         ("module/src/encounter.rs", 2, "guid high-water marks over spawn/gameobject TEMPLATE rows when allocating a wave guid, not live-world reads"),
         ("module/src/creatures/pet.rs", 1, "`nearest_hostile_near` — KNOWN DEBT, a textbook `entities_near` radius search kept only because pets are rare (one per online warlock)"),
         ("packages/deadmines/src/choreography.rs", 1, "single instance-scoped boss-liveness check inside one encounter"),

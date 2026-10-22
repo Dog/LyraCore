@@ -528,6 +528,12 @@ apply clears the whole band before it writes.
 Each band after the spell band sits one whole decade above the one before it, so the millions
 column says which family invented a row.
 
+The Operator Spawn Range, 14,000,000 to 14,999,999, is not a Package band. It holds the creature and
+gameobject spawn identifiers that the [Operator Content API](./operator-content-api.md) allocates.
+It shares its numbers with the Package Spell Metadata Range, but a spawn identifier and a
+`game_spell_learn.id` never meet. It sits below the Package Creature Range because a creature spawn
+identifier must fit 24 bits.
+
 - **Script.** No client and no import holds a Runtime Script identifier, so the band has no real data
   to clear and sits below every reserved band rather than above one. It is the whole of
   `game_script` by construction, which makes a script apply a total reconciliation.

@@ -7,7 +7,7 @@ A World of Warcraft 1.12.1 server. Game state lives in SpacetimeDB; the gateway 
 
 ## Index
 
-**A** [Account](#accounts-characters-and-sessions) · [Account Character Owner](#accounts-characters-and-sessions) · [Account Claim](#accounts-characters-and-sessions) · [Account Fence](#accounts-characters-and-sessions) · [Action Outcome](#procs) · [Actor](#accounts-characters-and-sessions) · [Alpha Test Tools](#accounts-characters-and-sessions) · [AOI](#gateway-and-module) · [Architecture Test](#working-method) · [Assistant](#sharding-and-transfer) · [Auction Cut](#auctions) · [Auction Mail](#auctions) · [Auction Market](#auctions) · [Auction Notice](#auctions) · [Authored Casting](#creature-ai) · [Authored Combat](#creature-ai) · [Authored Flee](#creature-ai) · [Authoring Library](#packages) · [Auto-Reply](#chat) · [Away Status](#chat)
+**A** [Account](#accounts-characters-and-sessions) · [Account Character Owner](#accounts-characters-and-sessions) · [Account Claim](#accounts-characters-and-sessions) · [Account Fence](#accounts-characters-and-sessions) · [Action Outcome](#procs) · [Actor](#accounts-characters-and-sessions) · [Alpha Test Tools](#accounts-characters-and-sessions) · [AOI](#gateway-and-module) · [Architecture Test](#working-method) · [Assistant](#sharding-and-transfer) · [Auction Cut](#auctions) · [Auction Mail](#auctions) · [Auction Market](#auctions) · [Auction Notice](#auctions) · [Authored Casting](#creature-ai) · [Authored Combat](#creature-ai) · [Authored Flee](#creature-ai) · [Authored Spawn](#gateway-and-module) · [Authoring Library](#packages) · [Auto-Reply](#chat) · [Away Status](#chat)
 
 **B** [Base Snapshot](#packages) · [Baseline](#client-content) · [Bot Capacity Lease](#sharding-and-transfer) · [Bot Controller](#sharding-and-transfer) · [Bot Objective](#sharding-and-transfer) · [Bounded Map Slice](#realm-topology) · [Build Identity](#packages)
 
@@ -31,7 +31,7 @@ A World of Warcraft 1.12.1 server. Game state lives in SpacetimeDB; the gateway 
 
 **N** [Navigation Inputs](#sharding-and-transfer)
 
-**O** [Officer Note](#guilds) · [Official Package Collection](#packages) · [Official Package Source](#packages) · [Open Role](#meeting-stones) · [Operator](#realm-topology) · [Owner Token](#gateway-and-module)
+**O** [Officer Note](#guilds) · [Official Package Collection](#packages) · [Official Package Source](#packages) · [Open Role](#meeting-stones) · [Operator](#realm-topology) · [Operator Content API](#gateway-and-module) · [Operator Spawn Range](#gateway-and-module) · [Owner Token](#gateway-and-module)
 
 **P** [Package](#packages) · [Package API](#packages) · [Package Cast Range](#packages) · [Package Config](#packages) · [Package Creature Range](#packages) · [Package Delta](#packages) · [Package Event](#runtime-scripts) · [Package EventAI Range](#packages) · [Package Fixture](#packages) · [Package Gameobject Range](#packages) · [Package Globals Range](#packages) · [Package Gossip Range](#packages) · [Package Identifier Range](#packages) · [Package Import](#packages) · [Package Inventory](#packages) · [Package Item Range](#packages) · [Package Loot Range](#packages) · [Package Quest Range](#packages) · [Package Script Range](#packages) · [Package Source](#packages) · [Package Spell](#packages) · [Package Spell Metadata Range](#packages) · [Package Spell Range](#packages) · [Package Teardown](#packages) · [Package Trainer Range](#packages) · [Package-owned Account](#accounts-characters-and-sessions) · [Party](#sharding-and-transfer) · [Party Partition](#sharding-and-transfer) · [Patrol Pause](#creature-ai) · [Petition](#guilds) · [Petitioner](#guilds) · [Pre-auth I/O Deadline](#accounts-characters-and-sessions) · [Proc](#procs) · [Proficiency](#gateway-and-module) · [Property Pool](#random-properties) · [Protocol Family](#working-method) · [Prototype](#working-method) · [Provenance Stamp](#packages) · [Provisioning Profile](#sharding-and-transfer) · [Public Note](#guilds)
 
@@ -203,6 +203,21 @@ A failed Durable Read or Durable Request that is not a Refusal: the transport dr
 timed out, or the send failed. Its durable outcome is unknown, so it ends the World Session and the
 client logs in again from durable state.
 _Avoid_: transport failure, fatal error, disconnect
+
+**Operator Content API**:
+The `operator_*` reducers that create, update or delete one creature spawn or gameobject spawn on a
+running realm, or apply a batch of those edits in one transaction. They use the Module's despawn
+and respawn code, so the world shows each edit at once. A later full import replaces their rows.
+`docs/operator-content-api.md` gives the contracts.
+_Avoid_: editor API, world editor reducers
+
+**Authored Spawn**:
+An instance-zero creature or gameobject spawn row that no Package, population copy, Instance or
+pool owns. The Operator Content API changes only an Authored Spawn.
+
+**Operator Spawn Range**:
+The spawn identifiers the Operator Content API allocates: 14,000,000 to 14,999,999, for creature
+and gameobject spawns. No import and no Package spawn uses it.
 
 ### Accounts, characters and sessions
 

@@ -198,6 +198,7 @@ mod mount;
 mod nav;
 
 mod operations;
+mod operator_content;
 
 mod package;
 

@@ -333,3 +333,19 @@ pub const fn is_package_creature_ai_id(id: u64) -> bool {
 pub const fn is_fixture_reserved_creature_ai_id(id: u64) -> bool {
     id >= FIXTURE_RESERVED_ID_FLOOR as u64 && id <= FIXTURE_RESERVED_ID_CEIL as u64
 }
+
+// Spawn identifiers the Operator Content API allocates; it shares numbers with spell metadata ids.
+pub const OPERATOR_SPAWN_ID_FLOOR: u32 = 14_000_000;
+
+pub const OPERATOR_SPAWN_ID_CEIL: u32 = 14_999_999;
+
+const _: () = assert!(OPERATOR_SPAWN_ID_FLOOR <= OPERATOR_SPAWN_ID_CEIL);
+const _: () = assert!(RESERVED_ID_CEIL < OPERATOR_SPAWN_ID_FLOOR);
+const _: () = assert!(OPERATOR_SPAWN_ID_CEIL < PACKAGE_CREATURE_ID_FLOOR);
+const _: () = assert!(OPERATOR_SPAWN_ID_CEIL < PACKAGE_GAMEOBJECT_ID_FLOOR);
+const _: () = assert!(OPERATOR_SPAWN_ID_CEIL <= MAX_CREATURE_GUID_COMPONENT);
+
+#[must_use]
+pub const fn is_operator_spawn_id(id: u32) -> bool {
+    id >= OPERATOR_SPAWN_ID_FLOOR && id <= OPERATOR_SPAWN_ID_CEIL
+}
