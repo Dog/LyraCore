@@ -26,7 +26,33 @@ pub fn describe_limit(v: u64) -> String {
 }
 
 const fn unlimited() -> u64 {
-    libc::RLIM_INFINITY
+    u64::MAX
+}
+
+fn to_u64_limit(value: libc::rlim_t, label: &'static str) -> io::Result<u64> {
+    if value == libc::RLIM_INFINITY {
+        Ok(u64::MAX)
+    } else {
+        u64::try_from(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("negative {label} limit"),
+            )
+        })
+    }
+}
+
+fn from_u64_limit(value: u64, label: &'static str) -> io::Result<libc::rlim_t> {
+    if value == u64::MAX {
+        Ok(libc::RLIM_INFINITY)
+    } else {
+        libc::rlim_t::try_from(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} limit does not fit libc::rlim_t"),
+            )
+        })
+    }
 }
 
 pub fn raise_nofile_soft_to_hard() -> Option<u64> {
@@ -85,10 +111,14 @@ fn read_nofile() -> io::Result<(u64, u64)> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((lim.rlim_cur, lim.rlim_max))
+    let soft = to_u64_limit(lim.rlim_cur, "soft RLIMIT_NOFILE")?;
+    let hard = to_u64_limit(lim.rlim_max, "hard RLIMIT_NOFILE")?;
+    Ok((soft, hard))
 }
 
 fn set_nofile_soft(soft: u64, hard: u64) -> io::Result<()> {
+    let soft = from_u64_limit(soft, "soft RLIMIT_NOFILE")?;
+    let hard = from_u64_limit(hard, "hard RLIMIT_NOFILE")?;
     let lim = libc::rlimit {
         rlim_cur: soft,
         rlim_max: hard,
@@ -104,6 +134,25 @@ fn set_nofile_soft(soft: u64, hard: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn infinity_maps_to_unlimited_and_back() {
+        let raw = libc::RLIM_INFINITY;
+        assert_eq!(to_u64_limit(raw, "test").unwrap(), unlimited());
+        assert_eq!(from_u64_limit(unlimited(), "test").unwrap(), raw);
+        assert_eq!(
+            describe_limit(to_u64_limit(raw, "test").unwrap()),
+            "unlimited"
+        );
+    }
+
+    #[test]
+    fn finite_limits_cross_the_libc_boundary_unchanged() {
+        for value in [0_u64, 1024, 524_288] {
+            let raw = from_u64_limit(value, "test").unwrap();
+            assert_eq!(to_u64_limit(raw, "test").unwrap(), value);
+        }
+    }
 
     #[test]
     fn the_default_docker_shape_gets_raised() {
